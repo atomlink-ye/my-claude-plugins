@@ -535,10 +535,10 @@ function summarizePrompt(prompt) {
   if (!normalized) {
     return "";
   }
-  if (normalized.length <= 96) {
+  if (normalized.length <= 120) {
     return normalized;
   }
-  return `${normalized.slice(0, 93)}...`;
+  return `${normalized.slice(0, 120)}...`;
 }
 
 function normalizePromptText(prompt) {
@@ -1555,10 +1555,14 @@ function parseSseBlock(block) {
   if (data === "[DONE]") {
     return { done: true, payload: "[DONE]" };
   }
-  return {
-    done: false,
-    payload: parseJsonMaybe(data)
-  };
+  try {
+    return {
+      done: false,
+      payload: JSON.parse(data)
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function streamSseResponse(stream, onEvent, { abortSignal } = {}) {
@@ -2342,11 +2346,32 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-main()
-  .then(() => {
-    process.exit(process.exitCode ?? 0);
-  })
-  .catch((error) => {
-    stderr(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  });
+const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);
+
+if (isDirectExecution) {
+  main()
+    .then(() => {
+      process.exit(process.exitCode ?? 0);
+    })
+    .catch((error) => {
+      stderr(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    });
+}
+
+export {
+  generateJobId,
+  formatDuration,
+  isActiveJob,
+  isPidRunning,
+  normalizePromptText,
+  parseArgs,
+  parseSseBlock,
+  readJobs,
+  readLogTail,
+  refreshStaleRunningJobs,
+  renderBackgroundTaskStart,
+  resolveDirectory,
+  summarizePrompt,
+  upsertJob
+};

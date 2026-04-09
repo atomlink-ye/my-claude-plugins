@@ -7,7 +7,7 @@ allowed-tools: Bash(node:*)
 Route the request to the companion runtime:
 - `start`: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" ensure-serve ...`
 - `stop`: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" cleanup ...`
-- `status`: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" status ...`
+- `status`: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" check ...` to show serve health, version, and port
 
 Rules:
 - Preserve `--directory DIR` when the user supplies it.

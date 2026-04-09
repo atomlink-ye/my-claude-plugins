@@ -1,6 +1,6 @@
 ---
 description: Check whether OpenCode is installed and the serve process is ready
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+argument-hint: '[--directory DIR]'
 allowed-tools: Bash(node:*), Bash(brew:*), Bash(npm:*), AskUserQuestion
 ---
 
