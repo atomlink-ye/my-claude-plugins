@@ -1,0 +1,21 @@
+{
+  "name": "opencode-slave",
+  "owner": {
+    "name": "atomlink-ye"
+  },
+  "metadata": {
+    "description": "OpenCode Claude Code plugin \u2014 delegate AI coding tasks to OpenCode via its serve API.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "opencode",
+      "description": "Use OpenCode from Claude Code to delegate coding tasks via its serve API.",
+      "version": "0.1.0",
+      "author": {
+        "name": "atomlink-ye"
+      },
+      "source": "./plugins/opencode"
+    }
+  ]
+}

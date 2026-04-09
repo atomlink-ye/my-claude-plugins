@@ -5,4 +5,3 @@
 .opencode-job-*.log
 .tmp-state/
 node_modules/
-.opencode-state/
