@@ -29,7 +29,8 @@ function printUsage() {
       "Usage:",
       "  node scripts/opencode-companion.mjs check [--directory DIR]",
       "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory DIR]",
-      "  node scripts/opencode-companion.mjs task [--directory DIR] [--model MODEL] [--async] [--background] PROMPT",
+      "  node scripts/opencode-companion.mjs task [--directory DIR] [--model MODEL] [--session SESSION_ID] [--async] [--background] PROMPT",
+      "  node scripts/opencode-companion.mjs sessions [--directory DIR] [--session SESSION_ID] [--since MINUTES] [--limit N]",
       "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory DIR] [--model MODEL]",
       "  node scripts/opencode-companion.mjs status [job-id] [--directory DIR] [--all]",
       "  node scripts/opencode-companion.mjs result <job-id> [--directory DIR]",
@@ -545,6 +546,18 @@ function normalizePromptText(prompt) {
   return String(prompt ?? "").trim();
 }
 
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function lastNonEmptyLine(value) {
+  const lines = String(value ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  return lines.at(-1) ?? "";
+}
+
 async function gitText(directory, args, options = {}) {
   const result = await runGitCommand(directory, args, options);
   return String(result.stdout ?? "").trimEnd();
@@ -602,74 +615,128 @@ function normalizeReviewScope(scope) {
 }
 
 async function collectWorkingTreeReviewContext(directory) {
-  const status = await gitText(directory, ["status", "--short", "--untracked-files=all"]);
-  const staged = await gitText(directory, ["diff", "--cached", "--no-ext-diff", "--unified=3"]);
-  const unstaged = await gitText(directory, ["diff", "--no-ext-diff", "--unified=3"]);
+  const [branch, head, statusShort, stagedQuiet, unstagedQuiet, stagedStat, unstagedStat] = await Promise.all([
+    getCurrentGitBranch(directory),
+    gitText(directory, ["rev-parse", "--short", "HEAD"], { allowNonZero: true }),
+    gitText(directory, ["status", "--short", "--untracked-files=all"]),
+    runGitCommand(directory, ["diff", "--cached", "--quiet"], { allowNonZero: true }),
+    runGitCommand(directory, ["diff", "--quiet"], { allowNonZero: true }),
+    gitText(directory, ["diff", "--cached", "--stat"], { allowNonZero: true }),
+    gitText(directory, ["diff", "--stat"], { allowNonZero: true })
+  ]);
 
-  if (!status.trim() && !staged.trim() && !unstaged.trim()) {
+  const hasStaged = stagedQuiet.exitCode === 1;
+  const hasUnstaged = unstagedQuiet.exitCode === 1;
+
+  if (!statusShort.trim() && !hasStaged && !hasUnstaged) {
     throw new Error("No staged or unstaged changes found for working-tree review.");
   }
 
-  const sections = [
-    "Review scope: working-tree",
-    `Directory: ${directory}`
-  ];
-
-  if (status.trim()) {
-    sections.push("", "Git status:", status.trimEnd());
-  }
-
-  sections.push("", "Staged diff:", staged.trimEnd() || "(none)", "", "Unstaged diff:", unstaged.trimEnd() || "(none)");
-  return sections.join("\n");
+  return {
+    scope: "working-tree",
+    directory,
+    branch,
+    head: head || null,
+    hasStaged,
+    hasUnstaged,
+    statusShort,
+    stagedStatFooter: lastNonEmptyLine(stagedStat),
+    unstagedStatFooter: lastNonEmptyLine(unstagedStat)
+  };
 }
 
 async function collectBranchReviewContext(directory, baseRef) {
-  const branch = await getCurrentGitBranch(directory);
-  const head = await gitText(directory, ["rev-parse", "--short", "HEAD"]);
-  const log = await gitText(directory, ["log", "--oneline", `${baseRef}..HEAD`]);
-  const diff = await gitText(directory, ["diff", "--no-ext-diff", "--unified=3", `${baseRef}...HEAD`]);
+  const [branch, head, commitLog, statText] = await Promise.all([
+    getCurrentGitBranch(directory),
+    gitText(directory, ["rev-parse", "--short", "HEAD"]),
+    gitText(directory, ["log", "--oneline", `${baseRef}..HEAD`]),
+    gitText(directory, ["diff", "--stat", `${baseRef}...HEAD`], { allowNonZero: true })
+  ]);
 
-  if (!log.trim() && !diff.trim()) {
+  if (!commitLog.trim() && !statText.trim()) {
     throw new Error(`No commits or diff found between ${baseRef} and HEAD for branch review.`);
   }
 
-  const sections = [
-    "Review scope: branch",
-    `Directory: ${directory}`,
-    `Branch: ${branch ?? "detached HEAD"}`,
-    `Base: ${baseRef}`,
-    `Head: ${head || "unknown"}`
-  ];
-
-  if (log.trim()) {
-    sections.push("", `Commit log (${baseRef}..HEAD):`, log.trimEnd());
-  }
-
-  if (diff.trim()) {
-    sections.push("", `Diff (${baseRef}...HEAD):`, diff.trimEnd());
-  }
-
-  return sections.join("\n");
+  return {
+    scope: "branch",
+    directory,
+    branch,
+    base: baseRef,
+    head: head || null,
+    commitLog,
+    statFooter: lastNonEmptyLine(statText)
+  };
 }
 
-function buildReviewPrompt(context, { adversarial = false, focusText = null } = {}) {
+function buildReviewPrompt(metadata, { adversarial = false, focusText = null } = {}) {
   const sections = [];
+  const directory = shellSingleQuote(metadata.directory);
+
+  if (metadata.scope === "branch") {
+    sections.push(`You are reviewing the branch of ${metadata.directory}.`);
+    sections.push(`Branch: ${metadata.branch ?? "detached HEAD"}. Base: ${metadata.base}. Head: ${metadata.head ?? "unknown"}.`);
+  } else {
+    sections.push(`You are reviewing the working-tree of ${metadata.directory}.`);
+    sections.push(`Branch: ${metadata.branch ?? "detached HEAD"}. Head: ${metadata.head ?? "unknown"}.`);
+  }
 
   if (adversarial) {
     sections.push(
+      "",
       "You are performing an adversarial code review. Challenge design decisions, question tradeoffs, and identify assumptions."
     );
   }
 
+  const commands =
+    metadata.scope === "branch"
+      ? [
+          `  git -C ${directory} log --oneline ${metadata.base}..HEAD`,
+          `  git -C ${directory} diff ${metadata.base}...HEAD`,
+          `  git -C ${directory} diff --stat ${metadata.base}...HEAD`
+        ]
+      : [
+          `  git -C ${directory} status --short`,
+          `  git -C ${directory} diff --cached`,
+          `  git -C ${directory} diff`,
+          `  git -C ${directory} diff --cached --stat`,
+          `  git -C ${directory} diff --stat`
+        ];
+
   sections.push(
-    "Please review the following code changes and report findings by severity (Critical/High/Medium/Low). Include file paths and line numbers."
+    "",
+    "Run the following commands yourself inside the session to read the changes. Do NOT rely on a pre-pasted diff; there isn't one.",
+    "",
+    ...commands,
+    ""
   );
+
+  if (metadata.scope === "branch" && metadata.commitLog?.trim()) {
+    sections.push("Commit log:", metadata.commitLog.trimEnd(), "");
+  }
+
+  if (metadata.scope === "working-tree" && metadata.statusShort?.trim()) {
+    sections.push("Status snapshot:", metadata.statusShort.trimEnd(), "");
+  }
+
+  const statLines =
+    metadata.scope === "branch"
+      ? [metadata.statFooter].filter(Boolean)
+      : [
+          metadata.stagedStatFooter ? `Staged: ${metadata.stagedStatFooter}` : "",
+          metadata.unstagedStatFooter ? `Unstaged: ${metadata.unstagedStatFooter}` : ""
+        ].filter(Boolean);
+
+  sections.push("Stat summary:");
+  if (statLines.length > 0) {
+    sections.push(...statLines);
+  }
+
+  sections.push("", "Report findings by severity (Critical/High/Medium/Low) with file paths and line numbers.");
 
   if (focusText) {
     sections.push("", `Focus the review on: ${focusText}`);
   }
 
-  sections.push("", context);
   return sections.join("\n");
 }
 
@@ -830,10 +897,8 @@ function renderJobTailSection(job) {
 
 function renderBackgroundTaskStart(jobId, scriptPath, directory) {
   const script = scriptPath ?? "scripts/opencode-companion.mjs";
-  // Shell-safe single-quote escaping: wrap in ' and replace internal ' with '\''
-  const sq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
-  const dirFlag = directory ? ` --directory ${sq(directory)}` : "";
-  return `OpenCode task started in background as ${jobId}. Check status: node ${sq(script)} status ${jobId}${dirFlag}\n`;
+  const dirFlag = directory ? ` --directory ${shellSingleQuote(directory)}` : "";
+  return `OpenCode task started in background as ${jobId}. Check status: node ${shellSingleQuote(script)} status ${jobId}${dirFlag}\n`;
 }
 
 function createJobLogFile(directory, jobId) {
@@ -848,6 +913,10 @@ function spawnBackgroundTaskWorker(directory, jobId, prompt, args = {}) {
 
   if (args.model) {
     childArgs.push("--model", args.model);
+  }
+
+  if (args.session) {
+    childArgs.push("--session", args.session);
   }
 
   childArgs.push("--", prompt);
@@ -971,12 +1040,22 @@ function isAbortError(error) {
 function formatUnexpectedTaskAbort(model) {
   const modelLabel = model
     ? model.providerID
-      ? `configured model ${model.providerID}/${model.modelID}`
-      : `configured model ${model.modelID}`
-    : "default model/provider";
+      ? `${model.providerID}/${model.modelID}`
+      : model.modelID
+    : "default";
 
   return new Error(
-    `OpenCode aborted the task request before it completed. The ${modelLabel} may have failed authentication or become unavailable. Refresh OpenCode credentials, or rerun with --model MODEL.`
+    [
+      `OpenCode aborted the foreground stream for this task (model: ${modelLabel}).`,
+      "IMPORTANT: this does NOT necessarily mean the OpenCode session is dead.",
+      "When a task triggers heavy planning or sub-agent delegation (@explorer, @librarian, @oracle, @designer, etc.),",
+      "the foreground request can be aborted while the underlying session keeps running on the serve.",
+      "Before retrying, check whether the session is still active:",
+      "  node scripts/opencode-companion.mjs sessions",
+      "If a session titled like your task shows verdict=active, DO NOT retry — it is still working.",
+      "Only retry if the session is absent or verdict=idle. When you retry, prefer a narrower scope",
+      "or explicitly instruct OpenCode not to delegate to sub-agents for stable foreground completion."
+    ].join("\n")
   );
 }
 
@@ -1490,16 +1569,51 @@ function summarizeSession(session) {
     (session.running ? "running" : null) ||
     (session.active ? "active" : null) ||
     "unknown";
-  const createdAt = session.createdAt || session.created_at || session.startedAt || "";
-  const updatedAt = session.updatedAt || session.updated_at || session.modifiedAt || "";
+
+  const time = session.time && typeof session.time === "object" ? session.time : {};
+  const createdRaw =
+    time.created ?? session.createdAt ?? session.created_at ?? session.startedAt ?? "";
+  const updatedRaw =
+    time.updated ?? session.updatedAt ?? session.updated_at ?? session.modifiedAt ?? "";
+
+  const createdAtMs = toEpochMs(createdRaw);
+  const updatedAtMs = toEpochMs(updatedRaw);
 
   return {
     id: session.id || session.sessionID || session.sessionId || "unknown",
     status: String(status),
-    createdAt: String(createdAt || ""),
-    updatedAt: String(updatedAt || ""),
+    createdAt: createdAtMs != null ? new Date(createdAtMs).toISOString() : String(createdRaw || ""),
+    updatedAt: updatedAtMs != null ? new Date(updatedAtMs).toISOString() : String(updatedRaw || ""),
+    createdAtMs,
+    updatedAtMs,
     summary: String(summary || "")
   };
+}
+
+function toEpochMs(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    // OpenCode serves Unix-ms numbers for time.created / time.updated.
+    return value > 1e12 ? value : value * 1000;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatRelativeAge(ms) {
+  if (ms == null) {
+    return "unknown";
+  }
+  const diff = Math.max(0, Date.now() - ms);
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 function renderStatus(directory, state, healthy, sessions, sessionError) {
@@ -1796,7 +1910,7 @@ async function handleEnsureServe(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--async", "--background"],
-    stringFlags: ["--directory", "--model", "--job-id"]
+    stringFlags: ["--directory", "--model", "--job-id", "--session"]
   });
 
   const directory = resolveDirectory(options.directory);
@@ -1812,6 +1926,10 @@ async function handleTask(argv) {
   const rawModel = options.model == null ? null : String(options.model);
   const model = parseModelOption(options.model);
   const jobId = options["job-id"] ?? null;
+  const resumeSessionId =
+    options.session != null && String(options.session).trim() !== ""
+      ? String(options.session).trim()
+      : null;
 
   if (options.background && jobId) {
     throw new Error("The --job-id flag is reserved for internal background workers.");
@@ -1833,7 +1951,8 @@ async function handleTask(argv) {
     let child;
     try {
       child = spawnBackgroundTaskWorker(directory, backgroundJobId, prompt, {
-        model: rawModel
+        model: rawModel,
+        session: resumeSessionId
       });
     } catch (error) {
       markJobFinished(directory, backgroundJobId, "failed", {
@@ -1923,8 +2042,13 @@ async function handleTask(argv) {
   try {
     state = await ensureManagedServe(directory, 0);
     baseUrl = buildBaseUrl(state.port);
-    sessionId = await createSession(baseUrl, directory);
-    log(`Created OpenCode session ${sessionId} on port ${state.port}.`);
+    if (resumeSessionId) {
+      sessionId = resumeSessionId;
+      log(`Resuming OpenCode session ${sessionId} on port ${state.port}.`);
+    } else {
+      sessionId = await createSession(baseUrl, directory);
+      log(`Created OpenCode session ${sessionId} on port ${state.port}.`);
+    }
 
     if (jobId) {
       const currentJob = readJob(directory, jobId);
@@ -2138,16 +2262,16 @@ async function handleReview(argv) {
     throw new Error("Cannot combine --wait with --background.");
   }
 
-  let context = null;
+  let metadata = null;
 
   if (reviewScope === "working-tree") {
-    context = await collectWorkingTreeReviewContext(directory);
+    metadata = await collectWorkingTreeReviewContext(directory);
   } else if (reviewScope === "branch") {
     const selectedBase = baseRef || (await resolveDefaultReviewBaseRef(directory));
     if (!selectedBase) {
       throw new Error("Unable to resolve a base ref for branch review. Pass --base REF.");
     }
-    context = await collectBranchReviewContext(directory, selectedBase);
+    metadata = await collectBranchReviewContext(directory, selectedBase);
   } else {
     const currentBranch = await getCurrentGitBranch(directory);
     const selectedBase = baseRef || (await resolveDefaultReviewBaseRef(directory));
@@ -2156,16 +2280,16 @@ async function handleReview(argv) {
     if (!isMainBranch && selectedBase) {
       const aheadCount = await getAheadCommitCount(directory, selectedBase);
       if (aheadCount > 0) {
-        context = await collectBranchReviewContext(directory, selectedBase);
+        metadata = await collectBranchReviewContext(directory, selectedBase);
       }
     }
 
-    if (!context) {
-      context = await collectWorkingTreeReviewContext(directory);
+    if (!metadata) {
+      metadata = await collectWorkingTreeReviewContext(directory);
     }
   }
 
-  const prompt = buildReviewPrompt(context, {
+  const prompt = buildReviewPrompt(metadata, {
     adversarial: Boolean(options.adversarial),
     focusText: focusText || null
   });
@@ -2181,6 +2305,91 @@ async function handleReview(argv) {
   taskArgs.push("--", prompt);
 
   await handleTask(taskArgs);
+}
+
+async function handleSessions(argv) {
+  const { options } = parseArgs(argv, {
+    stringFlags: ["--directory", "--session", "--since", "--limit"]
+  });
+  const directory = resolveDirectory(options.directory);
+  const sinceMinutes = options.since != null ? Number(options.since) : 5;
+  if (!Number.isFinite(sinceMinutes) || sinceMinutes < 0) {
+    throw new Error(`Invalid --since value: ${options.since}`);
+  }
+  const limit = options.limit != null ? Math.max(1, Number(options.limit)) : 10;
+  if (!Number.isFinite(limit)) {
+    throw new Error(`Invalid --limit value: ${options.limit}`);
+  }
+  const sessionFilter = options.session ? String(options.session).trim() : null;
+
+  const state = normalizeState(readState(directory));
+  if (!state) {
+    process.stdout.write(`No managed OpenCode serve state found for ${directory}.\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const baseUrl = buildBaseUrl(state.port);
+  if (!(await checkHealth(baseUrl))) {
+    process.stdout.write(
+      `OpenCode serve at ${baseUrl} is not reachable (pid ${state.pid}). Run \`check\` or \`ensure-serve\` to revive it.\n`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  let raw;
+  try {
+    raw = await listSessions(baseUrl, directory);
+  } catch (error) {
+    throw new Error(`Failed to list sessions: ${error.message}`);
+  }
+
+  const sessions = (Array.isArray(raw) ? raw : []).map(summarizeSession);
+  let filtered = sessionFilter
+    ? sessions.filter((s) => s.id === sessionFilter)
+    : sessions;
+
+  // Newest first by updatedAtMs, falling back to createdAtMs.
+  filtered.sort((a, b) => {
+    const av = a.updatedAtMs ?? a.createdAtMs ?? 0;
+    const bv = b.updatedAtMs ?? b.createdAtMs ?? 0;
+    return bv - av;
+  });
+  filtered = filtered.slice(0, limit);
+
+  if (filtered.length === 0) {
+    if (sessionFilter) {
+      process.stdout.write(`No session found with id ${sessionFilter} in ${directory}.\n`);
+      process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(`No sessions reported by the serve at ${baseUrl}.\n`);
+    return;
+  }
+
+  const cutoffMs = Date.now() - sinceMinutes * 60 * 1000;
+  const lines = [
+    `OpenCode sessions at ${baseUrl} (directory: ${directory})`,
+    `Active threshold: updated within ${sinceMinutes} minute${sinceMinutes === 1 ? "" : "s"}.`,
+    "",
+    "| verdict | id | age | title |",
+    "| --- | --- | --- | --- |"
+  ];
+  for (const s of filtered) {
+    const updMs = s.updatedAtMs ?? s.createdAtMs;
+    const verdict = updMs != null && updMs >= cutoffMs ? "active" : "idle";
+    const age = formatRelativeAge(updMs);
+    lines.push(
+      `| ${verdict} | ${escapeMarkdownCell(s.id)} | ${escapeMarkdownCell(age)} | ${escapeMarkdownCell(s.summary)} |`
+    );
+  }
+  lines.push(
+    "",
+    "Note: 'active' means the session was updated recently on the serve.",
+    "A foreground `task` call that returned non-zero may correspond to a session that is still active here;",
+    "check the verdict above before retrying so you don't double-fire a still-running session."
+  );
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
 async function handleStatus(argv) {
@@ -2330,6 +2539,10 @@ async function main() {
     await handleStatus(rest);
     return;
   }
+  if (command === "sessions") {
+    await handleSessions(rest);
+    return;
+  }
   if (command === "result") {
     await handleResult(rest);
     return;
@@ -2360,6 +2573,9 @@ if (isDirectExecution) {
 }
 
 export {
+  buildReviewPrompt,
+  collectBranchReviewContext,
+  collectWorkingTreeReviewContext,
   generateJobId,
   formatDuration,
   isActiveJob,

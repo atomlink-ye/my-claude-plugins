@@ -55,6 +55,7 @@ Guidelines for each block:
 - Hiding important constraints inside long prose.
 - Assuming files, modules, or architecture that have not been checked.
 - Asking for implementation and final review in the same unconstrained pass.
+- Telling OpenCode how to structure its internal work — which sub-agents to use, which internal tools to prefer, which delegation paths to avoid. Describe the outcome you need, not the mechanism inside the session.
 - Leaving verification implicit when the result will be reused or shipped.
 
 ## Verification Loop
