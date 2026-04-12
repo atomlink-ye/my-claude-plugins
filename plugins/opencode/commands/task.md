@@ -7,7 +7,7 @@ skills:
   - opencode
 ---
 
-Invoke the OpenCode companion **directly via Bash** — do NOT route through the `opencode:opencode-agent` subagent.
+Invoke the OpenCode companion **directly via Bash**.
 
 Consult the `opencode` skill for invocation syntax, prompt composition, and result handling.
 

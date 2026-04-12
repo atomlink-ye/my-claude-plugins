@@ -10,7 +10,6 @@ OpenCode 提供了 `opencode serve` 命令，可以在本地启动一个 HTTP AP
 
 1. **MCP Server**：将 OpenCode serve API 包装为 MCP（Model Context Protocol）工具，让 Claude Code 可以直接调用 OpenCode 执行编程任务
 2. **Skill**：提供用户可调用的斜杠命令（`/opencode:task`、`/opencode:status` 等），统一调度 OpenCode 完成复杂任务
-3. **Agent**：提供专用子代理（`opencode-agent`），作为任务转发的执行层
 
 ## 架构概览
 
@@ -71,8 +70,6 @@ opencode-slave/
 ├── skills/
 │   └── opencode/
 │       └── SKILL.md          # 统一技能：调用、提示、结果处理、运行时合约
-├── agents/
-│   └── opencode-agent.md     # 子代理：转发任务到 OpenCode
 ├── scripts/
 │   └── opencode-companion.mjs  # 核心：进程管理 + HTTP API 客户端
 ├── hooks/
@@ -124,23 +121,6 @@ user-invocable: false
 ---
 
 行为规则说明...
-```
-
-### Agent 格式（agents/）
-
-子代理定义执行层：
-
-```yaml
----
-name: opencode-agent
-description: 转发任务到 OpenCode serve API
-model: sonnet
-tools: Bash
-skills:
-  - opencode
----
-
-转发逻辑说明...
 ```
 
 ### Hooks（hooks/）

@@ -1,6 +1,6 @@
 ---
 name: opencode
-description: Authoritative reference for OpenCode invocation, prompt composition, and result handling. Consult before ANY OpenCode usage — especially session operations (continue, resume, list), task delegation, and serve lifecycle. This is the single source of truth for companion CLI syntax, flags, and behavioral contracts.
+description: Authoritative reference for OpenCode invocation, prompt composition, and result handling. Consult before ANY OpenCode usage — especially task delegation, session operations (continue, resume, list),  and serve lifecycle. This is the single source of truth for companion CLI syntax, flags, and behavioral contracts.
 user-invocable: false
 ---
 

@@ -8,3 +8,7 @@ node_modules/
 .opencode-state/
 
 .local
+
+# Tool build artifacts
+tools/*/dist/
+tools/*/node_modules/

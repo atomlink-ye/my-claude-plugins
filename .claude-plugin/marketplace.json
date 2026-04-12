@@ -17,6 +17,15 @@
         "name": "atomlink-ye"
       },
       "source": "./plugins/opencode"
+    },
+    {
+      "name": "google-workspace",
+      "description": "Interact with Google Workspace services (Docs, Drive, Sheets, etc.) via the gws CLI.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/google-workspace"
+      ]
     }
   ]
 }

@@ -1,0 +1,440 @@
+export function getInjectedShimCode(
+  wsPort: number,
+  address: string,
+  chainId: number,
+): string {
+  const normalizedAddress = address.toLowerCase();
+  const chainIdHex = `0x${chainId.toString(16)}`;
+
+  return `(function () {
+    var config = {
+      wsUrl: ${JSON.stringify(`ws://127.0.0.1:${wsPort}`)},
+      address: ${JSON.stringify(normalizedAddress)},
+      chainIdHex: ${JSON.stringify(chainIdHex)},
+      chainIdDec: ${JSON.stringify(String(chainId))}
+    };
+
+    var globalObject = typeof globalThis !== 'undefined' ? globalThis : window;
+    var pending = new Map();
+    var queuedMessages = [];
+    var inflightIds = new Set();
+    var listeners = new Map();
+    var reconnectTimer = null;
+    var reconnectDelay = 250;
+    var requestCounter = 0;
+    var ws = null;
+    var connected = false;
+    var destroyed = false;
+    var currentAddress = config.address;
+    var currentChainId = config.chainIdHex;
+    var currentChainNumeric = config.chainIdDec;
+    var providerUuid = createUuid();
+    var providerInfo = {
+      uuid: providerUuid,
+      name: 'Agent Wallet',
+      icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNiIgZmlsbD0iIzExMTgyNyIvPjxwYXRoIGQ9Ik0xOSAyMWgyNmE1IDUgMCAwIDEgNSA1djEyYTUgNSAwIDAgMS01IDVIMTlhNSA1IDAgMCAxLTUtNVYyNmE1IDUgMCAwIDEgNS01em0yIDEyaDE0IiBzdHJva2U9IiM2MEE1RkEiIHN0cm9rZS13aWR0aD0iNCIgZmlsbD0ibm9uZSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PGNpcmNsZSBjeD0iNDUiIGN5PSIzMiIgcj0iMyIgZmlsbD0iIzYwQTVGQSIvPjwvc3ZnPg==',
+      rdns: 'local.agent-wallet.bridge'
+    };
+
+    function createUuid() {
+      if (globalObject.crypto && typeof globalObject.crypto.randomUUID === 'function') {
+        return globalObject.crypto.randomUUID();
+      }
+
+      var template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+      return template.replace(/[xy]/g, function (char) {
+        var randomValue = Math.floor(Math.random() * 16);
+        var value = char === 'x' ? randomValue : ((randomValue & 0x3) | 0x8);
+        return value.toString(16);
+      });
+    }
+
+    function createError(code, message, data) {
+      var error = new Error(message);
+      error.code = code;
+      if (typeof data !== 'undefined') {
+        error.data = data;
+      }
+      return error;
+    }
+
+    function addListener(eventName, listener) {
+      if (typeof listener !== 'function') {
+        throw createError(-32602, 'Listener must be a function');
+      }
+
+      if (!listeners.has(eventName)) {
+        listeners.set(eventName, new Set());
+      }
+
+      listeners.get(eventName).add(listener);
+      return provider;
+    }
+
+    function removeListener(eventName, listener) {
+      var handlers = listeners.get(eventName);
+      if (handlers) {
+        handlers.delete(listener);
+        if (handlers.size === 0) {
+          listeners.delete(eventName);
+        }
+      }
+      return provider;
+    }
+
+    function emit(eventName, payload) {
+      var handlers = listeners.get(eventName);
+      if (!handlers) {
+        return;
+      }
+
+      handlers.forEach(function (handler) {
+        try {
+          handler(payload);
+        } catch (error) {
+          setTimeout(function () {
+            throw error;
+          }, 0);
+        }
+      });
+    }
+
+    function isConnected() {
+      return connected;
+    }
+
+    function nextRequestId() {
+      requestCounter += 1;
+      if (globalObject.crypto && typeof globalObject.crypto.randomUUID === 'function') {
+        return globalObject.crypto.randomUUID();
+      }
+      return 'agent-wallet-' + Date.now() + '-' + requestCounter;
+    }
+
+    function normalizeParams(params) {
+      if (typeof params === 'undefined' || params === null) {
+        return [];
+      }
+      if (Array.isArray(params)) {
+        return params;
+      }
+      return [params];
+    }
+
+    function sendRpc(method, params) {
+      var id = nextRequestId();
+      var message = {
+        type: 'rpc_request',
+        id: id,
+        method: method,
+        params: normalizeParams(params)
+      };
+
+      return new Promise(function (resolve, reject) {
+        pending.set(id, { resolve: resolve, reject: reject, message: message, sent: false });
+        queuedMessages.push(message);
+        flushQueue();
+      });
+    }
+
+    function flushQueue() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      while (queuedMessages.length > 0) {
+        var message = queuedMessages.shift();
+        var request = pending.get(message.id);
+        if (!request) {
+          continue;
+        }
+
+        try {
+          ws.send(JSON.stringify(message));
+          request.sent = true;
+          inflightIds.add(message.id);
+        } catch (error) {
+          queuedMessages.unshift(message);
+          break;
+        }
+      }
+    }
+
+    function rejectInflight(error) {
+      inflightIds.forEach(function (id) {
+        var request = pending.get(id);
+        if (!request) {
+          return;
+        }
+        pending.delete(id);
+        request.reject(error);
+      });
+      inflightIds.clear();
+    }
+
+    function scheduleReconnect() {
+      if (destroyed || reconnectTimer !== null) {
+        return;
+      }
+
+      reconnectTimer = globalObject.setTimeout(function () {
+        reconnectTimer = null;
+        connectWebSocket();
+      }, reconnectDelay);
+
+      reconnectDelay = Math.min(reconnectDelay * 2, 5000);
+    }
+
+    function handleDaemonMessage(event) {
+      var response;
+      try {
+        response = JSON.parse(event.data);
+      } catch (_error) {
+        return;
+      }
+
+      if (!response || response.type !== 'rpc_response' || typeof response.id !== 'string') {
+        return;
+      }
+
+      var request = pending.get(response.id);
+      if (!request) {
+        return;
+      }
+
+      pending.delete(response.id);
+      inflightIds.delete(response.id);
+
+      if (response.error) {
+        request.reject(createError(response.error.code, response.error.message));
+        return;
+      }
+
+      request.resolve(response.result);
+    }
+
+    function connectWebSocket() {
+      if (destroyed) {
+        return;
+      }
+
+      try {
+        ws = new WebSocket(config.wsUrl);
+      } catch (_error) {
+        scheduleReconnect();
+        return;
+      }
+
+      ws.addEventListener('open', function () {
+        connected = true;
+        reconnectDelay = 250;
+        emit('connect', { chainId: currentChainId });
+        emit('chainChanged', currentChainId);
+        emit('accountsChanged', currentAddress ? [currentAddress] : []);
+        flushQueue();
+      });
+
+      ws.addEventListener('message', handleDaemonMessage);
+
+      ws.addEventListener('close', function () {
+        var wasConnected = connected;
+        connected = false;
+        ws = null;
+        rejectInflight(createError(4900, 'Wallet disconnected from bridge daemon'));
+        if (wasConnected) {
+          emit('disconnect', { code: 4900, message: 'Wallet disconnected from bridge daemon' });
+        }
+        scheduleReconnect();
+      });
+
+      ws.addEventListener('error', function () {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          return;
+        }
+        connected = false;
+      });
+    }
+
+    function announceProvider() {
+      globalObject.dispatchEvent(new CustomEvent('eip6963:announceProvider', {
+        detail: {
+          info: providerInfo,
+          provider: provider
+        }
+      }));
+    }
+
+    function handleSwitchChain(params) {
+      var chain = params && params[0];
+      if (!chain || typeof chain !== 'object' || typeof chain.chainId !== 'string') {
+        throw createError(-32602, 'wallet_switchEthereumChain requires a chainId parameter');
+      }
+
+      // Only allow switching to the configured chain
+      if (chain.chainId.toLowerCase() !== config.chainIdHex.toLowerCase()) {
+        throw createError(4902, 'Unrecognized chain ID "' + chain.chainId + '". Only chain ' + config.chainIdHex + ' is supported.');
+      }
+
+      return null;
+    }
+
+    function request(requestArguments) {
+      if (!requestArguments || typeof requestArguments !== 'object') {
+        return Promise.reject(createError(-32602, 'Invalid request arguments'));
+      }
+
+      var method = requestArguments.method;
+      var params = normalizeParams(requestArguments.params);
+
+      if (typeof method !== 'string' || method.length === 0) {
+        return Promise.reject(createError(-32602, 'Invalid request method'));
+      }
+
+      if (method === 'eth_requestAccounts' || method === 'eth_accounts') {
+        return Promise.resolve(currentAddress ? [currentAddress] : []);
+      }
+
+      if (method === 'eth_chainId') {
+        return Promise.resolve(currentChainId);
+      }
+
+      if (method === 'wallet_switchEthereumChain') {
+        try {
+          return Promise.resolve(handleSwitchChain(params));
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      }
+
+      return sendRpc(method, params);
+    }
+
+    function send(methodOrPayload, paramsOrCallback) {
+      if (typeof methodOrPayload === 'string') {
+        return request({ method: methodOrPayload, params: normalizeParams(paramsOrCallback) });
+      }
+
+      if (!methodOrPayload || typeof methodOrPayload !== 'object') {
+        throw createError(-32602, 'Invalid send payload');
+      }
+
+      return request(methodOrPayload);
+    }
+
+    function sendAsync(payload, callback) {
+      if (typeof callback !== 'function') {
+        throw createError(-32602, 'Callback is required for sendAsync');
+      }
+
+      request(payload).then(function (result) {
+        callback(null, {
+          id: payload && payload.id,
+          jsonrpc: '2.0',
+          result: result
+        });
+      }).catch(function (error) {
+        callback(error, null);
+      });
+    }
+
+    var providerTarget = {
+      request: request,
+      send: send,
+      sendAsync: sendAsync,
+      on: addListener,
+      addListener: addListener,
+      removeListener: removeListener,
+      off: removeListener,
+      removeAllListeners: function (eventName) {
+        if (typeof eventName === 'string') {
+          listeners.delete(eventName);
+        } else {
+          listeners.clear();
+        }
+        return provider;
+      },
+      once: function (eventName, listener) {
+        function onceListener(payload) {
+          removeListener(eventName, onceListener);
+          listener(payload);
+        }
+        return addListener(eventName, onceListener);
+      },
+      enable: function () {
+        return request({ method: 'eth_requestAccounts' });
+      },
+      isConnected: isConnected,
+      _metamask: {
+        isUnlocked: function () {
+          return Promise.resolve(true);
+        }
+      }
+    };
+
+    var provider = new Proxy(providerTarget, {
+      get: function (target, property, receiver) {
+        if (property === 'isMetaMask') {
+          return true;
+        }
+        if (property === 'selectedAddress') {
+          return currentAddress;
+        }
+        if (property === 'chainId') {
+          return currentChainId;
+        }
+        if (property === 'networkVersion') {
+          return currentChainNumeric;
+        }
+        if (property === 'providers') {
+          return [receiver];
+        }
+        if (property === Symbol.toStringTag) {
+          return 'EthereumProvider';
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      has: function (target, property) {
+        return property === 'isMetaMask'
+          || property === 'selectedAddress'
+          || property === 'chainId'
+          || property === 'networkVersion'
+          || property === 'providers'
+          || Reflect.has(target, property);
+      },
+      ownKeys: function (target) {
+        var keys = Reflect.ownKeys(target);
+        keys.push('isMetaMask', 'selectedAddress', 'chainId', 'networkVersion', 'providers');
+        return Array.from(new Set(keys));
+      },
+      getOwnPropertyDescriptor: function (target, property) {
+        if (property === 'isMetaMask' || property === 'selectedAddress' || property === 'chainId' || property === 'networkVersion' || property === 'providers') {
+          return {
+            configurable: true,
+            enumerable: true,
+            writable: false,
+            value: provider[property]
+          };
+        }
+        return Object.getOwnPropertyDescriptor(target, property);
+      },
+      set: function (target, property, value, receiver) {
+        return Reflect.set(target, property, value, receiver);
+      }
+    });
+
+    Object.defineProperty(globalObject, 'ethereum', {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return provider;
+      },
+      set: function () {
+        return true;
+      }
+    });
+
+    globalObject.addEventListener('eip6963:requestProvider', announceProvider);
+    announceProvider();
+    connectWebSocket();
+  })();`;
+}
