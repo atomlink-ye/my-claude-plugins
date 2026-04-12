@@ -17,7 +17,7 @@ const RUNTIME_STATE_DIR_NAME = ".opencode-state";
 const STARTUP_TIMEOUT_MS = 10000;
 const HEALTH_TIMEOUT_MS = 1200;
 const SHUTDOWN_TIMEOUT_MS = 5000;
-const MESSAGE_POST_TIMEOUT_MS = 300000;
+const MESSAGE_POST_TIMEOUT_MS = 3600000;
 const STATUS_SESSION_LIMIT = 10;
 const MAX_STORED_JOBS = 50;
 const STATUS_RECENT_LIMIT = 5;
@@ -29,8 +29,9 @@ function printUsage() {
       "Usage:",
       "  node scripts/opencode-companion.mjs check [--directory DIR]",
       "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory DIR]",
-      "  node scripts/opencode-companion.mjs task [--directory DIR] [--model MODEL] [--async] [--background] PROMPT",
-      "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory DIR] [--model MODEL]",
+      "  node scripts/opencode-companion.mjs task [--directory DIR] [--model MODEL] [--async] [--background] [--timeout MINS] PROMPT",
+      "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory DIR] [--model MODEL] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs attach [session-id] [--directory DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs status [job-id] [--directory DIR] [--all]",
       "  node scripts/opencode-companion.mjs result <job-id> [--directory DIR]",
       "  node scripts/opencode-companion.mjs cancel <job-id> [--directory DIR]",
@@ -848,6 +849,10 @@ function spawnBackgroundTaskWorker(directory, jobId, prompt, args = {}) {
 
   if (args.model) {
     childArgs.push("--model", args.model);
+  }
+
+  if (args.timeout) {
+    childArgs.push("--timeout", String(args.timeout));
   }
 
   childArgs.push("--", prompt);
@@ -1793,10 +1798,191 @@ async function handleEnsureServe(argv) {
   process.stdout.write(renderEnsureServeResult(directory, state));
 }
 
+async function monitorSession({
+  baseUrl,
+  directory,
+  sessionId,
+  printer,
+  timeoutMins = 20,
+  onSignalAbort,
+  eventStreamController,
+  jobId = null,
+  rawModel = null,
+  abortedBySignal = false
+}) {
+  const directorySessions = new Map(); // sessionId -> { status, lastActivityAt }
+  let lastDirectoryActivityAt = Date.now();
+  let lastPrintedSessionId = null;
+  const QUIESCENCE_TIMEOUT_MS = 5000;
+  const FORCE_QUIESCENCE_TIMEOUT_MS = 30000;
+  const SETTLING_CHECK_INTERVAL_MS = 1000;
+  const timeoutMs = timeoutMins * 60 * 1000;
+  const startTime = Date.now();
+
+  const eventResponse = await openEventStream(baseUrl, directory, eventStreamController.signal);
+  const eventStreamPromise = streamSseResponse(
+    eventResponse.body,
+    async (event) => {
+      if (onSignalAbort.triggered) {
+        return { aborted: true };
+      }
+      if (event.done) {
+        return { done: true };
+      }
+      if (!event.payload || typeof event.payload !== "object") {
+        return null;
+      }
+
+      const payload = event.payload;
+      const properties = payload.properties;
+      if (!properties || typeof properties !== "object") {
+        return null;
+      }
+
+      const eventSessionId = properties.sessionID;
+      if (eventSessionId) {
+        if (!directorySessions.has(eventSessionId)) {
+          directorySessions.set(eventSessionId, { status: "unknown", lastActivityAt: Date.now() });
+        }
+        const sessionState = directorySessions.get(eventSessionId);
+
+        // Any event with a sessionID counts as activity (reasoning, step-start, etc.)
+        sessionState.lastActivityAt = Date.now();
+        lastDirectoryActivityAt = Date.now();
+
+        if (payload.type === "message.part.delta") {
+          if (properties.field === "text") {
+            if (eventSessionId === sessionId) {
+              if (lastPrintedSessionId !== sessionId) {
+                lastPrintedSessionId = sessionId;
+              }
+              printer.handleDelta(properties.delta);
+            } else {
+              const delta = properties.delta;
+              if (lastPrintedSessionId !== eventSessionId) {
+                const prefix = `\n[sub-agent ${eventSessionId.slice(0, 8)}] `;
+                printer.handleDelta(prefix + delta);
+                lastPrintedSessionId = eventSessionId;
+              } else {
+                printer.handleDelta(delta);
+              }
+            }
+          }
+        }
+
+        if (payload.type === "session.status") {
+          sessionState.status = properties.status?.type || properties.status || "unknown";
+        }
+
+        if (payload.type === "session.idle") {
+          sessionState.status = "idle";
+        }
+      }
+
+      return null;
+    },
+    { abortSignal: eventStreamController.signal }
+  );
+
+  // External loop to check for quiescence or timeout
+  const quiescencePromise = (async () => {
+    let quiescenceStartLogged = false;
+    
+    while (!onSignalAbort.triggered) {
+      await delay(SETTLING_CHECK_INTERVAL_MS);
+
+      const now = Date.now();
+      if (now - startTime > timeoutMs) {
+        log(`Error: Task timed out after ${timeoutMins} minutes.`);
+        eventStreamController.abort();
+        throw new Error(`Task timed out after ${timeoutMins} minutes.`);
+      }
+
+      const msSinceLastActivity = now - lastDirectoryActivityAt;
+      const mainSessionState = directorySessions.get(sessionId);
+      
+      // Check if any session is busy
+      let anyBusy = false;
+      for (const state of directorySessions.values()) {
+        if (state.status === "busy") {
+          anyBusy = true;
+          break;
+        }
+      }
+
+      const isMainIdle = mainSessionState?.status === "idle";
+      
+      // We can finish if:
+      // Quiescence: all sessions idle + no events for QUIESCENCE_TIMEOUT
+      // Force quiescence: no events for FORCE_QUIESCENCE_TIMEOUT, but only if
+      // no session is known to be busy (the overall --timeout covers truly stuck tasks)
+      const reachedQuiescence = !anyBusy && msSinceLastActivity >= QUIESCENCE_TIMEOUT_MS;
+      const hasSeenActivity = directorySessions.size > 0;
+      const reachedForceQuiescence = hasSeenActivity && !anyBusy && msSinceLastActivity >= FORCE_QUIESCENCE_TIMEOUT_MS;
+
+      if (isMainIdle && !quiescenceStartLogged && !reachedQuiescence) {
+        log("Main session idle. Waiting for quiescence...");
+        quiescenceStartLogged = true;
+      }
+
+      if ((isMainIdle && reachedQuiescence) || reachedForceQuiescence) {
+        const reason = reachedForceQuiescence ? "safety timeout" : "quiescence";
+        log(`Finished (${reason}) in directory ${directory}.`);
+        eventStreamController.abort();
+        return { done: true };
+      }
+    }
+    return { aborted: true };
+  })();
+
+  const streamResult = await Promise.race([eventStreamPromise, quiescencePromise]);
+  if (streamResult.aborted || onSignalAbort.triggered) {
+    process.exitCode = onSignalAbort.signalName === "SIGINT" ? 130 : 143;
+    if (jobId) {
+      markJobFinished(directory, jobId, "failed", {
+        sessionId,
+        model: rawModel,
+        error: "Task was aborted."
+      });
+    }
+    return null;
+  }
+
+  eventStreamController.abort();
+
+  let messages = [];
+  try {
+    messages = await listSessionMessages(baseUrl, directory, sessionId);
+  } catch (error) {
+    // If we can't fetch messages, at least return what we have
+  }
+  
+  const result = buildTaskResult({
+    directory,
+    sessionId,
+    messages,
+    streamedText: printer.getOutput(),
+    status: abortedBySignal ? "aborted" : "completed"
+  });
+
+  if (!printer.getOutput().trim() && result.combined_text) {
+    process.stdout.write(`${result.combined_text}\n`);
+  }
+  process.stdout.write(renderTaskSummary(result));
+  if (jobId) {
+    markJobFinished(directory, jobId, "completed", {
+      sessionId,
+      model: rawModel,
+      error: null
+    });
+  }
+  return result;
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--async", "--background"],
-    stringFlags: ["--directory", "--model", "--job-id"]
+    stringFlags: ["--directory", "--model", "--job-id", "--timeout"]
   });
 
   const directory = resolveDirectory(options.directory);
@@ -1812,6 +1998,11 @@ async function handleTask(argv) {
   const rawModel = options.model == null ? null : String(options.model);
   const model = parseModelOption(options.model);
   const jobId = options["job-id"] ?? null;
+  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
+
+  if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
+    throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
+  }
 
   if (options.background && jobId) {
     throw new Error("The --job-id flag is reserved for internal background workers.");
@@ -1833,7 +2024,8 @@ async function handleTask(argv) {
     let child;
     try {
       child = spawnBackgroundTaskWorker(directory, backgroundJobId, prompt, {
-        model: rawModel
+        model: rawModel,
+        timeout: timeoutMins
       });
     } catch (error) {
       markJobFinished(directory, backgroundJobId, "failed", {
@@ -1972,121 +2164,38 @@ async function handleTask(argv) {
     }
 
     const printer = createTextStreamPrinter();
-    const eventResponse = await openEventStream(baseUrl, directory, eventStreamController.signal);
-    const eventStreamPromise = streamSseResponse(
-      eventResponse.body,
-      async (event) => {
-        if (onSignalAbort.triggered) {
-          return { aborted: true };
-        }
-        if (event.done) {
-          return { done: true };
-        }
-        if (!event.payload || typeof event.payload !== "object") {
-          return null;
-        }
-
-        const payload = event.payload;
-        const properties = payload.properties;
-        if (!properties || typeof properties !== "object") {
-          return null;
-        }
-
-        if (
-          payload.type === "message.part.delta" &&
-          properties.sessionID === sessionId &&
-          properties.field === "text"
-        ) {
-          printer.handleDelta(properties.delta);
-          return null;
-        }
-
-        if (payload.type === "session.idle" && properties.sessionID === sessionId) {
-          return { done: true };
-        }
-
-        return null;
-      },
-      { abortSignal: eventStreamController.signal }
-    );
-    let postCompletedSuccessfully = false;
-    let eventStreamFailedBeforePostCompleted = false;
-    const guardedEventStreamPromise = eventStreamPromise.catch((error) => {
-      if (!postCompletedSuccessfully) {
-        eventStreamFailedBeforePostCompleted = true;
-      }
-      throw error;
+    const monitorPromise = monitorSession({
+      baseUrl,
+      directory,
+      sessionId,
+      printer,
+      timeoutMins,
+      onSignalAbort,
+      eventStreamController,
+      jobId,
+      rawModel,
+      abortedBySignal
     });
 
-    let postResult = null;
+    // Start the task asynchronously
     try {
-      postResult = await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/message`, {
+      await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         directory,
         body: buildTaskPayload(prompt, model),
-        timeoutMs: MESSAGE_POST_TIMEOUT_MS,
+        timeoutMs: 30000, // Small timeout for starting the task
         signal: onSignalAbort.signal
       });
-      postCompletedSuccessfully = true;
     } catch (error) {
       eventStreamController.abort();
-      await guardedEventStreamPromise.catch(() => {});
       if (!onSignalAbort.triggered || !isAbortError(error)) {
         throw error;
       }
     }
 
-    let streamResult;
-    try {
-      streamResult = await guardedEventStreamPromise;
-    } catch (error) {
-      if (eventStreamFailedBeforePostCompleted) {
-        throw error;
-      }
-      log(`Warning: GET /event stream ended before session.idle for session ${sessionId}; continuing because the message POST completed.`);
-      streamResult = { done: true };
-    }
-    if (streamResult.aborted || onSignalAbort.triggered) {
-      process.exitCode = onSignalAbort.signalName === "SIGINT" ? 130 : 143;
-      if (jobId) {
-        markJobFinished(directory, jobId, "failed", {
-          sessionId,
-          model: rawModel,
-          error: "Task was aborted."
-        });
-      }
+    const result = await monitorPromise;
+    if (!result) {
       return;
-    }
-
-    eventStreamController.abort();
-
-    let messages = [];
-    try {
-      messages = await listSessionMessages(baseUrl, directory, sessionId);
-    } catch (error) {
-      messages = normalizeMessageArray(postResult);
-      if (messages.length === 0) {
-        throw error;
-      }
-    }
-    const result = buildTaskResult({
-      directory,
-      sessionId,
-      messages,
-      streamedText: printer.getOutput(),
-      status: abortedBySignal ? "aborted" : "completed"
-    });
-
-    if (!printer.getOutput().trim() && result.combined_text) {
-      process.stdout.write(`${result.combined_text}\n`);
-    }
-    process.stdout.write(renderTaskSummary(result));
-    if (jobId) {
-      markJobFinished(directory, jobId, "completed", {
-        sessionId,
-        model: rawModel,
-        error: null
-      });
     }
     shouldExit = true;
   } catch (error) {
@@ -2126,7 +2235,7 @@ async function handleReview(argv) {
 
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--wait", "--background", "--adversarial"],
-    stringFlags: ["--base", "--scope", "--directory", "--model"]
+    stringFlags: ["--base", "--scope", "--directory", "--model", "--timeout"]
   });
 
   const directory = resolveDirectory(options.directory);
@@ -2178,9 +2287,82 @@ async function handleReview(argv) {
   if (options.background) {
     taskArgs.push("--background");
   }
+  if (options.timeout) {
+    taskArgs.push("--timeout", String(options.timeout));
+  }
   taskArgs.push("--", prompt);
 
   await handleTask(taskArgs);
+}
+
+async function handleAttach(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    stringFlags: ["--directory", "--timeout"]
+  });
+
+  const directory = resolveDirectory(options.directory);
+  let sessionId = positionals[0] ?? null;
+  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
+
+  if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
+    throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
+  }
+
+  const state = normalizeState(readState(directory));
+  if (!state) {
+    throw new Error(`No managed OpenCode serve state found for ${directory}. Is it running?`);
+  }
+
+  const baseUrl = buildBaseUrl(state.port);
+  const healthy = await checkHealth(baseUrl);
+  if (!healthy) {
+    throw new Error(`OpenCode serve at ${baseUrl} is not reachable.`);
+  }
+
+  if (!sessionId) {
+    const sessions = await listSessions(baseUrl, directory);
+    if (sessions.length === 0) {
+      throw new Error("No sessions found to attach to.");
+    }
+    // Default to the most recent one
+    sessionId = summarizeSession(sessions[0]).id;
+    log(`Attaching to most recent session: ${sessionId}`);
+  }
+
+  log(`Attaching to OpenCode session ${sessionId} on port ${state.port}.`);
+
+  const eventStreamController = new AbortController();
+  const onSignalAbort = createSignalAbort(async (signal) => {
+    log(`Received ${signal}; detaching from session ${sessionId}.`);
+    // We don't abort the session on attach detach
+  });
+
+  const sigintHandler = () => {
+    eventStreamController.abort();
+    void onSignalAbort.trigger("SIGINT");
+  };
+  const sigtermHandler = () => {
+    eventStreamController.abort();
+    void onSignalAbort.trigger("SIGTERM");
+  };
+  process.once("SIGINT", sigintHandler);
+  process.once("SIGTERM", sigtermHandler);
+
+  try {
+    const printer = createTextStreamPrinter();
+    await monitorSession({
+      baseUrl,
+      directory,
+      sessionId,
+      printer,
+      timeoutMins,
+      onSignalAbort,
+      eventStreamController
+    });
+  } finally {
+    process.removeListener("SIGINT", sigintHandler);
+    process.removeListener("SIGTERM", sigtermHandler);
+  }
 }
 
 async function handleStatus(argv) {
@@ -2324,6 +2506,10 @@ async function main() {
   }
   if (command === "review") {
     await handleReview(rest);
+    return;
+  }
+  if (command === "attach") {
+    await handleAttach(rest);
     return;
   }
   if (command === "status") {

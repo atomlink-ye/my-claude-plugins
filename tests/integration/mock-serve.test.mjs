@@ -114,7 +114,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    server.setResponse("POST /session/:id/message", async (ctx) => {
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
       await ctx.wait(350);
       return await ctx.next();
     });
@@ -180,7 +180,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    server.setResponse("POST /session/:id/message", async (ctx) => {
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
       await ctx.wait(1000);
       return await ctx.next();
     });
@@ -233,7 +233,7 @@ describe("mock serve integration tests", () => {
     });
 
     let capturedPrompt = "";
-    server.setResponse("POST /session/:id/message", async (ctx) => {
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
       capturedPrompt = String(ctx.body?.parts?.[0]?.text ?? "");
       return await ctx.next();
     });

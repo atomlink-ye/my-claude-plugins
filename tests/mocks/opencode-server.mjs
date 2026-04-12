@@ -90,7 +90,7 @@ function safeKey(value) {
 }
 
 function extractSessionId(pathname) {
-  const match = String(pathname ?? "").match(/^\/session\/([^/]+)\/(message|abort)$/);
+  const match = String(pathname ?? "").match(/^\/session\/([^/]+)\/(message|prompt_async|abort)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -247,7 +247,7 @@ export function createMockOpenCodeServer() {
       };
     }
 
-    if (method === "POST" && pathname === `/session/${encodeURIComponent(sessionId ?? "")}/message`) {
+    if (method === "POST" && (pathname === `/session/${encodeURIComponent(sessionId ?? "")}/message` || pathname === `/session/${encodeURIComponent(sessionId ?? "")}/prompt_async`)) {
       const session = sessionId ? scope.sessionsById.get(sessionId) : null;
       if (!session) {
         return { status: 404, headers: { "content-type": "application/json; charset=utf-8" }, body: { error: "Unknown session" } };
