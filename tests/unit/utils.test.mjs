@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, generateJobId, summarizePrompt } from "../../scripts/opencode-companion.mjs";
+import { formatDuration, generateJobId, summarizePrompt } from "../../plugins/opencode/scripts/opencode-companion.mjs";
 
 describe("utility helpers", () => {
   it("generates job ids that match the expected pattern", () => {

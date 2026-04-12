@@ -1,8 +1,0 @@
-{
-  "name": "opencode",
-  "version": "0.1.0",
-  "description": "Use OpenCode from Claude Code to delegate AI coding tasks via OpenCode's serve API.",
-  "author": {
-    "name": "opencode-slave"
-  }
-}

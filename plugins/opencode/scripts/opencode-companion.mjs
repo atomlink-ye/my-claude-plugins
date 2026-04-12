@@ -18,7 +18,7 @@ const RUNTIME_STATE_DIR_NAME = ".opencode-state";
 const STARTUP_TIMEOUT_MS = 10000;
 const HEALTH_TIMEOUT_MS = 1200;
 const SHUTDOWN_TIMEOUT_MS = 5000;
-const MESSAGE_POST_TIMEOUT_MS = 300000;
+const MESSAGE_POST_TIMEOUT_MS = 3600000;
 const STATUS_SESSION_LIMIT = 10;
 const MAX_STORED_JOBS = 50;
 const STATUS_RECENT_LIMIT = 5;
@@ -28,15 +28,18 @@ function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/opencode-companion.mjs check [--directory DIR]",
-      "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory DIR]",
-      "  node scripts/opencode-companion.mjs task [--directory DIR] [--model MODEL] [--session SESSION_ID] [--async] [--background] PROMPT",
-      "  node scripts/opencode-companion.mjs sessions [--directory DIR] [--session SESSION_ID] [--since MINUTES] [--limit N]",
-      "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory DIR] [--model MODEL]",
-      "  node scripts/opencode-companion.mjs status [job-id] [--directory DIR] [--all]",
-      "  node scripts/opencode-companion.mjs result <job-id> [--directory DIR]",
-      "  node scripts/opencode-companion.mjs cancel <job-id> [--directory DIR]",
-      "  node scripts/opencode-companion.mjs cleanup [--directory DIR]"
+      "  node scripts/opencode-companion.mjs check [--directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs task [--directory WORK_DIR] [--server-directory SERVER_DIR] [--session SID] [--model MODEL] [--async] [--background] [--timeout MINS] PROMPT",
+      "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs attach [session-id] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs status [job-id] [--directory WORK_DIR] [--all]",
+      "  node scripts/opencode-companion.mjs result <job-id> [--directory WORK_DIR]",
+      "  node scripts/opencode-companion.mjs cancel <job-id> [--directory WORK_DIR]",
+      "  node scripts/opencode-companion.mjs cleanup [--directory SERVER_DIR]",
+      "",
+      "  SERVER_DIR: where .opencode-serve.json lives (default: ~)",
+      "  WORK_DIR:   project working directory sent to OpenCode sessions (default: $CLAUDE_PROJECT_DIR or cwd)"
     ].join("\n") + "\n"
   );
 }
@@ -87,8 +90,7 @@ function parseArgs(argv, { booleanFlags = [], stringFlags = [] } = {}) {
   return { options, positionals };
 }
 
-function resolveDirectory(input) {
-  const resolved = path.resolve(input ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd());
+function resolveValidDirectory(resolved) {
   let stats;
   try {
     stats = fs.statSync(resolved);
@@ -99,6 +101,16 @@ function resolveDirectory(input) {
     throw new Error(`Not a directory: ${resolved}`);
   }
   return resolved;
+}
+
+// Server directory: where .opencode-serve.json lives. Defaults to home (~).
+function resolveServerDirectory(input) {
+  return resolveValidDirectory(path.resolve(input ?? os.homedir()));
+}
+
+// Working directory: the project context sent to OpenCode sessions.
+function resolveDirectory(input) {
+  return resolveValidDirectory(path.resolve(input ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd()));
 }
 
 function stateFilePath(directory) {
@@ -186,29 +198,6 @@ function opencodeEnv(directory) {
     ...process.env,
     XDG_STATE_HOME: process.env.XDG_STATE_HOME || stateRoot
   };
-}
-
-function serveWorkingDirectory() {
-  // The OpenCode serve routes each request by `x-opencode-directory`, so its
-  // own process cwd is only consulted as a last-resort fallback. Running it
-  // from the user's home keeps it project-agnostic: a single managed serve
-  // can host multiple project workspaces without accumulating stale state
-  // under whichever project happened to start it. The env override
-  // OPENCODE_COMPANION_SERVE_CWD lets operators pick a different location
-  // (e.g. a dedicated runtime dir) without editing this script.
-  const override = process.env.OPENCODE_COMPANION_SERVE_CWD;
-  if (override) {
-    const resolved = path.resolve(override);
-    try {
-      const stats = fs.statSync(resolved);
-      if (stats.isDirectory()) {
-        return resolved;
-      }
-    } catch (error) {
-      // fall through to home
-    }
-  }
-  return os.homedir();
 }
 
 async function runCommandCapture(command, args, { cwd, env, timeoutMs = 5000 } = {}) {
@@ -570,18 +559,6 @@ function normalizePromptText(prompt) {
   return String(prompt ?? "").trim();
 }
 
-function shellSingleQuote(value) {
-  return `'${String(value).replace(/'/g, "'\\''")}'`;
-}
-
-function lastNonEmptyLine(value) {
-  const lines = String(value ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean);
-  return lines.at(-1) ?? "";
-}
-
 async function gitText(directory, args, options = {}) {
   const result = await runGitCommand(directory, args, options);
   return String(result.stdout ?? "").trimEnd();
@@ -639,128 +616,74 @@ function normalizeReviewScope(scope) {
 }
 
 async function collectWorkingTreeReviewContext(directory) {
-  const [branch, head, statusShort, stagedQuiet, unstagedQuiet, stagedStat, unstagedStat] = await Promise.all([
-    getCurrentGitBranch(directory),
-    gitText(directory, ["rev-parse", "--short", "HEAD"], { allowNonZero: true }),
-    gitText(directory, ["status", "--short", "--untracked-files=all"]),
-    runGitCommand(directory, ["diff", "--cached", "--quiet"], { allowNonZero: true }),
-    runGitCommand(directory, ["diff", "--quiet"], { allowNonZero: true }),
-    gitText(directory, ["diff", "--cached", "--stat"], { allowNonZero: true }),
-    gitText(directory, ["diff", "--stat"], { allowNonZero: true })
-  ]);
+  const status = await gitText(directory, ["status", "--short", "--untracked-files=all"]);
+  const staged = await gitText(directory, ["diff", "--cached", "--no-ext-diff", "--unified=3"]);
+  const unstaged = await gitText(directory, ["diff", "--no-ext-diff", "--unified=3"]);
 
-  const hasStaged = stagedQuiet.exitCode === 1;
-  const hasUnstaged = unstagedQuiet.exitCode === 1;
-
-  if (!statusShort.trim() && !hasStaged && !hasUnstaged) {
+  if (!status.trim() && !staged.trim() && !unstaged.trim()) {
     throw new Error("No staged or unstaged changes found for working-tree review.");
   }
 
-  return {
-    scope: "working-tree",
-    directory,
-    branch,
-    head: head || null,
-    hasStaged,
-    hasUnstaged,
-    statusShort,
-    stagedStatFooter: lastNonEmptyLine(stagedStat),
-    unstagedStatFooter: lastNonEmptyLine(unstagedStat)
-  };
+  const sections = [
+    "Review scope: working-tree",
+    `Directory: ${directory}`
+  ];
+
+  if (status.trim()) {
+    sections.push("", "Git status:", status.trimEnd());
+  }
+
+  sections.push("", "Staged diff:", staged.trimEnd() || "(none)", "", "Unstaged diff:", unstaged.trimEnd() || "(none)");
+  return sections.join("\n");
 }
 
 async function collectBranchReviewContext(directory, baseRef) {
-  const [branch, head, commitLog, statText] = await Promise.all([
-    getCurrentGitBranch(directory),
-    gitText(directory, ["rev-parse", "--short", "HEAD"]),
-    gitText(directory, ["log", "--oneline", `${baseRef}..HEAD`]),
-    gitText(directory, ["diff", "--stat", `${baseRef}...HEAD`], { allowNonZero: true })
-  ]);
+  const branch = await getCurrentGitBranch(directory);
+  const head = await gitText(directory, ["rev-parse", "--short", "HEAD"]);
+  const log = await gitText(directory, ["log", "--oneline", `${baseRef}..HEAD`]);
+  const diff = await gitText(directory, ["diff", "--no-ext-diff", "--unified=3", `${baseRef}...HEAD`]);
 
-  if (!commitLog.trim() && !statText.trim()) {
+  if (!log.trim() && !diff.trim()) {
     throw new Error(`No commits or diff found between ${baseRef} and HEAD for branch review.`);
   }
 
-  return {
-    scope: "branch",
-    directory,
-    branch,
-    base: baseRef,
-    head: head || null,
-    commitLog,
-    statFooter: lastNonEmptyLine(statText)
-  };
+  const sections = [
+    "Review scope: branch",
+    `Directory: ${directory}`,
+    `Branch: ${branch ?? "detached HEAD"}`,
+    `Base: ${baseRef}`,
+    `Head: ${head || "unknown"}`
+  ];
+
+  if (log.trim()) {
+    sections.push("", `Commit log (${baseRef}..HEAD):`, log.trimEnd());
+  }
+
+  if (diff.trim()) {
+    sections.push("", `Diff (${baseRef}...HEAD):`, diff.trimEnd());
+  }
+
+  return sections.join("\n");
 }
 
-function buildReviewPrompt(metadata, { adversarial = false, focusText = null } = {}) {
+function buildReviewPrompt(context, { adversarial = false, focusText = null } = {}) {
   const sections = [];
-  const directory = shellSingleQuote(metadata.directory);
-
-  if (metadata.scope === "branch") {
-    sections.push(`You are reviewing the branch of ${metadata.directory}.`);
-    sections.push(`Branch: ${metadata.branch ?? "detached HEAD"}. Base: ${metadata.base}. Head: ${metadata.head ?? "unknown"}.`);
-  } else {
-    sections.push(`You are reviewing the working-tree of ${metadata.directory}.`);
-    sections.push(`Branch: ${metadata.branch ?? "detached HEAD"}. Head: ${metadata.head ?? "unknown"}.`);
-  }
 
   if (adversarial) {
     sections.push(
-      "",
       "You are performing an adversarial code review. Challenge design decisions, question tradeoffs, and identify assumptions."
     );
   }
 
-  const commands =
-    metadata.scope === "branch"
-      ? [
-          `  git -C ${directory} log --oneline ${metadata.base}..HEAD`,
-          `  git -C ${directory} diff ${metadata.base}...HEAD`,
-          `  git -C ${directory} diff --stat ${metadata.base}...HEAD`
-        ]
-      : [
-          `  git -C ${directory} status --short`,
-          `  git -C ${directory} diff --cached`,
-          `  git -C ${directory} diff`,
-          `  git -C ${directory} diff --cached --stat`,
-          `  git -C ${directory} diff --stat`
-        ];
-
   sections.push(
-    "",
-    "Run the following commands yourself inside the session to read the changes. Do NOT rely on a pre-pasted diff; there isn't one.",
-    "",
-    ...commands,
-    ""
+    "Please review the following code changes and report findings by severity (Critical/High/Medium/Low). Include file paths and line numbers."
   );
-
-  if (metadata.scope === "branch" && metadata.commitLog?.trim()) {
-    sections.push("Commit log:", metadata.commitLog.trimEnd(), "");
-  }
-
-  if (metadata.scope === "working-tree" && metadata.statusShort?.trim()) {
-    sections.push("Status snapshot:", metadata.statusShort.trimEnd(), "");
-  }
-
-  const statLines =
-    metadata.scope === "branch"
-      ? [metadata.statFooter].filter(Boolean)
-      : [
-          metadata.stagedStatFooter ? `Staged: ${metadata.stagedStatFooter}` : "",
-          metadata.unstagedStatFooter ? `Unstaged: ${metadata.unstagedStatFooter}` : ""
-        ].filter(Boolean);
-
-  sections.push("Stat summary:");
-  if (statLines.length > 0) {
-    sections.push(...statLines);
-  }
-
-  sections.push("", "Report findings by severity (Critical/High/Medium/Low) with file paths and line numbers.");
 
   if (focusText) {
     sections.push("", `Focus the review on: ${focusText}`);
   }
 
+  sections.push("", context);
   return sections.join("\n");
 }
 
@@ -921,8 +844,10 @@ function renderJobTailSection(job) {
 
 function renderBackgroundTaskStart(jobId, scriptPath, directory) {
   const script = scriptPath ?? "scripts/opencode-companion.mjs";
-  const dirFlag = directory ? ` --directory ${shellSingleQuote(directory)}` : "";
-  return `OpenCode task started in background as ${jobId}. Check status: node ${shellSingleQuote(script)} status ${jobId}${dirFlag}\n`;
+  // Shell-safe single-quote escaping: wrap in ' and replace internal ' with '\''
+  const sq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+  const dirFlag = directory ? ` --directory ${sq(directory)}` : "";
+  return `OpenCode task started in background as ${jobId}. Check status: node ${sq(script)} status ${jobId}${dirFlag}\n`;
 }
 
 function createJobLogFile(directory, jobId) {
@@ -935,12 +860,16 @@ function spawnBackgroundTaskWorker(directory, jobId, prompt, args = {}) {
   const scriptPath = fileURLToPath(import.meta.url);
   const childArgs = [scriptPath, "task", "--job-id", jobId, "--directory", directory];
 
+  if (args.serverDirectory) {
+    childArgs.push("--server-directory", args.serverDirectory);
+  }
+
   if (args.model) {
     childArgs.push("--model", args.model);
   }
 
-  if (args.session) {
-    childArgs.push("--session", args.session);
+  if (args.timeout) {
+    childArgs.push("--timeout", String(args.timeout));
   }
 
   childArgs.push("--", prompt);
@@ -1064,22 +993,12 @@ function isAbortError(error) {
 function formatUnexpectedTaskAbort(model) {
   const modelLabel = model
     ? model.providerID
-      ? `${model.providerID}/${model.modelID}`
-      : model.modelID
-    : "default";
+      ? `configured model ${model.providerID}/${model.modelID}`
+      : `configured model ${model.modelID}`
+    : "default model/provider";
 
   return new Error(
-    [
-      `OpenCode aborted the foreground stream for this task (model: ${modelLabel}).`,
-      "IMPORTANT: this does NOT necessarily mean the OpenCode session is dead.",
-      "When a task triggers heavy planning or sub-agent delegation (@explorer, @librarian, @oracle, @designer, etc.),",
-      "the foreground request can be aborted while the underlying session keeps running on the serve.",
-      "Before retrying, check whether the session is still active:",
-      "  node scripts/opencode-companion.mjs sessions",
-      "If a session titled like your task shows verdict=active, DO NOT retry — it is still working.",
-      "Only retry if the session is absent or verdict=idle. When you retry, prefer a narrower scope",
-      "or explicitly instruct OpenCode not to delegate to sub-agents for stable foreground completion."
-    ].join("\n")
+    `OpenCode aborted the task request before it completed. The ${modelLabel} may have failed authentication or become unavailable. Refresh OpenCode credentials, or rerun with --model MODEL.`
   );
 }
 
@@ -1186,16 +1105,8 @@ async function runServeProbe(directory, requestedPort = 0) {
   const env = opencodeEnv(directory);
   const logs = [];
 
-  // Spawn the serve from the user's home so its process-level cwd is
-  // decoupled from any specific project directory. The serve routes every
-  // request by the `x-opencode-directory` header / query param anyway, and
-  // session data lives in the global DB at `~/.local/share/opencode/`. A
-  // neutral cwd avoids pinning state fallbacks, plugin cascades, and
-  // process.cwd()-derived defaults to whichever project dir happened to
-  // launch the companion.
-  const serveCwd = serveWorkingDirectory();
   const child = spawn("opencode", ["serve", "--port", String(port), "--hostname", HOSTNAME, "--print-logs"], {
-    cwd: serveCwd,
+    cwd: directory,
     env,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1277,12 +1188,8 @@ async function ensureManagedServe(directory, requestedPort = 0) {
   const env = opencodeEnv(directory);
   let spawnError = null;
 
-  // See runServeProbe() comment: always run the serve from a neutral cwd
-  // (the user's home by default) so its process-level state is decoupled
-  // from whichever project's companion invocation happened to spawn it.
-  const serveCwd = serveWorkingDirectory();
   const child = spawn("opencode", ["serve", "--port", String(port), "--hostname", HOSTNAME], {
-    cwd: serveCwd,
+    cwd: directory,
     env,
     detached: true,
     stdio: "ignore"
@@ -1605,51 +1512,16 @@ function summarizeSession(session) {
     (session.running ? "running" : null) ||
     (session.active ? "active" : null) ||
     "unknown";
-
-  const time = session.time && typeof session.time === "object" ? session.time : {};
-  const createdRaw =
-    time.created ?? session.createdAt ?? session.created_at ?? session.startedAt ?? "";
-  const updatedRaw =
-    time.updated ?? session.updatedAt ?? session.updated_at ?? session.modifiedAt ?? "";
-
-  const createdAtMs = toEpochMs(createdRaw);
-  const updatedAtMs = toEpochMs(updatedRaw);
+  const createdAt = session.createdAt || session.created_at || session.startedAt || "";
+  const updatedAt = session.updatedAt || session.updated_at || session.modifiedAt || "";
 
   return {
     id: session.id || session.sessionID || session.sessionId || "unknown",
     status: String(status),
-    createdAt: createdAtMs != null ? new Date(createdAtMs).toISOString() : String(createdRaw || ""),
-    updatedAt: updatedAtMs != null ? new Date(updatedAtMs).toISOString() : String(updatedRaw || ""),
-    createdAtMs,
-    updatedAtMs,
+    createdAt: String(createdAt || ""),
+    updatedAt: String(updatedAt || ""),
     summary: String(summary || "")
   };
-}
-
-function toEpochMs(value) {
-  if (value == null || value === "") {
-    return null;
-  }
-  if (typeof value === "number" && Number.isFinite(value)) {
-    // OpenCode serves Unix-ms numbers for time.created / time.updated.
-    return value > 1e12 ? value : value * 1000;
-  }
-  const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatRelativeAge(ms) {
-  if (ms == null) {
-    return "unknown";
-  }
-  const diff = Math.max(0, Date.now() - ms);
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
 }
 
 function renderStatus(directory, state, healthy, sessions, sessionError) {
@@ -1920,35 +1792,217 @@ async function handleCheck(argv) {
   const { options } = parseArgs(argv, {
     stringFlags: ["--directory"]
   });
-  const directory = resolveDirectory(options.directory);
-  const version = await ensureOpencodeInstalled(directory);
-  const probe = await runServeProbe(directory, 0);
+  const serverDirectory = resolveServerDirectory(options.directory);
+  const version = await ensureOpencodeInstalled(serverDirectory);
+  const probe = await runServeProbe(serverDirectory, 0);
   if (!probe.ok) {
     const detail = probe.error?.message || firstNonEmptyLine(probe.logs) || "Unknown startup failure.";
     throw new Error(`OpenCode is installed but serve could not start. ${detail}`);
   }
-  process.stdout.write(renderCheckResult({ directory, version, port: probe.port }));
+  process.stdout.write(renderCheckResult({ directory: serverDirectory, version, port: probe.port }));
 }
 
 async function handleEnsureServe(argv) {
   const { options } = parseArgs(argv, {
     stringFlags: ["--port", "--directory"]
   });
-  const directory = resolveDirectory(options.directory);
+  const serverDirectory = resolveServerDirectory(options.directory);
   const requestedPort = options.port ? Number(options.port) : 0;
   if (!Number.isFinite(requestedPort) || requestedPort < 0) {
     throw new Error(`Invalid port: ${options.port}`);
   }
-  const state = await ensureManagedServe(directory, requestedPort);
-  process.stdout.write(renderEnsureServeResult(directory, state));
+  const state = await ensureManagedServe(serverDirectory, requestedPort);
+  process.stdout.write(renderEnsureServeResult(serverDirectory, state));
+}
+
+async function monitorSession({
+  baseUrl,
+  directory,
+  sessionId,
+  printer,
+  timeoutMins = 20,
+  onSignalAbort,
+  eventStreamController,
+  jobId = null,
+  rawModel = null,
+  abortedBySignal = false
+}) {
+  const directorySessions = new Map(); // sessionId -> { status, lastActivityAt }
+  let lastDirectoryActivityAt = Date.now();
+  let lastPrintedSessionId = null;
+  const QUIESCENCE_TIMEOUT_MS = 5000;
+  const FORCE_QUIESCENCE_TIMEOUT_MS = 30000;
+  const SETTLING_CHECK_INTERVAL_MS = 1000;
+  const timeoutMs = timeoutMins * 60 * 1000;
+  const startTime = Date.now();
+
+  const eventResponse = await openEventStream(baseUrl, directory, eventStreamController.signal);
+  const eventStreamPromise = streamSseResponse(
+    eventResponse.body,
+    async (event) => {
+      if (onSignalAbort.triggered) {
+        return { aborted: true };
+      }
+      if (event.done) {
+        return { done: true };
+      }
+      if (!event.payload || typeof event.payload !== "object") {
+        return null;
+      }
+
+      const payload = event.payload;
+      const properties = payload.properties;
+      if (!properties || typeof properties !== "object") {
+        return null;
+      }
+
+      const eventSessionId = properties.sessionID;
+      if (eventSessionId) {
+        if (!directorySessions.has(eventSessionId)) {
+          directorySessions.set(eventSessionId, { status: "unknown", lastActivityAt: Date.now() });
+        }
+        const sessionState = directorySessions.get(eventSessionId);
+
+        // Any event with a sessionID counts as activity (reasoning, step-start, etc.)
+        sessionState.lastActivityAt = Date.now();
+        lastDirectoryActivityAt = Date.now();
+
+        if (payload.type === "message.part.delta") {
+          if (properties.field === "text") {
+            if (eventSessionId === sessionId) {
+              if (lastPrintedSessionId !== sessionId) {
+                lastPrintedSessionId = sessionId;
+              }
+              printer.handleDelta(properties.delta);
+            } else {
+              const delta = properties.delta;
+              if (lastPrintedSessionId !== eventSessionId) {
+                const prefix = `\n[sub-agent ${eventSessionId.slice(0, 8)}] `;
+                printer.handleDelta(prefix + delta);
+                lastPrintedSessionId = eventSessionId;
+              } else {
+                printer.handleDelta(delta);
+              }
+            }
+          }
+        }
+
+        if (payload.type === "session.status") {
+          sessionState.status = properties.status?.type || properties.status || "unknown";
+        }
+
+        if (payload.type === "session.idle") {
+          sessionState.status = "idle";
+        }
+      }
+
+      return null;
+    },
+    { abortSignal: eventStreamController.signal }
+  );
+
+  // External loop to check for quiescence or timeout
+  const quiescencePromise = (async () => {
+    let quiescenceStartLogged = false;
+    
+    while (!onSignalAbort.triggered) {
+      await delay(SETTLING_CHECK_INTERVAL_MS);
+
+      const now = Date.now();
+      if (now - startTime > timeoutMs) {
+        log(`Error: Task timed out after ${timeoutMins} minutes.`);
+        eventStreamController.abort();
+        throw new Error(`Task timed out after ${timeoutMins} minutes.`);
+      }
+
+      const msSinceLastActivity = now - lastDirectoryActivityAt;
+      const mainSessionState = directorySessions.get(sessionId);
+      
+      // Check if any session is busy
+      let anyBusy = false;
+      for (const state of directorySessions.values()) {
+        if (state.status === "busy") {
+          anyBusy = true;
+          break;
+        }
+      }
+
+      const isMainIdle = mainSessionState?.status === "idle";
+      
+      // We can finish if:
+      // Quiescence: all sessions idle + no events for QUIESCENCE_TIMEOUT
+      // Force quiescence: no events for FORCE_QUIESCENCE_TIMEOUT, but only if
+      // no session is known to be busy (the overall --timeout covers truly stuck tasks)
+      const reachedQuiescence = !anyBusy && msSinceLastActivity >= QUIESCENCE_TIMEOUT_MS;
+      const hasSeenActivity = directorySessions.size > 0;
+      const reachedForceQuiescence = hasSeenActivity && !anyBusy && msSinceLastActivity >= FORCE_QUIESCENCE_TIMEOUT_MS;
+
+      if (isMainIdle && !quiescenceStartLogged && !reachedQuiescence) {
+        log("Main session idle. Waiting for quiescence...");
+        quiescenceStartLogged = true;
+      }
+
+      if ((isMainIdle && reachedQuiescence) || reachedForceQuiescence) {
+        const reason = reachedForceQuiescence ? "safety timeout" : "quiescence";
+        log(`Finished (${reason}) in directory ${directory}.`);
+        eventStreamController.abort();
+        return { done: true };
+      }
+    }
+    return { aborted: true };
+  })();
+
+  const streamResult = await Promise.race([eventStreamPromise, quiescencePromise]);
+  if (streamResult.aborted || onSignalAbort.triggered) {
+    process.exitCode = onSignalAbort.signalName === "SIGINT" ? 130 : 143;
+    if (jobId) {
+      markJobFinished(directory, jobId, "failed", {
+        sessionId,
+        model: rawModel,
+        error: "Task was aborted."
+      });
+    }
+    return null;
+  }
+
+  eventStreamController.abort();
+
+  let messages = [];
+  try {
+    messages = await listSessionMessages(baseUrl, directory, sessionId);
+  } catch (error) {
+    // If we can't fetch messages, at least return what we have
+  }
+  
+  const result = buildTaskResult({
+    directory,
+    sessionId,
+    messages,
+    streamedText: printer.getOutput(),
+    status: abortedBySignal ? "aborted" : "completed"
+  });
+
+  if (!printer.getOutput().trim() && result.combined_text) {
+    process.stdout.write(`${result.combined_text}\n`);
+  }
+  process.stdout.write(renderTaskSummary(result));
+  if (jobId) {
+    markJobFinished(directory, jobId, "completed", {
+      sessionId,
+      model: rawModel,
+      error: null
+    });
+  }
+  return result;
 }
 
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--async", "--background"],
-    stringFlags: ["--directory", "--model", "--job-id", "--session"]
+    stringFlags: ["--directory", "--server-directory", "--model", "--job-id", "--timeout", "--session"]
   });
 
+  const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const directory = resolveDirectory(options.directory);
   const prompt = readPrompt(positionals);
   if (!prompt) {
@@ -1962,10 +2016,12 @@ async function handleTask(argv) {
   const rawModel = options.model == null ? null : String(options.model);
   const model = parseModelOption(options.model);
   const jobId = options["job-id"] ?? null;
-  const resumeSessionId =
-    options.session != null && String(options.session).trim() !== ""
-      ? String(options.session).trim()
-      : null;
+  const existingSessionId = options.session ? String(options.session).trim() : null;
+  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
+
+  if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
+    throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
+  }
 
   if (options.background && jobId) {
     throw new Error("The --job-id flag is reserved for internal background workers.");
@@ -1987,8 +2043,9 @@ async function handleTask(argv) {
     let child;
     try {
       child = spawnBackgroundTaskWorker(directory, backgroundJobId, prompt, {
+        serverDirectory,
         model: rawModel,
-        session: resumeSessionId
+        timeout: timeoutMins
       });
     } catch (error) {
       markJobFinished(directory, backgroundJobId, "failed", {
@@ -2076,10 +2133,10 @@ async function handleTask(argv) {
   process.once("SIGTERM", sigtermHandler);
 
   try {
-    state = await ensureManagedServe(directory, 0);
+    state = await ensureManagedServe(serverDirectory, 0);
     baseUrl = buildBaseUrl(state.port);
-    if (resumeSessionId) {
-      sessionId = resumeSessionId;
+    if (existingSessionId) {
+      sessionId = existingSessionId;
       log(`Resuming OpenCode session ${sessionId} on port ${state.port}.`);
     } else {
       sessionId = await createSession(baseUrl, directory);
@@ -2132,121 +2189,38 @@ async function handleTask(argv) {
     }
 
     const printer = createTextStreamPrinter();
-    const eventResponse = await openEventStream(baseUrl, directory, eventStreamController.signal);
-    const eventStreamPromise = streamSseResponse(
-      eventResponse.body,
-      async (event) => {
-        if (onSignalAbort.triggered) {
-          return { aborted: true };
-        }
-        if (event.done) {
-          return { done: true };
-        }
-        if (!event.payload || typeof event.payload !== "object") {
-          return null;
-        }
-
-        const payload = event.payload;
-        const properties = payload.properties;
-        if (!properties || typeof properties !== "object") {
-          return null;
-        }
-
-        if (
-          payload.type === "message.part.delta" &&
-          properties.sessionID === sessionId &&
-          properties.field === "text"
-        ) {
-          printer.handleDelta(properties.delta);
-          return null;
-        }
-
-        if (payload.type === "session.idle" && properties.sessionID === sessionId) {
-          return { done: true };
-        }
-
-        return null;
-      },
-      { abortSignal: eventStreamController.signal }
-    );
-    let postCompletedSuccessfully = false;
-    let eventStreamFailedBeforePostCompleted = false;
-    const guardedEventStreamPromise = eventStreamPromise.catch((error) => {
-      if (!postCompletedSuccessfully) {
-        eventStreamFailedBeforePostCompleted = true;
-      }
-      throw error;
+    const monitorPromise = monitorSession({
+      baseUrl,
+      directory,
+      sessionId,
+      printer,
+      timeoutMins,
+      onSignalAbort,
+      eventStreamController,
+      jobId,
+      rawModel,
+      abortedBySignal
     });
 
-    let postResult = null;
+    // Start the task asynchronously
     try {
-      postResult = await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/message`, {
+      await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         directory,
         body: buildTaskPayload(prompt, model),
-        timeoutMs: MESSAGE_POST_TIMEOUT_MS,
+        timeoutMs: 30000, // Small timeout for starting the task
         signal: onSignalAbort.signal
       });
-      postCompletedSuccessfully = true;
     } catch (error) {
       eventStreamController.abort();
-      await guardedEventStreamPromise.catch(() => {});
       if (!onSignalAbort.triggered || !isAbortError(error)) {
         throw error;
       }
     }
 
-    let streamResult;
-    try {
-      streamResult = await guardedEventStreamPromise;
-    } catch (error) {
-      if (eventStreamFailedBeforePostCompleted) {
-        throw error;
-      }
-      log(`Warning: GET /event stream ended before session.idle for session ${sessionId}; continuing because the message POST completed.`);
-      streamResult = { done: true };
-    }
-    if (streamResult.aborted || onSignalAbort.triggered) {
-      process.exitCode = onSignalAbort.signalName === "SIGINT" ? 130 : 143;
-      if (jobId) {
-        markJobFinished(directory, jobId, "failed", {
-          sessionId,
-          model: rawModel,
-          error: "Task was aborted."
-        });
-      }
+    const result = await monitorPromise;
+    if (!result) {
       return;
-    }
-
-    eventStreamController.abort();
-
-    let messages = [];
-    try {
-      messages = await listSessionMessages(baseUrl, directory, sessionId);
-    } catch (error) {
-      messages = normalizeMessageArray(postResult);
-      if (messages.length === 0) {
-        throw error;
-      }
-    }
-    const result = buildTaskResult({
-      directory,
-      sessionId,
-      messages,
-      streamedText: printer.getOutput(),
-      status: abortedBySignal ? "aborted" : "completed"
-    });
-
-    if (!printer.getOutput().trim() && result.combined_text) {
-      process.stdout.write(`${result.combined_text}\n`);
-    }
-    process.stdout.write(renderTaskSummary(result));
-    if (jobId) {
-      markJobFinished(directory, jobId, "completed", {
-        sessionId,
-        model: rawModel,
-        error: null
-      });
     }
     shouldExit = true;
   } catch (error) {
@@ -2286,7 +2260,7 @@ async function handleReview(argv) {
 
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--wait", "--background", "--adversarial"],
-    stringFlags: ["--base", "--scope", "--directory", "--model"]
+    stringFlags: ["--base", "--scope", "--directory", "--server-directory", "--model", "--timeout"]
   });
 
   const directory = resolveDirectory(options.directory);
@@ -2298,16 +2272,16 @@ async function handleReview(argv) {
     throw new Error("Cannot combine --wait with --background.");
   }
 
-  let metadata = null;
+  let context = null;
 
   if (reviewScope === "working-tree") {
-    metadata = await collectWorkingTreeReviewContext(directory);
+    context = await collectWorkingTreeReviewContext(directory);
   } else if (reviewScope === "branch") {
     const selectedBase = baseRef || (await resolveDefaultReviewBaseRef(directory));
     if (!selectedBase) {
       throw new Error("Unable to resolve a base ref for branch review. Pass --base REF.");
     }
-    metadata = await collectBranchReviewContext(directory, selectedBase);
+    context = await collectBranchReviewContext(directory, selectedBase);
   } else {
     const currentBranch = await getCurrentGitBranch(directory);
     const selectedBase = baseRef || (await resolveDefaultReviewBaseRef(directory));
@@ -2316,116 +2290,108 @@ async function handleReview(argv) {
     if (!isMainBranch && selectedBase) {
       const aheadCount = await getAheadCommitCount(directory, selectedBase);
       if (aheadCount > 0) {
-        metadata = await collectBranchReviewContext(directory, selectedBase);
+        context = await collectBranchReviewContext(directory, selectedBase);
       }
     }
 
-    if (!metadata) {
-      metadata = await collectWorkingTreeReviewContext(directory);
+    if (!context) {
+      context = await collectWorkingTreeReviewContext(directory);
     }
   }
 
-  const prompt = buildReviewPrompt(metadata, {
+  const prompt = buildReviewPrompt(context, {
     adversarial: Boolean(options.adversarial),
     focusText: focusText || null
   });
 
   const taskArgs = [];
   taskArgs.push("--directory", directory);
+  if (options["server-directory"]) {
+    taskArgs.push("--server-directory", String(options["server-directory"]));
+  }
   if (options.model) {
     taskArgs.push("--model", String(options.model));
   }
   if (options.background) {
     taskArgs.push("--background");
   }
+  if (options.timeout) {
+    taskArgs.push("--timeout", String(options.timeout));
+  }
   taskArgs.push("--", prompt);
 
   await handleTask(taskArgs);
 }
 
-async function handleSessions(argv) {
-  const { options } = parseArgs(argv, {
-    stringFlags: ["--directory", "--session", "--since", "--limit"]
+async function handleAttach(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    stringFlags: ["--directory", "--server-directory", "--timeout"]
   });
+
+  const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const directory = resolveDirectory(options.directory);
-  const sinceMinutes = options.since != null ? Number(options.since) : 5;
-  if (!Number.isFinite(sinceMinutes) || sinceMinutes < 0) {
-    throw new Error(`Invalid --since value: ${options.since}`);
-  }
-  const limit = options.limit != null ? Math.max(1, Number(options.limit)) : 10;
-  if (!Number.isFinite(limit)) {
-    throw new Error(`Invalid --limit value: ${options.limit}`);
-  }
-  const sessionFilter = options.session ? String(options.session).trim() : null;
+  let sessionId = positionals[0] ?? null;
+  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
 
-  const state = normalizeState(readState(directory));
+  if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
+    throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
+  }
+
+  const state = normalizeState(readState(serverDirectory));
   if (!state) {
-    process.stdout.write(`No managed OpenCode serve state found for ${directory}.\n`);
-    process.exitCode = 1;
-    return;
+    throw new Error(`No managed OpenCode serve state found for ${serverDirectory}. Is it running?`);
   }
+
   const baseUrl = buildBaseUrl(state.port);
-  if (!(await checkHealth(baseUrl))) {
-    process.stdout.write(
-      `OpenCode serve at ${baseUrl} is not reachable (pid ${state.pid}). Run \`check\` or \`ensure-serve\` to revive it.\n`
-    );
-    process.exitCode = 1;
-    return;
+  const healthy = await checkHealth(baseUrl);
+  if (!healthy) {
+    throw new Error(`OpenCode serve at ${baseUrl} is not reachable.`);
   }
 
-  let raw;
-  try {
-    raw = await listSessions(baseUrl, directory);
-  } catch (error) {
-    throw new Error(`Failed to list sessions: ${error.message}`);
-  }
-
-  const sessions = (Array.isArray(raw) ? raw : []).map(summarizeSession);
-  let filtered = sessionFilter
-    ? sessions.filter((s) => s.id === sessionFilter)
-    : sessions;
-
-  // Newest first by updatedAtMs, falling back to createdAtMs.
-  filtered.sort((a, b) => {
-    const av = a.updatedAtMs ?? a.createdAtMs ?? 0;
-    const bv = b.updatedAtMs ?? b.createdAtMs ?? 0;
-    return bv - av;
-  });
-  filtered = filtered.slice(0, limit);
-
-  if (filtered.length === 0) {
-    if (sessionFilter) {
-      process.stdout.write(`No session found with id ${sessionFilter} in ${directory}.\n`);
-      process.exitCode = 1;
-      return;
+  if (!sessionId) {
+    const sessions = await listSessions(baseUrl, directory);
+    if (sessions.length === 0) {
+      throw new Error("No sessions found to attach to.");
     }
-    process.stdout.write(`No sessions reported by the serve at ${baseUrl}.\n`);
-    return;
+    // Default to the most recent one
+    sessionId = summarizeSession(sessions[0]).id;
+    log(`Attaching to most recent session: ${sessionId}`);
   }
 
-  const cutoffMs = Date.now() - sinceMinutes * 60 * 1000;
-  const lines = [
-    `OpenCode sessions at ${baseUrl} (directory: ${directory})`,
-    `Active threshold: updated within ${sinceMinutes} minute${sinceMinutes === 1 ? "" : "s"}.`,
-    "",
-    "| verdict | id | age | title |",
-    "| --- | --- | --- | --- |"
-  ];
-  for (const s of filtered) {
-    const updMs = s.updatedAtMs ?? s.createdAtMs;
-    const verdict = updMs != null && updMs >= cutoffMs ? "active" : "idle";
-    const age = formatRelativeAge(updMs);
-    lines.push(
-      `| ${verdict} | ${escapeMarkdownCell(s.id)} | ${escapeMarkdownCell(age)} | ${escapeMarkdownCell(s.summary)} |`
-    );
+  log(`Attaching to OpenCode session ${sessionId} on port ${state.port}.`);
+
+  const eventStreamController = new AbortController();
+  const onSignalAbort = createSignalAbort(async (signal) => {
+    log(`Received ${signal}; detaching from session ${sessionId}.`);
+    // We don't abort the session on attach detach
+  });
+
+  const sigintHandler = () => {
+    eventStreamController.abort();
+    void onSignalAbort.trigger("SIGINT");
+  };
+  const sigtermHandler = () => {
+    eventStreamController.abort();
+    void onSignalAbort.trigger("SIGTERM");
+  };
+  process.once("SIGINT", sigintHandler);
+  process.once("SIGTERM", sigtermHandler);
+
+  try {
+    const printer = createTextStreamPrinter();
+    await monitorSession({
+      baseUrl,
+      directory,
+      sessionId,
+      printer,
+      timeoutMins,
+      onSignalAbort,
+      eventStreamController
+    });
+  } finally {
+    process.removeListener("SIGINT", sigintHandler);
+    process.removeListener("SIGTERM", sigtermHandler);
   }
-  lines.push(
-    "",
-    "Note: 'active' means the session was updated recently on the serve.",
-    "A foreground `task` call that returned non-zero may correspond to a session that is still active here;",
-    "check the verdict above before retrying so you don't double-fire a still-running session."
-  );
-  process.stdout.write(lines.join("\n") + "\n");
 }
 
 async function handleStatus(argv) {
@@ -2524,11 +2490,11 @@ async function handleCleanup(argv) {
   const { options } = parseArgs(argv, {
     stringFlags: ["--directory"]
   });
-  const directory = resolveDirectory(options.directory);
-  const state = normalizeState(readState(directory));
+  const serverDirectory = resolveServerDirectory(options.directory);
+  const state = normalizeState(readState(serverDirectory));
 
   if (!state) {
-    process.stdout.write(renderCleanupResult(directory, { found: false }));
+    process.stdout.write(renderCleanupResult(serverDirectory, { found: false }));
     return;
   }
 
@@ -2536,10 +2502,10 @@ async function handleCleanup(argv) {
   if (wasRunning) {
     await terminateProcess(state.pid);
   }
-  removeState(directory);
+  removeState(serverDirectory);
 
   process.stdout.write(
-    renderCleanupResult(directory, {
+    renderCleanupResult(serverDirectory, {
       found: true,
       wasRunning,
       pid: state.pid,
@@ -2571,12 +2537,12 @@ async function main() {
     await handleReview(rest);
     return;
   }
-  if (command === "status") {
-    await handleStatus(rest);
+  if (command === "attach") {
+    await handleAttach(rest);
     return;
   }
-  if (command === "sessions") {
-    await handleSessions(rest);
+  if (command === "status") {
+    await handleStatus(rest);
     return;
   }
   if (command === "result") {
@@ -2609,9 +2575,6 @@ if (isDirectExecution) {
 }
 
 export {
-  buildReviewPrompt,
-  collectBranchReviewContext,
-  collectWorkingTreeReviewContext,
   generateJobId,
   formatDuration,
   isActiveJob,

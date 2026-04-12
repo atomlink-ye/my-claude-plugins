@@ -6,14 +6,14 @@ const sharedTestConfig = {
   coverage: {
     provider: "v8",
     reporter: ["text", "html"],
-    include: ["scripts/**"]
+    include: ["plugins/*/scripts/**"]
   },
   testTimeout: 30000,
   pool: "forks"
 };
 
 export default defineConfig({
-  cacheDir: "/tmp/opencode-slave-vitest-cache",
+  cacheDir: "/tmp/my-claude-plugins-vitest-cache",
   test: {
     ...sharedTestConfig,
     projects: [

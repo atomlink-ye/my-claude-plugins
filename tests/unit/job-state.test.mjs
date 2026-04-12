@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isActiveJob, readJobs, refreshStaleRunningJobs, upsertJob } from "../../scripts/opencode-companion.mjs";
+import { isActiveJob, readJobs, refreshStaleRunningJobs, upsertJob } from "../../plugins/opencode/scripts/opencode-companion.mjs";
 
 const { mkdtempSync, rmSync, writeFileSync } = fs;
 const { tmpdir } = os;

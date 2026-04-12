@@ -14,7 +14,7 @@ const STATE_FILE_NAME = ".opencode-serve.json";
 const JOBS_FILE_NAME = ".opencode-jobs.json";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-const companionScript = path.join(repoRoot, "scripts", "opencode-companion.mjs");
+const companionScript = path.join(repoRoot, "plugins", "opencode", "scripts", "opencode-companion.mjs");
 const workspaceDir = mkdtempSync(path.join(tmpdir(), "opencode-real-serve-"));
 const stateFilePath = path.join(workspaceDir, STATE_FILE_NAME);
 const jobsFilePath = path.join(workspaceDir, JOBS_FILE_NAME);

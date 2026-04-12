@@ -91,7 +91,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const result = await spawnCompanion(["task", "--directory", workspace, "--", "write a hello world function"], {
+    const result = await spawnCompanion(["task", "--directory", workspace, "--server-directory", workspace, "--", "write a hello world function"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -119,7 +119,7 @@ describe("mock serve integration tests", () => {
       return await ctx.next();
     });
 
-    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--", "background job"], {
+    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--server-directory", workspace, "--", "background job"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -185,7 +185,7 @@ describe("mock serve integration tests", () => {
       return await ctx.next();
     });
 
-    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--", "cancel me"], {
+    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--server-directory", workspace, "--", "cancel me"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -238,7 +238,7 @@ describe("mock serve integration tests", () => {
       return await ctx.next();
     });
 
-    const result = await spawnCompanion(["review", "--scope", "working-tree", "--directory", workspace], {
+    const result = await spawnCompanion(["review", "--scope", "working-tree", "--directory", workspace, "--server-directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`

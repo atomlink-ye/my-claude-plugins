@@ -1,6 +1,7 @@
 {
-  "name": "opencode-slave",
+  "name": "my-claude-plugins",
   "version": "0.1.0",
+  "description": "Personal Claude Code plugin marketplace.",
   "type": "module",
   "scripts": {
     "test": "vitest run",
