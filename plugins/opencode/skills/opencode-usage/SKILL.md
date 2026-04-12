@@ -31,10 +31,36 @@ The previous task output ends with `Session ID: ses_...`. To reuse that session'
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
-  --session ses_XXXX -- "follow-up message"
+  --session ses_XXXX --directory /abs/path/to/original/project -- "follow-up message"
 ```
 
-Sessions are alive as long as the managed serve is alive. Restart = new session.
+**Sessions persist across serve restarts.** OpenCode stores all sessions,
+messages, and parts in a global SQLite DB at `~/.local/share/opencode/opencode.db`
+(plus content-addressable blobs under `~/.local/share/opencode/storage/`). The
+DB is NOT scoped to the managed serve's pid — killing and re-spawning the
+serve does not lose session history. To resume:
+
+1. Pass the original session id via `--session`.
+2. Pass the original project directory via `--directory` — this must match
+   the directory the session was created under (the serve routes by
+   `x-opencode-directory` header, and each session is bound to a
+   `project_id` derived from that directory).
+3. The current serve (whether original or a fresh one) queries the DB and
+   replays the prior conversation as context.
+
+If the companion reports "No managed OpenCode serve state found for <dir>",
+that's the companion's own pid-file state, not the session storage. Run
+`ensure-serve --directory <original-project-dir>` to spawn a fresh serve
+keyed to the right project, then `task --session <id> --directory <dir>`
+to resume.
+
+**Caveat on a stuck session.** A session whose foreground stream dropped
+while an @-delegation was in flight may remain "active" on the serve
+indefinitely. Use `sessions --session <id>` to check liveness; if verdict
+is `active` it's still working, if `idle` (no updates within the
+`--since` threshold, default 5 minutes) it's safe to resume. Empty result
+means the serve can't see it for the given directory — double-check the
+`--directory` argument matches the session's project.
 
 ## List sessions
 
@@ -44,9 +70,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" sessions \
 ```
 
 Verdict meaning:
-- `active` — still working. **Do not retry.**
-- `idle` — safe to retry or continue with `--session SID`.
-- missing — serve restarted or aborted. Fire fresh.
+- `active` — still working (updated within `--since`, default 5 min). **Do not retry.**
+- `idle` — safe to retry or continue with `--session SID --directory DIR`.
+- missing — not visible to the serve for the supplied `--directory`. Double-check
+  the directory matches the session's original project before assuming the session
+  is gone — sessions persist in the global DB at `~/.local/share/opencode/opencode.db`
+  and can usually be resumed by pointing at the correct directory (see "Continue a
+  session" above). If you genuinely need to drop it, fire fresh.
 
 ## Serve lifecycle (prefer `/opencode:serve`)
 

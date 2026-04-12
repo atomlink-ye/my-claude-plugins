@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -185,6 +186,29 @@ function opencodeEnv(directory) {
     ...process.env,
     XDG_STATE_HOME: process.env.XDG_STATE_HOME || stateRoot
   };
+}
+
+function serveWorkingDirectory() {
+  // The OpenCode serve routes each request by `x-opencode-directory`, so its
+  // own process cwd is only consulted as a last-resort fallback. Running it
+  // from the user's home keeps it project-agnostic: a single managed serve
+  // can host multiple project workspaces without accumulating stale state
+  // under whichever project happened to start it. The env override
+  // OPENCODE_COMPANION_SERVE_CWD lets operators pick a different location
+  // (e.g. a dedicated runtime dir) without editing this script.
+  const override = process.env.OPENCODE_COMPANION_SERVE_CWD;
+  if (override) {
+    const resolved = path.resolve(override);
+    try {
+      const stats = fs.statSync(resolved);
+      if (stats.isDirectory()) {
+        return resolved;
+      }
+    } catch (error) {
+      // fall through to home
+    }
+  }
+  return os.homedir();
 }
 
 async function runCommandCapture(command, args, { cwd, env, timeoutMs = 5000 } = {}) {
@@ -1162,8 +1186,16 @@ async function runServeProbe(directory, requestedPort = 0) {
   const env = opencodeEnv(directory);
   const logs = [];
 
+  // Spawn the serve from the user's home so its process-level cwd is
+  // decoupled from any specific project directory. The serve routes every
+  // request by the `x-opencode-directory` header / query param anyway, and
+  // session data lives in the global DB at `~/.local/share/opencode/`. A
+  // neutral cwd avoids pinning state fallbacks, plugin cascades, and
+  // process.cwd()-derived defaults to whichever project dir happened to
+  // launch the companion.
+  const serveCwd = serveWorkingDirectory();
   const child = spawn("opencode", ["serve", "--port", String(port), "--hostname", HOSTNAME, "--print-logs"], {
-    cwd: directory,
+    cwd: serveCwd,
     env,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -1245,8 +1277,12 @@ async function ensureManagedServe(directory, requestedPort = 0) {
   const env = opencodeEnv(directory);
   let spawnError = null;
 
+  // See runServeProbe() comment: always run the serve from a neutral cwd
+  // (the user's home by default) so its process-level state is decoupled
+  // from whichever project's companion invocation happened to spawn it.
+  const serveCwd = serveWorkingDirectory();
   const child = spawn("opencode", ["serve", "--port", String(port), "--hostname", HOSTNAME], {
-    cwd: directory,
+    cwd: serveCwd,
     env,
     detached: true,
     stdio: "ignore"
