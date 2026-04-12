@@ -21,11 +21,7 @@ Claude Code
     ├── /opencode:status
     │
     ▼
-opencode-agent               ← 子代理（agents/）
-    │  使用 skills: opencode-runtime, opencode-result-handling
-    │
-    ▼
-scripts/opencode-companion.mjs  ← 核心运行时
+scripts/opencode-companion.mjs  ← 核心运行时（直接通过 Bash 调用）
     │  管理 opencode serve 进程
     │  通过 HTTP API 创建会话、发送消息、流式读取输出
     │
@@ -73,10 +69,8 @@ opencode-slave/
 │   ├── status.md             # /opencode:status - 查看任务状态
 │   └── serve.md              # /opencode:serve - 启动/停止 serve
 ├── skills/
-│   ├── opencode-runtime/
-│   │   └── SKILL.md          # 内部：调用 companion 脚本的合约
-│   └── opencode-result-handling/
-│       └── SKILL.md          # 内部：呈现 OpenCode 输出的规则
+│   └── opencode/
+│       └── SKILL.md          # 统一技能：调用、提示、结果处理、运行时合约
 ├── agents/
 │   └── opencode-agent.md     # 子代理：转发任务到 OpenCode
 ├── scripts/
@@ -124,8 +118,8 @@ allowed-tools: Bash
 
 ```yaml
 ---
-name: opencode-runtime
-description: 调用 opencode-companion 脚本的合约
+name: opencode
+description: OpenCode 调用、提示、结果处理、运行时合约
 user-invocable: false
 ---
 
@@ -143,8 +137,7 @@ description: 转发任务到 OpenCode serve API
 model: sonnet
 tools: Bash
 skills:
-  - opencode-runtime
-  - opencode-result-handling
+  - opencode
 ---
 
 转发逻辑说明...

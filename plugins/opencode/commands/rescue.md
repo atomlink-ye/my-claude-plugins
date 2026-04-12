@@ -1,22 +1,32 @@
 ---
-description: Delegate investigation, fix request, or follow-up work to the OpenCode agent
+description: Delegate investigation, fix request, or follow-up work to OpenCode
 argument-hint: '[--background|--wait] [--model MODEL] [task description]'
 context: fork
 allowed-tools: Bash(node:*), AskUserQuestion
+skills:
+  - opencode
 ---
 
-Route this request to the `opencode:opencode-agent` subagent in `agents/opencode-agent.md`.
-The final user-visible response must be the OpenCode companion output verbatim.
+Invoke the OpenCode companion **directly via Bash** — do NOT route through the `opencode:opencode-agent` subagent.
 
-Execution mode:
-- If the request includes `--background`, run the subagent in the background.
-- If the request includes `--wait`, run the subagent in the foreground.
-- If neither flag is present, default to foreground.
-- Strip `--background` and `--wait` from the forwarded prompt before sending it to the agent.
-- Preserve `--model` when the user provides it, and pass it through to the agent.
+Consult the `opencode` skill for invocation syntax, prompt composition, and result handling.
 
-Operating rules:
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the companion stdout verbatim to the user.
-- Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- If the user did not supply a task, ask what OpenCode should investigate or fix.
+Execution:
+1. Parse flags from `$ARGUMENTS`:
+   - `--background` → use Bash `run_in_background: true`. Strip from prompt.
+   - `--wait` → run Bash in foreground. Strip from prompt.
+   - If neither flag is present, default to foreground.
+   - `--model MODEL` → pass through to companion. Strip from prompt.
+2. Compose the prompt using the `opencode` skill's prompt composition guidance.
+3. Invoke the companion directly:
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
+     [--model MODEL] -- "PROMPT"
+   ```
+4. Apply the result handling rules from the `opencode` skill.
+
+Presentation rules:
+- Return the companion stdout verbatim.
+- Do not paraphrase, summarize, rewrite, or add commentary around the output.
+
+If the user did not supply a task, ask what OpenCode should investigate or fix.

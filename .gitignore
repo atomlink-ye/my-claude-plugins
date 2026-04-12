@@ -6,3 +6,5 @@
 .tmp-state/
 node_modules/
 .opencode-state/
+
+.local

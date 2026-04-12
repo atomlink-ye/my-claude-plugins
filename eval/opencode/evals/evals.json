@@ -1,0 +1,55 @@
+{
+  "skill_name": "opencode",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I need to start the OpenCode server for my project at /Users/fan/my-app so I can delegate some work to it later",
+      "expected_output": "Runs ensure-serve via Bash with --directory /Users/fan/my-app. Does NOT spawn an agent subagent.",
+      "assertions": [
+        { "id": "a1", "text": "Uses Bash to call opencode-companion.mjs ensure-serve", "type": "behavioral" },
+        { "id": "a2", "text": "Passes --directory /Users/fan/my-app", "type": "behavioral" },
+        { "id": "a3", "text": "Does NOT spawn an Agent or route to opencode-agent", "type": "behavioral" }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "delegate an analysis of the current project to OpenCode — look at the test coverage and suggest improvements",
+      "expected_output": "Calls companion task subcommand directly via Bash with run_in_background: true. Does NOT spawn opencode-agent.",
+      "assertions": [
+        { "id": "b1", "text": "Uses Bash to call opencode-companion.mjs task", "type": "behavioral" },
+        { "id": "b2", "text": "Uses run_in_background: true on the Bash call", "type": "behavioral" },
+        { "id": "b3", "text": "Does NOT spawn an Agent subagent", "type": "behavioral" },
+        { "id": "b4", "text": "Prompt forwarded to companion includes the analysis request", "type": "behavioral" }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "continue the previous OpenCode session ses_abcdef123, the project was /Users/fan/my-app — tell it to fix the remaining test failures in auth.test.ts",
+      "expected_output": "Calls companion task with --session ses_abcdef123 --directory /Users/fan/my-app via Bash.",
+      "assertions": [
+        { "id": "c1", "text": "Uses Bash to call opencode-companion.mjs task", "type": "behavioral" },
+        { "id": "c2", "text": "Passes --session ses_abcdef123", "type": "behavioral" },
+        { "id": "c3", "text": "Passes --directory /Users/fan/my-app", "type": "behavioral" },
+        { "id": "c4", "text": "Does NOT create a new session (no missing --session)", "type": "behavioral" }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "use an agent to handle this OpenCode task: review the API endpoints for security issues",
+      "expected_output": "This is the ONE case where the Agent subagent should be used, because the user explicitly said 'use an agent'.",
+      "assertions": [
+        { "id": "d1", "text": "Spawns the opencode-agent via Agent tool OR routes through the agent", "type": "behavioral" },
+        { "id": "d2", "text": "The agent ultimately calls opencode-companion.mjs task", "type": "behavioral" }
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "is OpenCode installed and ready? check if the serve is running",
+      "expected_output": "Runs check subcommand via Bash directly.",
+      "assertions": [
+        { "id": "e1", "text": "Uses Bash to call opencode-companion.mjs check", "type": "behavioral" },
+        { "id": "e2", "text": "Does NOT spawn an Agent subagent", "type": "behavioral" }
+      ]
+    }
+  ]
+}
