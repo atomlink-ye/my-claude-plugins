@@ -1,18 +1,29 @@
 ---
 name: opencode
-description: Authoritative reference for OpenCode invocation, prompt composition, and result handling. Consult before ANY OpenCode usage — especially task delegation, session operations (continue, resume, list),  and serve lifecycle. This is the single source of truth for companion CLI syntax, flags, and behavioral contracts.
+description: Authoritative reference for OpenCode agent routing, direct companion invocation, prompt composition, and result handling. Consult before ANY OpenCode usage — especially task delegation via the OpenCode agent, session operations (continue, resume, list), and serve lifecycle. This is the single source of truth for agent routing, companion CLI syntax, flags, and behavioral contracts.
 user-invocable: false
 ---
 
 # OpenCode Skill
 
-Unified reference for delegating work to OpenCode. Covers invocation, prompt composition, result handling, and the runtime contract.
+Unified reference for delegating work to OpenCode. The default route for task delegation is the `opencode-agent` wrapper. Direct companion invocation is the fallback path when the agent is being bypassed on purpose or when low-level runtime control is needed.
 
 ---
 
 ## 1. Invocation (Usage)
 
-Direct-invocation reference for `opencode-companion.mjs`.
+### Preferred route: `opencode-agent`
+
+Use `opencode:opencode-agent` as the primary entrypoint for OpenCode task delegation.
+
+- `/opencode:task` and `/opencode:rescue` should route through the agent by default.
+- The agent is a thin forwarder around `opencode-companion.mjs task`.
+- The agent should return the companion stdout verbatim.
+- Do not prefer direct Bash invocation when normal agent routing is available.
+
+### Direct companion path
+
+Direct-invocation reference for `opencode-companion.mjs` when the agent is being bypassed explicitly.
 
 ### Companion path
 
@@ -27,7 +38,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
   [--directory DIR] [--model MODEL] [--session SID] -- "PROMPT"
 ```
 
-**Preferred: call via Bash with `run_in_background: true`**, unless the user explicitly requests blocking behaviour. This keeps Claude Code free and delivers the full result via notification + output file when OpenCode finishes. Do **not** also pass the companion's own `--background` flag — that's a detached job-queue mode with different semantics.
+If you want non-blocking behavior in this direct-call path, run the Bash command with `run_in_background: true`. Otherwise run it in the foreground. Do **not** also pass the companion's own `--background` flag — that's a detached job-queue mode with different semantics.
 
 ### Continue a session
 
@@ -175,4 +186,3 @@ CRITICAL:
 - Stop after presenting the OpenCode results.
 - Never auto-apply, refine, or extend OpenCode changes without explicit user permission.
 - If the run failed or was incomplete, report that and stop instead of improvising a fallback implementation.
-

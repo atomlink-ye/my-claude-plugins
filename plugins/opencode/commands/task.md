@@ -7,24 +7,16 @@ skills:
   - opencode
 ---
 
-Invoke the OpenCode companion **directly via Bash**.
+Route to the `opencode:opencode-agent` subagent.
 
-Consult the `opencode` skill for invocation syntax, prompt composition, and result handling.
+Execution mode:
+- `--background` means run the subagent in the background.
+- `--wait` means run the subagent in the foreground.
+- If neither flag is present, default to foreground.
+- Strip `--background` and `--wait` from the forwarded agent prompt.
+- Strip `--directory DIR` and `--model MODEL` from the agent prompt, then pass them through as companion args.
 
-Execution:
-1. Parse flags from `$ARGUMENTS`:
-   - `--background` → use Bash `run_in_background: true`. Strip from prompt.
-   - `--wait` → run Bash in foreground. Strip from prompt.
-   - If neither flag is present, default to `run_in_background: true`.
-   - `--directory DIR` → pass through to companion. Strip from prompt.
-   - `--model MODEL` → pass through to companion. Strip from prompt.
-2. Compose the prompt using the `opencode` skill's prompt composition guidance.
-3. Invoke the companion directly:
-   ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
-     [--directory DIR] [--model MODEL] -- "PROMPT"
-   ```
-4. Apply the result handling rules from the `opencode` skill.
+If the user explicitly wants to bypass the agent and call the companion directly, consult the `opencode` skill. In that direct-call path, suggest Bash `run_in_background: true` only when non-blocking execution is desired.
 
 Presentation rules:
 - Return the companion stdout verbatim.

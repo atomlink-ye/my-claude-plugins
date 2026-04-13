@@ -299,9 +299,34 @@ async function ensureOpencodeInstalled(directory) {
   return (result.stdout || result.stderr).trim();
 }
 
+async function isPortAvailable(port) {
+  return await new Promise((resolve) => {
+    const server = net.createServer();
+    server.unref();
+
+    server.on("error", () => {
+      resolve(false);
+    });
+
+    server.listen(port, HOSTNAME, () => {
+      server.close((error) => {
+        if (error) {
+          resolve(false);
+          return;
+        }
+        resolve(true);
+      });
+    });
+  });
+}
+
 async function choosePort(requestedPort) {
   const numeric = Number(requestedPort ?? 0);
   if (Number.isInteger(numeric) && numeric > 0) {
+    const available = await isPortAvailable(numeric);
+    if (!available) {
+      throw new Error(`Port ${numeric} is unavailable.`);
+    }
     return numeric;
   }
 
@@ -1333,6 +1358,10 @@ function collectTextParts(value, parts = [], seen = new Set(), hintKey = "", par
   }
 
   const nextType = typeof value.type === "string" ? value.type : parentType;
+  // Skip reasoning/thinking and structural parts — only extract actual text output
+  if (nextType === "reasoning" || nextType === "step-start" || nextType === "step-finish") {
+    return parts;
+  }
   for (const [key, entry] of Object.entries(value)) {
     collectTextParts(entry, parts, seen, key, nextType);
   }
@@ -1353,6 +1382,17 @@ function collectAssistantNodes(value, nodes = []) {
 
   if (!value || typeof value !== "object") {
     return nodes;
+  }
+
+  // OpenCode format: messages have { info: { role: "assistant" }, parts: [...] }.
+  // Check info.role first so we push the full message (with parts), not the info sub-object.
+  const infoRole = value.info?.role;
+  if (infoRole) {
+    const normalized = String(infoRole).toLowerCase();
+    if (normalized.includes("assistant") || normalized === "model" || normalized === "ai") {
+      nodes.push(value);
+      return nodes; // Don't recurse — we want the full message, not sub-objects
+    }
   }
 
   const roleFields = [value.role, value.author, value.sender, value.source, value.kind, value.type]
@@ -1483,12 +1523,16 @@ function renderCleanupResult(directory, details) {
   return `Removed stale OpenCode serve state for ${directory} (pid ${details.pid}, port ${details.port}).\n`;
 }
 
-function renderCheckResult({ directory, version, port }) {
+function renderCheckResult({ directory, version, managedState, healthy, pidRunning }) {
   return [
     "OpenCode companion check passed.",
     `Directory: ${directory}`,
     `OpenCode version: ${version}`,
-    `Serve probe port: ${port}`
+    `Managed serve state file: ${stateFilePath(directory)}`,
+    `Managed serve pid: ${managedState?.pid ?? "none"}`,
+    `Managed serve pid running: ${pidRunning ? "yes" : "no"}`,
+    `Managed serve port: ${managedState?.port ?? "none"}`,
+    `Managed serve health: ${healthy ? "healthy" : "not reachable"}`
   ].join("\n") + "\n";
 }
 
@@ -1631,12 +1675,12 @@ async function streamSseResponse(stream, onEvent, { abortSignal } = {}) {
         if (event) {
           if (event.done) {
             await cancelReader();
-            return { done: true };
+            return { streamClosed: true };
           }
           const result = await onEvent(event);
           if (result?.done || result?.aborted) {
             await cancelReader();
-            return { aborted: Boolean(result.aborted) };
+            return result?.aborted ? { aborted: true } : { streamClosed: true };
           }
         }
         if (aborted) {
@@ -1653,12 +1697,12 @@ async function streamSseResponse(stream, onEvent, { abortSignal } = {}) {
       if (event) {
         if (event.done) {
           await cancelReader();
-          return { done: true };
+          return { streamClosed: true };
         }
         const result = await onEvent(event);
         if (result?.done || result?.aborted) {
           await cancelReader();
-          return { aborted: Boolean(result.aborted) };
+          return result?.aborted ? { aborted: true } : { streamClosed: true };
         }
       }
     }
@@ -1667,13 +1711,48 @@ async function streamSseResponse(stream, onEvent, { abortSignal } = {}) {
       return { aborted: true };
     }
 
-    throw new Error("OpenCode event stream ended before session.idle.");
+    return { streamClosed: true };
   } finally {
     if (abortSignal) {
       abortSignal.removeEventListener("abort", abortListener);
     }
     reader.releaseLock();
   }
+}
+
+function normalizeSessionStatus(status) {
+  return String(status ?? "unknown").trim().toLowerCase();
+}
+
+function isSuccessfulTerminalSessionStatus(status) {
+  return new Set(["idle", "completed", "complete", "done"]).has(normalizeSessionStatus(status));
+}
+
+function isFailedTerminalSessionStatus(status) {
+  return new Set(["aborted", "cancelled", "canceled", "failed", "error"]).has(normalizeSessionStatus(status));
+}
+
+function isTerminalSessionStatus(status) {
+  return isSuccessfulTerminalSessionStatus(status) || isFailedTerminalSessionStatus(status);
+}
+
+function isBusySessionStatus(status) {
+  return new Set(["busy", "active", "running", "working"]).has(normalizeSessionStatus(status));
+}
+
+function deriveResultStatus({ terminalStatus, abortedBySignal }) {
+  if (abortedBySignal) {
+    return "aborted";
+  }
+  if (isSuccessfulTerminalSessionStatus(terminalStatus)) {
+    return "completed";
+  }
+  return normalizeSessionStatus(terminalStatus);
+}
+
+async function getSessionSummary(baseUrl, directory, sessionId) {
+  const sessions = await listSessions(baseUrl, directory);
+  return sessions.map(summarizeSession).find((session) => session.id === sessionId) ?? null;
 }
 
 function createTextStreamPrinter() {
@@ -1794,12 +1873,10 @@ async function handleCheck(argv) {
   });
   const serverDirectory = resolveServerDirectory(options.directory);
   const version = await ensureOpencodeInstalled(serverDirectory);
-  const probe = await runServeProbe(serverDirectory, 0);
-  if (!probe.ok) {
-    const detail = probe.error?.message || firstNonEmptyLine(probe.logs) || "Unknown startup failure.";
-    throw new Error(`OpenCode is installed but serve could not start. ${detail}`);
-  }
-  process.stdout.write(renderCheckResult({ directory: serverDirectory, version, port: probe.port }));
+  const managedState = normalizeState(readState(serverDirectory));
+  const healthy = managedState ? await checkHealth(buildBaseUrl(managedState.port)) : false;
+  const pidRunning = managedState ? isPidRunning(managedState.pid) : false;
+  process.stdout.write(renderCheckResult({ directory: serverDirectory, version, managedState, healthy, pidRunning }));
 }
 
 async function handleEnsureServe(argv) {
@@ -1823,18 +1900,42 @@ async function monitorSession({
   timeoutMins = 20,
   onSignalAbort,
   eventStreamController,
+  canUseStatusPolling = () => true,
   jobId = null,
   rawModel = null,
   abortedBySignal = false
 }) {
   const directorySessions = new Map(); // sessionId -> { status, lastActivityAt }
   let lastDirectoryActivityAt = Date.now();
+  let lastMainSessionActivityAt = Date.now();
   let lastPrintedSessionId = null;
+  const partTypes = new Map(); // partID -> part type (e.g. "text", "reasoning", "tool")
   const QUIESCENCE_TIMEOUT_MS = 5000;
   const FORCE_QUIESCENCE_TIMEOUT_MS = 30000;
+  const STATUS_POLL_INTERVAL_MS = 1500;
+  const STREAM_CLOSE_GRACE_MS = 4000;
   const SETTLING_CHECK_INTERVAL_MS = 1000;
   const timeoutMs = timeoutMins * 60 * 1000;
   const startTime = Date.now();
+  let lastStatusPollAt = 0;
+
+  async function refreshMainSessionStatus() {
+    const summary = await getSessionSummary(baseUrl, directory, sessionId);
+    if (!summary) {
+      return null;
+    }
+
+    const nextStatus = normalizeSessionStatus(summary.status);
+    if (!directorySessions.has(sessionId)) {
+      directorySessions.set(sessionId, { status: nextStatus, lastActivityAt: Date.now() });
+    } else {
+      const state = directorySessions.get(sessionId);
+      state.status = nextStatus;
+      state.lastActivityAt = Date.now();
+    }
+
+    return summary;
+  }
 
   const eventResponse = await openEventStream(baseUrl, directory, eventStreamController.signal);
   const eventStreamPromise = streamSseResponse(
@@ -1866,10 +1967,36 @@ async function monitorSession({
         // Any event with a sessionID counts as activity (reasoning, step-start, etc.)
         sessionState.lastActivityAt = Date.now();
         lastDirectoryActivityAt = Date.now();
+        if (eventSessionId === sessionId) {
+          lastMainSessionActivityAt = Date.now();
+        }
+
+        // Track part types so we can filter reasoning from text deltas
+        if (payload.type === "message.part.updated" && properties.part) {
+          try {
+            const partInfo = typeof properties.part === "string" ? JSON.parse(properties.part) : properties.part;
+            if (partInfo.id && partInfo.type) {
+              partTypes.set(partInfo.id, partInfo.type);
+            }
+            // Print brief tool call summary
+            if (partInfo.type === "tool" && partInfo.state === "completed" && partInfo.name) {
+              const toolSummary = `[tool: ${partInfo.name}${partInfo.result ? " ✓" : ""}]\n`;
+              if (eventSessionId === sessionId) {
+                printer.handleDelta(toolSummary);
+              }
+            }
+          } catch {
+            // Ignore parse errors
+          }
+        }
 
         if (payload.type === "message.part.delta") {
           if (properties.field === "text") {
-            if (eventSessionId === sessionId) {
+            // Skip reasoning/thinking parts — only stream actual text output
+            const knownType = properties.partID ? partTypes.get(properties.partID) : null;
+            if (knownType === "reasoning") {
+              // Don't stream reasoning content
+            } else if (eventSessionId === sessionId) {
               if (lastPrintedSessionId !== sessionId) {
                 lastPrintedSessionId = sessionId;
               }
@@ -1888,7 +2015,7 @@ async function monitorSession({
         }
 
         if (payload.type === "session.status") {
-          sessionState.status = properties.status?.type || properties.status || "unknown";
+          sessionState.status = normalizeSessionStatus(properties.status?.type || properties.status || "unknown");
         }
 
         if (payload.type === "session.idle") {
@@ -1915,44 +2042,84 @@ async function monitorSession({
         throw new Error(`Task timed out after ${timeoutMins} minutes.`);
       }
 
-      const msSinceLastActivity = now - lastDirectoryActivityAt;
+      const msSinceDirectoryActivity = now - lastDirectoryActivityAt;
+      const msSinceMainActivity = now - lastMainSessionActivityAt;
+      const shouldPollStatus = canUseStatusPolling() && now - lastStatusPollAt >= STATUS_POLL_INTERVAL_MS;
+
+      if (shouldPollStatus) {
+        lastStatusPollAt = now;
+        try {
+          const summary = await refreshMainSessionStatus();
+          if (summary && isTerminalSessionStatus(summary.status)) {
+            const terminalStatus = normalizeSessionStatus(summary.status);
+            log(`Finished (session status ${terminalStatus}) in directory ${directory}.`);
+            return { done: true, terminalStatus };
+          }
+        } catch {
+          // Ignore status polling failures and keep waiting on the event stream.
+        }
+      }
+
       const mainSessionState = directorySessions.get(sessionId);
-      
-      // Check if any session is busy
+
+      const isMainIdle = normalizeSessionStatus(mainSessionState?.status) === "idle";
+
+      // Check if any tracked session is busy (for force-quiescence safety)
       let anyBusy = false;
       for (const state of directorySessions.values()) {
-        if (state.status === "busy") {
+        if (isBusySessionStatus(state.status)) {
           anyBusy = true;
           break;
         }
       }
 
-      const isMainIdle = mainSessionState?.status === "idle";
-      
-      // We can finish if:
-      // Quiescence: all sessions idle + no events for QUIESCENCE_TIMEOUT
-      // Force quiescence: no events for FORCE_QUIESCENCE_TIMEOUT, but only if
-      // no session is known to be busy (the overall --timeout covers truly stuck tasks)
-      const reachedQuiescence = !anyBusy && msSinceLastActivity >= QUIESCENCE_TIMEOUT_MS;
+      // Normal quiescence: main session idle + no main-session events for QUIESCENCE_TIMEOUT.
+      // Uses main-session activity only — unrelated sessions in the same directory
+      // must not block completion (they keep lastDirectoryActivityAt fresh).
+      const reachedQuiescence = msSinceMainActivity >= QUIESCENCE_TIMEOUT_MS;
+      // Force quiescence: directory-wide silence for FORCE_QUIESCENCE_TIMEOUT as a safety net.
       const hasSeenActivity = directorySessions.size > 0;
-      const reachedForceQuiescence = hasSeenActivity && !anyBusy && msSinceLastActivity >= FORCE_QUIESCENCE_TIMEOUT_MS;
+      const reachedForceQuiescence = hasSeenActivity && !anyBusy && msSinceDirectoryActivity >= FORCE_QUIESCENCE_TIMEOUT_MS;
 
-      if (isMainIdle && !quiescenceStartLogged && !reachedQuiescence) {
-        log("Main session idle. Waiting for quiescence...");
-        quiescenceStartLogged = true;
-      }
+        if (isMainIdle && !quiescenceStartLogged && !reachedQuiescence) {
+          log("Main session idle. Waiting for quiescence...");
+          quiescenceStartLogged = true;
+        }
 
-      if ((isMainIdle && reachedQuiescence) || reachedForceQuiescence) {
-        const reason = reachedForceQuiescence ? "safety timeout" : "quiescence";
-        log(`Finished (${reason}) in directory ${directory}.`);
-        eventStreamController.abort();
-        return { done: true };
+        if ((isMainIdle && reachedQuiescence) || reachedForceQuiescence) {
+          const reason = reachedForceQuiescence ? "safety timeout" : "quiescence";
+          log(`Finished (${reason}) in directory ${directory}.`);
+          return { done: true, terminalStatus: normalizeSessionStatus(mainSessionState?.status || "idle") };
+        }
       }
-    }
-    return { aborted: true };
+      return { aborted: true };
   })();
 
-  const streamResult = await Promise.race([eventStreamPromise, quiescencePromise]);
+  let streamResult = await Promise.race([eventStreamPromise, quiescencePromise]);
+  if (streamResult.streamClosed) {
+    const deadline = Date.now() + STREAM_CLOSE_GRACE_MS;
+    while (Date.now() < deadline && !onSignalAbort.triggered) {
+      try {
+        const summary = canUseStatusPolling() ? await refreshMainSessionStatus() : null;
+        if (summary && isTerminalSessionStatus(summary.status)) {
+          break;
+        }
+      } catch {
+        // Ignore polling errors while giving the server a brief chance to settle.
+      }
+      await delay(200);
+    }
+
+    const finalSummary = canUseStatusPolling() ? await getSessionSummary(baseUrl, directory, sessionId).catch(() => null) : null;
+    if (!finalSummary || !isTerminalSessionStatus(finalSummary.status)) {
+      throw new Error("OpenCode event stream ended before session completion.");
+    }
+    streamResult = {
+      done: true,
+      terminalStatus: normalizeSessionStatus(finalSummary.status)
+    };
+  }
+
   if (streamResult.aborted || onSignalAbort.triggered) {
     process.exitCode = onSignalAbort.signalName === "SIGINT" ? 130 : 143;
     if (jobId) {
@@ -1974,24 +2141,44 @@ async function monitorSession({
     // If we can't fetch messages, at least return what we have
   }
   
+  const resultStatus = deriveResultStatus({
+    terminalStatus: streamResult.terminalStatus,
+    abortedBySignal
+  });
+
   const result = buildTaskResult({
     directory,
     sessionId,
     messages,
     streamedText: printer.getOutput(),
-    status: abortedBySignal ? "aborted" : "completed"
+    status: resultStatus
   });
 
-  if (!printer.getOutput().trim() && result.combined_text) {
-    process.stdout.write(`${result.combined_text}\n`);
+  const streamedLength = printer.getOutput().trim().length;
+  const resultLength = (result.combined_text || "").length;
+  // Print combined_text if streaming missed significant content (>50% longer from API)
+  // or if nothing was streamed at all
+  if (result.combined_text && (!streamedLength || resultLength > streamedLength * 1.5)) {
+    process.stdout.write(`\n${result.combined_text}\n`);
   }
   process.stdout.write(renderTaskSummary(result));
   if (jobId) {
-    markJobFinished(directory, jobId, "completed", {
-      sessionId,
-      model: rawModel,
-      error: null
-    });
+    if (isFailedTerminalSessionStatus(result.status)) {
+      markJobFinished(directory, jobId, "failed", {
+        sessionId,
+        model: rawModel,
+        error: `OpenCode session ended with status ${result.status}.`
+      });
+    } else {
+      markJobFinished(directory, jobId, "completed", {
+        sessionId,
+        model: rawModel,
+        error: null
+      });
+    }
+  }
+  if (isFailedTerminalSessionStatus(result.status)) {
+    process.exitCode = 1;
   }
   return result;
 }
@@ -2112,6 +2299,7 @@ async function handleTask(argv) {
   let sessionId = null;
   let abortedBySignal = false;
   let shouldExit = false;
+  const taskLifecycle = { promptSubmitted: false };
   const eventStreamController = new AbortController();
   const onSignalAbort = createSignalAbort(async (signal) => {
     abortedBySignal = true;
@@ -2197,6 +2385,7 @@ async function handleTask(argv) {
       timeoutMins,
       onSignalAbort,
       eventStreamController,
+      canUseStatusPolling: () => taskLifecycle.promptSubmitted,
       jobId,
       rawModel,
       abortedBySignal
@@ -2211,6 +2400,7 @@ async function handleTask(argv) {
         timeoutMs: 30000, // Small timeout for starting the task
         signal: onSignalAbort.signal
       });
+      taskLifecycle.promptSubmitted = true;
     } catch (error) {
       eventStreamController.abort();
       if (!onSignalAbort.triggered || !isAbortError(error)) {
@@ -2222,7 +2412,9 @@ async function handleTask(argv) {
     if (!result) {
       return;
     }
-    shouldExit = true;
+    if (!isFailedTerminalSessionStatus(result.status)) {
+      shouldExit = true;
+    }
   } catch (error) {
     if (isAbortError(error) && !onSignalAbort.triggered) {
       if (jobId) {
@@ -2386,7 +2578,8 @@ async function handleAttach(argv) {
       printer,
       timeoutMins,
       onSignalAbort,
-      eventStreamController
+      eventStreamController,
+      canUseStatusPolling: () => true
     });
   } finally {
     process.removeListener("SIGINT", sigintHandler);
@@ -2575,10 +2768,14 @@ if (isDirectExecution) {
 }
 
 export {
+  deriveResultStatus,
   generateJobId,
   formatDuration,
+  isBusySessionStatus,
+  isFailedTerminalSessionStatus,
   isActiveJob,
   isPidRunning,
+  isSuccessfulTerminalSessionStatus,
   normalizePromptText,
   parseArgs,
   parseSseBlock,

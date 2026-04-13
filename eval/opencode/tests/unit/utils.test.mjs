@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, generateJobId, summarizePrompt } from "../../plugins/opencode/scripts/opencode-companion.mjs";
+import {
+  deriveResultStatus,
+  formatDuration,
+  generateJobId,
+  isBusySessionStatus,
+  isFailedTerminalSessionStatus,
+  isSuccessfulTerminalSessionStatus,
+  summarizePrompt
+} from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
 
 describe("utility helpers", () => {
   it("generates job ids that match the expected pattern", () => {
@@ -17,5 +25,21 @@ describe("utility helpers", () => {
     const normalized = prompt.trim().replace(/\s+/g, " ");
 
     expect(summarizePrompt(prompt)).toBe(`${normalized.slice(0, 120)}...`);
+  });
+
+  it("classifies session states consistently", () => {
+    expect(isSuccessfulTerminalSessionStatus("idle")).toBe(true);
+    expect(isFailedTerminalSessionStatus("failed")).toBe(true);
+    expect(isBusySessionStatus("active")).toBe(true);
+    expect(isBusySessionStatus("running")).toBe(true);
+    expect(isBusySessionStatus("busy")).toBe(true);
+    expect(isBusySessionStatus("idle")).toBe(false);
+  });
+
+  it("derives failed result statuses without collapsing them to completed", () => {
+    expect(deriveResultStatus({ terminalStatus: "idle", abortedBySignal: false })).toBe("completed");
+    expect(deriveResultStatus({ terminalStatus: "failed", abortedBySignal: false })).toBe("failed");
+    expect(deriveResultStatus({ terminalStatus: "cancelled", abortedBySignal: false })).toBe("cancelled");
+    expect(deriveResultStatus({ terminalStatus: "idle", abortedBySignal: true })).toBe("aborted");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseArgs } from "../../plugins/opencode/scripts/opencode-companion.mjs";
+import { parseArgs } from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
 
 describe("parseArgs", () => {
   const booleanFlags = ["--all", "--background", "--wait", "--adversarial"];
