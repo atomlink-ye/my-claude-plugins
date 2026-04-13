@@ -26,6 +26,15 @@
       "skills": [
         "./skills/google-workspace"
       ]
+    },
+    {
+      "name": "task-iteration",
+      "description": "Orchestrate end-to-end feature implementation from an exec-plan document. Delegates coding to OpenCode, runs independent evaluation, loops fixes until clean, and gates completion on an advisory review.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/task-iteration"
+      ]
     }
   ]
 }

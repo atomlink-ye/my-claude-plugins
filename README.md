@@ -7,6 +7,7 @@ Personal Claude Code plugin marketplace.
 | Plugin | Description |
 |--------|-------------|
 | [opencode](plugins/opencode/) | Delegate AI coding tasks to OpenCode via its serve API |
+| [task-iteration](skills/task-iteration/) | Orchestrate feature implementation from exec-plans with Plan→Generate→Evaluate workflow |
 
 ## Installation
 
