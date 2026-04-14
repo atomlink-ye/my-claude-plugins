@@ -104,11 +104,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" cleanup      [--dire
 
 Heavy planning or sub-agent delegation inside OpenCode (`@explorer`, `@librarian`, `@oracle`, …) can abort the foreground stream while the session keeps running on the serve. A `failed` / exit-1 notification does **not** mean the session is dead.
 
-Before retrying, run `sessions` to check liveness. Blind retries double-fire and corrupt in-flight work.
+Before retrying, check whether the current session is still active. Blind retries double-fire and corrupt in-flight work.
 
 Mitigations:
 - Narrow scope; split multi-file work into additive steps chained via `--session`.
-- OpenCode decides when to delegate to its own sub-agents. Do not instruct it to avoid them in prompts. On a false-negative abort, poll liveness with `sessions --session <id>` and resume with `--session <id>` when it goes idle.
+- OpenCode decides when to delegate to its own sub-agents. Do not instruct it to avoid them in prompts.
+- For the `opencode-agent` path, the agent should own the full session lifecycle: if the initial `task` call times out after the default 20-minute window, extract the session id, attach with a short bounded timeout around 5 minutes, then re-check and continue the loop until the session is done or clearly failed.
 - Keep prompts focused (50–150 lines of prompt is a good target).
 
 ---
