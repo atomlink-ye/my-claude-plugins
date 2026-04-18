@@ -19,14 +19,14 @@ pnpm build        # outputs dist/launcher.js
 
 ## Register the MCP server (no env required)
 
-The CLI takes the dApp URL as its first argument and starts the MCP server on stdio when `AGENT_WALLET_MCP=true`. **No private key needed at startup** — set or generate one at runtime via MCP tools. Chain defaults to Arbitrum One (`42161`) and can be switched at any time.
+The CLI starts the MCP server on stdio when `AGENT_WALLET_MCP=true`. Passing a URL is optional; if omitted, the browser opens `about:blank` and the agent can navigate anywhere later via MCP. **No private key needed at startup** — set or generate one at runtime via MCP tools. Chain defaults to Arbitrum One (`42161`) and can be switched at any time.
 
 ### Claude Code
 
 ```bash
 claude mcp add agent-wallet \
   --env AGENT_WALLET_MCP=true \
-  -- node /absolute/path/to/tools/agent-wallet/dist/launcher.js https://app.hyperliquid.xyz
+  -- node /absolute/path/to/tools/agent-wallet/dist/launcher.js
 ```
 
 ### Claude Desktop / generic stdio config
@@ -37,8 +37,7 @@ claude mcp add agent-wallet \
     "agent-wallet": {
       "command": "node",
       "args": [
-        "/absolute/path/to/tools/agent-wallet/dist/launcher.js",
-        "https://app.hyperliquid.xyz"
+        "/absolute/path/to/tools/agent-wallet/dist/launcher.js"
       ],
       "env": { "AGENT_WALLET_MCP": "true" }
     }
@@ -72,6 +71,16 @@ For development without building, swap `node dist/launcher.js` for `pnpm --silen
 | `clear_private_key`     | —                                           | Removes the key, broadcasts empty `accountsChanged`                    |
 | `set_chain`             | `chainId` (int), `rpcUrl?` (string)         | Switches chain, broadcasts `chainChanged`; updates RPC if provided     |
 
+### Browser control
+
+| Tool          | Args             | Effect                                                              |
+| ------------- | ---------------- | ------------------------------------------------------------------- |
+| `navigate`    | `url`, `newTab?` | Navigates the active tab or opens a new tab and navigates there     |
+| `list_tabs`   | —                | Returns `{ tabs: [{ index, url, title, active }] }`                 |
+| `switch_tab`  | `index`          | Makes the selected tab active                                       |
+| `close_tab`   | `index`          | Closes a tab and returns `{ closed, remaining }`                    |
+| `screenshot`  | `fullPage?`      | Returns PNG metadata plus an MCP `image` content block              |
+
 ### Approval queue
 
 | Tool                   | Args                | Returns                                                       |
@@ -87,17 +96,28 @@ For development without building, swap `node dist/launcher.js` for `pnpm --silen
 
 ## Typical agent loop
 
-1. Browser opens to the configured dApp URL with the wallet shim pre-injected.
-2. Agent calls `set_private_key` (or `generate_private_key`) and, if needed, `set_chain` for the dApp's network. The shim emits `accountsChanged` / `chainChanged` so the page sees the new state without a reload.
-3. The dApp triggers `personal_sign` / `eth_signTypedData_v4` / `eth_sendTransaction`; the daemon enqueues it.
-4. Agent calls `get_pending_requests`, `inspect_request`, then `approve_request` or `reject_request`.
-5. The shim resolves the original EIP-1193 promise inside the page, and the dApp continues.
+1. Browser opens to `about:blank` (or an optional startup URL) with the wallet shim pre-injected.
+2. Agent calls `navigate` to reach the target site.
+3. Agent calls `set_private_key` (or `generate_private_key`) and, if needed, `set_chain` for the site's network. The shim emits `accountsChanged` / `chainChanged` so the page sees the new state without a reload.
+4. The site triggers `personal_sign` / `eth_signTypedData_v4` / `eth_sendTransaction`; the daemon enqueues it.
+5. Agent calls `get_pending_requests`, `inspect_request`, then `approve_request` or `reject_request`.
+6. The shim resolves the original EIP-1193 promise inside the page, and the site continues.
+
+## Example: drive Polymarket
+
+Typical MCP call sequence:
+
+1. `set_chain({ chainId: 137, rpcUrl: "https://polygon-rpc.com" })`
+2. `set_private_key({ privateKey: "0x..." })`
+3. `navigate({ url: "https://polymarket.com" })`
+
+The wallet is single-account at any moment. To use a different wallet for a different site, call `set_private_key` again (and optionally `set_chain`) before or after navigating.
 
 `AGENT_WALLET_AUTO_APPROVE=true` short-circuits step 4 by approving everything immediately. Use only for local testing against a throwaway key.
 
 ## Notes & limits
 
-- One wallet at a time. Calling `set_private_key` again replaces the previous account and notifies the dApp.
+- One wallet at a time. Calling `set_private_key` again replaces the previous account and notifies the current site.
 - The daemon binds `127.0.0.1:<wsPort>` only — it is not safe to expose on a LAN.
 - Read-only RPC traffic (`eth_call`, `eth_getBalance`, …) is forwarded to the current `rpcUrl` without prompting; only signing/sending requests hit the approval queue.
 - Activity log is in-memory by default; nothing persists across restarts.

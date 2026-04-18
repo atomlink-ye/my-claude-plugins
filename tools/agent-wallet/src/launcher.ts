@@ -9,8 +9,8 @@ import type { BridgeConfig } from './types/index.js';
 import { DEFAULT_CONFIG } from './types/index.js';
 
 export interface LaunchOptions {
-  /** URL to navigate to */
-  url: string;
+  /** Optional URL to navigate to. If omitted, opens about:blank. */
+  url?: string;
   /** Partial config overrides */
   config?: Partial<BridgeConfig>;
   /** Run browser in headless mode (default: false) */
@@ -37,14 +37,6 @@ export async function launch(options: LaunchOptions) {
   let mcpServer: Awaited<ReturnType<typeof createMcpServer>> | undefined;
   let browser;
   try {
-    if (options.mcp) {
-      mcpServer = createMcpServer(daemon);
-      const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
-      const transport = new StdioServerTransport();
-      await mcpServer.connect(transport);
-      console.error('[agent-wallet] MCP server started on stdio');
-    }
-
     browser = await chromium.launch({
       headless: options.headless ?? false,
       args: [
@@ -56,6 +48,7 @@ export async function launch(options: LaunchOptions) {
 
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
     });
 
     const shimCode = getInjectedShimCode(config.wsPort);
@@ -63,8 +56,23 @@ export async function launch(options: LaunchOptions) {
 
     const page = await context.newPage();
 
-    console.log(`[agent-wallet] Navigating to ${options.url}`);
-    await page.goto(options.url, { waitUntil: 'domcontentloaded' });
+    if (options.url) {
+      console.log(`[agent-wallet] Navigating to ${options.url}`);
+      await page.goto(options.url, { waitUntil: 'domcontentloaded' });
+    } else {
+      console.log('[agent-wallet] No URL provided — opening about:blank');
+      await page.goto('about:blank', { waitUntil: 'domcontentloaded' });
+    }
+
+    if (options.mcp) {
+      mcpServer = createMcpServer(daemon, context);
+      const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
+      const transport = new StdioServerTransport();
+      await mcpServer.connect(transport);
+      console.error('[agent-wallet] MCP server started on stdio');
+    } else {
+      mcpServer = createMcpServer(daemon, context);
+    }
 
     return { daemon, browser, context, page, address, config, mcpServer };
   } catch (error) {
@@ -76,7 +84,7 @@ export async function launch(options: LaunchOptions) {
 }
 
 async function main() {
-  const url = process.argv[2] || 'https://app.hyperliquid.xyz';
+  const url = process.argv[2]; // optional
 
   // All env vars are optional. Anything missing falls back to DEFAULT_CONFIG
   // (or stays unset, e.g. privateKey — set later via MCP set_private_key).

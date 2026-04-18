@@ -1,3 +1,4 @@
+import type { BrowserContext, Page } from 'playwright';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -152,11 +153,79 @@ function getRequestInspection(request: PendingRequest): Record<string, unknown> 
   }
 }
 
-export function createMcpServer(daemon: BridgeDaemon): McpServer {
+// ---------------------------------------------------------------------------
+// Browser tab state (module-level, reset per createMcpServer call)
+// ---------------------------------------------------------------------------
+
+let activeBrowserContext: BrowserContext | undefined;
+let activeTabIndex = 0;
+
+function requireBrowserContext(): BrowserContext {
+  if (!activeBrowserContext) {
+    throw new Error('No BrowserContext available. The MCP server was started without a browser context.');
+  }
+  return activeBrowserContext;
+}
+
+function getActivePage(): Page {
+  const ctx = requireBrowserContext();
+  const pages = ctx.pages();
+  if (pages.length === 0) {
+    throw new Error('No open tabs in the browser context.');
+  }
+  // Clamp in case activeTabIndex is stale
+  const idx = Math.min(activeTabIndex, pages.length - 1);
+  return pages[idx];
+}
+
+function handlePageClose(): void {
+  const ctx = activeBrowserContext;
+  if (!ctx) return;
+  const pages = ctx.pages();
+  if (pages.length === 0) {
+    activeTabIndex = 0;
+    return;
+  }
+  activeTabIndex = Math.min(activeTabIndex, pages.length - 1);
+}
+
+async function getTabEntry(page: Page, index: number) {
+  return {
+    index,
+    url: page.url(),
+    title: await page.title(),
+    active: index === activeTabIndex,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// createMcpServer
+// ---------------------------------------------------------------------------
+
+export function createMcpServer(daemon: BridgeDaemon, browserContext?: BrowserContext): McpServer {
+  // Wire up browser context state
+  activeBrowserContext = browserContext;
+  activeTabIndex = 0;
+
+  if (browserContext) {
+    // Track new tabs opened by window.open / target=_blank
+    browserContext.on('page', (page: Page) => {
+      page.on('close', () => handlePageClose());
+    });
+    // Also attach close handler to all existing pages
+    for (const page of browserContext.pages()) {
+      page.on('close', () => handlePageClose());
+    }
+  }
+
   const server = new McpServer({
     name: 'agent-wallet-bridge',
     version: '0.2.0',
   });
+
+  // ---------------------------------------------------------------------------
+  // Wallet & chain tools
+  // ---------------------------------------------------------------------------
 
   server.tool(
     'get_status',
@@ -304,6 +373,156 @@ export function createMcpServer(daemon: BridgeDaemon): McpServer {
       return toToolResult({
         chainId: daemon.chainId,
       });
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Browser control tools
+  // ---------------------------------------------------------------------------
+
+  server.tool(
+    'navigate',
+    'Navigate the active tab to a URL, or open it in a new tab. Waits until DOMContentLoaded.',
+    {
+      url: z.string().url().describe('URL to navigate to'),
+      newTab: z.boolean().optional().describe('Open in a new tab instead of navigating the active tab'),
+    },
+    async ({ url, newTab }) => {
+      const ctx = requireBrowserContext();
+      let page: Page;
+
+      if (newTab) {
+        page = await ctx.newPage();
+        const pages = ctx.pages();
+        activeTabIndex = pages.indexOf(page);
+      } else {
+        page = getActivePage();
+      }
+
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      const title = await page.title();
+      const pages = ctx.pages();
+      const tabIndex = pages.indexOf(page);
+      if (tabIndex !== -1) activeTabIndex = tabIndex;
+
+      return toToolResult({ tabIndex: activeTabIndex, url: page.url(), title });
+    },
+  );
+
+  server.tool(
+    'list_tabs',
+    'List all open browser tabs.',
+    async () => {
+      const ctx = requireBrowserContext();
+      const pages = ctx.pages();
+      const tabs = await Promise.all(pages.map((page, index) => getTabEntry(page, index)));
+      return toToolResult({ tabs });
+    },
+  );
+
+  server.tool(
+    'switch_tab',
+    'Make a tab active by index.',
+    {
+      index: z.number().int().nonnegative().describe('Tab index from list_tabs'),
+    },
+    async ({ index }) => {
+      const ctx = requireBrowserContext();
+      const pages = ctx.pages();
+      if (index < 0 || index >= pages.length) {
+        throw new Error(`Tab index ${index} out of range (0–${pages.length - 1})`);
+      }
+      activeTabIndex = index;
+      const page = pages[index];
+      return toToolResult(await getTabEntry(page, index));
+    },
+  );
+
+  server.tool(
+    'close_tab',
+    'Close a tab by index. The active tab pointer is updated if needed.',
+    {
+      index: z.number().int().nonnegative().describe('Tab index to close'),
+    },
+    async ({ index }) => {
+      const ctx = requireBrowserContext();
+      const pages = ctx.pages();
+      if (index < 0 || index >= pages.length) {
+        throw new Error(`Tab index ${index} out of range (0–${pages.length - 1})`);
+      }
+      await pages[index].close();
+      // handlePageClose fires via the 'close' event, but call it here too for safety
+      handlePageClose();
+      const remaining = ctx.pages().length;
+      return toToolResult({ closed: index, remaining });
+    },
+  );
+
+  server.tool(
+    'screenshot',
+    'Capture a screenshot of the active tab. Returns a JSON summary and an image content block (base64 PNG).',
+    {
+      fullPage: z.boolean().optional().describe('Capture the full scrollable page (default: false)'),
+    },
+    async ({ fullPage }) => {
+      requireBrowserContext();
+      const page = getActivePage();
+      const buffer = await page.screenshot({ fullPage: fullPage ?? false, type: 'png' });
+      const base64 = buffer.toString('base64');
+      const byteLength = buffer.byteLength;
+
+      const dimensions = await page.evaluate(() => {
+        const doc = document.documentElement;
+        const body = document.body;
+        return {
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          fullWidth: Math.max(
+            doc?.scrollWidth ?? 0,
+            doc?.clientWidth ?? 0,
+            body?.scrollWidth ?? 0,
+            body?.clientWidth ?? 0,
+          ),
+          fullHeight: Math.max(
+            doc?.scrollHeight ?? 0,
+            doc?.clientHeight ?? 0,
+            body?.scrollHeight ?? 0,
+            body?.clientHeight ?? 0,
+          ),
+        };
+      });
+
+      const structuredContent: {
+        width: number;
+        height: number;
+        byteLength: number;
+        mediaType: 'image/png';
+        warning?: string;
+      } = {
+        width: fullPage ? dimensions.fullWidth : dimensions.viewportWidth,
+        height: fullPage ? dimensions.fullHeight : dimensions.viewportHeight,
+        byteLength,
+        mediaType: 'image/png',
+      };
+
+      if (base64.length > 900_000) {
+        structuredContent.warning = 'Screenshot base64 payload exceeds 900000 characters; consider fullPage=false or a smaller viewport.';
+      }
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(structuredContent, null, 2),
+          },
+          {
+            type: 'image' as const,
+            data: base64,
+            mimeType: 'image/png',
+          },
+        ],
+        structuredContent,
+      };
     },
   );
 
