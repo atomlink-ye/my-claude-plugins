@@ -1,8 +1,18 @@
-export function getInjectedShimCode(wsPort: number): string {
+import type { BridgeIdentity } from '../types/index.js';
+import { DEFAULT_IDENTITY } from '../types/index.js';
+
+export function getInjectedShimCode(wsPort: number, identity?: Partial<BridgeIdentity>): string {
+  const providerName = identity?.name ?? DEFAULT_IDENTITY.name;
+  const providerIcon = identity?.icon ?? DEFAULT_IDENTITY.icon;
+  const providerRdns = identity?.rdns ?? DEFAULT_IDENTITY.rdns;
+
   return `(function () {
     var config = {
       wsUrl: ${JSON.stringify(`ws://127.0.0.1:${wsPort}`)}
     };
+    var PROVIDER_NAME = ${JSON.stringify(providerName)};
+    var PROVIDER_ICON = ${JSON.stringify(providerIcon)};
+    var PROVIDER_RDNS = ${JSON.stringify(providerRdns)};
 
     var globalObject = typeof globalThis !== 'undefined' ? globalThis : window;
     var pending = new Map();
@@ -22,9 +32,9 @@ export function getInjectedShimCode(wsPort: number): string {
     var providerUuid = createUuid();
     var providerInfo = {
       uuid: providerUuid,
-      name: 'Agent Wallet',
-      icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNiIgZmlsbD0iIzExMTgyNyIvPjxwYXRoIGQ9Ik0xOSAyMWgyNmE1IDUgMCAwIDEgNSA1djEyYTUgNSAwIDAgMS01IDVIMTlhNSA1IDAgMCAxLTUtNVYyNmE1IDUgMCAwIDEgNS01em0yIDEyaDE0IiBzdHJva2U9IiM2MEE1RkEiIHN0cm9rZS13aWR0aD0iNCIgZmlsbD0ibm9uZSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PGNpcmNsZSBjeD0iNDUiIGN5PSIzMiIgcj0iMyIgZmlsbD0iIzYwQTVGQSIvPjwvc3ZnPg==',
-      rdns: 'local.agent-wallet.bridge'
+      name: PROVIDER_NAME,
+      icon: PROVIDER_ICON,
+      rdns: PROVIDER_RDNS
     };
 
     function createUuid() {
@@ -203,6 +213,16 @@ export function getInjectedShimCode(wsPort: number): string {
       initialStateReceived = true;
     }
 
+    function updateIdentity(identity) {
+      providerUuid = createUuid();
+      providerInfo = {
+        uuid: providerUuid,
+        name: identity && typeof identity.name === 'string' ? identity.name : PROVIDER_NAME,
+        icon: identity && typeof identity.icon === 'string' ? identity.icon : PROVIDER_ICON,
+        rdns: identity && typeof identity.rdns === 'string' ? identity.rdns : PROVIDER_RDNS
+      };
+    }
+
     function handleDaemonMessage(event) {
       var message;
       try {
@@ -227,6 +247,11 @@ export function getInjectedShimCode(wsPort: number): string {
         }
         if (message.event === 'chainChanged') {
           applyState(currentAddress, message.chainIdHex);
+          return;
+        }
+        if (message.event === 'identityChanged') {
+          updateIdentity(message.identity);
+          announceProvider();
           return;
         }
         return;

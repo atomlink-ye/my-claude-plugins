@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 
-import { chromium } from 'playwright';
+import { fileURLToPath } from 'node:url';
 
+import { chromium } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
+
+import { installCspStripRoute } from './browser/csp.js';
 import { BridgeDaemon } from './daemon/index.js';
 import { createMcpServer } from './mcp/server.js';
 import { getInjectedShimCode } from './shim/injected.js';
@@ -17,6 +21,14 @@ export interface LaunchOptions {
   headless?: boolean;
   /** Start MCP server on stdio (default: false) */
   mcp?: boolean;
+  /** Start only the daemon/MCP, without launching Playwright */
+  noBrowser?: boolean;
+}
+
+function parseOptionalBoolean(value: string | undefined): boolean | undefined {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return undefined;
 }
 
 export async function launch(options: LaunchOptions) {
@@ -29,14 +41,38 @@ export async function launch(options: LaunchOptions) {
   const daemon = new BridgeDaemon(config);
   await daemon.start();
   const address = daemon.address;
-  console.log(`[agent-wallet] Daemon started on ws://127.0.0.1:${config.wsPort}`);
-  console.log(`[agent-wallet] Wallet address: ${address ?? '(unset — set via MCP)'}`);
-  console.log(`[agent-wallet] Chain ID: ${config.chainId}`);
-  console.log(`[agent-wallet] Auto-approve: ${config.autoApprove}`);
+  // All status logs go to stderr — when MCP runs over stdio, stdout is reserved for the protocol stream.
+  console.error(`[agent-wallet] Daemon started on ws://127.0.0.1:${config.wsPort}`);
+  console.error(`[agent-wallet] Wallet address: ${address ?? '(unset — set via MCP)'}`);
+  console.error(`[agent-wallet] Chain ID: ${config.chainId}`);
+  console.error(`[agent-wallet] Auto-approve: ${config.autoApprove}`);
 
   let mcpServer: Awaited<ReturnType<typeof createMcpServer>> | undefined;
-  let browser;
+  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
+  let page: Page | undefined;
   try {
+    if (options.noBrowser) {
+      if (options.url) {
+        console.warn('[agent-wallet] Ignoring URL because --no-browser mode is enabled');
+      }
+
+      mcpServer = createMcpServer(daemon);
+      if (options.mcp) {
+        const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
+        const transport = new StdioServerTransport();
+        await mcpServer.connect(transport);
+        console.error('[agent-wallet] MCP server started on stdio');
+      }
+
+      const shimSourcePath = fileURLToPath(new URL('./shim/injected.ts', import.meta.url));
+      console.error('[agent-wallet] No browser mode enabled — Playwright launch skipped');
+      console.error(`[agent-wallet] Inject shim via getInjectedShimCode(${config.wsPort}) from ${shimSourcePath}`);
+      console.error(`[agent-wallet] Shim bridge URL: ws://127.0.0.1:${config.wsPort}`);
+
+      return { daemon, browser: undefined, context: undefined, page: undefined, address, config, mcpServer };
+    }
+
     browser = await chromium.launch({
       headless: options.headless ?? false,
       args: [
@@ -46,21 +82,26 @@ export async function launch(options: LaunchOptions) {
       ],
     });
 
-    const context = await browser.newContext({
+    context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
     });
 
-    const shimCode = getInjectedShimCode(config.wsPort);
+    const shouldStripCSP = config.stripCSP === false ? false : (options.mcp === true || config.stripCSP === true);
+    if (shouldStripCSP) {
+      await installCspStripRoute(context);
+    }
+
+    const shimCode = getInjectedShimCode(config.wsPort, config.identity);
     await context.addInitScript(shimCode);
 
-    const page = await context.newPage();
+    page = await context.newPage();
 
     if (options.url) {
-      console.log(`[agent-wallet] Navigating to ${options.url}`);
+      console.error(`[agent-wallet] Navigating to ${options.url}`);
       await page.goto(options.url, { waitUntil: 'domcontentloaded' });
     } else {
-      console.log('[agent-wallet] No URL provided — opening about:blank');
+      console.error('[agent-wallet] No URL provided — opening about:blank');
       await page.goto('about:blank', { waitUntil: 'domcontentloaded' });
     }
 
@@ -84,7 +125,9 @@ export async function launch(options: LaunchOptions) {
 }
 
 async function main() {
-  const url = process.argv[2]; // optional
+  const args = process.argv.slice(2);
+  const cliNoBrowser = args.includes('--no-browser');
+  const url = args.find((arg) => !arg.startsWith('-'));
 
   // All env vars are optional. Anything missing falls back to DEFAULT_CONFIG
   // (or stays unset, e.g. privateKey — set later via MCP set_private_key).
@@ -92,6 +135,8 @@ async function main() {
   const autoApprove = process.env.AGENT_WALLET_AUTO_APPROVE === 'true';
   const headless = process.env.AGENT_WALLET_HEADLESS === 'true';
   const mcp = process.env.AGENT_WALLET_MCP === 'true';
+  const noBrowser = cliNoBrowser || process.env.AGENT_WALLET_NO_BROWSER === 'true';
+  const stripCSP = parseOptionalBoolean(process.env.AGENT_WALLET_STRIP_CSP);
   const chainId = process.env.AGENT_WALLET_CHAIN_ID
     ? parseInt(process.env.AGENT_WALLET_CHAIN_ID, 10)
     : DEFAULT_CONFIG.chainId;
@@ -99,23 +144,32 @@ async function main() {
   const wsPort = process.env.AGENT_WALLET_WS_PORT
     ? parseInt(process.env.AGENT_WALLET_WS_PORT, 10)
     : DEFAULT_CONFIG.wsPort;
+  const identity = {
+    ...(process.env.AGENT_WALLET_IDENTITY_NAME ? { name: process.env.AGENT_WALLET_IDENTITY_NAME } : {}),
+    ...(process.env.AGENT_WALLET_IDENTITY_ICON ? { icon: process.env.AGENT_WALLET_IDENTITY_ICON } : {}),
+    ...(process.env.AGENT_WALLET_IDENTITY_RDNS ? { rdns: process.env.AGENT_WALLET_IDENTITY_RDNS } : {}),
+  };
 
-  const { daemon, browser } = await launch({
+  const { daemon, browser, mcpServer } = await launch({
     url,
     headless,
     mcp,
+    noBrowser,
     config: {
       ...(privateKey ? { privateKey } : {}),
       autoApprove,
       chainId,
       rpcUrl,
       wsPort,
+      ...(typeof stripCSP !== 'undefined' ? { stripCSP } : {}),
+      ...(Object.keys(identity).length > 0 ? { identity } : {}),
     },
   });
 
   const shutdown = async () => {
-    console.log('\n[agent-wallet] Shutting down...');
-    await browser.close();
+    console.error('\n[agent-wallet] Shutting down...');
+    await mcpServer?.close().catch(() => {});
+    await browser?.close().catch(() => {});
     await daemon.stop();
     process.exit(0);
   };

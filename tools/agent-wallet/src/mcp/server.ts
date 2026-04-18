@@ -1,9 +1,12 @@
-import type { BrowserContext, Page } from 'playwright';
+import { chromium } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
+import { installCspStripRoute, uninstallCspStripRoute } from '../browser/csp.js';
 import type { BridgeDaemon } from '../daemon/index.js';
+import { getInjectedShimCode } from '../shim/injected.js';
 import type { PendingRequest } from '../types/index.js';
 
 const ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
@@ -159,10 +162,31 @@ function getRequestInspection(request: PendingRequest): Record<string, unknown> 
 
 let activeBrowserContext: BrowserContext | undefined;
 let activeTabIndex = 0;
+let launcherBrowserContext: BrowserContext | undefined;
+let attachedCdpBrowser: Browser | undefined;
+let attachedCdpContext: BrowserContext | undefined;
+
+function bindContextPageLifecycle(browserContext: BrowserContext): void {
+  browserContext.on('page', (page: Page) => {
+    page.on('close', () => handlePageClose());
+  });
+
+  for (const page of browserContext.pages()) {
+    page.on('close', () => handlePageClose());
+  }
+}
+
+function setActiveBrowserContext(browserContext: BrowserContext | undefined): void {
+  activeBrowserContext = browserContext;
+  activeTabIndex = 0;
+  if (browserContext) {
+    bindContextPageLifecycle(browserContext);
+  }
+}
 
 function requireBrowserContext(): BrowserContext {
   if (!activeBrowserContext) {
-    throw new Error('No BrowserContext available. The MCP server was started without a browser context.');
+    throw new Error('no browser context — call attach_to_cdp first or restart without --no-browser');
   }
   return activeBrowserContext;
 }
@@ -203,20 +227,10 @@ async function getTabEntry(page: Page, index: number) {
 // ---------------------------------------------------------------------------
 
 export function createMcpServer(daemon: BridgeDaemon, browserContext?: BrowserContext): McpServer {
-  // Wire up browser context state
-  activeBrowserContext = browserContext;
-  activeTabIndex = 0;
-
-  if (browserContext) {
-    // Track new tabs opened by window.open / target=_blank
-    browserContext.on('page', (page: Page) => {
-      page.on('close', () => handlePageClose());
-    });
-    // Also attach close handler to all existing pages
-    for (const page of browserContext.pages()) {
-      page.on('close', () => handlePageClose());
-    }
-  }
+  launcherBrowserContext = browserContext;
+  attachedCdpBrowser = undefined;
+  attachedCdpContext = undefined;
+  setActiveBrowserContext(browserContext);
 
   const server = new McpServer({
     name: 'agent-wallet-bridge',
@@ -229,13 +243,15 @@ export function createMcpServer(daemon: BridgeDaemon, browserContext?: BrowserCo
 
   server.tool(
     'get_status',
-    'Return the current wallet state: address (or null), chainId, rpcUrl.',
+    'Return the current wallet state: address (or null), chainId, rpcUrl, shim connection state, and connected origins.',
     async () => {
       return toToolResult({
         address: daemon.address,
         chainId: daemon.chainId,
         chainIdHex: daemon.chainIdHex,
         rpcUrl: daemon.rpcRouter.getRpcUrl(),
+        shimConnected: daemon.isShimConnected,
+        connectedOrigins: daemon.connectedOrigins,
       });
     },
   );
@@ -288,11 +304,66 @@ export function createMcpServer(daemon: BridgeDaemon, browserContext?: BrowserCo
   );
 
   server.tool(
+    'set_identity',
+    'Update the EIP-6963 identity announced by the injected shim and trigger a re-announce.',
+    {
+      name: z.string().min(1).optional().describe('Optional EIP-6963 provider name'),
+      icon: z.string().min(1).optional().describe('Optional EIP-6963 provider icon URL or data URL'),
+      rdns: z.string().min(1).optional().describe('Optional reverse-DNS identifier'),
+    },
+    async ({ name, icon, rdns }) => {
+      const identity = daemon.setIdentity({
+        ...(typeof name === 'string' ? { name } : {}),
+        ...(typeof icon === 'string' ? { icon } : {}),
+        ...(typeof rdns === 'string' ? { rdns } : {}),
+      });
+
+      return toToolResult({ identity });
+    },
+  );
+
+  server.tool(
     'get_pending_requests',
     'List all pending wallet requests.',
     async () => {
       const requests = daemon.requestQueue.getPending().map(getPendingEntry);
       return toToolResult({ requests });
+    },
+  );
+
+  server.tool(
+    'wait_for_request',
+    'Wait for the next pending wallet request, or return immediately if one is already queued.',
+    {
+      timeoutMs: z.number().int().positive().optional().describe('Maximum time to wait in milliseconds (default: 30000)'),
+    },
+    async ({ timeoutMs }) => {
+      const pending = daemon.requestQueue.getPending()[0];
+      if (pending) {
+        return toToolResult(getPendingEntry(pending));
+      }
+
+      const nextRequest = await new Promise<PendingRequest>((resolve, reject) => {
+        const effectiveTimeoutMs = timeoutMs ?? 30_000;
+        const onAdded = (request: PendingRequest) => {
+          cleanup();
+          resolve(request);
+        };
+
+        const cleanup = () => {
+          clearTimeout(timer);
+          daemon.requestQueue.off('added', onAdded);
+        };
+
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`wait_for_request timed out after ${effectiveTimeoutMs}ms`));
+        }, effectiveTimeoutMs);
+
+        daemon.requestQueue.on('added', onAdded);
+      });
+
+      return toToolResult(getPendingEntry(nextRequest));
     },
   );
 
@@ -381,10 +452,81 @@ export function createMcpServer(daemon: BridgeDaemon, browserContext?: BrowserCo
   // ---------------------------------------------------------------------------
 
   server.tool(
+    'attach_to_cdp',
+    'Attach agent-wallet to an existing Chrome/Chromium instance over CDP, install the shim + CSP route on the selected context, and make browser tools operate on it.',
+    {
+      endpoint: z.string().url().describe('HTTP CDP endpoint, e.g. http://127.0.0.1:9222'),
+      contextIndex: z.number().int().nonnegative().optional().describe('Existing browser context index to attach to (default: 0)'),
+    },
+    async ({ endpoint, contextIndex }) => {
+      if (attachedCdpBrowser) {
+        throw new Error('Already attached to a CDP browser. Call detach_from_cdp before attaching again.');
+      }
+
+      const nextBrowser = await chromium.connectOverCDP(endpoint);
+
+      try {
+        const nextContextIndex = contextIndex ?? 0;
+        const nextContext = nextBrowser.contexts()[nextContextIndex];
+        if (!nextContext) {
+          throw new Error(`Browser context index ${nextContextIndex} not found. Available contexts: ${nextBrowser.contexts().length}`);
+        }
+
+        const shimCode = getInjectedShimCode(daemon.config.wsPort, daemon.identity);
+        await installCspStripRoute(nextContext);
+        await nextContext.addInitScript(shimCode);
+
+        await Promise.all(nextContext.pages().map(async (page) => {
+          try {
+            await page.evaluate(shimCode);
+          } catch {
+            // Best-effort for already-open pages.
+          }
+        }));
+
+        attachedCdpBrowser = nextBrowser;
+        attachedCdpContext = nextContext;
+        setActiveBrowserContext(nextContext);
+
+        return toToolResult({
+          endpoint,
+          contextIndex: nextContextIndex,
+          pageCount: nextContext.pages().length,
+          attachedAt: Date.now(),
+        });
+      } catch (error) {
+        await nextBrowser.close().catch(() => {});
+        throw error;
+      }
+    },
+  );
+
+  server.tool(
+    'detach_from_cdp',
+    'Detach agent-wallet from a previously attached CDP browser and restore the launcher-owned context if one exists.',
+    async () => {
+      const contextToDetach = attachedCdpContext;
+      const browserToDetach = attachedCdpBrowser;
+
+      if (contextToDetach) {
+        await uninstallCspStripRoute(contextToDetach);
+      }
+
+      attachedCdpContext = undefined;
+      attachedCdpBrowser = undefined;
+      setActiveBrowserContext(launcherBrowserContext);
+
+      await browserToDetach?.close().catch(() => {});
+
+      return toToolResult({ detached: true });
+    },
+  );
+
+  server.tool(
     'navigate',
     'Navigate the active tab to a URL, or open it in a new tab. Waits until DOMContentLoaded.',
     {
-      url: z.string().url().describe('URL to navigate to'),
+      url: z.string().min(1).describe('URL to navigate to'),
       newTab: z.boolean().optional().describe('Open in a new tab instead of navigating the active tab'),
     },
     async ({ url, newTab }) => {

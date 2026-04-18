@@ -19,6 +19,7 @@ describe('Polymarket e2e', () => {
       headless: true,
       config: {
         wsPort: 18547,
+        stripCSP: true,
       },
     });
   }, 60_000);
@@ -51,6 +52,13 @@ describe('Polymarket e2e', () => {
           await ctx.page.waitForFunction(
             () => typeof (window as any).ethereum !== 'undefined',
             { timeout: 10_000 },
+          );
+
+          await ctx.page.waitForFunction(() => document.location.origin === 'https://polymarket.com', { timeout: 10_000 });
+
+          await expect.poll(() => ctx.daemon.isShimConnected, { timeout: 10_000 }).toBe(true);
+          await expect.poll(() => ctx.daemon.connectedOrigins, { timeout: 10_000 }).toSatisfy(
+            (origins) => origins.some((origin) => origin.includes('https://polymarket.com')),
           );
 
           const observed = await ctx.page.evaluate(async () => {

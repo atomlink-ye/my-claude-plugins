@@ -24,6 +24,11 @@ const WS_PORT = parseInt(process.env.AGENT_WALLET_WS_PORT ?? String(DEFAULT_CONF
 const CHAIN_ID = parseInt(process.env.AGENT_WALLET_CHAIN_ID ?? String(DEFAULT_CONFIG.chainId), 10);
 const RPC_URL = process.env.AGENT_WALLET_RPC_URL ?? DEFAULT_CONFIG.rpcUrl;
 const AUTO_APPROVE = process.env.AGENT_WALLET_AUTO_APPROVE === 'true';
+const IDENTITY = {
+  ...(process.env.AGENT_WALLET_IDENTITY_NAME ? { name: process.env.AGENT_WALLET_IDENTITY_NAME } : {}),
+  ...(process.env.AGENT_WALLET_IDENTITY_ICON ? { icon: process.env.AGENT_WALLET_IDENTITY_ICON } : {}),
+  ...(process.env.AGENT_WALLET_IDENTITY_RDNS ? { rdns: process.env.AGENT_WALLET_IDENTITY_RDNS } : {}),
+};
 
 async function main() {
   const daemon = new BridgeDaemon({
@@ -33,6 +38,7 @@ async function main() {
     rpcUrl: RPC_URL,
     wsPort: WS_PORT,
     autoApprove: AUTO_APPROVE,
+    ...(Object.keys(IDENTITY).length > 0 ? { identity: IDENTITY } : {}),
   });
 
   await daemon.start();
@@ -44,8 +50,8 @@ async function main() {
   console.error(`[agent-wallet] Auto-approve: ${AUTO_APPROVE}`);
   console.error(`[agent-wallet] RPC: ${RPC_URL}`);
 
-  const shimCode = getInjectedShimCode(WS_PORT);
-  console.log(JSON.stringify({ address, wsPort: WS_PORT, chainId: CHAIN_ID, shimCode }));
+  const shimCode = getInjectedShimCode(WS_PORT, Object.keys(IDENTITY).length > 0 ? IDENTITY : undefined);
+  console.log(JSON.stringify({ address, wsPort: WS_PORT, chainId: CHAIN_ID, identity: daemon.identity, shimCode }));
 
   const shutdown = async () => {
     console.error('\n[agent-wallet] Shutting down...');

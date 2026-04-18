@@ -35,6 +35,8 @@ export class WsServer {
 
   private readonly pendingSockets = new Map<string, PendingSocketContext>();
 
+  private readonly connectedSockets = new Map<WebSocket, string>();
+
   constructor(
     private readonly config: BridgeConfig,
     private readonly requestQueue: RequestQueue,
@@ -61,7 +63,9 @@ export class WsServer {
 
     const server = new WebSocketServer({ host: '127.0.0.1', port: this.config.wsPort });
 
-    server.on('connection', (socket) => {
+    server.on('connection', (socket, request) => {
+      this.connectedSockets.set(socket, request.headers.origin ?? '');
+
       // Push current state so the shim doesn't need to bake address/chain
       this.sendToSocket(socket, {
         type: 'event',
@@ -76,6 +80,7 @@ export class WsServer {
 
       socket.on('close', () => {
         this.dropSocketReferences(socket);
+        this.dropConnectedSocket(socket);
       });
     });
 
@@ -111,6 +116,18 @@ export class WsServer {
 
     this.server = undefined;
     this.pendingSockets.clear();
+    this.connectedSockets.clear();
+  }
+
+  getConnectedOrigins(): string[] {
+    return Array.from(new Set(
+      Array.from(this.connectedSockets.values())
+        .filter((origin) => origin.length > 0),
+    ));
+  }
+
+  isAnyShimConnected(): boolean {
+    return this.connectedSockets.size > 0;
   }
 
   /** Broadcast a daemon event to every connected shim. */
@@ -370,6 +387,10 @@ export class WsServer {
         }
       }
     }
+  }
+
+  private dropConnectedSocket(socket: WebSocket): void {
+    this.connectedSockets.delete(socket);
   }
 
   private toMessageString(data: RawData): string {

@@ -1,6 +1,7 @@
 import { generatePrivateKey } from 'viem/accounts';
 
-import type { BridgeConfig, DaemonEvent } from '../types/index.js';
+import type { BridgeConfig, BridgeIdentity, DaemonEvent } from '../types/index.js';
+import { DEFAULT_IDENTITY } from '../types/index.js';
 
 import { Logger } from './logger.js';
 import { RequestQueue } from './request-queue.js';
@@ -15,6 +16,8 @@ export class BridgeDaemon {
 
   private currentChainId: number;
 
+  private currentIdentity: BridgeIdentity;
+
   readonly requestQueue: RequestQueue;
 
   readonly rpcRouter: RpcRouter;
@@ -26,6 +29,10 @@ export class BridgeDaemon {
   constructor(readonly config: BridgeConfig) {
     this.currentSigner = config.privateKey ? new Signer(config.privateKey) : null;
     this.currentChainId = config.chainId;
+    this.currentIdentity = {
+      ...DEFAULT_IDENTITY,
+      ...(config.identity ?? {}),
+    };
     this.requestQueue = new RequestQueue();
     this.rpcRouter = new RpcRouter(config.rpcUrl);
     this.logger = new Logger(config.dbPath);
@@ -57,6 +64,18 @@ export class BridgeDaemon {
 
   get address(): string | null {
     return this.currentSigner?.getAddress() ?? null;
+  }
+
+  get identity(): BridgeIdentity {
+    return { ...this.currentIdentity };
+  }
+
+  get connectedOrigins(): string[] {
+    return this.wsServer.getConnectedOrigins();
+  }
+
+  get isShimConnected(): boolean {
+    return this.wsServer.isAnyShimConnected();
   }
 
   setPrivateKey(privateKey: `0x${string}`): string {
@@ -92,6 +111,16 @@ export class BridgeDaemon {
       this.rpcRouter.setRpcUrl(rpcUrl);
     }
     this.wsServer.broadcast({ type: 'event', event: 'chainChanged', chainIdHex: this.chainIdHex });
+  }
+
+  setIdentity(identity: Partial<BridgeIdentity>): BridgeIdentity {
+    this.currentIdentity = {
+      ...this.currentIdentity,
+      ...identity,
+    };
+    const nextIdentity = this.identity;
+    this.wsServer.broadcast({ type: 'event', event: 'identityChanged', identity: nextIdentity });
+    return nextIdentity;
   }
 
   async start(): Promise<void> {
