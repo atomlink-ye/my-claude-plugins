@@ -1,16 +1,4 @@
 {
-  "description": "Clean up the managed OpenCode serve process when the Claude session ends.",
-  "hooks": {
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs\" cleanup --directory \"${CLAUDE_PROJECT_DIR}\"",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
+  "description": "OpenCode managed serve is intentionally long-lived; do not auto-stop it on Claude session end.",
+  "hooks": {}
 }

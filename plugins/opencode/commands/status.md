@@ -1,12 +1,16 @@
 ---
-description: Show OpenCode job status and recent sessions for this repository
+description: Show OpenCode background job status for this repository
 argument-hint: '[job-id] [--all] [--directory DIR]'
 disable-model-invocation: true
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(python3:*), Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" status "$ARGUMENTS"`
+!`python3 - <<'PY'
+import subprocess
+args = '''$ARGUMENTS'''.strip()
+base = ['node', '${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs', 'job']
+cmd = base + (['status', args] if args else ['list'])
+subprocess.run(cmd, check=True)
+PY`
 
-If no job ID is provided, render the result as a compact Markdown table with columns for job ID, status, elapsed, model, prompt summary, and follow-up commands.
-
-If a job ID is provided, present the full output verbatim without condensing, rewriting, or summarizing it.
+Present the companion output exactly as returned.

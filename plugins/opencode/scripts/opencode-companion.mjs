@@ -23,21 +23,30 @@ const STATUS_SESSION_LIMIT = 10;
 const MAX_STORED_JOBS = 50;
 const STATUS_RECENT_LIMIT = 5;
 const STATUS_LOG_TAIL_LINES = 5;
+const DEFAULT_SESSION_TIMEOUT_MINS = 60;
 
 function printUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  node scripts/opencode-companion.mjs check [--directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs task [--directory WORK_DIR] [--server-directory SERVER_DIR] [--session SID] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] PROMPT",
-      "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--timeout MINS]",
-      "  node scripts/opencode-companion.mjs attach [session-id] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
-      "  node scripts/opencode-companion.mjs status [job-id] [--directory WORK_DIR] [--all]",
-      "  node scripts/opencode-companion.mjs result <job-id> [--directory WORK_DIR]",
-      "  node scripts/opencode-companion.mjs cancel <job-id> [--directory WORK_DIR]",
-      "  node scripts/opencode-companion.mjs cleanup [--directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs serve start [--port N] [--server-directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs serve status [--server-directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs serve stop [--server-directory SERVER_DIR]",
       "",
+      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] -- \"PROMPT\"",
+      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] -- \"PROMPT\"",
+      "  node scripts/opencode-companion.mjs session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs session list [--directory WORK_DIR] [--server-directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
+      "",
+      "  node scripts/opencode-companion.mjs job list [--directory WORK_DIR] [--all]",
+      "  node scripts/opencode-companion.mjs job status <job-id> [--directory WORK_DIR]",
+      "  node scripts/opencode-companion.mjs job wait <job-id> [--directory WORK_DIR] [--timeout MINS]",
+      "  node scripts/opencode-companion.mjs job result <job-id> [--directory WORK_DIR]",
+      "  node scripts/opencode-companion.mjs job cancel <job-id> [--directory WORK_DIR]",
+      "",
+      `  Default session timeout: ${DEFAULT_SESSION_TIMEOUT_MINS} minutes`,
       "  SERVER_DIR: where .opencode-serve.json lives (default: ~)",
       "  WORK_DIR:   project working directory sent to OpenCode sessions (default: $CLAUDE_PROJECT_DIR or cwd)"
     ].join("\n") + "\n"
@@ -872,7 +881,7 @@ function renderBackgroundTaskStart(jobId, scriptPath, directory) {
   // Shell-safe single-quote escaping: wrap in ' and replace internal ' with '\''
   const sq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
   const dirFlag = directory ? ` --directory ${sq(directory)}` : "";
-  return `OpenCode task started in background as ${jobId}. Check status: node ${sq(script)} status ${jobId}${dirFlag}\n`;
+  return `OpenCode task started in background as ${jobId}. Check status: node ${sq(script)} job status ${jobId}${dirFlag}\n`;
 }
 
 function createJobLogFile(directory, jobId) {
@@ -883,7 +892,7 @@ function createJobLogFile(directory, jobId) {
 
 function spawnBackgroundTaskWorker(directory, jobId, prompt, args = {}) {
   const scriptPath = fileURLToPath(import.meta.url);
-  const childArgs = [scriptPath, "task", "--job-id", jobId, "--directory", directory];
+  const childArgs = [scriptPath, "session", "new", "--job-id", jobId, "--directory", directory];
 
   if (args.serverDirectory) {
     childArgs.push("--server-directory", args.serverDirectory);
@@ -1601,6 +1610,52 @@ function renderStatus(directory, state, healthy, sessions, sessionError) {
   return `${lines.join("\n")}\n`;
 }
 
+function renderSessionTable(sessions) {
+  const lines = [
+    "| id | status | created | updated | summary |",
+    "| --- | --- | --- | --- | --- |"
+  ];
+
+  if (!sessions || sessions.length === 0) {
+    lines.push("| none | - | - | - | No sessions reported by the server. |");
+    return `${lines.join("\n")}\n`;
+  }
+
+  for (const session of sessions.map(summarizeSession)) {
+    lines.push(
+      `| ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(session.createdAt)} | ${escapeMarkdownCell(session.updatedAt)} | ${escapeMarkdownCell(session.summary)} |`
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function renderSessionDetails(session, directory) {
+  const details = summarizeSession(session);
+  const verdict = deriveSessionLifecycleVerdict(details.status);
+  const nextAction = recommendSessionAction(details.id, details.status);
+  return [
+    "| field | value |",
+    "| --- | --- |",
+    `| directory | ${escapeMarkdownCell(directory)} |`,
+    `| id | ${escapeMarkdownCell(details.id)} |`,
+    `| status | ${escapeMarkdownCell(details.status)} |`,
+    `| lifecycle verdict | ${escapeMarkdownCell(verdict)} |`,
+    `| recommended next action | ${escapeMarkdownCell(nextAction)} |`,
+    `| created | ${escapeMarkdownCell(details.createdAt)} |`,
+    `| updated | ${escapeMarkdownCell(details.updatedAt)} |`,
+    `| summary | ${escapeMarkdownCell(details.summary)} |`
+  ].join("\n") + "\n";
+}
+
+function buildSessionListView(directory, sessions) {
+  return ["# OpenCode Sessions", "", `Directory: ${directory}`, "", renderSessionTable(sessions).trimEnd()].join("\n") + "\n";
+}
+
+function buildSingleSessionView(directory, session) {
+  return ["# OpenCode Session Status", "", renderSessionDetails(session, directory).trimEnd()].join("\n") + "\n";
+}
+
 function parseSseBlock(block) {
   const normalized = block.replace(/\r/g, "");
   const lines = normalized.split("\n");
@@ -1726,6 +1781,34 @@ async function streamSseResponse(stream, onEvent, { abortSignal } = {}) {
 
 function normalizeSessionStatus(status) {
   return String(status ?? "unknown").trim().toLowerCase();
+}
+
+function deriveSessionLifecycleVerdict(status) {
+  const normalized = normalizeSessionStatus(status);
+  if (isBusySessionStatus(normalized)) {
+    return "active";
+  }
+  if (isSuccessfulTerminalSessionStatus(normalized)) {
+    return "reusable_or_finished";
+  }
+  if (isFailedTerminalSessionStatus(normalized)) {
+    return "failed";
+  }
+  return "unknown";
+}
+
+function recommendSessionAction(sessionId, status) {
+  const verdict = deriveSessionLifecycleVerdict(status);
+  if (verdict === "active") {
+    return `wait or session attach ${sessionId}`;
+  }
+  if (verdict === "reusable_or_finished") {
+    return `session continue ${sessionId} or inspect artifacts`;
+  }
+  if (verdict === "failed") {
+    return `inspect artifacts, then consider session new if reuse is no longer useful`;
+  }
+  return `session attach ${sessionId} to determine whether reuse is still viable`;
 }
 
 function isSuccessfulTerminalSessionStatus(status) {
@@ -1913,9 +1996,9 @@ function createSignalAbort(onAbort) {
 
 async function handleCheck(argv) {
   const { options } = parseArgs(argv, {
-    stringFlags: ["--directory"]
+    stringFlags: ["--directory", "--server-directory"]
   });
-  const serverDirectory = resolveServerDirectory(options.directory);
+  const serverDirectory = resolveServerDirectory(options["server-directory"] ?? options.directory);
   const version = await ensureOpencodeInstalled(serverDirectory);
   const managedState = normalizeState(readState(serverDirectory));
   const healthy = managedState ? await checkHealth(buildBaseUrl(managedState.port)) : false;
@@ -1925,9 +2008,9 @@ async function handleCheck(argv) {
 
 async function handleEnsureServe(argv) {
   const { options } = parseArgs(argv, {
-    stringFlags: ["--port", "--directory"]
+    stringFlags: ["--port", "--directory", "--server-directory"]
   });
-  const serverDirectory = resolveServerDirectory(options.directory);
+  const serverDirectory = resolveServerDirectory(options["server-directory"] ?? options.directory);
   const requestedPort = options.port ? Number(options.port) : 0;
   if (!Number.isFinite(requestedPort) || requestedPort < 0) {
     throw new Error(`Invalid port: ${options.port}`);
@@ -1941,7 +2024,7 @@ async function monitorSession({
   directory,
   sessionId,
   printer,
-  timeoutMins = 20,
+  timeoutMins = DEFAULT_SESSION_TIMEOUT_MINS,
   onSignalAbort,
   eventStreamController,
   canUseStatusPolling = () => true,
@@ -2045,15 +2128,6 @@ async function monitorSession({
                 lastPrintedSessionId = sessionId;
               }
               printer.handleDelta(properties.delta);
-            } else {
-              const delta = properties.delta;
-              if (lastPrintedSessionId !== eventSessionId) {
-                const prefix = `\n[sub-agent ${eventSessionId.slice(0, 8)}] `;
-                printer.handleDelta(prefix + delta);
-                lastPrintedSessionId = eventSessionId;
-              } else {
-                printer.handleDelta(delta);
-              }
             }
           }
         }
@@ -2249,7 +2323,7 @@ async function handleTask(argv) {
   const requestedAgent = options.agent ? String(options.agent).trim() : null;
   const jobId = options["job-id"] ?? null;
   const existingSessionId = options.session ? String(options.session).trim() : null;
-  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
+  const timeoutMins = options.timeout ? Number(options.timeout) : DEFAULT_SESSION_TIMEOUT_MINS;
 
   if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
     throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
@@ -2574,7 +2648,7 @@ async function handleAttach(argv) {
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const directory = resolveDirectory(options.directory);
   let sessionId = positionals[0] ?? null;
-  const timeoutMins = options.timeout ? Number(options.timeout) : 20;
+  const timeoutMins = options.timeout ? Number(options.timeout) : DEFAULT_SESSION_TIMEOUT_MINS;
 
   if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
     throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
@@ -2732,9 +2806,9 @@ async function handleCancel(argv) {
 
 async function handleCleanup(argv) {
   const { options } = parseArgs(argv, {
-    stringFlags: ["--directory"]
+    stringFlags: ["--directory", "--server-directory"]
   });
-  const serverDirectory = resolveServerDirectory(options.directory);
+  const serverDirectory = resolveServerDirectory(options["server-directory"] ?? options.directory);
   const state = normalizeState(readState(serverDirectory));
 
   if (!state) {
@@ -2758,6 +2832,181 @@ async function handleCleanup(argv) {
   );
 }
 
+async function getReadySessionRuntime(serverDirectory) {
+  const state = await ensureManagedServe(serverDirectory, 0);
+  return { state, baseUrl: buildBaseUrl(state.port) };
+}
+
+async function handleSessionList(argv) {
+  const { options } = parseArgs(argv, {
+    stringFlags: ["--directory", "--server-directory"]
+  });
+  const serverDirectory = resolveServerDirectory(options["server-directory"]);
+  const directory = resolveDirectory(options.directory);
+  const { baseUrl } = await getReadySessionRuntime(serverDirectory);
+  const sessions = await listSessions(baseUrl, directory);
+  process.stdout.write(buildSessionListView(directory, sessions));
+}
+
+async function handleSessionStatus(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    stringFlags: ["--directory", "--server-directory"]
+  });
+  const serverDirectory = resolveServerDirectory(options["server-directory"]);
+  const directory = resolveDirectory(options.directory);
+  const sessionId = positionals[0];
+  if (!sessionId) {
+    await handleSessionList(argv);
+    return;
+  }
+  const { baseUrl } = await getReadySessionRuntime(serverDirectory);
+  const sessions = await listSessions(baseUrl, directory);
+  const session = sessions.find((entry) => summarizeSession(entry).id === sessionId) ?? null;
+  if (!session) {
+    throw new Error(`No session found for ${sessionId} in ${directory}.`);
+  }
+  process.stdout.write(buildSingleSessionView(directory, session));
+}
+
+async function handleSessionCommand(argv) {
+  const [subcommand, ...rest] = argv;
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+    printUsage();
+    return;
+  }
+
+  if (subcommand === "new") {
+    await handleTask(rest);
+    return;
+  }
+
+  if (subcommand === "continue" || subcommand === "resume") {
+    const { options, positionals } = parseArgs(rest, {
+      booleanFlags: ["--async", "--background"],
+      stringFlags: ["--directory", "--server-directory", "--model", "--timeout"]
+    });
+    const sessionId = positionals[0];
+    if (!sessionId) {
+      throw new Error(`Missing session id for session ${subcommand}.`);
+    }
+    const taskArgs = [];
+    if (options.directory) taskArgs.push("--directory", String(options.directory));
+    if (options["server-directory"]) taskArgs.push("--server-directory", String(options["server-directory"]));
+    if (options.model) taskArgs.push("--model", String(options.model));
+    if (options.timeout) taskArgs.push("--timeout", String(options.timeout));
+    if (options.async) taskArgs.push("--async");
+    if (options.background) taskArgs.push("--background");
+    taskArgs.push("--session", String(sessionId));
+    if (positionals.length > 1) {
+      taskArgs.push("--", ...positionals.slice(1));
+    }
+    await handleTask(taskArgs);
+    return;
+  }
+
+  if (subcommand === "attach") {
+    await handleAttach(rest);
+    return;
+  }
+
+  if (subcommand === "wait") {
+    await handleAttach(rest);
+    return;
+  }
+
+  if (subcommand === "list") {
+    await handleSessionList(rest);
+    return;
+  }
+
+  if (subcommand === "status") {
+    await handleSessionStatus(rest);
+    return;
+  }
+
+  throw new Error(`Unknown session command: ${subcommand}`);
+}
+
+async function handleServeCommand(argv) {
+  const [subcommand, ...rest] = argv;
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+    printUsage();
+    return;
+  }
+  if (subcommand === "start") {
+    await handleEnsureServe(rest);
+    return;
+  }
+  if (subcommand === "status") {
+    await handleCheck(rest);
+    return;
+  }
+  if (subcommand === "stop") {
+    await handleCleanup(rest);
+    return;
+  }
+  throw new Error(`Unknown serve command: ${subcommand}`);
+}
+
+async function handleJobCommand(argv) {
+  const [subcommand, ...rest] = argv;
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+    printUsage();
+    return;
+  }
+  if (subcommand === "list") {
+    await handleStatus(rest);
+    return;
+  }
+  if (subcommand === "status") {
+    await handleStatus(rest);
+    return;
+  }
+  if (subcommand === "wait") {
+    await handleJobWait(rest);
+    return;
+  }
+  if (subcommand === "result") {
+    await handleResult(rest);
+    return;
+  }
+  if (subcommand === "cancel") {
+    await handleCancel(rest);
+    return;
+  }
+  throw new Error(`Unknown job command: ${subcommand}`);
+}
+
+async function handleJobWait(argv) {
+  const { options, positionals } = parseArgs(argv, {
+    stringFlags: ["--directory", "--timeout"]
+  });
+  const directory = resolveDirectory(options.directory);
+  const jobId = positionals[0];
+  if (!jobId) {
+    throw new Error("Missing job id for job wait.");
+  }
+  const timeoutMins = options.timeout ? Number(options.timeout) : DEFAULT_SESSION_TIMEOUT_MINS;
+  if (Number.isNaN(timeoutMins) || timeoutMins <= 0) {
+    throw new Error(`Invalid timeout: ${options.timeout}. Use a positive number of minutes.`);
+  }
+
+  const deadline = Date.now() + timeoutMins * 60 * 1000;
+  while (Date.now() < deadline) {
+    const job = refreshStaleRunningJobs(directory).find((entry) => entry.id === jobId) ?? null;
+    if (!job) {
+      throw new Error(`No job found for ${jobId}.`);
+    }
+    if (!isActiveJob(job)) {
+      await handleResult([jobId, "--directory", directory]);
+      return;
+    }
+    await delay(1500);
+  }
+
+  throw new Error(`Timed out after ${timeoutMins} minutes waiting for job ${jobId}.`);
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (!command || command === "--help" || command === "-h") {
@@ -2765,40 +3014,20 @@ async function main() {
     return;
   }
 
-  if (command === "check") {
-    await handleCheck(rest);
+  if (command === "serve") {
+    await handleServeCommand(rest);
     return;
   }
-  if (command === "ensure-serve") {
-    await handleEnsureServe(rest);
+  if (command === "session") {
+    await handleSessionCommand(rest);
     return;
   }
-  if (command === "task") {
-    await handleTask(rest);
+  if (command === "job") {
+    await handleJobCommand(rest);
     return;
   }
   if (command === "review") {
     await handleReview(rest);
-    return;
-  }
-  if (command === "attach") {
-    await handleAttach(rest);
-    return;
-  }
-  if (command === "status") {
-    await handleStatus(rest);
-    return;
-  }
-  if (command === "result") {
-    await handleResult(rest);
-    return;
-  }
-  if (command === "cancel") {
-    await handleCancel(rest);
-    return;
-  }
-  if (command === "cleanup") {
-    await handleCleanup(rest);
     return;
   }
 
@@ -2819,6 +3048,7 @@ if (isDirectExecution) {
 }
 
 export {
+  buildReviewPrompt,
   deriveResultStatus,
   generateJobId,
   formatDuration,
@@ -2836,5 +3066,9 @@ export {
   renderBackgroundTaskStart,
   resolveDirectory,
   summarizePrompt,
-  upsertJob
+  upsertJob,
+  buildSessionListView,
+  buildSingleSessionView,
+  deriveSessionLifecycleVerdict,
+  recommendSessionAction
 };

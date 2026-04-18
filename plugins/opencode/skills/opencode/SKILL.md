@@ -1,189 +1,291 @@
 ---
 name: opencode
-description: Authoritative reference for OpenCode agent routing, direct companion invocation, prompt composition, and result handling. Consult before ANY OpenCode usage — especially task delegation via the OpenCode agent, session operations (continue, resume, list), and serve lifecycle. This is the single source of truth for agent routing, companion CLI syntax, flags, and behavioral contracts.
+description: Authoritative reference for OpenCode companion invocation, session reuse, serve lifecycle, background jobs, and result handling. Always load this skill for any OpenCode runtime/lifecycle question — especially when the user mentions a session ID, timeout, attach/reattach, resume, rerun vs reuse, background job status, serve health, or companion-managed session reuse. If a timeout happened and a session ID exists, this skill should take over before Claude gives generic retry or restart advice.
 user-invocable: false
 ---
 
-# OpenCode Skill
+# OpenCode Runtime Skill
 
-Unified reference for delegating work to OpenCode. The default route for task delegation is the `opencode-agent` wrapper. Direct companion invocation is the fallback path when the agent is being bypassed on purpose or when low-level runtime control is needed.
+This skill defines the **runtime contract** for OpenCode companion usage.
 
----
+It does **not** define global delegation philosophy.
+Use the orchestrator/global task policy to decide **whether** OpenCode should own a task.
+Use this skill to decide **how** to run OpenCode safely and efficiently once that decision is made.
 
-## 1. Invocation (Usage)
+## Runtime scope
 
-### Preferred route: `opencode-agent`
+This skill owns:
+- companion invocation
+- serve lifecycle
+- session reuse
+- timeout / false-negative recovery
+- background job handling
+- result handling
+- artifact verification after companion runs
 
-Use `opencode:opencode-agent` as the primary entrypoint for OpenCode task delegation.
+It should trigger aggressively for runtime questions such as:
+- "the task timed out"
+- "I have a session id"
+- "should I attach or rerun?"
+- "how do I resume this OpenCode job?"
+- "check serve health / status / result / cancel"
 
-- `/opencode:task` and `/opencode:rescue` should route through the agent by default.
-- The agent is a thin forwarder around `opencode-companion.mjs task`.
-- The agent should return the companion stdout verbatim.
-- Do not prefer direct Bash invocation when normal agent routing is available.
+## Preferred route: plugin commands and `opencode-agent`
 
-### Direct companion path
+Preferred order of use:
+1. user-facing plugin commands such as `/opencode:task`, `/opencode:review`, `/opencode:status`
+2. `opencode:opencode-agent` when Claude needs a thin task-forwarding wrapper
+3. direct `opencode-companion.mjs` invocation only when low-level control is needed
 
-Direct-invocation reference for `opencode-companion.mjs` when the agent is being bypassed explicitly.
+The agent / command wrappers should forward companion output verbatim.
+They should not invent repository analysis that the companion did not produce.
 
-### Companion path
+## Companion path
 
-```
+```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs
 ```
 
-### Delegate a task
+## Supported companion verbs
+
+Primary namespaced surface:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
-  [--directory DIR] [--model MODEL] [--session SID] -- "PROMPT"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" serve status [--server-directory SERVER_DIR]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" serve start [--port N] [--server-directory SERVER_DIR]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" serve stop [--server-directory SERVER_DIR]
+
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] -- "PROMPT"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] -- "PROMPT"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session list [--directory WORK_DIR] [--server-directory SERVER_DIR]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]
+
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job list [--directory WORK_DIR] [--all]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job status <job-id> [--directory WORK_DIR]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job wait <job-id> [--directory WORK_DIR] [--timeout MINS]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job result <job-id> [--directory WORK_DIR]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job cancel <job-id> [--directory WORK_DIR]
 ```
 
-If you want non-blocking behavior in this direct-call path, run the Bash command with `run_in_background: true`. Otherwise run it in the foreground. Do **not** also pass the companion's own `--background` flag — that's a detached job-queue mode with different semantics.
+## Two kinds of state: do not mix them up
 
-### Continue a session
+### 1. Serve state
 
-The previous task output ends with `Session ID: ses_...`. To reuse that session's memory:
+Serve state answers:
+- is the managed OpenCode runtime reachable?
+- what port is it on?
+- does the companion know about the managed serve process for this server directory?
+
+Use:
+- `serve status`
+- `serve start`
+- `serve stop`
+
+For serve commands, prefer `--server-directory` explicitly. Legacy `--directory` still works as an alias for the server-state root.
+
+### 2. Session / job state
+
+Task state answers:
+- what work was launched?
+- is the same coding thread still reusable?
+- do I have a background job id?
+- do I have a session id to reattach to?
+
+Use:
+- `session new`
+- `session continue`
+- `session attach`
+- `session wait`
+- `session list`
+- `session status`
+- `job list`
+- `job status`
+- `job wait`
+- `job result`
+- `job cancel`
+
+A task timeout is **not** the same thing as a serve failure.
+Do not restart or relaunch just because one foreground stream dropped.
+
+## Working directory vs server directory
+
+These are different.
+
+- `--directory WORK_DIR` = the repo / project context bound to the OpenCode session
+- `--server-directory SERVER_DIR` = where companion-managed serve state is stored
+
+The session is tied to the **working directory**.
+If you want to reuse a session, reuse the same session id **and** the same working directory.
+
+## Session reuse is the default efficiency path
+
+OpenCode companion session reuse is a major efficiency feature.
+
+Prefer reusing the same session when:
+- fixing issues in the same work thread
+- following up on a prior implementation
+- continuing a code review thread
+- narrowing a previous broad run into a final write / fix pass
+
+Why:
+- repo warmup has already happened
+- file-state context is already loaded
+- repeated implementation loops become cheaper
+- you avoid duplicated work and duplicated token burn
+
+### Reuse rule
+
+If the coding thread is the same, bias toward:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task \
-  --session ses_XXXX --directory /abs/path/to/original/project -- "follow-up message"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session continue ses_XXXX \
+  --directory /abs/path/to/original/project \
+  -- "follow-up prompt"
 ```
 
-**Sessions persist across serve restarts.** OpenCode stores all sessions,
-messages, and parts in a global SQLite DB at `~/.local/share/opencode/opencode.db`
-(plus content-addressable blobs under `~/.local/share/opencode/storage/`). The
-DB is NOT scoped to the managed serve's pid — killing and re-spawning the
-serve does not lose session history. To resume:
+Only start a fresh session when:
+- the topic changed enough that warm context would be harmful
+- the old session is clearly unrecoverable
+- isolation is more valuable than continuity
 
-1. Pass the original session id via `--session`.
-2. Pass the original project directory via `--directory` — this must match
-   the directory the session was created under (the serve routes by
-   `x-opencode-directory` header, and each session is bound to a
-   `project_id` derived from that directory).
-3. The current serve (whether original or a fresh one) queries the DB and
-   replays the prior conversation as context.
+## Foreground, background, and async
 
-If the companion reports "No managed OpenCode serve state found for <dir>",
-that's the companion's own pid-file state, not the session storage. Run
-`ensure-serve --directory <original-project-dir>` to spawn a fresh serve
-keyed to the right project, then `task --session <id> --directory <dir>`
-to resume.
+Default timeout for session work is now **60 minutes** unless explicitly overridden with `--timeout`.
 
-**Caveat on a stuck session.** A session whose foreground stream dropped
-while an @-delegation was in flight may remain "active" on the serve
-indefinitely. Use `sessions --session <id>` to check liveness; if verdict
-is `active` it's still working, if `idle` (no updates within the
-`--since` threshold, default 5 minutes) it's safe to resume. Empty result
-means the serve can't see it for the given directory — double-check the
-`--directory` argument matches the session's project.
+### Foreground `session new` / `session continue`
 
-### List sessions
+Use when you want streamed output now and are willing to watch the run.
+
+### `--background`
+
+Use when you want a background **job id** and later retrieval via:
+- `status`
+- `result`
+- `cancel`
+
+This is the companion's managed background-job layer.
+It is different from merely running a shell command in the background.
+
+### `--async`
+
+Use only when you intentionally want to queue a prompt asynchronously and handle the rest elsewhere.
+This is not the normal default for task orchestration.
+
+## Timeout / false-negative recovery
+
+A dropped stream, timeout, or exit-1 does **not** automatically mean the OpenCode work failed.
+Do not jump straight to generic retry, restart, or support-escalation advice if a reusable companion session is still available.
+
+### Recovery procedure
+
+1. capture any returned `Session ID: ses_...`
+2. do **not** submit the same task again immediately
+3. prefer attaching to the same session:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" sessions \
-  [--directory DIR] [--session SID] [--since MINUTES] [--limit N]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" session attach ses_XXXX \
+  --directory /abs/path/to/original/project \
+  --timeout 5
 ```
 
-Verdict meaning:
-- `active` — still working (updated within `--since`, default 5 min). **Do not retry.**
-- `idle` — safe to retry or continue with `--session SID --directory DIR`.
-- missing — not visible to the serve for the supplied `--directory`. Double-check
-  the directory matches the session's original project before assuming the session
-  is gone — sessions persist in the global DB and can usually be resumed by
-  pointing at the correct directory.
+4. keep attach windows bounded
+5. if the session still appears productive, continue reattaching
+6. only relaunch fresh work when reuse is no longer reliable
 
-### Serve lifecycle (prefer `/opencode:serve`)
+### Canonical timeout answer
+
+If the user asks what to do after a timeout **and they already have a session id**, the default answer should be:
+- attach to the same companion session
+- keep the same working directory
+- verify artifacts before considering a relaunch
+
+Do **not** default to generic restart / support / configuration advice before covering attach-and-reuse.
+
+### Strong rule
+
+**Reuse before relaunch.**
+
+This is both safer and cheaper.
+
+## Background job monitoring
+
+If you launched with `--background`, the source of truth is the job id.
+
+Use:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" ensure-serve [--port N] [--directory DIR]   # start
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" check        [--directory DIR]              # status
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" cleanup      [--directory DIR]              # stop
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job status <job-id> --directory /abs/path/to/project
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job wait <job-id> --directory /abs/path/to/project --timeout 60
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job result <job-id> --directory /abs/path/to/project
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job cancel <job-id> --directory /abs/path/to/project
 ```
 
-### Gotcha: false-negative "failed" notifications
+Important:
+- `job list` shows the recent job table
+- `job status` shows a single job snapshot
+- `job wait` blocks until the job finishes or times out
+- `job result` is for finished or partially finished background-job logs
+- `job cancel` stops the active background job
 
-Heavy planning or sub-agent delegation inside OpenCode (`@explorer`, `@librarian`, `@oracle`, …) can abort the foreground stream while the session keeps running on the serve. A `failed` / exit-1 notification does **not** mean the session is dead.
+## Progress is not completion
 
-Before retrying, check whether the current session is still active. Blind retries double-fire and corrupt in-flight work.
+Never treat these as proof of success by themselves:
+- `Session ID:` appearing early
+- a long stream of reasoning / exploration output
+- a touched-files summary
+- a non-empty background log
 
-Mitigations:
-- Narrow scope; split multi-file work into additive steps chained via `--session`.
-- OpenCode decides when to delegate to its own sub-agents. Do not instruct it to avoid them in prompts.
-- For the `opencode-agent` path, the agent should own the full session lifecycle: if the initial `task` call times out after the default 20-minute window, extract the session id, attach with a short bounded timeout around 5 minutes, then re-check and continue the loop until the session is done or clearly failed.
-- Keep prompts focused (50–150 lines of prompt is a good target).
+Those are progress signals.
+Not completion signals.
 
----
+## Artifact verification is mandatory
 
-## 2. Prompt Composition
+A companion run is not done just because it produced output.
 
-### Core Rules
+Always verify the requested artifact directly when an artifact matters.
+Examples:
+- read the target file
+- inspect the diff
+- inspect git status
+- run the relevant test/build/lint/typecheck
+- verify the file is substantial and not placeholder-level
 
-- Give one clear task per run.
-- State the exact output contract up front.
-- Ground the request in facts from the codebase, not assumptions.
-- Include the relevant files, scope boundaries, and non-goals.
-- Keep the prompt small enough that a single pass can finish it.
-- If the task depends on repo state, say what must be checked before acting.
+### Strong rule
 
-### Default Prompt Recipe
+Do **not** trust a file-change summary as proof that the actual requested deliverable exists.
 
-```xml
-<task>
-  One concrete coding task, phrased as an action with a clear finish line.
-</task>
+If the artifact is missing or incomplete:
+- continue the same session
+- narrow the prompt to writing the actual deliverable now
+- verify again after the follow-up
 
-<output_contract>
-  What the agent must return, the file scope, the required checks, and when to stop.
-</output_contract>
+## Review mode
 
-<follow_through>
-  What to do if blocked, what to verify before finalizing, and whether to keep iterating.
-</follow_through>
-```
+Use `review` when you want a code review against repo state.
+Use `review --adversarial` when you want a stronger challenge pass.
 
-### Selection Guidance
+These are runtime surfaces, not strategy surfaces.
+The orchestrator decides **when** to invoke them.
+This skill defines **how** they run.
 
-- Use `task` for implementation, refactors, fixes, or narrow code changes.
-- Use `review` when you want a bug hunt, regression check, or evidence-backed critique without code changes.
-- Use `adversarial-review` when you want the strongest attempt to break the plan, find edge cases, or challenge assumptions.
-- If the request mixes implementation and review, split it into separate runs unless the review is only a verification step for the implementation.
+## Result-handling contract
 
-### Common Antipatterns
+When reporting OpenCode companion output:
+- preserve the output as returned
+- preserve session metadata and job ids
+- preserve file paths and file-change summaries
+- preserve failure details instead of paraphrasing them into confidence
 
-- Bundling unrelated requests into one prompt.
-- Saying "improve this" without defining what success looks like.
-- Hiding important constraints inside long prose.
-- Assuming files, modules, or architecture that have not been checked.
-- Asking for implementation and final review in the same unconstrained pass.
-- Telling OpenCode how to structure its internal work — describe the outcome you need, not the mechanism inside the session.
-- Leaving verification implicit when the result will be reused or shipped.
+If the run was incomplete or ambiguous, say so plainly.
+Do not silently upgrade ambiguous output into success.
 
-### Verification Loop
+## Non-goals of this skill
 
-- Check the result against the output contract before treating it as done.
-- Verify that the work stayed within the requested scope.
-- Verify that the result is grounded in the repository state or tool output.
-- If the result is incomplete, rerun with a narrower scope and a tighter contract.
-- If the result is uncertain, ask for the missing fact instead of guessing.
+This skill intentionally does **not** answer:
+- whether a task should stay in Claude or move to OpenCode
+- whether a planning/doc task should be delegated
+- how the manager tree should be decomposed
 
----
-
-## 3. Result Handling
-
-When the helper returns OpenCode output:
-- Preserve the streamed text from the SSE response.
-- Preserve the final session metadata block, including session ID, status, and directory.
-- Preserve any reported file change summary exactly as the helper reports it.
-- If the helper reports malformed output or a failed run, include the most actionable stderr lines and stop there.
-- If the helper reports no file changes, keep that statement.
-- If the helper reports file changes, call out the touched paths explicitly.
-
-Presentation rules:
-- Do not transform OpenCode output into a separate Claude-side implementation.
-- Do not add repository analysis that OpenCode did not report.
-- If the user asks what changed, answer from the helper output first.
-
-CRITICAL:
-- Stop after presenting the OpenCode results.
-- Never auto-apply, refine, or extend OpenCode changes without explicit user permission.
-- If the run failed or was incomplete, report that and stop instead of improvising a fallback implementation.
+Those belong in orchestration policy, not runtime mechanics.

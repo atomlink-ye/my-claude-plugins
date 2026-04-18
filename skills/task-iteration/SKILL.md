@@ -1,18 +1,40 @@
 ---
 name: task-iteration
-description: "Orchestrate end-to-end feature implementation from an exec-plan document. Delegates coding to OpenCode, runs independent evaluation, loops fixes until clean, and gates completion on an advisory review. Use when the user says 'implement feature', 'execute plan', references an exec-plan path, or wants the Plan-Generate-Evaluate workflow for a structured feature."
+description: "Orchestrate end-to-end feature implementation from an exec-plan document. Use this whenever the user wants a structured Plan → Generate → Evaluate loop for a feature. It keeps planning and acceptance in Claude, pushes bounded coding/test execution to OpenCode companion sessions, reuses warm sessions across fix rounds, and gates completion on independent evaluation plus an advisory review."
 user-invocable: true
 ---
 
 # Task Iteration
 
-Orchestrate feature implementation from exec-plan documents using the Plan → Generate → Evaluate workflow.
+Orchestrate exec-plan-driven feature delivery using a structured **Plan → Generate → Evaluate** loop.
 
 **Invocation:** `/task-iteration <exec-plan-path> [feature-identifier] [--max-fix-rounds N]`
 
+## What this skill owns
+
+This is a **user-facing workflow skill**.
+It owns:
+- exec-plan parsing
+- phase sequencing
+- generator/reviewer bookkeeping
+- checklist completion logic
+- final advisory gate
+- concrete companion command patterns for GENERATE / EVALUATE / FIX LOOP
+
+It does **not** define the global delegation philosophy or low-level OpenCode runtime syntax by itself.
+
+Use these layers together:
+- **Global task policy / hidden orchestrator skill** → decides what stays in Claude vs what becomes an OpenCode execution lane
+- **OpenCode runtime skill** → defines companion invocation, session reuse, timeout recovery, and result handling
+- **This skill** → sequences the feature-delivery loop on top of those two layers
+
 ## Overview
 
-Seven phases run in sequence. Coding and evaluation are delegated to OpenCode sessions that persist across fix iterations. The orchestrator (Claude Code) holds the vision, tracks session IDs, and gates transitions.
+Seven phases run in sequence.
+
+- Claude owns parse / plan / acceptance / judgment-heavy prose
+- OpenCode companion owns bounded coding / test execution lanes
+- generator and reviewer sessions are reused when that is more efficient than relaunching
 
 ```
 PARSE → PLAN → GENERATE → EVALUATE → FIX LOOP → ADVISORY → DONE
@@ -22,21 +44,40 @@ PARSE → PLAN → GENERATE → EVALUATE → FIX LOOP → ADVISORY → DONE
 
 ## Key principles
 
-- **Generator = Fixer.** One OpenCode session (`GENERATOR_SID`) handles initial implementation and all subsequent fix iterations. It holds warm file state.
-- **Reviewer stays independent.** A separate session (`REVIEWER_SID`) evaluates the Generator's output. It never sees the Generator's internal reasoning — only the code and the review criteria.
-- **Whole picture, scoped work.** When delegating to OpenCode, include the full feature context (spec, deliverable standard, authority refs, file scope) so the subagent can make informed decisions, but restrict its output to only the work within its scope.
-- **Background by default.** GENERATE and EVALUATE dispatch via `run_in_background: true`. Claude Code stays free to orchestrate.
-- **Bounded fix loop.** Max 3 rounds with early exit on clean pass. If exhausted, escalate to user.
+- **Generator = Fixer.** One OpenCode companion session (`GENERATOR_SID`) handles initial implementation and all subsequent fix iterations.
+- **Reviewer stays independent.** A separate session (`REVIEWER_SID`) evaluates the Generator's output.
+- **Whole picture, scoped work.** Generator and Reviewer get the full feature context, but each run stays constrained to its role and file scope.
+- **Structural prose stays with Claude.** Planning docs, governance docs, exec-plan updates, and completion summaries default to Claude unless a doc change is explicitly a mechanical transformation.
+- **Session reuse is an efficiency feature.** Reusing the same generator/reviewer sessions avoids repeating repo warmup and keeps fix rounds cheaper.
+- **Reuse before relaunch.** If a companion run times out or the stream drops after yielding a session id, attach to the same session before launching fresh work.
+- **Bounded fix loop.** Max 3 rounds by default, with early exit on clean pass.
+
+## Efficiency heuristic
+
+If the expected execution lane would likely require **more than 10 tool calls** in Claude — especially across many files or repeated read/edit/test loops — prefer pushing that lane to OpenCode companion rather than grinding it out directly in chat.
+
+This applies strongly to:
+- implementation passes
+- test-writing passes
+- fix rounds
+- bounded code review passes
 
 ## Session tracking
 
-| Session        | Created                         | Reused for                                           |
-|----------------|---------------------------------|------------------------------------------------------|
-| GENERATOR_SID  | Phase 3 (initial implementation)| All fix iterations (Phase 5), doc updates (Phase 7)   |
-| REVIEWER_SID   | Phase 4 (initial evaluation)    | All re-evaluations (Phase 5)                         |
-| Advisory       | Phase 6                         | Fresh OpenCode session each time (stateless review)  |
+| Session / handle | Created | Reused for |
+|---|---|---|
+| `GENERATOR_SID` | Phase 3 | All fix iterations |
+| `REVIEWER_SID` | Phase 4 | All re-evaluations |
+| `GENERATOR_JOB_ID` / `REVIEWER_JOB_ID` | optional if using companion background jobs | monitoring and result retrieval |
+| Advisory session | Phase 6 | fresh each time |
 
-Store session IDs as local variables in the conversation. Pass them on subsequent OpenCode calls via `opencode run --session <sid>`.
+Always track:
+- session id
+- working directory
+- base ref
+- whether the run used foreground attach/recovery or companion background jobs
+
+A session id without the original working directory is not enough for safe reuse.
 
 ---
 
@@ -45,200 +86,246 @@ Store session IDs as local variables in the conversation. Pass them on subsequen
 Read the exec-plan and extract the target feature.
 
 1. Read the exec-plan file at `<exec-plan-path>`.
-2. Load `references/exec-plan-parsing.md` for extraction guidance.
-3. Extract target feature data:
+2. Load `references/exec-plan-parsing.md`.
+3. Extract:
    - User story
    - Specification
    - Deliverable standard
    - Test scenarios
    - Checklist items
    - Authority references
-4. If no `[feature-identifier]` given, list available features and ask user to select.
-5. Record current git ref as `BASE_REF` for later advisory scoping:
-   ```
-   git rev-parse HEAD → BASE_REF
-   ```
-6. Present extracted summary to user for confirmation before proceeding.
+4. If no `[feature-identifier]` is given, list available features and ask the user to choose.
+5. Record current git ref as `BASE_REF`:
 
-**Exit criteria:** User confirms the extracted feature is correct.
+   ```bash
+   git rev-parse HEAD
+   ```
+
+6. Present the extracted summary for confirmation.
+
+**Exit criteria:** User confirms the target feature.
 
 ## Phase 2: PLAN
 
 Map the implementation surface and draft a plan.
 
-1. Use a built-in Explore Agent to map affected files, interfaces, and existing patterns. Focus on:
-   - Files that will be modified or created
-   - Existing patterns to follow (naming, structure, error handling)
-   - Interfaces that change
-   - Test file locations
-2. Draft a concise implementation plan (1–3 paragraphs). Cover:
-   - What changes, where, and in what order
-   - Risks or edge cases spotted during exploration
-   - Any dependencies on other features (from Implementation Sequence in the exec-plan)
-3. Present plan to user for approval.
+1. Explore the relevant codebase surface:
+   - files to modify or create
+   - existing patterns to follow
+   - interfaces that change
+   - test locations
+2. Draft a concise implementation plan covering:
+   - what changes
+   - where it changes
+   - execution order
+   - risks / edge cases
+   - prerequisite dependencies from the exec-plan
+3. Present the plan for approval.
 
-**Exit criteria:** User approves the plan. This is the last human checkpoint before machines take over.
+**Exit criteria:** User approves the plan.
 
 ## Phase 3: GENERATE
 
-Delegate initial implementation to OpenCode.
+Delegate the initial implementation to OpenCode companion.
 
-1. Load `references/prompt-templates.md`, use the **Initial Implementation** template.
-2. Compose the OpenCode task prompt using the XML recipe. Inject:
-   - `{{FEATURE_SPEC}}` — specification from exec-plan
-   - `{{USER_STORY}}` — user story
-   - `{{DELIVERABLE_STANDARD}}` — quality bar
-   - `{{PLAN}}` — the approved plan from Phase 2
-   - `{{FILE_SCOPE}}` — files identified in Phase 2
-   - `{{AUTHORITY_REFERENCES}}` — authority docs from exec-plan
-3. Include the **whole picture** in the prompt: full spec, deliverable standard, authority refs, and file scope. This lets the subagent make informed decisions. But explicitly restrict its output to only the files in scope — no speculative changes outside the feature boundary.
-4. Dispatch to OpenCode:
+1. Load `references/prompt-templates.md` and use the **Initial Implementation** template.
+2. Compose the Generator prompt with:
+   - `{{FEATURE_SPEC}}`
+   - `{{USER_STORY}}`
+   - `{{DELIVERABLE_STANDARD}}`
+   - `{{PLAN}}`
+   - `{{FILE_SCOPE}}`
+   - `{{AUTHORITY_REFERENCES}}`
+3. Include the whole picture, but restrict output to the declared file scope.
+4. Dispatch to OpenCode companion.
 
-   ```bash
-   opencode run --session "" --title "implement: <feature-name>" "<prompt>"
-   ```
+### Preferred companion pattern
 
-   Use `run_in_background: true` in the Bash tool so Claude Code stays free.
+Use the companion-managed task flow, not raw `opencode run`.
+When the user asks for the concrete GENERATE or FIX LOOP command pattern, answer with these `opencode-companion.mjs` command forms directly rather than inventing extra `/task-iteration` subcommands.
 
-5. Record the returned session ID as `GENERATOR_SID`.
-6. Report file changes and completion status to user.
+### Canonical answer shape for command-pattern questions
 
-**Exit criteria:** Generator completes initial implementation. Session ID recorded.
+When the user asks for task-iteration command patterns, the answer should contain:
+1. one **GENERATE** block using companion `task`
+2. one **FIX LOOP** block using companion `task --session "$GENERATOR_SID"`
+3. one **RE-EVALUATE** block using companion `task --session "$REVIEWER_SID"`
+4. one sentence explaining why session reuse matters
+
+Do not answer with made-up commands like `/task-iteration generate` or `/task-iteration fix-loop`.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+  --directory "$WORK_DIR" \
+  --timeout 60 \
+  -- "<generator-prompt>"
+```
+
+If you want non-blocking execution, you may use the companion background-job layer:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+  --directory "$WORK_DIR" \
+  --background \
+  --timeout 60 \
+  -- "<generator-prompt>"
+```
+
+If you use `--background`, record `GENERATOR_JOB_ID` and later retrieve the session id from the result/output before the fix loop begins.
+
+5. Record the returned session id as `GENERATOR_SID`.
+6. If the run times out or the stream drops **after** yielding a session id, prefer:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session attach "$GENERATOR_SID" \
+  --directory "$WORK_DIR" \
+  --timeout 5
+```
+
+Do not submit a duplicate implementation run unless reuse is no longer reliable.
+
+**Exit criteria:** Initial implementation finishes and `GENERATOR_SID` is recorded.
 
 ## Phase 4: EVALUATE
 
-Run independent evaluation against the deliverable standard.
+Run an independent evaluation against the deliverable standard.
 
-1. Load `references/prompt-templates.md`, use the **Initial Evaluation** template.
-2. Compose a fresh prompt for a **new** OpenCode session. Ground it in:
-   - Deliverable standard from exec-plan
-   - Test scenarios
-   - Authority references
-   - The file scope (so the reviewer knows what to examine)
-3. Include the full feature context in the prompt so the reviewer can make informed judgments, but restrict its role to evaluation only — no code changes.
-4. Dispatch to a fresh OpenCode session (do NOT reuse GENERATOR_SID):
+1. Load `references/prompt-templates.md` and use the **Initial Evaluation** template.
+2. Compose a fresh Reviewer prompt grounded in:
+   - deliverable standard
+   - test scenarios
+   - authority references
+   - file scope
+3. Keep this lane evaluation-only — no code changes.
+4. Dispatch to a **fresh** companion session (do not reuse `GENERATOR_SID`):
 
-   ```bash
-   opencode run --session "" --title "review: <feature-name>" "<prompt>"
-   ```
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+  --directory "$WORK_DIR" \
+  --timeout 60 \
+  -- "<reviewer-prompt>"
+```
 
-   Use `run_in_background: true`.
-
-5. Record the returned session ID as `REVIEWER_SID`.
+5. Record the returned session id as `REVIEWER_SID`.
 6. Classify findings:
-   - **PASS** — no Critical or High findings
-   - **PASS_WITH_NOTES** — only Low/Medium findings, feature is shippable
-   - **FAIL** — one or more Critical/High findings
+   - `PASS` — no Critical or High findings
+   - `PASS_WITH_NOTES` — only Medium / Low findings
+   - `FAIL` — one or more Critical / High findings
 
-**Exit criteria:** Evaluation complete, findings classified.
+If the reviewer run drops after producing a session id, attach to the same reviewer session before relaunching.
+
+**Exit criteria:** Evaluation completes and findings are classified.
 
 ## Phase 5: FIX LOOP
 
 Iterate until clean or rounds exhausted.
 
-Only entered when Phase 4 returns FAIL.
+Only enter this phase when Phase 4 returns `FAIL`.
 
 ```
 round = 0
 while findings == FAIL and round < max_fix_rounds:
     round += 1
-    → Resume GENERATOR_SID with fix prompt
-    → Resume REVIEWER_SID with re-evaluation prompt
-    → Classify findings
+    → resume GENERATOR_SID with fix prompt
+    → resume REVIEWER_SID with re-evaluation prompt
+    → classify findings
     if PASS or PASS_WITH_NOTES: break
 ```
 
-**Fix iteration:**
+### Fix iteration
 
-1. Load `references/prompt-templates.md`, use the **Fix Iteration** template.
-2. Resume the Generator session with reviewer findings:
+1. Load `references/prompt-templates.md` and use the **Fix Iteration** template.
+2. Resume the generator session:
 
-   ```bash
-   opencode run --session "$GENERATOR_SID" "<fix-prompt>"
-   ```
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session continue "$GENERATOR_SID" \
+  --directory "$WORK_DIR" \
+  --timeout 60 \
+  -- "<fix-prompt>"
+```
 
-   Inject `{{REVIEWER_FINDINGS}}` with the full findings from the last evaluation. Include the whole context again (spec, deliverable standard) so the Generator understands *why* each fix matters.
+3. Include `{{REVIEWER_FINDINGS}}` plus the whole feature context again so the generator understands why each fix matters.
+4. After the generator completes, resume the reviewer session:
 
-3. After Generator completes, resume the Reviewer session:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session continue "$REVIEWER_SID" \
+  --directory "$WORK_DIR" \
+  --timeout 60 \
+  -- "<re-eval-prompt>"
+```
 
-   ```bash
-   opencode run --session "$REVIEWER_SID" "<re-eval-prompt>"
-   ```
+5. If either run drops after yielding a session id, attach to the same session before launching fresh work.
+6. Reclassify findings.
+7. If `round == max_fix_rounds` and the result is still `FAIL`, escalate to the user with explicit options.
 
-   Use the **Re-Evaluation** template. The reviewer verifies specific fixes and checks for regressions.
-
-4. Classify new findings. If PASS or PASS_WITH_NOTES, exit loop.
-5. If `round == max_fix_rounds` (default 3) and still FAIL, present remaining issues to the user for direction. Options:
-   - Accept remaining issues and proceed to advisory
-   - Continue fixing (reset round counter)
-   - Abort
-
-**Exit criteria:** Reviewer returns PASS / PASS_WITH_NOTES, or user accepts remaining issues.
+**Exit criteria:** Reviewer returns `PASS` / `PASS_WITH_NOTES`, or the user explicitly accepts the residual issues.
 
 ## Phase 6: ADVISORY
 
-Final quality gate — adversarial review of the full diff.
-
-This is a hard gate. The feature is not done until advisory passes or the user explicitly accepts the findings.
+Run the final adversarial gate against the full diff.
 
 1. Generate the diff scope:
 
-   ```bash
-   git diff "$BASE_REF"..HEAD --stat
-   ```
+```bash
+git diff "$BASE_REF"..HEAD --stat
+```
 
-2. Run adversarial review. Prefer the project's `review` command if available:
+2. Prefer the project review command if available:
 
-   ```bash
-   review --adversarial --scope branch --base "$BASE_REF" --wait
-   ```
+```bash
+review --adversarial --scope branch --base "$BASE_REF" --wait
+```
 
-   If `review` is not available, dispatch to a fresh OpenCode session with the **Advisory Review** prompt from `references/prompt-templates.md`. Include the full diff and the deliverable standard.
+3. If that is not available, dispatch to a fresh OpenCode companion session using the **Advisory Review** template from `references/prompt-templates.md`.
+4. If Critical or High findings remain:
+   - do one more generator fix round by reusing `GENERATOR_SID`
+   - re-run advisory once
+   - do not loop forever
 
-3. If Critical or High findings:
-   - One more Generator fix round (resume `GENERATOR_SID`)
-   - Re-run advisory
-   - Repeat at most once (bounded — don't loop forever)
-4. Present advisory output to user.
-
-**Exit criteria:** Advisory returns no Critical/High findings, OR user explicitly accepts the remaining findings.
+**Exit criteria:** Advisory returns no Critical / High findings, or the user explicitly accepts the remaining issues.
 
 ## Phase 7: DONE
 
 Finalize and verify completeness.
 
-1. **Checklist verification.** Cross-reference every checklist item from the exec-plan feature against the implementation. Each item must be demonstrably satisfied.
-2. **Update exec-plan.** Mark completed items:
+1. Cross-check every checklist item from the exec-plan against the implementation.
+2. Update the exec-plan checklist items.
+3. Verify documentation consistency:
+   - authority references still match implementation
+   - terminology is consistent
+   - no stale examples remain
+4. If doc gaps exist, update them in Claude by default.
+   Only send a doc step to OpenCode if it is a clearly mechanical, code-coupled transformation.
+5. Present a completion summary:
+   - files changed
+   - checklist items satisfied
+   - advisory status
+   - any accepted residual issues
 
-   ```
-   - [ ] item → - [x] item
-   ```
-
-3. **Documentation consistency.** Verify:
-   - Authority docs referenced in the feature are consistent with the implementation
-   - Terminology matches what's used in the codebase
-   - No orphaned references or stale examples
-4. If doc gaps found, dispatch one more Generator task (resume `GENERATOR_SID`) to update docs.
-5. Present completion summary:
-   - Files changed
-   - Checklist items satisfied
-   - Advisory status
-   - Any accepted residual issues
-
-**Exit criteria:** All checklist items marked complete, docs consistent, summary presented.
+**Exit criteria:** Checklist complete, docs consistent, summary delivered.
 
 ---
 
+## Runtime safety rules
+
+- There are no `/task-iteration generate` or `/task-iteration fix-loop` subcommands. Do not invent phase-specific slash commands when the user asks for command patterns.
+- When the user asks for phase command patterns, show the actual companion `task` / `attach` patterns from this skill.
+- Do not use raw `opencode run` in this workflow.
+- Prefer companion-managed `task` / `attach` flows.
+- Treat session reuse as the default path for fix loops.
+- Treat timeouts as ambiguous until attach / verification says otherwise.
+- Do not confuse progress signals with completion.
+- Verify artifacts, diffs, and validation output before advancing phases.
+
 ## Error handling
 
-- **OpenCode session fails to start:** Check `opencode serve` is running. Run `/opencode:setup` if needed.
-- **Session ID becomes invalid (serve restart):** Start fresh sessions. Copy relevant context from the conversation into the new session's prompt.
-- **User interrupts mid-phase:** Record current state (phase, session IDs, BASE_REF). Resume by re-invoking `/task-iteration` with `--resume` flag or by picking up from the last completed phase.
-- **Fix loop exhausted:** Always escalate to user. Never silently accept a failing state.
+- **Companion / serve not ready:** use the OpenCode runtime setup/check flow before Phase 3.
+- **Session id invalid after a serve restart:** start fresh sessions and explicitly carry forward the relevant context.
+- **Background job still running:** use companion `status` / `result` rather than guessing.
+- **Fix loop exhausted:** always escalate to the user.
 
-## Integration with other skills
+## Integration notes
 
-- `/opencode:task` — alternative dispatch mechanism for simpler tasks
-- `/opencode:rescue` — if the Generator gets stuck on a hard problem
-- `/opencode:setup` — ensure OpenCode is ready before Phase 3
-- `/simplify` — optional post-advisory cleanup pass
+- `/opencode:task` can still be used as a simpler manual entrypoint for one-off execution lanes.
+- `/opencode:rescue` is appropriate if a generator thread gets stuck and you need a follow-up intervention.
+- This skill should follow the hidden orchestrator skill's ownership rules rather than redefining them.

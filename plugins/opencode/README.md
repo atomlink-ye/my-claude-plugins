@@ -125,14 +125,11 @@ user-invocable: false
 
 ### Hooks（hooks/）
 
-会话生命周期钩子，用于管理 OpenCode serve 进程：
+默认不在 Claude 会话结束时自动停止 managed serve。OpenCode 运行时现在偏向**长生命周期、可复用会话**，由显式命令管理：
 
 ```json
 {
-  "hooks": [
-    { "event": "SessionStart", "command": "node scripts/opencode-companion.mjs ensure-serve" },
-    { "event": "SessionEnd",   "command": "node scripts/opencode-companion.mjs cleanup" }
-  ]
+  "hooks": {}
 }
 ```
 
@@ -147,17 +144,17 @@ user-invocable: false
 ### 运行测试
 
 ```bash
-# 验证 OpenCode serve 是否可用
-node scripts/opencode-companion.mjs check
+# 验证 managed serve 状态
+node scripts/opencode-companion.mjs serve status --server-directory ~
 
 # 手动启动 serve（调试用）
-opencode serve --port 4321
+node scripts/opencode-companion.mjs serve start --server-directory ~
 
-# 发送测试任务
-node scripts/opencode-companion.mjs task "帮我写一个 hello world 函数"
+# 新建一个任务会话
+node scripts/opencode-companion.mjs session new --directory . -- "帮我写一个 hello world 函数"
 
-# 查看任务状态
-node scripts/opencode-companion.mjs status
+# 查看会话列表
+node scripts/opencode-companion.mjs session list --directory .
 ```
 
 ### 本地安装插件
