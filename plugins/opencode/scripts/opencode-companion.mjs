@@ -30,7 +30,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/opencode-companion.mjs check [--directory SERVER_DIR]",
       "  node scripts/opencode-companion.mjs ensure-serve [--port N] [--directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs task [--directory WORK_DIR] [--server-directory SERVER_DIR] [--session SID] [--model MODEL] [--async] [--background] [--timeout MINS] PROMPT",
+      "  node scripts/opencode-companion.mjs task [--directory WORK_DIR] [--server-directory SERVER_DIR] [--session SID] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] PROMPT",
       "  node scripts/opencode-companion.mjs review [--wait|--background] [--base REF] [--scope auto|working-tree|branch] [--adversarial] [focus text] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs attach [session-id] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs status [job-id] [--directory WORK_DIR] [--all]",
@@ -891,6 +891,10 @@ function spawnBackgroundTaskWorker(directory, jobId, prompt, args = {}) {
 
   if (args.model) {
     childArgs.push("--model", args.model);
+  }
+
+  if (args.agent) {
+    childArgs.push("--agent", args.agent);
   }
 
   if (args.timeout) {
@@ -1791,7 +1795,7 @@ async function createSession(baseUrl, directory) {
   return String(sessionId);
 }
 
-function buildTaskPayload(prompt, model) {
+function buildTaskPayload(prompt, model, agent) {
   const payload = {
     parts: [
       {
@@ -1803,7 +1807,47 @@ function buildTaskPayload(prompt, model) {
   if (model) {
     payload.model = model;
   }
+  if (agent) {
+    payload.agent = agent;
+  }
   return payload;
+}
+
+// Agent resolution: prefer "orchestrator" if it is registered on the serve.
+// Per-process cache keyed by baseUrl+directory so we don't re-fetch on each
+// background-worker subprocess separately, but DO re-fetch when serve restarts.
+const __agentListCache = new Map();
+
+async function listAvailableAgents(baseUrl, directory) {
+  const cacheKey = `${baseUrl}::${directory}`;
+  if (__agentListCache.has(cacheKey)) {
+    return __agentListCache.get(cacheKey);
+  }
+  try {
+    const response = await requestJson(baseUrl, "/agent", { directory, timeoutMs: 5000 });
+    const names = Array.isArray(response)
+      ? response.map((entry) => (entry && typeof entry.name === "string" ? entry.name : null)).filter(Boolean)
+      : [];
+    __agentListCache.set(cacheKey, names);
+    return names;
+  } catch (error) {
+    log(`Could not list OpenCode agents: ${error.message}`);
+    __agentListCache.set(cacheKey, []);
+    return [];
+  }
+}
+
+// Resolve which agent to send. Explicit --agent always wins; otherwise
+// default to "orchestrator" if it's registered, else null (serve default).
+async function resolveAgent(baseUrl, directory, requested) {
+  if (requested) {
+    return String(requested);
+  }
+  const names = await listAvailableAgents(baseUrl, directory);
+  if (names.includes("orchestrator")) {
+    return "orchestrator";
+  }
+  return null;
 }
 
 async function listSessionMessages(baseUrl, directory, sessionId) {
@@ -2186,7 +2230,7 @@ async function monitorSession({
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--async", "--background"],
-    stringFlags: ["--directory", "--server-directory", "--model", "--job-id", "--timeout", "--session"]
+    stringFlags: ["--directory", "--server-directory", "--model", "--job-id", "--timeout", "--session", "--agent"]
   });
 
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
@@ -2202,6 +2246,7 @@ async function handleTask(argv) {
 
   const rawModel = options.model == null ? null : String(options.model);
   const model = parseModelOption(options.model);
+  const requestedAgent = options.agent ? String(options.agent).trim() : null;
   const jobId = options["job-id"] ?? null;
   const existingSessionId = options.session ? String(options.session).trim() : null;
   const timeoutMins = options.timeout ? Number(options.timeout) : 20;
@@ -2232,6 +2277,7 @@ async function handleTask(argv) {
       child = spawnBackgroundTaskWorker(directory, backgroundJobId, prompt, {
         serverDirectory,
         model: rawModel,
+        agent: requestedAgent,
         timeout: timeoutMins
       });
     } catch (error) {
@@ -2331,6 +2377,11 @@ async function handleTask(argv) {
       log(`Created OpenCode session ${sessionId} on port ${state.port}.`);
     }
 
+    var resolvedAgent = await resolveAgent(baseUrl, directory, requestedAgent);
+    if (resolvedAgent) {
+      log(`Using OpenCode agent: ${resolvedAgent}${requestedAgent ? "" : " (auto-selected)"}`);
+    }
+
     if (jobId) {
       const currentJob = readJob(directory, jobId);
       if (currentJob?.status === "cancelled") {
@@ -2357,7 +2408,7 @@ async function handleTask(argv) {
       await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         directory,
-        body: buildTaskPayload(prompt, model)
+        body: buildTaskPayload(prompt, model, resolvedAgent)
       });
       process.stdout.write(
         [
@@ -2396,7 +2447,7 @@ async function handleTask(argv) {
       await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         directory,
-        body: buildTaskPayload(prompt, model),
+        body: buildTaskPayload(prompt, model, resolvedAgent),
         timeoutMs: 30000, // Small timeout for starting the task
         signal: onSignalAbort.signal
       });
