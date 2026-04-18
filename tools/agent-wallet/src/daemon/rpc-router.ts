@@ -36,7 +36,15 @@ export class RpcRouter {
 
   private readonly readonlyMethodSet = new Set<string>(this.readonlyMethods);
 
-  constructor(private readonly rpcUrl: string) {}
+  constructor(private rpcUrl: string) {}
+
+  setRpcUrl(rpcUrl: string): void {
+    this.rpcUrl = rpcUrl;
+  }
+
+  getRpcUrl(): string {
+    return this.rpcUrl;
+  }
 
   isReadOnly(method: string): boolean {
     return this.readonlyMethodSet.has(method);

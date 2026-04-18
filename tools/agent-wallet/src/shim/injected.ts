@@ -1,17 +1,7 @@
-export function getInjectedShimCode(
-  wsPort: number,
-  address: string,
-  chainId: number,
-): string {
-  const normalizedAddress = address.toLowerCase();
-  const chainIdHex = `0x${chainId.toString(16)}`;
-
+export function getInjectedShimCode(wsPort: number): string {
   return `(function () {
     var config = {
-      wsUrl: ${JSON.stringify(`ws://127.0.0.1:${wsPort}`)},
-      address: ${JSON.stringify(normalizedAddress)},
-      chainIdHex: ${JSON.stringify(chainIdHex)},
-      chainIdDec: ${JSON.stringify(String(chainId))}
+      wsUrl: ${JSON.stringify(`ws://127.0.0.1:${wsPort}`)}
     };
 
     var globalObject = typeof globalThis !== 'undefined' ? globalThis : window;
@@ -25,9 +15,10 @@ export function getInjectedShimCode(
     var ws = null;
     var connected = false;
     var destroyed = false;
-    var currentAddress = config.address;
-    var currentChainId = config.chainIdHex;
-    var currentChainNumeric = config.chainIdDec;
+    var currentAddress = null;
+    var currentChainId = '0x1';
+    var currentChainNumeric = '1';
+    var initialStateReceived = false;
     var providerUuid = createUuid();
     var providerInfo = {
       uuid: providerUuid,
@@ -185,32 +176,80 @@ export function getInjectedShimCode(
       reconnectDelay = Math.min(reconnectDelay * 2, 5000);
     }
 
+    function applyState(address, chainIdHex) {
+      var nextAddress = typeof address === 'string' ? address.toLowerCase() : null;
+      var nextChainHex = typeof chainIdHex === 'string' ? chainIdHex : currentChainId;
+
+      var addressChanged = nextAddress !== currentAddress;
+      var chainChanged = nextChainHex !== currentChainId;
+
+      currentAddress = nextAddress;
+      if (chainChanged) {
+        currentChainId = nextChainHex;
+        try {
+          currentChainNumeric = String(parseInt(nextChainHex, 16));
+        } catch (_error) {
+          currentChainNumeric = nextChainHex;
+        }
+      }
+
+      if (chainChanged) {
+        emit('chainChanged', currentChainId);
+      }
+      if (addressChanged || !initialStateReceived) {
+        emit('accountsChanged', currentAddress ? [currentAddress] : []);
+      }
+
+      initialStateReceived = true;
+    }
+
     function handleDaemonMessage(event) {
-      var response;
+      var message;
       try {
-        response = JSON.parse(event.data);
+        message = JSON.parse(event.data);
       } catch (_error) {
         return;
       }
 
-      if (!response || response.type !== 'rpc_response' || typeof response.id !== 'string') {
+      if (!message || typeof message !== 'object') {
         return;
       }
 
-      var request = pending.get(response.id);
+      if (message.type === 'event') {
+        if (message.event === 'state') {
+          applyState(message.address, message.chainIdHex);
+          return;
+        }
+        if (message.event === 'accountsChanged') {
+          var accounts = Array.isArray(message.accounts) ? message.accounts : [];
+          applyState(accounts[0] || null, currentChainId);
+          return;
+        }
+        if (message.event === 'chainChanged') {
+          applyState(currentAddress, message.chainIdHex);
+          return;
+        }
+        return;
+      }
+
+      if (message.type !== 'rpc_response' || typeof message.id !== 'string') {
+        return;
+      }
+
+      var request = pending.get(message.id);
       if (!request) {
         return;
       }
 
-      pending.delete(response.id);
-      inflightIds.delete(response.id);
+      pending.delete(message.id);
+      inflightIds.delete(message.id);
 
-      if (response.error) {
-        request.reject(createError(response.error.code, response.error.message));
+      if (message.error) {
+        request.reject(createError(message.error.code, message.error.message));
         return;
       }
 
-      request.resolve(response.result);
+      request.resolve(message.result);
     }
 
     function connectWebSocket() {
@@ -229,8 +268,6 @@ export function getInjectedShimCode(
         connected = true;
         reconnectDelay = 250;
         emit('connect', { chainId: currentChainId });
-        emit('chainChanged', currentChainId);
-        emit('accountsChanged', currentAddress ? [currentAddress] : []);
         flushQueue();
       });
 
@@ -270,9 +307,9 @@ export function getInjectedShimCode(
         throw createError(-32602, 'wallet_switchEthereumChain requires a chainId parameter');
       }
 
-      // Only allow switching to the configured chain
-      if (chain.chainId.toLowerCase() !== config.chainIdHex.toLowerCase()) {
-        throw createError(4902, 'Unrecognized chain ID "' + chain.chainId + '". Only chain ' + config.chainIdHex + ' is supported.');
+      // Only allow switching to the current chain
+      if (chain.chainId.toLowerCase() !== currentChainId.toLowerCase()) {
+        throw createError(4902, 'Unrecognized chain ID "' + chain.chainId + '". Only chain ' + currentChainId + ' is supported.');
       }
 
       return null;

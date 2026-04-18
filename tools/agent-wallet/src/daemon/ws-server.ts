@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { Hex } from 'viem';
 
-import type { BridgeConfig, DaemonResponse, PendingRequest, ShimMessage } from '../types/index.js';
+import type { BridgeConfig, DaemonEvent, DaemonResponse, PendingRequest, ShimMessage } from '../types/index.js';
 import { Logger } from './logger.js';
 import { RequestQueue } from './request-queue.js';
 import { RpcRouter } from './rpc-router.js';
@@ -24,27 +24,34 @@ interface TransactionParams {
   chainId?: string | number;
 }
 
+export interface DaemonAccessors {
+  getSigner(): Signer | null;
+  getChainId(): number;
+  getRpcUrl(): string;
+}
+
 export class WsServer {
   private server?: WebSocketServer;
 
   private readonly pendingSockets = new Map<string, PendingSocketContext>();
 
-  private readonly chainIdHex: Hex;
-
   constructor(
     private readonly config: BridgeConfig,
     private readonly requestQueue: RequestQueue,
-    private readonly signer: Signer,
     private readonly rpcRouter: RpcRouter,
     private readonly logger: Logger,
+    private readonly accessors: DaemonAccessors,
   ) {
-    this.chainIdHex = `0x${config.chainId.toString(16)}`;
     this.requestQueue.on('approved', (request) => {
       void this.handleApprovedRequest(request);
     });
     this.requestQueue.on('rejected', (request) => {
       this.handleRejectedRequest(request);
     });
+  }
+
+  private get chainIdHex(): Hex {
+    return `0x${this.accessors.getChainId().toString(16)}` as Hex;
   }
 
   async start(): Promise<void> {
@@ -55,6 +62,14 @@ export class WsServer {
     const server = new WebSocketServer({ host: '127.0.0.1', port: this.config.wsPort });
 
     server.on('connection', (socket) => {
+      // Push current state so the shim doesn't need to bake address/chain
+      this.sendToSocket(socket, {
+        type: 'event',
+        event: 'state',
+        address: this.accessors.getSigner()?.getAddress() ?? null,
+        chainIdHex: this.chainIdHex,
+      });
+
       socket.on('message', (data) => {
         void this.handleSocketMessage(socket, data);
       });
@@ -98,6 +113,20 @@ export class WsServer {
     this.pendingSockets.clear();
   }
 
+  /** Broadcast a daemon event to every connected shim. */
+  broadcast(event: DaemonEvent): void {
+    if (!this.server) {
+      return;
+    }
+
+    const payload = JSON.stringify(event);
+    for (const client of this.server.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    }
+  }
+
   private async handleSocketMessage(socket: WebSocket, rawData: RawData): Promise<void> {
     let message: unknown;
 
@@ -113,7 +142,8 @@ export class WsServer {
 
     try {
       if (message.method === 'eth_requestAccounts' || message.method === 'eth_accounts') {
-        this.sendResponse(socket, { type: 'rpc_response', id: message.id, result: [this.signer.getAddress()] });
+        const address = this.accessors.getSigner()?.getAddress();
+        this.sendResponse(socket, { type: 'rpc_response', id: message.id, result: address ? [address] : [] });
         return;
       }
 
@@ -123,7 +153,6 @@ export class WsServer {
       }
 
       if (message.method === 'wallet_switchEthereumChain') {
-        // Only allow switching to the configured chain; reject others
         const requestedChain = (message.params[0] as { chainId?: string })?.chainId;
         if (requestedChain && requestedChain.toLowerCase() !== this.chainIdHex.toLowerCase()) {
           this.sendError(socket, message.id, 4902, `Unrecognized chain ID "${requestedChain}". Only chain ${this.chainIdHex} is supported.`);
@@ -134,6 +163,10 @@ export class WsServer {
       }
 
       if (message.method === 'personal_sign' || message.method === 'eth_signTypedData_v4' || message.method === 'eth_sendTransaction') {
+        if (!this.accessors.getSigner()) {
+          this.sendError(socket, message.id, 4100, 'No wallet account configured. Call set_private_key via MCP first.');
+          return;
+        }
         this.enqueueApprovalRequest(socket, message);
         return;
       }
@@ -204,13 +237,18 @@ export class WsServer {
   }
 
   private async fulfillApprovedRequest(request: PendingRequest): Promise<unknown> {
+    const signer = this.accessors.getSigner();
+    if (!signer) {
+      throw new Error('No wallet account configured');
+    }
+
     switch (request.method) {
       case 'personal_sign':
-        return this.signer.signMessage(this.getPersonalSignPayload(request.params));
+        return signer.signMessage(this.getPersonalSignPayload(request.params));
       case 'eth_signTypedData_v4':
-        return this.signer.signTypedData(this.getTypedDataPayload(request.params));
+        return signer.signTypedData(this.getTypedDataPayload(request.params));
       case 'eth_sendTransaction':
-        return this.signer.sendTransaction(this.getTransactionPayload(request.params), this.config.rpcUrl);
+        return signer.sendTransaction(this.getTransactionPayload(request.params, signer), this.accessors.getRpcUrl());
       default:
         throw new Error(`Unsupported approval method: ${request.method}`);
     }
@@ -255,7 +293,7 @@ export class WsServer {
     };
   }
 
-  private getTransactionPayload(params: unknown[]): Record<string, unknown> {
+  private getTransactionPayload(params: unknown[], signer: Signer): Record<string, unknown> {
     const candidate = params.find((param) => typeof param === 'object' && param !== null);
 
     if (!candidate) {
@@ -265,7 +303,7 @@ export class WsServer {
     const transaction = { ...(candidate as TransactionParams) };
 
     if (!transaction.from) {
-      transaction.from = this.signer.getAddress();
+      transaction.from = signer.getAddress();
     }
 
     return transaction;
@@ -298,12 +336,16 @@ export class WsServer {
     return method === 'eth_sendTransaction' ? 'transaction.failed' : 'signature.rejected';
   }
 
-  private sendResponse(socket: WebSocket, response: DaemonResponse): void {
+  private sendToSocket(socket: WebSocket, message: DaemonResponse | DaemonEvent): void {
     if (socket.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    socket.send(JSON.stringify(response));
+    socket.send(JSON.stringify(message));
+  }
+
+  private sendResponse(socket: WebSocket, response: DaemonResponse): void {
+    this.sendToSocket(socket, response);
   }
 
   private sendError(socket: WebSocket, id: string, code: number, message: string): void {
@@ -318,7 +360,6 @@ export class WsServer {
     for (const [requestId, context] of this.pendingSockets.entries()) {
       if (context.socket === socket) {
         this.pendingSockets.delete(requestId);
-        // Reject orphaned pending requests so they don't linger approvable
         const request = this.requestQueue.get(requestId);
         if (request && request.status === 'pending') {
           try {

@@ -26,9 +26,14 @@ export interface DaemonResponse {
   error?: { code: number; message: string };
 }
 
+export type DaemonEvent =
+  | { type: 'event'; event: 'state'; address: string | null; chainIdHex: string }
+  | { type: 'event'; event: 'accountsChanged'; accounts: string[] }
+  | { type: 'event'; event: 'chainChanged'; chainIdHex: string };
+
 export interface BridgeConfig {
-  /** Private key hex (0x-prefixed) for the signer vault */
-  privateKey: `0x${string}`;
+  /** Private key hex (0x-prefixed) for the signer vault. Optional — can be set later via MCP. */
+  privateKey?: `0x${string}`;
   /** Chain ID to present to the Dapp (default: 42161 Arbitrum One) */
   chainId: number;
   /** Upstream RPC URL for read-only requests */
@@ -43,7 +48,7 @@ export interface BridgeConfig {
   dbPath: string;
 }
 
-export const DEFAULT_CONFIG: Omit<BridgeConfig, 'privateKey'> & { privateKey?: `0x${string}` } = {
+export const DEFAULT_CONFIG: BridgeConfig = {
   chainId: 42161,
   rpcUrl: 'https://arb1.arbitrum.io/rpc',
   wsPort: 18545,
