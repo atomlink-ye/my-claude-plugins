@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { renderBackgroundTaskStart } from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
+import { renderBackgroundTaskStart, renderTaskSummary } from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
 
 describe("renderBackgroundTaskStart", () => {
   it("renders the basic case", () => {
     expect(renderBackgroundTaskStart("task-abc123-def456", "/abs/scripts/opencode-companion.mjs")).toBe(
-      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode-companion.mjs' status task-abc123-def456\n"
+      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode-companion.mjs' job status task-abc123-def456\n"
     );
   });
 
@@ -12,7 +12,7 @@ describe("renderBackgroundTaskStart", () => {
     expect(
       renderBackgroundTaskStart("task-abc123-def456", "/abs/scripts/opencode companion.mjs", "/tmp/my project")
     ).toBe(
-      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode companion.mjs' status task-abc123-def456 --directory '/tmp/my project'\n"
+      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode companion.mjs' job status task-abc123-def456 --directory '/tmp/my project'\n"
     );
   });
 
@@ -20,7 +20,7 @@ describe("renderBackgroundTaskStart", () => {
     expect(
       renderBackgroundTaskStart("task-abc123-def456", "/abs/scripts/opencode-companion.mjs", "/tmp/dir's project")
     ).toBe(
-      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode-companion.mjs' status task-abc123-def456 --directory '/tmp/dir'\\''s project'\n"
+      "OpenCode task started in background as task-abc123-def456. Check status: node '/abs/scripts/opencode-companion.mjs' job status task-abc123-def456 --directory '/tmp/dir'\\''s project'\n"
     );
   });
 
@@ -31,5 +31,25 @@ describe("renderBackgroundTaskStart", () => {
     expect(
       renderBackgroundTaskStart("task-abc123-def456", "/abs/scripts/opencode-companion.mjs", undefined)
     ).not.toContain("--directory");
+  });
+});
+
+describe("renderTaskSummary", () => {
+  it("renders delegated guidance without leaking the raw busy status as the main result", () => {
+    const summary = renderTaskSummary({
+      session_id: "ses_demo",
+      directory: "/tmp/demo",
+      status: "delegated",
+      completion_mode: "delegated_settled",
+      raw_session_status: "busy"
+    });
+
+    expect(summary).toContain("Status: delegated");
+    expect(summary).toContain("Wrapper completion: delegated_settled");
+    expect(summary).toContain("Root session raw status: busy");
+    expect(summary).toContain("Delegation to subagents is normal");
+    expect(summary).toContain("session status ses_demo");
+    expect(summary).toContain("session attach ses_demo");
+    expect(summary).not.toContain("Status: busy\n");
   });
 });

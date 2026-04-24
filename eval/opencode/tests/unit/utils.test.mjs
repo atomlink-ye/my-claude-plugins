@@ -38,6 +38,9 @@ describe("utility helpers", () => {
 
   it("derives failed result statuses without collapsing them to completed", () => {
     expect(deriveResultStatus({ terminalStatus: "idle", abortedBySignal: false })).toBe("completed");
+    expect(deriveResultStatus({ terminalStatus: "busy", abortedBySignal: false, completionMode: "delegated_settled" })).toBe("delegated");
+    expect(deriveResultStatus({ terminalStatus: "busy", abortedBySignal: false, completionMode: "quiescence" })).toBe("completed");
+    expect(deriveResultStatus({ terminalStatus: "busy", abortedBySignal: false, completionMode: "descendant_failed" })).toBe("failed");
     expect(deriveResultStatus({ terminalStatus: "failed", abortedBySignal: false })).toBe("failed");
     expect(deriveResultStatus({ terminalStatus: "cancelled", abortedBySignal: false })).toBe("cancelled");
     expect(deriveResultStatus({ terminalStatus: "idle", abortedBySignal: true })).toBe("aborted");

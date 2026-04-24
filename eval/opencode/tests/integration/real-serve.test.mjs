@@ -214,7 +214,7 @@ try {
     suiteReady = false;
   } else {
     setupGitWorkspace(workspaceDir);
-    const probe = await spawnCompanion(["check", "--directory", workspaceDir], {
+    const probe = await spawnCompanion(["serve", "status", "--server-directory", workspaceDir], {
       timeoutMs: 25_000
     });
 
@@ -239,8 +239,8 @@ describeMaybe("real opencode serve lifecycle", () => {
 
   beforeAll(async () => {
     const result = await runAndAssertSuccessful(
-      "ensure-serve",
-      ["ensure-serve", "--directory", workspaceDir],
+      "serve start",
+      ["serve", "start", "--server-directory", workspaceDir],
       { timeoutMs: 25_000 }
     );
 
@@ -251,7 +251,7 @@ describeMaybe("real opencode serve lifecycle", () => {
 
   afterAll(async () => {
     try {
-      await spawnCompanion(["cleanup", "--directory", workspaceDir], {
+      await spawnCompanion(["serve", "stop", "--server-directory", workspaceDir], {
         timeoutMs: 20_000
       });
     } finally {
@@ -279,11 +279,11 @@ describeMaybe("real opencode serve lifecycle", () => {
   );
 
   test(
-    "status shows the running serve",
+    "job list / serve status surface shows the running serve",
     async () => {
       const result = await runAndAssertSuccessful(
-        "status",
-        ["status", "--directory", workspaceDir],
+        "serve status",
+        ["serve", "status", "--server-directory", workspaceDir],
         { timeoutMs: 15_000 }
       );
 
@@ -295,12 +295,13 @@ describeMaybe("real opencode serve lifecycle", () => {
   );
 
   test(
-    `task --model ${TEST_MODEL} (foreground)`,
+    `session new --model ${TEST_MODEL} (foreground)`,
     async () => {
       const startedAt = Date.now();
       const result = await spawnCompanion(
         [
-          "task",
+          "session",
+          "new",
           "--directory",
           workspaceDir,
           "--model",
@@ -323,12 +324,13 @@ describeMaybe("real opencode serve lifecycle", () => {
   );
 
   test(
-    `task --background --model ${TEST_MODEL}`,
+    `session new --background --model ${TEST_MODEL}`,
     async () => {
       const start = await runAndAssertSuccessful(
         "background task start",
         [
-          "task",
+          "session",
+          "new",
           "--directory",
           workspaceDir,
           "--background",
@@ -345,8 +347,8 @@ describeMaybe("real opencode serve lifecycle", () => {
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         const status = await runAndAssertSuccessful(
-          `status ${jobId}`,
-          ["status", jobId, "--directory", workspaceDir],
+          `job status ${jobId}`,
+          ["job", "status", jobId, "--directory", workspaceDir],
           { timeoutMs: 10_000 }
         );
         statusOutput = status.stdout;
@@ -364,8 +366,8 @@ describeMaybe("real opencode serve lifecycle", () => {
       expect(jobRecord.status).toBe("completed");
 
       const result = await runAndAssertSuccessful(
-        `result ${jobId}`,
-        ["result", jobId, "--directory", workspaceDir],
+        `job result ${jobId}`,
+        ["job", "result", jobId, "--directory", workspaceDir],
         { timeoutMs: 15_000 }
       );
       expect(result.stdout.trim()).not.toHaveLength(0);
@@ -379,7 +381,8 @@ describeMaybe("real opencode serve lifecycle", () => {
       const start = await runAndAssertSuccessful(
         "cancel target start",
         [
-          "task",
+          "session",
+          "new",
           "--directory",
           workspaceDir,
           "--background",
@@ -393,8 +396,8 @@ describeMaybe("real opencode serve lifecycle", () => {
       const jobId = extractJobId(start.stdout);
 
       const cancel = await runAndAssertSuccessful(
-        `cancel ${jobId}`,
-        ["cancel", jobId, "--directory", workspaceDir],
+        `job cancel ${jobId}`,
+        ["job", "cancel", jobId, "--directory", workspaceDir],
         { timeoutMs: 15_000 }
       );
       expect(cancel.stdout).toContain(`Cancelled background job ${jobId}.`);
@@ -403,8 +406,8 @@ describeMaybe("real opencode serve lifecycle", () => {
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         const status = await runAndAssertSuccessful(
-          `status ${jobId}`,
-          ["status", jobId, "--directory", workspaceDir],
+          `job status ${jobId}`,
+          ["job", "status", jobId, "--directory", workspaceDir],
           { timeoutMs: 10_000 }
         );
         statusOutput = status.stdout;
@@ -458,8 +461,8 @@ describeMaybe("real opencode serve lifecycle", () => {
     "cleanup stops the serve",
     async () => {
       const cleanup = await runAndAssertSuccessful(
-        "cleanup",
-        ["cleanup", "--directory", workspaceDir],
+        "serve stop",
+        ["serve", "stop", "--server-directory", workspaceDir],
         { timeoutMs: 20_000 }
       );
 

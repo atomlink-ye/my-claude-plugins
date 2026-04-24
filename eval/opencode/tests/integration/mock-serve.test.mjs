@@ -55,8 +55,242 @@ async function makeGitWorkspace() {
   return dir;
 }
 
+function delegatedCompanionEnv(binDir) {
+  return {
+    PATH: `${binDir}:${process.env.PATH || ""}`,
+    OPENCODE_FORCE_QUIESCENCE_TIMEOUT_MS: "80",
+    OPENCODE_STATUS_POLL_INTERVAL_MS: "10",
+    OPENCODE_SETTLING_CHECK_INTERVAL_MS: "10"
+  };
+}
+
+function installDelegatedPromptScenario(server, {
+  rootText = "Delegating to @explorer...",
+  childSummary = "@explorer finished",
+  nestedChildSummary = null,
+  childSlug = "explorer-child",
+  nestedChildSlug = "explorer-grandchild",
+  childTerminalStatus = "idle",
+  nestedChildTerminalStatus = "idle"
+} = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const userMessageId = `msg_user_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const childSessionId = `ses_child_${String(++ctx.scope.counter)}`;
+    const promptText = String(ctx.body?.parts?.[0]?.text ?? "").trim();
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+
+    messages.push(
+      {
+        info: { id: userMessageId, sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: promptText, id: "prt_user" }]
+      },
+      {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_delegate" }]
+      }
+    );
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "busy";
+    session.summary = rootText;
+    session.updatedAt = new Date().toISOString();
+
+    const childSession = {
+      id: childSessionId,
+      slug: childSlug,
+      parentID: sessionId,
+      status: nestedChildSummary ? "busy" : childTerminalStatus,
+      createdAt: new Date(Date.now() - 1000).toISOString(),
+      updatedAt: new Date().toISOString(),
+      directory: ctx.directory,
+      summary: childSummary
+    };
+    ctx.scope.sessions.unshift(childSession);
+    ctx.scope.sessionsById.set(childSessionId, childSession);
+    ctx.scope.messagesBySessionId.set(childSessionId, []);
+
+    ctx.pushEvent({
+      type: "session.status",
+      properties: {
+        sessionID: sessionId,
+        status: { type: "busy" }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_delegate",
+        field: "text",
+        delta: rootText
+      }
+    });
+    ctx.pushEvent({
+      type: "session.status",
+      properties: {
+        sessionID: childSessionId,
+        status: { type: "busy" }
+      }
+    });
+
+    if (nestedChildSummary) {
+      const nestedChildSessionId = `ses_grandchild_${String(++ctx.scope.counter)}`;
+      const nestedChildSession = {
+        id: nestedChildSessionId,
+        slug: nestedChildSlug,
+        parentID: childSessionId,
+        status: nestedChildTerminalStatus,
+        createdAt: new Date(Date.now() - 500).toISOString(),
+        updatedAt: new Date().toISOString(),
+        directory: ctx.directory,
+        summary: nestedChildSummary
+      };
+      ctx.scope.sessions.unshift(nestedChildSession);
+      ctx.scope.sessionsById.set(nestedChildSessionId, nestedChildSession);
+      ctx.scope.messagesBySessionId.set(nestedChildSessionId, []);
+      ctx.pushEvent({
+        type: "session.status",
+        properties: {
+          sessionID: nestedChildSessionId,
+          status: { type: "busy" }
+        }
+      });
+      if (nestedChildTerminalStatus === "failed") {
+        ctx.pushEvent({
+          type: "session.error",
+          properties: {
+            sessionID: nestedChildSessionId,
+            message: "nested child failed"
+          }
+        });
+      } else {
+        ctx.pushEvent({
+          type: "session.idle",
+          properties: {
+            sessionID: nestedChildSessionId
+          }
+        });
+      }
+      if (childTerminalStatus === "failed") {
+        ctx.pushEvent({
+          type: "session.error",
+          properties: {
+            sessionID: childSessionId,
+            message: "child failed"
+          }
+        });
+      } else {
+        ctx.pushEvent({
+          type: "session.idle",
+          properties: {
+            sessionID: childSessionId
+          }
+        });
+        childSession.status = childTerminalStatus;
+        childSession.updatedAt = new Date().toISOString();
+      }
+    } else if (childTerminalStatus === "failed") {
+      ctx.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: childSessionId,
+          message: "child failed"
+        }
+      });
+      childSession.status = "failed";
+      childSession.updatedAt = new Date().toISOString();
+    } else {
+      ctx.pushEvent({
+        type: "session.idle",
+        properties: {
+          sessionID: childSessionId
+        }
+      });
+    }
+
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_delegate" }]
+      }
+    };
+  });
+
+  return () => {
+    server.setResponse(promptRoute, null);
+  };
+}
+
+function installQuietRootPromptScenario(server, {
+  rootText = "quiet root response"
+} = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const userMessageId = `msg_user_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const promptText = String(ctx.body?.parts?.[0]?.text ?? "").trim();
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+
+    messages.push(
+      {
+        info: { id: userMessageId, sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: promptText, id: "prt_user" }]
+      },
+      {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_root" }]
+      }
+    );
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "busy";
+    session.summary = rootText;
+    session.updatedAt = new Date().toISOString();
+
+    ctx.pushEvent({
+      type: "session.status",
+      properties: {
+        sessionID: sessionId,
+        status: { type: "busy" }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_root",
+        field: "text",
+        delta: rootText
+      }
+    });
+
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_root" }]
+      }
+    };
+  });
+
+  return () => {
+    server.setResponse(promptRoute, null);
+  };
+}
+
 describe("mock serve integration tests", () => {
-  test("check reports the managed serve port without spawning a probe serve", async () => {
+  test("serve status reports the managed serve port without spawning a probe serve", async () => {
     const workspace = tempWorkspace("opencode-check-managed-");
     const markerFile = path.join(workspace, "serve-invocations.log");
     const binDir = path.join(workspace, "bin");
@@ -69,7 +303,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const result = await spawnCompanion(["check", "--directory", workspace], {
+    const result = await spawnCompanion(["serve", "status", "--server-directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -82,13 +316,13 @@ describe("mock serve integration tests", () => {
     expect(fs.existsSync(markerFile)).toBe(false);
   });
 
-  test("check without managed state reports none and does not spawn serve", async () => {
+  test("serve status without managed state reports none and does not spawn serve", async () => {
     const workspace = tempWorkspace("opencode-check-none-");
     const markerFile = path.join(workspace, "serve-invocations.log");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir, { markerFile });
 
-    const result = await spawnCompanion(["check", "--directory", workspace], {
+    const result = await spawnCompanion(["serve", "status", "--server-directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -101,7 +335,7 @@ describe("mock serve integration tests", () => {
     expect(fs.existsSync(markerFile)).toBe(false);
   });
 
-  test("ensure-serve reuses healthy mock server state without spawning serve", async () => {
+  test("serve start reuses healthy mock server state without spawning serve", async () => {
     const workspace = tempWorkspace("opencode-ensure-serve-");
     const markerFile = path.join(workspace, "serve-invocations.log");
     const binDir = path.join(workspace, "bin");
@@ -114,7 +348,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const result = await spawnCompanion(["ensure-serve", "--directory", workspace], {
+    const result = await spawnCompanion(["serve", "start", "--server-directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -126,7 +360,7 @@ describe("mock serve integration tests", () => {
     expect(fs.existsSync(markerFile)).toBe(false);
   });
 
-  test("ensure-serve rejects an unavailable requested port before spawning serve", async () => {
+  test("serve start rejects an unavailable requested port before spawning serve", async () => {
     const workspace = tempWorkspace("opencode-port-unavailable-");
     const markerFile = path.join(workspace, "serve-invocations.log");
     const binDir = path.join(workspace, "bin");
@@ -138,7 +372,7 @@ describe("mock serve integration tests", () => {
     const occupiedPort = typeof address === "object" && address ? address.port : null;
 
     try {
-      const result = await spawnCompanion(["ensure-serve", "--directory", workspace, "--port", String(occupiedPort)], {
+      const result = await spawnCompanion(["serve", "start", "--server-directory", workspace, "--port", String(occupiedPort)], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -153,7 +387,7 @@ describe("mock serve integration tests", () => {
     }
   });
 
-  test("task in foreground creates a session, streams output, and exits 0", async () => {
+  test("session new in foreground creates a session, streams output, and exits 0", async () => {
     const workspace = tempWorkspace("opencode-task-foreground-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -164,7 +398,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const result = await spawnCompanion(["task", "--directory", workspace, "--server-directory", workspace, "--", "write a hello world function"], {
+    const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "write a hello world function"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -176,7 +410,7 @@ describe("mock serve integration tests", () => {
     expect(result.stdout).toContain("Session ID:");
   });
 
-  test("task in foreground finishes even if the idle event is missing", async () => {
+  test("session new in foreground finishes even if the idle event is missing", async () => {
     const workspace = tempWorkspace("opencode-task-no-idle-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -242,7 +476,7 @@ describe("mock serve integration tests", () => {
 
     try {
       const startedAt = Date.now();
-      const result = await spawnCompanion(["task", "--directory", workspace, "--server-directory", workspace, "--", "finish without idle event"], {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "finish without idle event"], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -260,7 +494,7 @@ describe("mock serve integration tests", () => {
     }
   });
 
-  test("task exits non-zero when the session reaches a failed terminal state", async () => {
+  test("session new exits non-zero when the session reaches a failed terminal state", async () => {
     const workspace = tempWorkspace("opencode-task-failed-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -325,7 +559,7 @@ describe("mock serve integration tests", () => {
     });
 
     try {
-      const result = await spawnCompanion(["task", "--directory", workspace, "--server-directory", workspace, "--", "surface a failed session"], {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "surface a failed session"], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -341,7 +575,289 @@ describe("mock serve integration tests", () => {
     }
   });
 
-  test("task --background reports started in background, then status and result complete", async () => {
+  test("session new reports delegated settling as informational instead of an error", async () => {
+    const workspace = tempWorkspace("opencode-delegated-foreground-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installDelegatedPromptScenario(server);
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "delegate this task"
+      ], {
+        cwd: workspace,
+        env: delegatedCompanionEnv(binDir),
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toContain("Finished (settled after delegated activity)");
+      expect(result.stdout).toContain("Status: delegated");
+      expect(result.stdout).toContain("Delegation to subagents is normal");
+      expect(result.stdout).toContain("session status");
+      expect(result.stdout).toContain("session attach");
+      expect(result.stdout).not.toContain("Status: busy");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("background delegated jobs stay non-failed and avoid misleading error output", async () => {
+    const workspace = tempWorkspace("opencode-delegated-background-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installDelegatedPromptScenario(server);
+
+    try {
+      const startResult = await spawnCompanion([
+        "session",
+        "new",
+        "--background",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "delegate this background task"
+      ], {
+        cwd: workspace,
+        env: delegatedCompanionEnv(binDir),
+        timeoutMs: 10000
+      });
+
+      expect(startResult.exitCode).toBe(0);
+      const jobId = startResult.stdout.match(/started in background as (task-[a-f0-9-]+)/i)?.[1];
+      expect(jobId).toBeTruthy();
+
+      const delegatedStatus = await waitFor(async () => {
+        const status = await spawnCompanion([
+          "job",
+          "status",
+          jobId,
+          "--directory",
+          workspace,
+          "--server-directory",
+          workspace
+        ], {
+          cwd: workspace,
+          env: {
+            PATH: `${binDir}:${process.env.PATH || ""}`
+          },
+          timeoutMs: 10000
+        });
+        return status.stdout.includes("| status | delegated |") ? status : null;
+      }, { description: "background delegated job to settle informationally", timeoutMs: 10000, intervalMs: 50 });
+
+      expect(delegatedStatus.stdout).toContain("| status | delegated |");
+      expect(delegatedStatus.stdout).not.toContain("| status | failed |");
+
+      const result = await spawnCompanion([
+        "job",
+        "result",
+        jobId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: delegated");
+      expect(result.stdout).toContain("Delegation to subagents is normal");
+      expect(result.stdout).not.toContain("Error:");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("session status renders a two-level delegated hierarchy without misreporting failure", async () => {
+    const workspace = tempWorkspace("opencode-delegated-two-level-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installDelegatedPromptScenario(server, {
+      rootText: "Root delegated to @manager...",
+      childSummary: "manager lane finished",
+      nestedChildSummary: "explorer leaf finished",
+      childSlug: "manager-lane",
+      nestedChildSlug: "explorer-leaf"
+    });
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "delegate across two layers"
+      ], {
+        cwd: workspace,
+        env: delegatedCompanionEnv(binDir),
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: delegated");
+      const sessionId = result.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
+      expect(sessionId).toBeTruthy();
+
+      const status = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("## Session Hierarchy");
+      expect(status.stdout).toContain("Root delegated to @manager...");
+      expect(status.stdout).toContain("manager lane finished");
+      expect(status.stdout).toContain("explorer leaf finished");
+      expect(status.stdout).toContain("descendant count | 2");
+      expect(status.stdout).toContain("root");
+      expect(status.stdout).toContain("child");
+      expect(status.stdout).not.toContain("| hierarchy verdict | failed |");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("delegated fallback fails when a descendant session fails", async () => {
+    const workspace = tempWorkspace("opencode-delegated-descendant-failed-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installDelegatedPromptScenario(server, {
+      rootText: "Root delegated to @manager...",
+      childSummary: "manager lane failed",
+      nestedChildSummary: "explorer leaf failed",
+      childSlug: "manager-lane",
+      nestedChildSlug: "explorer-leaf",
+      childTerminalStatus: "failed",
+      nestedChildTerminalStatus: "failed"
+    });
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "delegate into a failing subtree"
+      ], {
+        cwd: workspace,
+        env: delegatedCompanionEnv(binDir),
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("Status: failed");
+      expect(result.stdout).not.toContain("Status: delegated");
+      expect(result.stderr).toContain("descendant session status failed");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("quiet non-delegated sessions still settle after bounded quiescence", async () => {
+    const workspace = tempWorkspace("opencode-quiet-root-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installQuietRootPromptScenario(server, {
+      rootText: "root became quiet"
+    });
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "be quiet after first response"
+      ], {
+        cwd: workspace,
+        env: {
+          ...delegatedCompanionEnv(binDir),
+          OPENCODE_QUIESCENCE_TIMEOUT_MS: "80"
+        },
+        timeoutMs: 4000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: completed");
+      expect(result.stdout).toContain("Wrapper completion: quiescence");
+      expect(result.stdout).toContain("Root session raw status: busy");
+      expect(result.stdout).not.toContain("Delegation to subagents is normal");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("session new --background reports started in background, then job status and result complete", async () => {
     const workspace = tempWorkspace("opencode-task-background-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -357,7 +873,7 @@ describe("mock serve integration tests", () => {
       return await ctx.next();
     });
 
-    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--server-directory", workspace, "--", "background job"], {
+    const startResult = await spawnCompanion(["session", "new", "--background", "--directory", workspace, "--server-directory", workspace, "--", "background job"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -370,7 +886,7 @@ describe("mock serve integration tests", () => {
     const jobId = match[1];
 
     const runningStatus = await waitFor(async () => {
-      const status = await spawnCompanion(["status", jobId, "--directory", workspace], {
+      const status = await spawnCompanion(["job", "status", jobId, "--directory", workspace], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -383,7 +899,7 @@ describe("mock serve integration tests", () => {
     expect(runningStatus).toContain(jobId);
 
     const completedStatus = await waitFor(async () => {
-      const status = await spawnCompanion(["status", jobId, "--directory", workspace], {
+      const status = await spawnCompanion(["job", "status", jobId, "--directory", workspace], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -395,7 +911,7 @@ describe("mock serve integration tests", () => {
 
     expect(completedStatus).toContain("completed");
 
-    const result = await spawnCompanion(["result", jobId, "--directory", workspace], {
+    const result = await spawnCompanion(["job", "result", jobId, "--directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -407,7 +923,7 @@ describe("mock serve integration tests", () => {
     expect(result.stdout).toContain("mock response");
   });
 
-  test("cancel stops a background task and status shows cancelled", async () => {
+  test("job cancel stops a background task and status shows cancelled", async () => {
     const workspace = tempWorkspace("opencode-task-cancel-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -423,7 +939,7 @@ describe("mock serve integration tests", () => {
       return await ctx.next();
     });
 
-    const startResult = await spawnCompanion(["task", "--background", "--directory", workspace, "--server-directory", workspace, "--", "cancel me"], {
+    const startResult = await spawnCompanion(["session", "new", "--background", "--directory", workspace, "--server-directory", workspace, "--", "cancel me"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -435,7 +951,7 @@ describe("mock serve integration tests", () => {
     expect(jobId).toBeTruthy();
 
     await waitFor(async () => {
-      const status = await spawnCompanion(["status", jobId, "--directory", workspace], {
+      const status = await spawnCompanion(["job", "status", jobId, "--directory", workspace], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -445,7 +961,7 @@ describe("mock serve integration tests", () => {
       return status.stdout.includes("queued") || status.stdout.includes("running") ? status.stdout : null;
     }, { description: "background job to become cancellable", timeoutMs: 10000 });
 
-    const cancelResult = await spawnCompanion(["cancel", jobId, "--directory", workspace], {
+    const cancelResult = await spawnCompanion(["job", "cancel", jobId, "--directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -457,7 +973,7 @@ describe("mock serve integration tests", () => {
     expect(cancelResult.stdout).toContain(`Cancelled background job ${jobId}.`);
 
     const status = await waitFor(async () => {
-      const nextStatus = await spawnCompanion(["status", jobId, "--directory", workspace], {
+      const nextStatus = await spawnCompanion(["job", "status", jobId, "--directory", workspace], {
         cwd: workspace,
         env: {
           PATH: `${binDir}:${process.env.PATH || ""}`
@@ -481,7 +997,7 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const initialTask = await spawnCompanion(["task", "--directory", workspace, "--server-directory", workspace, "--", "create a finished session"], {
+    const initialTask = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "create a finished session"], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
@@ -494,7 +1010,7 @@ describe("mock serve integration tests", () => {
     expect(sessionId).toBeTruthy();
 
     const startedAt = Date.now();
-    const attachResult = await spawnCompanion(["attach", sessionId, "--directory", workspace, "--server-directory", workspace], {
+    const attachResult = await spawnCompanion(["session", "attach", sessionId, "--directory", workspace, "--server-directory", workspace], {
       cwd: workspace,
       env: {
         PATH: `${binDir}:${process.env.PATH || ""}`
