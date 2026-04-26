@@ -20,6 +20,7 @@ This skill owns:
 - session reuse
 - timeout / false-negative recovery
 - background job handling
+- review execution surfaces
 - result handling
 - artifact verification after companion runs
 
@@ -46,6 +47,8 @@ They should not invent repository analysis that the companion did not produce.
 ${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs
 ```
 
+Inside the OpenCode plugin, `${CLAUDE_PLUGIN_ROOT}` refers to the plugin root itself, so the companion lives directly under `scripts/`.
+
 ## Supported companion verbs
 
 Primary namespaced surface:
@@ -67,6 +70,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job status <job-id> 
 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job wait <job-id> [--directory WORK_DIR] [--timeout MINS]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job result <job-id> [--directory WORK_DIR]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" job cancel <job-id> [--directory WORK_DIR]
+
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review [--directory WORK_DIR] [--scope auto|working-tree|branch] [--base REF] [--wait|--background] [--adversarial] [FOCUS_TEXT]
 ```
 
 ## Two kinds of state: do not mix them up
@@ -153,6 +158,12 @@ Only start a fresh session when:
 ## Foreground, background, and async
 
 Default timeout for session work is now **60 minutes** unless explicitly overridden with `--timeout`.
+
+Important runtime behavior update:
+- the companion should **not** auto-force the `orchestrator` agent when no `--agent` is supplied
+- if you want `orchestrator`, request it explicitly with `--agent orchestrator`
+- otherwise let OpenCode/serve use its own default agent selection
+- this avoids surprise nested delegation and the misleading force-quiescence endings that previously surfaced as `safety timeout`
 
 ### Foreground `session new` / `session continue`
 
@@ -263,8 +274,13 @@ If the artifact is missing or incomplete:
 
 ## Review mode
 
+The companion also exposes a higher-level `review` surface on top of repo git state.
 Use `review` when you want a code review against repo state.
 Use `review --adversarial` when you want a stronger challenge pass.
+
+This is a runtime surface, but it is **not** part of the minimal serve/session/job lifecycle core.
+When you want the user-facing wrapper, prefer plugin commands such as `/opencode:review` or `/opencode:adversarial-review`.
+When you need low-level control, call the companion `review` command directly.
 
 These are runtime surfaces, not strategy surfaces.
 The orchestrator decides **when** to invoke them.

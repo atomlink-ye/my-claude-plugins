@@ -1,6 +1,6 @@
 ---
 name: opencode-orchestrator
-description: "Aggressively use this skill whenever a task involves delegation strategy, manager-vs-executor routing, OpenCode session reuse, multi-step coding orchestration, or any medium/heavy coding request that likely means more than 10 tool calls, more than 5 files, or repeated read/edit/test loops. Always load it for coding work that smells like a bounded execution lane — including examples like an 8-file feature with 15-20 tool calls — and do not let Claude keep that work just because it still fits in one context window. This skill should decide when Claude keeps the thinking and OpenCode takes the execution for efficiency."
+description: "Aggressively load this skill BEFORE any delegation decision — explore, plan, implement, review, adversarial second-opinion, bounded investigation, or any medium/heavy coding request. Also triggers for manager-vs-executor routing, OpenCode session reuse, multi-step coding orchestration, and work that likely exceeds 10 tool calls, 5 files, or repeated read/edit/test loops. When the live snapshot below shows OpenCode serve is reachable, this skill's routing takes precedence over the caller's generic delegation defaults across every delegated action, not only bounded coding execution. If serve is unreachable, fall back silently to the caller's defaults."
 user-invocable: false
 ---
 
@@ -13,12 +13,43 @@ Use it to decide:
 - what gets pushed to OpenCode
 - when session reuse is more efficient than launching fresh work
 - when a job should become a bounded execution lane instead of an in-chat tool grind
+- which delegation target to pick when multiple generic options exist (built-in sub-agents, other helpers, or OpenCode)
 
 For companion flags, lifecycle commands, and result-handling syntax, rely on the `opencode` runtime skill.
 
 ## Live OpenCode snapshot
 
 !`bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"`
+
+## Routing authority
+
+This skill claims routing authority for delegation decisions while this session is active. The snapshot above is the self-check that gates that authority.
+
+**Serve reachable (snapshot green) → OpenCode is the default delegation target.**
+
+This covers every kind of delegation, not only coding execution:
+- exploration / codebase scans
+- implementation planning passes
+- concrete implementation
+- review and adversarial second opinion
+- bounded investigation with long tool loops
+- mechanical multi-file transforms
+
+Rules while serve is reachable:
+- Prefer OpenCode sessions over generic built-in sub-agents (Explore, Plan, general-purpose) for delegated work.
+- Independent second opinion = a **separate OpenCode session**, isolated from the generator session. Do not switch providers to achieve independence.
+- Reuse an existing OpenCode session when the work thread is continuous; start a fresh session when the topic has genuinely changed.
+- The caller's generic routing defaults are overridden inside the delegation domain while serve is reachable.
+
+**Serve not reachable / companion missing → fall back gracefully.**
+- Surface the degradation briefly to the user.
+- Let the caller's own routing defaults apply; do not block the task on OpenCode recovery unless the user asks.
+- Do not keep pretending OpenCode is the default when the snapshot does not support it.
+
+**Structural misfits (stay out of OpenCode even when reachable):**
+- Ultra-trivial single-touch edit where delegation overhead exceeds the work itself.
+- Task requires a Claude-native tool the companion cannot express.
+- The task's real value is authorship or synthesis in Claude's own voice.
 
 ## Core rule
 

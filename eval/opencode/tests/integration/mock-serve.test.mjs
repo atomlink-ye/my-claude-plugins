@@ -289,6 +289,143 @@ function installQuietRootPromptScenario(server, {
   };
 }
 
+function installTransportAcceptedPromptScenario(server, {
+  rootText = "request accepted after transport timeout",
+  settleDelayMs = 120,
+  finalStatus = "idle"
+} = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const userMessageId = `msg_user_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const promptText = String(ctx.body?.parts?.[0]?.text ?? "").trim();
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+
+    messages.push(
+      {
+        info: { id: userMessageId, sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: promptText, id: "prt_user" }]
+      },
+      {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_transport" }]
+      }
+    );
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "busy";
+    session.summary = rootText;
+    session.updatedAt = new Date().toISOString();
+
+    ctx.pushEvent({
+      type: "session.status",
+      properties: {
+        sessionID: sessionId,
+        status: { type: "busy" }
+      }
+    });
+
+    const timer = setTimeout(() => {
+      session.status = finalStatus;
+      session.updatedAt = new Date().toISOString();
+      ctx.pushEvent({
+        type: finalStatus === "failed" ? "session.error" : "session.idle",
+        properties: {
+          sessionID: sessionId,
+          ...(finalStatus === "failed" ? { message: "transport accepted scenario failed" } : {})
+        }
+      });
+    }, settleDelayMs);
+    timer.unref?.();
+
+    await ctx.wait(settleDelayMs + 80);
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_transport" }]
+      }
+    };
+  });
+
+  return () => {
+    server.setResponse(promptRoute, null);
+  };
+}
+
+function installTransportClosedDelegatedScenario(server, {
+  rootText = "Delegating despite an early stream close...",
+  childSummary = "explorer finished after transport closed",
+  childSlug = "explorer-after-stream-close"
+} = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  const eventRoute = "GET /event";
+
+  server.setResponse(eventRoute, async () => ({
+    status: 200,
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+    body: ""
+  }));
+
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const childSessionId = `ses_child_${String(++ctx.scope.counter)}`;
+    const userMessageId = `msg_user_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const promptText = String(ctx.body?.parts?.[0]?.text ?? "").trim();
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+
+    messages.push(
+      {
+        info: { id: userMessageId, sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: promptText, id: "prt_user" }]
+      },
+      {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_delegate" }]
+      }
+    );
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "busy";
+    session.summary = rootText;
+    session.updatedAt = new Date().toISOString();
+
+    const childSession = {
+      id: childSessionId,
+      slug: childSlug,
+      parentID: sessionId,
+      status: "idle",
+      createdAt: new Date(Date.now() - 1000).toISOString(),
+      updatedAt: new Date().toISOString(),
+      directory: ctx.directory,
+      summary: childSummary
+    };
+    ctx.scope.sessions.unshift(childSession);
+    ctx.scope.sessionsById.set(childSessionId, childSession);
+    ctx.scope.messagesBySessionId.set(childSessionId, []);
+
+    await ctx.wait(60);
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [{ type: "text", text: rootText, id: "prt_delegate" }]
+      }
+    };
+  });
+
+  return () => {
+    server.setResponse(promptRoute, null);
+    server.setResponse(eventRoute, null);
+  };
+}
+
 describe("mock serve integration tests", () => {
   test("serve status reports the managed serve port without spawning a probe serve", async () => {
     const workspace = tempWorkspace("opencode-check-managed-");
@@ -854,6 +991,92 @@ describe("mock serve integration tests", () => {
       expect(result.stdout).not.toContain("Delegation to subagents is normal");
     } finally {
       restorePromptRoute();
+    }
+  });
+
+  test("delegated sessions still settle cleanly when the event stream closes before a terminal root status", async () => {
+    const workspace = tempWorkspace("opencode-stream-close-delegated-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restoreRoutes = installTransportClosedDelegatedScenario(server);
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "delegate after early stream close"
+      ], {
+        cwd: workspace,
+        env: {
+          ...delegatedCompanionEnv(binDir),
+          OPENCODE_STREAM_CLOSE_GRACE_MS: "80"
+        },
+        timeoutMs: 4000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: delegated");
+      expect(result.stdout).toContain("Wrapper completion: delegated_settled");
+      expect(result.stdout).toContain("Hierarchy verdict: quiet_delegated");
+      expect(result.stdout).toContain("Recommended action: session_status_or_attach");
+      expect(result.stderr).toContain("Event stream closed before a terminal root status");
+      expect(result.stderr).not.toContain("event stream ended before session completion");
+    } finally {
+      restoreRoutes();
+    }
+  });
+
+  test("prompt submit transport timeouts fall back to session monitoring when OpenCode accepts the work", async () => {
+    const workspace = tempWorkspace("opencode-prompt-timeout-recover-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restoreRoutes = installTransportAcceptedPromptScenario(server);
+
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "recover after prompt submit timeout"
+      ], {
+        cwd: workspace,
+        env: {
+          ...delegatedCompanionEnv(binDir),
+          OPENCODE_PROMPT_SUBMIT_TIMEOUT_MS: "40"
+        },
+        timeoutMs: 2000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: completed");
+      expect(result.stderr).toContain("Prompt submission timed out");
+      expect(result.stderr).toContain("checking session state in case OpenCode accepted the work");
+      expect(result.stderr).not.toContain("aborted the task request before it completed");
+    } finally {
+      restoreRoutes();
     }
   });
 

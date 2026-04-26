@@ -41,12 +41,16 @@ describe("renderTaskSummary", () => {
       directory: "/tmp/demo",
       status: "delegated",
       completion_mode: "delegated_settled",
-      raw_session_status: "busy"
+      raw_session_status: "busy",
+      hierarchy_verdict: "quiet_delegated",
+      recommended_action: "session_status_or_attach"
     });
 
     expect(summary).toContain("Status: delegated");
     expect(summary).toContain("Wrapper completion: delegated_settled");
     expect(summary).toContain("Root session raw status: busy");
+    expect(summary).toContain("Hierarchy verdict: quiet_delegated");
+    expect(summary).toContain("Recommended action: session_status_or_attach");
     expect(summary).toContain("Delegation to subagents is normal");
     expect(summary).toContain("session status ses_demo");
     expect(summary).toContain("session attach ses_demo");

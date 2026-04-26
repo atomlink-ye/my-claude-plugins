@@ -143,13 +143,14 @@ Delegate the initial implementation to OpenCode companion.
 
 Use the companion-managed task flow, not raw `opencode run`.
 When the user asks for the concrete GENERATE or FIX LOOP command pattern, answer with these `opencode-companion.mjs` command forms directly rather than inventing extra `/task-iteration` subcommands.
+In this marketplace-level skill, `${CLAUDE_PLUGIN_ROOT}` refers to the marketplace root, so the companion lives under `plugins/opencode/scripts/`.
 
 ### Canonical answer shape for command-pattern questions
 
 When the user asks for task-iteration command patterns, the answer should contain:
-1. one **GENERATE** block using companion `task`
-2. one **FIX LOOP** block using companion `task --session "$GENERATOR_SID"`
-3. one **RE-EVALUATE** block using companion `task --session "$REVIEWER_SID"`
+1. one **GENERATE** block using companion `session new`
+2. one **FIX LOOP** block using companion `session continue "$GENERATOR_SID"`
+3. one **RE-EVALUATE** block using companion `session continue "$REVIEWER_SID"`
 4. one sentence explaining why session reuse matters
 
 Do not answer with made-up commands like `/task-iteration generate` or `/task-iteration fix-loop`.
@@ -270,14 +271,23 @@ Run the final adversarial gate against the full diff.
 git diff "$BASE_REF"..HEAD --stat
 ```
 
-2. Prefer the project review command if available:
+2. Prefer the plugin review command if available:
 
 ```bash
-review --adversarial --scope branch --base "$BASE_REF" --wait
+/opencode:adversarial-review --wait --scope branch --base "$BASE_REF"
 ```
 
-3. If that is not available, dispatch to a fresh OpenCode companion session using the **Advisory Review** template from `references/prompt-templates.md`.
-4. If Critical or High findings remain:
+3. If the plugin command is not available, call the low-level companion review surface directly:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" review \
+  --adversarial \
+  --scope branch \
+  --base "$BASE_REF"
+```
+
+4. If neither review surface is available, dispatch to a fresh OpenCode companion session using the **Advisory Review** template from `references/prompt-templates.md`.
+5. If Critical or High findings remain:
    - do one more generator fix round by reusing `GENERATOR_SID`
    - re-run advisory once
    - do not loop forever
@@ -309,9 +319,9 @@ Finalize and verify completeness.
 ## Runtime safety rules
 
 - There are no `/task-iteration generate` or `/task-iteration fix-loop` subcommands. Do not invent phase-specific slash commands when the user asks for command patterns.
-- When the user asks for phase command patterns, show the actual companion `task` / `attach` patterns from this skill.
+- When the user asks for phase command patterns, show the actual companion `session new` / `session continue` / `session attach` patterns from this skill.
 - Do not use raw `opencode run` in this workflow.
-- Prefer companion-managed `task` / `attach` flows.
+- Prefer companion-managed `session` / `job` flows.
 - Treat session reuse as the default path for fix loops.
 - Treat timeouts as ambiguous until attach / verification says otherwise.
 - Do not confuse progress signals with completion.
@@ -321,7 +331,7 @@ Finalize and verify completeness.
 
 - **Companion / serve not ready:** use the OpenCode runtime setup/check flow before Phase 3.
 - **Session id invalid after a serve restart:** start fresh sessions and explicitly carry forward the relevant context.
-- **Background job still running:** use companion `status` / `result` rather than guessing.
+- **Background job still running:** use companion `job status` / `job result` rather than guessing.
 - **Fix loop exhausted:** always escalate to the user.
 
 ## Integration notes

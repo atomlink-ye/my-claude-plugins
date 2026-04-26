@@ -1566,7 +1566,9 @@ function buildTaskResult({
   streamedText,
   status,
   completionMode = "terminal",
-  rawSessionStatus = status
+  rawSessionStatus = status,
+  hierarchyVerdict = null,
+  recommendedAction = null
 }) {
   const assistantNodes = collectAssistantNodes(messages);
   const preferredNode = assistantNodes.at(-1) ?? normalizeMessageArray(messages).at(-1) ?? messages;
@@ -1580,6 +1582,8 @@ function buildTaskResult({
     status,
     completion_mode: completionMode,
     raw_session_status: normalizeSessionStatus(rawSessionStatus),
+    hierarchy_verdict: hierarchyVerdict,
+    recommended_action: recommendedAction,
     text_parts: textParts,
     combined_text: combinedText,
     file_changes: fileChanges,
@@ -1603,6 +1607,12 @@ function renderTaskSummary(result) {
   }
   if (result.raw_session_status && result.raw_session_status !== result.status) {
     lines.push(`Root session raw status: ${result.raw_session_status}`);
+  }
+  if (result.hierarchy_verdict) {
+    lines.push(`Hierarchy verdict: ${result.hierarchy_verdict}`);
+  }
+  if (result.recommended_action) {
+    lines.push(`Recommended action: ${result.recommended_action}`);
   }
 
   if (result.completion_mode === "delegated_settled") {
@@ -2025,6 +2035,101 @@ function deriveResultStatus({ terminalStatus, abortedBySignal, completionMode })
     return "completed";
   }
   return normalizeSessionStatus(terminalStatus);
+}
+
+function deriveTaskHierarchyVerdict({
+  terminalStatus,
+  completionMode,
+  hierarchyVerdict = null,
+  sawDelegatedHierarchy = false,
+  hasPendingDescendants = false,
+  hasFailedDescendants = false,
+  pendingToolSessionIds = []
+}) {
+  if (hierarchyVerdict) {
+    return hierarchyVerdict;
+  }
+  if (completionMode === "descendant_failed" || hasFailedDescendants) {
+    return "descendant_failed";
+  }
+  if (pendingToolSessionIds.length > 0 || hasPendingDescendants) {
+    return sawDelegatedHierarchy ? "active_descendants" : "active";
+  }
+  if (completionMode === "delegated_settled") {
+    return "quiet_delegated";
+  }
+  if (completionMode === "quiescence") {
+    return "quiet_root";
+  }
+  if (isSuccessfulTerminalSessionStatus(terminalStatus)) {
+    return "completed_tree";
+  }
+  if (isFailedTerminalSessionStatus(terminalStatus)) {
+    return sawDelegatedHierarchy ? "descendant_failed" : "failed_root";
+  }
+  if (sawDelegatedHierarchy) {
+    return "quiet_delegated";
+  }
+  if (isBusySessionStatus(terminalStatus)) {
+    return "quiet_root";
+  }
+  return "unknown";
+}
+
+function deriveRecommendedTaskAction({ status, completionMode, hierarchyVerdict }) {
+  if (status === "delegated") {
+    return "session_status_or_attach";
+  }
+  if (status === "failed") {
+    return "inspect_artifacts";
+  }
+  if (status === "aborted") {
+    return "session_status";
+  }
+  if (completionMode === "quiescence" || hierarchyVerdict === "quiet_root") {
+    return "inspect_artifacts_or_session_status";
+  }
+  if (status === "completed") {
+    return "inspect_artifacts";
+  }
+  return "session_attach";
+}
+
+function classifySessionOutcome({
+  sessionId,
+  terminalStatus,
+  rawSessionStatus = terminalStatus,
+  abortedBySignal,
+  completionMode,
+  hierarchyVerdict = null,
+  sawDelegatedHierarchy = false,
+  hasPendingDescendants = false,
+  hasFailedDescendants = false,
+  pendingToolSessionIds = []
+}) {
+  const status = deriveResultStatus({ terminalStatus, abortedBySignal, completionMode });
+  const resolvedHierarchyVerdict = deriveTaskHierarchyVerdict({
+    terminalStatus,
+    completionMode,
+    hierarchyVerdict,
+    sawDelegatedHierarchy,
+    hasPendingDescendants,
+    hasFailedDescendants,
+    pendingToolSessionIds
+  });
+
+  return {
+    status,
+    completionMode: completionMode ?? "terminal",
+    rawSessionStatus: normalizeSessionStatus(rawSessionStatus ?? terminalStatus),
+    hierarchyVerdict: resolvedHierarchyVerdict,
+    recommendedAction: deriveRecommendedTaskAction({
+      sessionId,
+      status,
+      completionMode: completionMode ?? "terminal",
+      hierarchyVerdict: resolvedHierarchyVerdict
+    })
+  };
 }
 
 async function getSessionSummary(baseUrl, directory, sessionId) {
@@ -2820,7 +2925,7 @@ async function monitorSession({
 
       const now = Date.now();
       if (now - startTime > timeoutMs) {
-        log(`Error: Task timed out after ${timeoutMins} minutes.`);
+        log(`Task timed out after ${timeoutMins} minutes.`);
         eventStreamController.abort();
         throw new Error(`Task timed out after ${timeoutMins} minutes.`);
       }
@@ -2882,7 +2987,15 @@ async function monitorSession({
 
       if (isMainFailedTerminal) {
         log(`Finished (session status ${mainSessionStatus}) in directory ${directory}.`);
-        return { done: true, terminalStatus: mainSessionStatus };
+        return {
+          done: true,
+          terminalStatus: mainSessionStatus,
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "failed_root",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
       }
 
       if (hierarchyProgress.hasFailedDescendants) {
@@ -2891,13 +3004,25 @@ async function monitorSession({
           done: true,
           completionMode: "descendant_failed",
           terminalStatus: "failed",
-          rawSessionStatus: mainSessionStatus
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "descendant_failed",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
         };
       }
 
       if (isMainSuccessfulTerminal && !hierarchyProgress.hasPendingDescendants) {
         log(`Finished (session status ${mainSessionStatus}) in directory ${directory}.`);
-        return { done: true, terminalStatus: mainSessionStatus };
+        return {
+          done: true,
+          terminalStatus: mainSessionStatus,
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "completed_tree",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
       }
 
       const hasSeenActivity = directorySessions.size > 0;
@@ -2913,7 +3038,11 @@ async function monitorSession({
           done: true,
           completionMode: "quiescence",
           terminalStatus: "idle",
-          rawSessionStatus: mainSessionStatus
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "quiet_root",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
         };
       }
 
@@ -2928,7 +3057,11 @@ async function monitorSession({
           done: true,
           completionMode: "delegated_settled",
           terminalStatus: mainSessionStatus,
-          rawSessionStatus: mainSessionStatus
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "quiet_delegated",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
         };
       }
     }
@@ -2937,29 +3070,136 @@ async function monitorSession({
 
   let streamResult = await Promise.race([eventStreamPromise, quiescencePromise]);
   if (streamResult.streamClosed) {
-    const deadline = Date.now() + STREAM_CLOSE_GRACE_MS;
-    while (Date.now() < deadline && !onSignalAbort.triggered) {
+    log("Event stream closed before a terminal root status; reconciling via session polling...");
+    let settleDeadline = null;
+    let reconciledResult = null;
+    while (!onSignalAbort.triggered) {
       try {
-        const summary = canUseStatusPolling() ? await refreshSessionHierarchy() : null;
-        if (summary && isTerminalSessionStatus(summary.status)) {
-          break;
+        if (canUseStatusPolling()) {
+          await refreshSessionHierarchy();
         }
       } catch {
         // Ignore polling errors while giving the server a brief chance to settle.
       }
-      await delay(200);
+
+      const now = Date.now();
+      if ((canUseStatusPolling() || directorySessions.size > 0) && settleDeadline == null) {
+        settleDeadline = now + STREAM_CLOSE_GRACE_MS;
+      }
+      if (settleDeadline != null && now >= settleDeadline) {
+        break;
+      }
+      const mainSessionState = directorySessions.get(sessionId);
+      const mainSessionStatus = normalizeSessionStatus(
+        mainSessionState?.status || sessionSummariesById.get(sessionId)?.status || "unknown"
+      );
+      const isMainSuccessfulTerminal = isSuccessfulTerminalSessionStatus(mainSessionStatus);
+      const isMainFailedTerminal = isFailedTerminalSessionStatus(mainSessionStatus);
+      const hierarchyProgress = summarizeHierarchyProgress({
+        rootSessionId: sessionId,
+        hierarchySessionIds,
+        sessionSummariesById,
+        directorySessions,
+        now,
+        pendingGraceMs: HIERARCHY_PENDING_GRACE_MS
+      });
+      let pendingToolSessionIds = [];
+      if (hierarchyProgress.pendingSessionIds.length === 0) {
+        pendingToolSessionIds = await findHierarchySessionsWithPendingToolCalls(
+          baseUrl,
+          directory,
+          [...hierarchySessionIds]
+        );
+      }
+      const hasSeenActivity = directorySessions.size > 0;
+      const msSinceMainActivity = now - lastMainSessionActivityAt;
+      const msSinceDirectoryActivity = now - lastDirectoryActivityAt;
+
+      if (isMainFailedTerminal) {
+        reconciledResult = {
+          done: true,
+          completionMode: "terminal",
+          terminalStatus: mainSessionStatus,
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "failed_root",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
+        break;
+      }
+      if (hierarchyProgress.hasFailedDescendants) {
+        reconciledResult = {
+          done: true,
+          completionMode: "descendant_failed",
+          terminalStatus: "failed",
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "descendant_failed",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
+        break;
+      }
+      if (isMainSuccessfulTerminal && !hierarchyProgress.hasPendingDescendants && pendingToolSessionIds.length === 0) {
+        reconciledResult = {
+          done: true,
+          completionMode: "terminal",
+          terminalStatus: mainSessionStatus,
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "completed_tree",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
+        break;
+      }
+      if (
+        hasSeenActivity &&
+        !sawDelegatedHierarchy &&
+        hierarchyProgress.pendingSessionIds.length === 0 &&
+        pendingToolSessionIds.length === 0 &&
+        msSinceMainActivity >= QUIESCENCE_TIMEOUT_MS
+      ) {
+        reconciledResult = {
+          done: true,
+          completionMode: "quiescence",
+          terminalStatus: "idle",
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "quiet_root",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
+        break;
+      }
+      if (
+        hasSeenActivity &&
+        sawDelegatedHierarchy &&
+        hierarchyProgress.pendingSessionIds.length === 0 &&
+        pendingToolSessionIds.length === 0 &&
+        msSinceDirectoryActivity >= FORCE_QUIESCENCE_TIMEOUT_MS
+      ) {
+        reconciledResult = {
+          done: true,
+          completionMode: "delegated_settled",
+          terminalStatus: mainSessionStatus,
+          rawSessionStatus: mainSessionStatus,
+          hierarchyVerdict: "quiet_delegated",
+          hasPendingDescendants: hierarchyProgress.hasPendingDescendants,
+          hasFailedDescendants: hierarchyProgress.hasFailedDescendants,
+          pendingToolSessionIds
+        };
+        break;
+      }
+
+      await delay(100);
     }
 
-    const finalSummary = canUseStatusPolling() ? await getSessionSummary(baseUrl, directory, sessionId).catch(() => null) : null;
-    if (!finalSummary || !isTerminalSessionStatus(finalSummary.status)) {
+    if (!reconciledResult) {
       throw new Error("OpenCode event stream ended before session completion.");
     }
-    streamResult = {
-      done: true,
-      completionMode: "terminal",
-      terminalStatus: normalizeSessionStatus(finalSummary.status),
-      rawSessionStatus: normalizeSessionStatus(finalSummary.status)
-    };
+    streamResult = reconciledResult;
   }
 
   if (streamResult.aborted || onSignalAbort.triggered) {
@@ -2983,10 +3223,17 @@ async function monitorSession({
     // If we can't fetch messages, at least return what we have
   }
   
-  const resultStatus = deriveResultStatus({
+  const classifiedOutcome = classifySessionOutcome({
+    sessionId,
     terminalStatus: streamResult.terminalStatus,
+    rawSessionStatus: streamResult.rawSessionStatus ?? streamResult.terminalStatus,
     abortedBySignal,
-    completionMode: streamResult.completionMode
+    completionMode: streamResult.completionMode,
+    hierarchyVerdict: streamResult.hierarchyVerdict,
+    sawDelegatedHierarchy,
+    hasPendingDescendants: streamResult.hasPendingDescendants ?? false,
+    hasFailedDescendants: streamResult.hasFailedDescendants ?? false,
+    pendingToolSessionIds: streamResult.pendingToolSessionIds ?? []
   });
 
   const result = buildTaskResult({
@@ -2994,9 +3241,11 @@ async function monitorSession({
     sessionId,
     messages,
     streamedText: printer.getOutput(),
-    status: resultStatus,
-    completionMode: streamResult.completionMode ?? "terminal",
-    rawSessionStatus: streamResult.rawSessionStatus ?? streamResult.terminalStatus
+    status: classifiedOutcome.status,
+    completionMode: classifiedOutcome.completionMode,
+    rawSessionStatus: classifiedOutcome.rawSessionStatus,
+    hierarchyVerdict: classifiedOutcome.hierarchyVerdict,
+    recommendedAction: classifiedOutcome.recommendedAction
   });
 
   const streamedLength = printer.getOutput().trim().length;
@@ -3259,18 +3508,24 @@ async function handleTask(argv) {
 
     // Start the task asynchronously
     try {
+      const promptSubmitTimeoutMs = readEnvDurationMs("OPENCODE_PROMPT_SUBMIT_TIMEOUT_MS", 30000);
       await requestJson(baseUrl, `/session/${encodeURIComponent(sessionId)}/prompt_async`, {
         method: "POST",
         directory,
         body: buildTaskPayload(prompt, model, resolvedAgent),
-        timeoutMs: 30000, // Small timeout for starting the task
+        timeoutMs: promptSubmitTimeoutMs,
         signal: onSignalAbort.signal
       });
       taskLifecycle.promptSubmitted = true;
     } catch (error) {
-      eventStreamController.abort();
-      if (!onSignalAbort.triggered || !isAbortError(error)) {
-        throw error;
+      if (isAbortError(error) && !onSignalAbort.triggered) {
+        log("Prompt submission timed out; checking session state in case OpenCode accepted the work...");
+        taskLifecycle.promptSubmitted = true;
+      } else {
+        eventStreamController.abort();
+        if (!onSignalAbort.triggered || !isAbortError(error)) {
+          throw error;
+        }
       }
     }
 
@@ -3800,6 +4055,7 @@ if (isDirectExecution) {
 
 export {
   buildReviewPrompt,
+  classifySessionOutcome,
   deriveResultStatus,
   generateJobId,
   formatDuration,

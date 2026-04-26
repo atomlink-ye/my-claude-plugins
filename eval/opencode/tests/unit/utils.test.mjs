@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  classifySessionOutcome,
   deriveResultStatus,
   formatDuration,
   generateJobId,
@@ -44,5 +45,24 @@ describe("utility helpers", () => {
     expect(deriveResultStatus({ terminalStatus: "failed", abortedBySignal: false })).toBe("failed");
     expect(deriveResultStatus({ terminalStatus: "cancelled", abortedBySignal: false })).toBe("cancelled");
     expect(deriveResultStatus({ terminalStatus: "idle", abortedBySignal: true })).toBe("aborted");
+  });
+
+  it("classifies delegated outcomes with hierarchy and recommended-action metadata", () => {
+    expect(
+      classifySessionOutcome({
+        sessionId: "ses_demo",
+        terminalStatus: "busy",
+        rawSessionStatus: "busy",
+        abortedBySignal: false,
+        completionMode: "delegated_settled",
+        hierarchyVerdict: "quiet_delegated"
+      })
+    ).toEqual({
+      status: "delegated",
+      completionMode: "delegated_settled",
+      rawSessionStatus: "busy",
+      hierarchyVerdict: "quiet_delegated",
+      recommendedAction: "session_status_or_attach"
+    });
   });
 });
