@@ -19,6 +19,15 @@
       "source": "./plugins/opencode"
     },
     {
+      "name": "daytona",
+      "description": "Manage Daytona sandboxes from Claude Code with safe project-local state and artifact workflows.",
+      "version": "0.1.0",
+      "author": {
+        "name": "atomlink-ye"
+      },
+      "source": "./plugins/daytona"
+    },
+    {
       "name": "google-workspace",
       "description": "Interact with Google Workspace services (Docs, Drive, Sheets, etc.) via the gws CLI.",
       "source": "./",

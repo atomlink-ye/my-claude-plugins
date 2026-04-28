@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 const sharedTestConfig = {
   environment: "node",
-  include: ["eval/opencode/tests/**/*.test.mjs", "eval/opencode/tests/**/*.test.js"],
+  include: ["eval/*/tests/**/*.test.mjs", "eval/*/tests/**/*.test.js"],
   coverage: {
     provider: "v8",
     reporter: ["text", "html"],
@@ -21,7 +21,7 @@ export default defineConfig({
         test: {
           name: "unit",
           environment: "node",
-          include: ["eval/opencode/tests/unit/**/*.test.mjs", "eval/opencode/tests/unit/**/*.test.js"],
+          include: ["eval/*/tests/unit/**/*.test.mjs", "eval/*/tests/unit/**/*.test.js"],
           pool: "forks",
           testTimeout: 5000
         }
@@ -30,7 +30,7 @@ export default defineConfig({
         test: {
           name: "integration",
           environment: "node",
-          include: ["eval/opencode/tests/integration/**/*.test.mjs", "eval/opencode/tests/integration/**/*.test.js"],
+          include: ["eval/*/tests/integration/**/*.test.mjs", "eval/*/tests/integration/**/*.test.js"],
           pool: "forks",
           testTimeout: 30000
         }
