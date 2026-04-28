@@ -7,6 +7,7 @@ import {
   deriveSessionLifecycleVerdict,
   recommendSessionAction,
 } from "../../scripts/opencode-companion.mjs";
+import { DEFAULT_SESSION_TIMEOUT_MINS } from "../../scripts/opencode-companion/constants.mjs";
 
 const companionPath = path.resolve(
   process.cwd(),
@@ -26,7 +27,7 @@ describe("opencode companion command surface", () => {
     expect(source).toContain("job list");
     expect(source).toContain("job status");
     expect(source).toContain("job wait");
-    expect(source).toContain("DEFAULT_SESSION_TIMEOUT_MINS = 60");
+    expect(DEFAULT_SESSION_TIMEOUT_MINS).toBe(60);
     expect(source).not.toContain("Convenience aliases");
   });
 
