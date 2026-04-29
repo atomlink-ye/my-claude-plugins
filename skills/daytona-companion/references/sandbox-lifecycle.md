@@ -18,10 +18,13 @@ node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <comma
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" up \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
+  --class small \
   --env-file "$WORK_DIR/.env.local"
 ```
 
 `up` reconnects to existing project state when present. If the existing sandbox is stopped, the manager starts it and waits for it to become executable before returning.
+
+Use `--class small|medium|large` to request a Daytona class. `small` also maps to the observed self-hosted resource shape (`cpu=1`, `memory=1`, `disk=3`, `gpu=0`) when no explicit resource flags are supplied. Use `--cpu`, `--memory`, `--disk`, and `--gpu` to pass explicit resources. Do not use `DAYTONA_TARGET=small`; `target` is a Daytona region/target selector, not a size.
 
 ## Adopt an existing sandbox
 
@@ -63,6 +66,29 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 ```
 
 Pass commands after `--` so arguments are quoted as literal remote command arguments.
+
+`exec` stores command artifacts under the remote artifact directory and writes `stdout.txt`, `stderr.txt`, `exit-code.txt`, and `manifest.json` for later `pull`.
+
+## Preview URLs
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" preview \
+  --directory "$WORK_DIR" \
+  --port 3000
+```
+
+`preview` prints the preview URL only and does not print separate credentials or environment secrets. Signed preview URLs may contain embedded access material; treat the URL itself as sensitive when sharing logs.
+
+## Real smoke test
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" smoke-test \
+  --class small \
+  --include-git \
+  --include-preview
+```
+
+The smoke test creates a temporary project, runs `up`, `status --refresh`, bundle `push`, remote `exec`, bundle `pull`, optional preview, optional git sync, and always attempts `down` cleanup.
 
 ## Delete
 

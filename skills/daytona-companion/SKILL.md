@@ -1,6 +1,6 @@
 ---
 name: daytona-companion
-description: "Daytona sandbox companion skill. Load for old /daytona:* command terms, sandbox up/status/push/exec/pull/down requests, artifact workflows, global project-scoped Daytona state, env/secrets handling, and questions about the removed slash-command wrappers. Commands are replaced by direct daytona-manager calls under skills/daytona-companion/scripts."
+description: "Daytona sandbox companion skill. Load for old /daytona:* command terms, sandbox up/status/push/exec/pull/down/preview/smoke-test requests, artifact and git-sync workflows, global project-scoped Daytona state, env/secrets handling, and questions about the removed slash-command wrappers. Commands are replaced by direct daytona-manager calls under skills/daytona-companion/scripts."
 user-invocable: true
 ---
 
@@ -20,12 +20,14 @@ node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <comma
 
 ## Quick map from old commands
 
-- `/daytona:up` → `up [--directory DIR] [--task-id ID] ...`
+- `/daytona:up` → `up [--directory DIR] [--task-id ID] [--class small|medium|large] ...`
 - Adopt an existing CLI-created sandbox → `adopt --sandbox-id ID [--directory DIR] [--task-id ID]`
 - `/daytona:status` → `status [--directory DIR] [--refresh]`
-- `/daytona:push` → `push --path PATH [--remote-path PATH]`
+- `/daytona:push` → `push --path PATH [--remote-path PATH] [--mode bundle|git]`
 - `/daytona:exec` → `exec -- COMMAND...`
-- `/daytona:pull` → `pull [--output DIR] [--remote-path PATH]`
+- `/daytona:pull` → `pull [--output DIR] [--remote-path PATH] [--mode bundle|git]`
+- Preview a running service → `preview --port PORT`
+- Real integration smoke test → `smoke-test [--class small] [--include-git] [--include-preview]`
 - `/daytona:down` → `down [--keep-state]`
 
 ## Read next

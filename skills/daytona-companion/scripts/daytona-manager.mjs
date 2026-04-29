@@ -5,13 +5,17 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
-const BOOL_FLAGS = ["--help", "--refresh", "--keep-state"];
-const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--sandbox-id", "--sandbox-name"];
+const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview"];
+const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
+const CLASS_RESOURCE_DEFAULTS = {
+  small: { cpu: 1, memory: 1, disk: 3, gpu: 0 },
+};
 
 function flagName(flag) {
   return flag.replace(/^--/, "");
@@ -59,6 +63,78 @@ function sanitizeTaskId(value, source = "task id") {
     throw new Error(`Invalid ${source}: use only letters, numbers, dots, underscores, and hyphens`);
   }
   return taskId;
+}
+
+function parseResourceNumber(value, source) {
+  if (value === undefined) return undefined;
+  const number = Number(value);
+  const min = source === "gpu" ? 0 : Number.MIN_VALUE;
+  if (!Number.isFinite(number) || number < min) throw new Error(`Invalid ${source}: expected ${source === "gpu" ? "a non-negative" : "a positive"} number`);
+  return number;
+}
+
+function parsePositiveInteger(value, source) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) throw new Error(`Invalid ${source}: expected a positive integer`);
+  return number;
+}
+
+function parsePort(value) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid port: expected integer 1-65535");
+  return port;
+}
+
+function validateSandboxClass(value) {
+  if (value === undefined) return undefined;
+  const normalized = String(value).toLowerCase();
+  if (!["small", "medium", "large"].includes(normalized)) throw new Error("Invalid class: expected small, medium, or large");
+  return normalized;
+}
+
+function collectResources(options = {}) {
+  const resources = {};
+  for (const key of ["cpu", "memory", "disk", "gpu"]) {
+    const parsed = parseResourceNumber(options[key], key);
+    if (parsed !== undefined) resources[key] = parsed;
+  }
+  const sandboxClass = validateSandboxClass(options.class);
+  if (!Object.keys(resources).length && sandboxClass && CLASS_RESOURCE_DEFAULTS[sandboxClass]) return { ...CLASS_RESOURCE_DEFAULTS[sandboxClass] };
+  return Object.keys(resources).length ? resources : undefined;
+}
+
+function hasExplicitResourceFlags(options = {}) {
+  return ["cpu", "memory", "disk", "gpu"].some((key) => options[key] !== undefined);
+}
+
+function toRemoteAbsolute(remotePath) {
+  const normalized = String(remotePath ?? "").replaceAll("\\", "/");
+  if (!normalized) throw new Error("Remote path must not be empty");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.includes("..")) throw new Error(`Unsafe remote path rejected: ${remotePath}`);
+  const absolute = normalized.startsWith("/") ? path.posix.normalize(normalized) : path.posix.normalize(path.posix.join("/home/daytona", normalized));
+  return absolute;
+}
+
+function assertSafeDestructiveRemoteWorkspace(remotePath) {
+  const absolute = toRemoteAbsolute(remotePath);
+  const allowed = ["/home/daytona/workspace/", "/workspace/"];
+  if (!allowed.some((prefix) => absolute.startsWith(prefix)) || ["/", "/home", "/home/daytona", "/home/daytona/workspace", "/workspace", "/tmp"].includes(absolute)) {
+    throw new Error(`Refusing destructive operation on unsafe remote path: ${absolute}`);
+  }
+  return absolute;
+}
+
+function validateGitBranch(branch) {
+  const value = String(branch ?? "").trim();
+  if (!value.startsWith("daytona/")) throw new Error("Git sync branch must be under daytona/");
+  const result = spawnSync("git", ["check-ref-format", "--branch", value], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`Invalid git branch: ${value}`);
+  return value;
+}
+
+function remoteEnsureGitCommand() {
+  return "if ! command -v git >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then SUDO=''; if [ \"$(id -u)\" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi; $SUDO apt-get update && $SUDO apt-get install -y git; elif command -v apk >/dev/null 2>&1; then apk add --no-cache git; else echo 'git not found and no supported package manager available' >&2; exit 127; fi; fi";
 }
 
 function resolveProjectPaths(options = {}) {
@@ -146,15 +222,17 @@ function buildUsage() {
     "Usage: node scripts/daytona-manager.mjs <command> [options]",
     "",
     "Commands:",
-    "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--env-file FILE]",
+    "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--class small|medium|large] [--cpu N --memory GB --disk GB --gpu N] [--env-file FILE]",
     "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
-    "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle]",
+    "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
     "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] -- COMMAND...",
-    "  pull [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH]",
+    "  pull [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
+    "  preview [--directory DIR] [--state-directory DIR] --port PORT [--expires-in SECONDS]",
+    "  smoke-test [--directory DIR] [--state-directory DIR] [--task-id ID] [--class small|medium|large] [--include-git] [--include-preview]",
     "  down [--directory DIR] [--state-directory DIR] [--keep-state] [--env-file FILE]",
     "",
-    "State defaults to ~/.daytona/claude-code/projects/<project-hash>.json keyed by --directory or cwd. Git mode is planned; bundle mode is currently required."
+    "State defaults to ~/.daytona/claude-code/projects/<project-hash>.json keyed by --directory or cwd. Bundle mode syncs files/artifacts; git mode syncs committed Git history into a local branch."
   ].join("\n");
 }
 
@@ -178,8 +256,17 @@ function readProjectState(paths) {
 async function loadDaytonaSdk() {
   try {
     return await import("@daytona/sdk");
-  } catch (error) {
-    throw new Error("Daytona SDK is required for this command. Install it with: pnpm add @daytona/sdk (or install plugin dependencies).");
+  } catch (directImportError) {
+    const fallbackRoots = [
+      process.env.DAYTONA_SDK_MODULE_ROOT,
+      path.join(homedir(), ".claude", "plugins", "marketplaces", "my-claude-plugins"),
+    ].filter(Boolean);
+    for (const root of fallbackRoots) {
+      try {
+        return createRequire(path.join(root, "package.json"))("@daytona/sdk");
+      } catch {}
+    }
+    throw new Error(`Daytona SDK is required for this command. Install it with: pnpm add @daytona/sdk (or install plugin dependencies). Original error: ${directImportError?.message ?? directImportError}`);
   }
 }
 
@@ -317,6 +404,32 @@ function createBundle(inputPath, taskId) {
   return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
 }
 
+function runLocal(command, args, cwd, action) {
+  const result = spawnSync(command, args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`${action} failed: ${result.stderr || result.stdout}`.trim());
+  return result;
+}
+
+function createGitBundle(repoPath, taskId) {
+  const abs = path.resolve(repoPath);
+  if (!existsSync(abs) || !statSync(abs).isDirectory()) throw new Error(`Git mode requires an existing local repository directory: ${abs}`);
+  runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
+  runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check");
+  const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-input-"));
+  const bundlePath = path.join(tempDir, `daytona-git-input-${taskId}.bundle`);
+  runLocal("git", ["bundle", "create", bundlePath, "HEAD"], abs, "git bundle create");
+  return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
+}
+
+function fetchGitBundleIntoBranch(bundlePath, repoPath, branch) {
+  const abs = path.resolve(repoPath);
+  const safeBranch = validateGitBranch(branch);
+  runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
+  const current = spawnSync("git", ["branch", "--show-current"], { cwd: abs, encoding: "utf8" });
+  if (current.status === 0 && current.stdout.trim() === safeBranch) throw new Error(`Refusing to overwrite currently checked-out branch: ${safeBranch}`);
+  runLocal("git", ["fetch", bundlePath, `HEAD:${safeBranch}`, "--force"], abs, "git fetch bundle");
+}
+
 async function sandboxExec(sandbox, command, cwd) {
   if (sandbox.process?.executeCommand) return sandbox.process.executeCommand(command, cwd);
   if (sandbox.process?.exec) return sandbox.process.exec(command, cwd ? { cwd } : undefined);
@@ -358,14 +471,24 @@ async function handleUp(options) {
   const client = await createClient();
   let sandbox = await getSandbox(client, existing?.sandboxId);
   if (!sandbox) {
-    const params = { name: options.name, snapshot: options.snapshot, labels: { taskId: paths.taskId } };
+    const resources = collectResources(options);
+    const params = { name: options.name, snapshot: options.snapshot, resources, labels: { taskId: paths.taskId } };
     for (const key of Object.keys(params)) if (params[key] === undefined) delete params[key];
-    sandbox = await callFirst(client, ["create", "createSandbox"], params);
+    try {
+      sandbox = await callFirst(client, ["create", "createSandbox"], params);
+    } catch (error) {
+      if (!resources || hasExplicitResourceFlags(options)) throw error;
+      console.error(`Daytona SDK rejected class-derived resources (${describeDaytonaError(error)}); retrying with provider defaults.`);
+      const fallbackParams = { ...params };
+      delete fallbackParams.resources;
+      sandbox = await callFirst(client, ["create", "createSandbox"], fallbackParams);
+    }
   }
   sandbox = await ensureSandboxStarted(sandbox);
   const sandboxId = sandbox.id ?? sandbox.sandboxId ?? sandbox.instanceId;
   const now = new Date().toISOString();
-  const state = { projectDirectory: paths.directory, taskId: paths.taskId, sandboxId, remoteWorkspacePath: paths.remoteWorkspacePath, remoteArtifactsPath: paths.remoteArtifactsPath, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  const state = { projectDirectory: paths.directory, taskId: paths.taskId, sandboxId, sandboxClass: validateSandboxClass(options.class) ?? existing?.sandboxClass, resources: collectResources(options) ?? existing?.resources, remoteWorkspacePath: paths.remoteWorkspacePath, remoteArtifactsPath: paths.remoteArtifactsPath, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  for (const key of Object.keys(state)) if (state[key] === undefined) delete state[key];
   writeState(paths, state);
   console.log(JSON.stringify(redactStateForDisplay(state), null, 2));
 }
@@ -427,10 +550,25 @@ async function requireSandbox(options) {
 }
 
 async function handlePush(options) {
-  if ((options.mode ?? "bundle") !== "bundle") throw new Error("Only --mode bundle is implemented; git mode is planned.");
   if (!options.path) throw new Error("push requires --path PATH");
+  const mode = options.mode ?? "bundle";
+  if (!["bundle", "git"].includes(mode)) throw new Error("push --mode must be bundle or git");
   const { paths, state, sandbox } = await requireSandbox(options);
-  const remoteWorkspace = options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath;
+  const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
+  if (mode === "git") {
+    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
+    const safeRemoteWorkspace = assertSafeDestructiveRemoteWorkspace(remoteWorkspace);
+    const { bundlePath, cleanup } = createGitBundle(options.path, paths.taskId);
+    try {
+      const remoteBundle = `/tmp/daytona-git-input-${paths.taskId}.bundle`;
+      await uploadFile(sandbox, bundlePath, remoteBundle);
+      const result = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && rm -rf ${shellQuote(safeRemoteWorkspace)} && mkdir -p ${shellQuote(path.posix.dirname(safeRemoteWorkspace))} && git clone ${shellQuote(remoteBundle)} ${shellQuote(safeRemoteWorkspace)} && cd ${shellQuote(safeRemoteWorkspace)} && git checkout -B ${shellQuote(branch)} && git config user.name ${shellQuote("Daytona Companion")} && git config user.email ${shellQuote("daytona-companion@example.invalid")}`);
+      assertRemoteCommandSuccess(result, "git push sync");
+      writeState(paths, { ...state, remoteWorkspacePath: options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
+      console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch}`);
+    } finally { cleanup(); }
+    return;
+  }
   const { bundlePath, cleanup } = createBundle(options.path, paths.taskId);
   try {
     const remoteBundle = `/tmp/daytona-input-${paths.taskId}.tar.gz`;
@@ -444,10 +582,10 @@ async function handlePush(options) {
 async function handleExec(options, command) {
   if (!command.length) throw new Error("exec requires a command after --");
   const { paths, state, sandbox } = await requireSandbox(options);
-  const artifacts = state.remoteArtifactsPath ?? paths.remoteArtifactsPath;
-  const cwd = options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath;
+  const artifacts = toRemoteAbsolute(state.remoteArtifactsPath ?? paths.remoteArtifactsPath);
+  const cwd = toRemoteAbsolute(options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
   const cmd = command.map(shellQuote).join(" ");
-  const wrapped = `mkdir -p ${shellQuote(artifacts)}; { cd ${shellQuote(cwd)} && ${cmd}; } > ${shellQuote(`${artifacts}/stdout.txt`)} 2> ${shellQuote(`${artifacts}/stderr.txt`)}; code=$?; printf '%s\n' "$code" > ${shellQuote(`${artifacts}/exit-code.txt`)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
+  const wrapped = `mkdir -p ${shellQuote(artifacts)}; ( cd ${shellQuote(cwd)} && ${cmd}; ) > ${shellQuote(`${artifacts}/stdout.txt`)} 2> ${shellQuote(`${artifacts}/stderr.txt`)}; code=$?; printf '%s\n' "$code" > ${shellQuote(`${artifacts}/exit-code.txt`)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
   const result = await sandboxExec(sandbox, wrapped);
   if (result?.stdout) process.stdout.write(String(result.stdout));
   if (result?.stderr) process.stderr.write(String(result.stderr));
@@ -456,7 +594,26 @@ async function handleExec(options, command) {
 
 async function handlePull(options) {
   const { paths, state, sandbox } = await requireSandbox(options);
-  const remotePath = options["remote-path"] ?? state.remoteArtifactsPath ?? paths.remoteArtifactsPath;
+  const mode = options.mode ?? "bundle";
+  if (!["bundle", "git"].includes(mode)) throw new Error("pull --mode must be bundle or git");
+  if (mode === "git") {
+    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
+    const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
+    const remoteBundle = `/tmp/daytona-git-output-${paths.taskId}.bundle`;
+    const commitMessage = `sync from Daytona companion ${new Date().toISOString()}`;
+    const gitResult = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && cd ${shellQuote(remoteWorkspace)} && git config user.name ${shellQuote("Daytona Companion")} && git config user.email ${shellQuote("daytona-companion@example.invalid")} && git add -A && (git diff --cached --quiet || git commit -m ${shellQuote(commitMessage)}) && git bundle create ${shellQuote(remoteBundle)} HEAD`);
+    assertRemoteCommandSuccess(gitResult, "git pull sync bundling");
+    const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-output-"));
+    const localBundle = path.join(tempDir, `daytona-git-output-${paths.taskId}.bundle`);
+    try {
+      await downloadFile(sandbox, remoteBundle, localBundle);
+      fetchGitBundleIntoBranch(localBundle, paths.directory, branch);
+      writeState(paths, { ...state, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
+      console.log(`Fetched remote git changes into local branch ${branch}`);
+    } finally { rmSync(tempDir, { recursive: true, force: true }); }
+    return;
+  }
+  const remotePath = toRemoteAbsolute(options["remote-path"] ?? state.remoteArtifactsPath ?? paths.remoteArtifactsPath);
   const output = path.resolve(options.output ?? paths.localArtifactsPath);
   mkdirSync(output, { recursive: true });
   const remoteBundle = `/tmp/daytona-artifacts-${paths.taskId}.tar.gz`;
@@ -467,6 +624,72 @@ async function handlePull(options) {
   validateTarEntries(listTarEntries(localBundle));
   runTar(["-xzf", localBundle, "-C", output], process.cwd());
   console.log(`Downloaded artifacts to ${output}`);
+}
+
+async function handlePreview(options) {
+  if (!options.port) throw new Error("preview requires --port PORT");
+  const port = parsePort(options.port);
+  const { sandbox } = await requireSandbox(options);
+  let preview;
+  if (options["expires-in"] && typeof sandbox.getSignedPreviewUrl === "function") preview = await sandbox.getSignedPreviewUrl(port, parsePositiveInteger(options["expires-in"], "expires-in"));
+  else if (typeof sandbox.getPreviewLink === "function") preview = await sandbox.getPreviewLink(port);
+  else throw new Error("Sandbox preview URL is not supported by this @daytona/sdk version.");
+  const url = typeof preview === "string" ? preview : (preview?.url ?? preview?.previewUrl);
+  if (!url) throw new Error("Sandbox preview response did not include a URL.");
+  console.log(JSON.stringify({ port, url }, null, 2));
+}
+
+async function handleSmokeTest(options) {
+  const parentDir = path.resolve(options.directory ?? tmpdir());
+  mkdirSync(parentDir, { recursive: true });
+  const testDir = mkdtempSync(path.join(parentDir, "daytona-companion-smoke-"));
+  const smokeStateDir = mkdtempSync(path.join(tmpdir(), "daytona-companion-smoke-state-"));
+  const taskId = sanitizeTaskId(options["task-id"] ?? `smoke-${Date.now()}`, "task id");
+  const inputDir = path.join(testDir, "input");
+  const outputDir = path.join(testDir, "pulled");
+  mkdirSync(inputDir, { recursive: true });
+  writeFileSync(path.join(inputDir, "smoke.txt"), "daytona companion smoke test\n");
+  const defaultEnvFile = path.join(DEFAULT_STATE_ROOT, ".env.local");
+  const baseOptions = { ...options, directory: testDir, "state-directory": smokeStateDir, "task-id": taskId, class: options.class ?? "small", name: options.name ?? `daytona-companion-${taskId}` };
+  if (!baseOptions["env-file"] && existsSync(defaultEnvFile)) baseOptions["env-file"] = defaultEnvFile;
+  const summary = { directory: testDir, taskId, checks: [] };
+  try {
+    await handleUp(baseOptions);
+    summary.checks.push("up");
+    await handleStatus({ ...baseOptions, refresh: true });
+    summary.checks.push("status-refresh");
+    await handlePush({ ...baseOptions, path: inputDir, mode: "bundle" });
+    summary.checks.push("push-bundle");
+    await handleExec(baseOptions, ["sh", "-lc", "grep -q 'daytona companion smoke test' smoke.txt && echo REMOTE_SMOKE_OK"]);
+    summary.checks.push("exec");
+    await handlePull({ ...baseOptions, output: outputDir, mode: "bundle" });
+    const stdout = readFileSync(path.join(outputDir, "stdout.txt"), "utf8");
+    if (!stdout.includes("REMOTE_SMOKE_OK")) throw new Error("Smoke exec stdout did not contain REMOTE_SMOKE_OK");
+    summary.checks.push("pull-bundle");
+    if (options["include-preview"]) {
+      await handleExec(baseOptions, ["sh", "-lc", "(python3 -m http.server 8765 >/tmp/daytona-companion-smoke-http.log 2>&1 &) && echo PREVIEW_SERVER_STARTED"]);
+      await handlePreview({ ...baseOptions, port: "8765" });
+      summary.checks.push("preview");
+    }
+    if (options["include-git"]) {
+      runLocal("git", ["init"], testDir, "smoke git init");
+      runLocal("git", ["add", "."], testDir, "smoke git add");
+      runLocal("git", ["-c", "user.name=Daytona Companion", "-c", "user.email=daytona-companion@example.invalid", "commit", "-m", "initial smoke fixture"], testDir, "smoke git commit");
+      const branch = `daytona/${taskId}`;
+      await handlePush({ ...baseOptions, path: testDir, mode: "git", branch });
+      await handleExec(baseOptions, ["sh", "-lc", "printf 'remote git change\\n' > input/remote-git.txt"]);
+      await handlePull({ ...baseOptions, mode: "git", branch });
+      runLocal("git", ["rev-parse", "--verify", branch], testDir, "smoke git branch verify");
+      const shown = runLocal("git", ["show", `${branch}:input/remote-git.txt`], testDir, "smoke git branch content verify");
+      if (!shown.stdout.includes("remote git change")) throw new Error("Git smoke branch did not contain expected remote change");
+      summary.checks.push("git-sync");
+    }
+    console.log(JSON.stringify({ ok: true, ...summary }, null, 2));
+  } finally {
+    try { await handleDown(baseOptions); } catch (error) { console.error(`Smoke cleanup failed: ${error?.message ?? error}`); }
+    rmSync(testDir, { recursive: true, force: true });
+    rmSync(smokeStateDir, { recursive: true, force: true });
+  }
 }
 
 async function handleDown(options) {
@@ -495,6 +718,8 @@ async function main(argv = process.argv.slice(2)) {
   if (parsed.command === "push") return handlePush(parsed.options);
   if (parsed.command === "exec") return handleExec(parsed.options, parsed.passthrough.length ? parsed.passthrough : parsed.positionals);
   if (parsed.command === "pull") return handlePull(parsed.options);
+  if (parsed.command === "preview") return handlePreview(parsed.options);
+  if (parsed.command === "smoke-test") return handleSmokeTest(parsed.options);
   if (parsed.command === "down") return handleDown(parsed.options);
   throw new Error(`Unknown command: ${parsed.command}`);
 }
@@ -507,4 +732,4 @@ function isSameRealPath(a, b) {
 const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
-export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, readProjectState, redactStateForDisplay, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };
+export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildUsage, collectResources, createBundle, createGitBundle, downloadFile, fetchGitBundleIntoBranch, hasExplicitResourceFlags, listTarEntries, loadEnvFile, parseArgs, parsePort, readProjectState, redactStateForDisplay, remoteEnsureGitCommand, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries };
