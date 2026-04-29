@@ -104,14 +104,14 @@ function resolveEnvFile(options = {}, paths = resolveProjectPaths(options)) {
   if (options["env-file"]) return path.resolve(options["env-file"]);
   const projectEnvFile = path.join(paths.directory, ".env.local");
   if (existsSync(projectEnvFile)) return projectEnvFile;
-  const globalEnvFile = path.join(homedir(), ".daytona", "ENV");
+  const globalEnvFile = path.join(paths.stateRoot, ".env.local");
   return existsSync(globalEnvFile) ? globalEnvFile : null;
 }
 
 function resolveEnvFiles(options = {}, paths = resolveProjectPaths(options)) {
   if (options["env-file"]) return [path.resolve(options["env-file"])];
   const files = [];
-  const globalEnvFile = path.join(homedir(), ".daytona", "ENV");
+  const globalEnvFile = path.join(paths.stateRoot, ".env.local");
   const projectEnvFile = path.join(paths.directory, ".env.local");
   if (existsSync(globalEnvFile)) files.push(globalEnvFile);
   if (existsSync(projectEnvFile)) files.push(projectEnvFile);
@@ -124,7 +124,9 @@ function applyDaytonaEnv(env = {}) {
 }
 
 function applyProjectEnv(options = {}, paths = resolveProjectPaths(options)) {
-  for (const envFile of resolveEnvFiles(options, paths)) applyDaytonaEnv(loadEnvFile(envFile));
+  const env = {};
+  for (const envFile of resolveEnvFiles(options, paths)) Object.assign(env, loadEnvFile(envFile));
+  applyDaytonaEnv(env);
 }
 
 function redactStateForDisplay(state = {}) {
@@ -505,4 +507,4 @@ function isSameRealPath(a, b) {
 const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
-export { applyDaytonaEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, readProjectState, redactStateForDisplay, resolveEnvFile, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };
+export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, readProjectState, redactStateForDisplay, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };

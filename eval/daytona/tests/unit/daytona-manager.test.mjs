@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyDaytonaEnv,
+  applyProjectEnv,
   assertRemoteCommandSuccess,
   buildUsage,
   createBundle,
@@ -15,6 +16,7 @@ import {
   parseArgs,
   redactStateForDisplay,
   resolveEnvFile,
+  resolveEnvFiles,
   resolveProjectPaths,
   sandboxExec,
   sanitizeTaskId,
@@ -65,22 +67,52 @@ describe("daytona-manager env loading", () => {
     }
   });
 
-  it("falls back to ~/.daytona/ENV when no project env file exists", () => {
+  it("falls back to global .env.local under the state root when no project env file exists", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "daytona-global-env-project-test-"));
-    const home = mkdtempSync(path.join(tmpdir(), "daytona-global-env-home-test-"));
-    const oldHome = process.env.HOME;
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-global-env-root-test-"));
     try {
-      mkdirSync(path.join(home, ".daytona"), { recursive: true });
-      const globalEnvFile = path.join(home, ".daytona", "ENV");
+      const globalEnvFile = path.join(stateRoot, ".env.local");
       writeFileSync(globalEnvFile, "DAYTONA_API_KEY=test-key\n");
-      process.env.HOME = home;
 
-      expect(resolveEnvFile({}, resolveProjectPaths({ directory: dir }))).toBe(globalEnvFile);
+      expect(resolveEnvFile({}, resolveProjectPaths({ directory: dir, "state-directory": stateRoot }))).toBe(globalEnvFile);
     } finally {
-      if (oldHome === undefined) delete process.env.HOME;
-      else process.env.HOME = oldHome;
       rmSync(dir, { recursive: true, force: true });
-      rmSync(home, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("loads global .env.local before project .env.local so project values override global values", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "daytona-env-layer-project-test-"));
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-env-layer-root-test-"));
+    const oldApiKey = process.env.DAYTONA_API_KEY;
+    const oldVisible = process.env.VISIBLE;
+    const oldShared = process.env.SHARED;
+    try {
+      const globalEnvFile = path.join(stateRoot, ".env.local");
+      const projectEnvFile = path.join(dir, ".env.local");
+      writeFileSync(globalEnvFile, "DAYTONA_API_KEY=global-key\nVISIBLE=global\nSHARED=global\n");
+      writeFileSync(projectEnvFile, "DAYTONA_API_KEY=project-key\nSHARED=project\n");
+
+      const paths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot });
+      expect(resolveEnvFiles({}, paths)).toEqual([globalEnvFile, projectEnvFile]);
+
+      delete process.env.DAYTONA_API_KEY;
+      delete process.env.VISIBLE;
+      delete process.env.SHARED;
+      applyProjectEnv({}, paths);
+
+      expect(process.env.DAYTONA_API_KEY).toBe("project-key");
+      expect(process.env.VISIBLE).toBe("global");
+      expect(process.env.SHARED).toBe("project");
+    } finally {
+      if (oldApiKey === undefined) delete process.env.DAYTONA_API_KEY;
+      else process.env.DAYTONA_API_KEY = oldApiKey;
+      if (oldVisible === undefined) delete process.env.VISIBLE;
+      else process.env.VISIBLE = oldVisible;
+      if (oldShared === undefined) delete process.env.SHARED;
+      else process.env.SHARED = oldShared;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
     }
   });
 
