@@ -8,7 +8,7 @@ import {
   isFailedTerminalSessionStatus,
   isSuccessfulTerminalSessionStatus,
   summarizePrompt
-} from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
+} from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
 
 describe("utility helpers", () => {
   it("generates job ids that match the expected pattern", () => {

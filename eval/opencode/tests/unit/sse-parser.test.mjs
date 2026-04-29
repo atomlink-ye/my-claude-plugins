@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSseBlock } from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
+import { parseSseBlock } from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
 
 describe("parseSseBlock", () => {
   it("parses valid JSON data events", () => {

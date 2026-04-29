@@ -6,7 +6,7 @@ const sharedTestConfig = {
   coverage: {
     provider: "v8",
     reporter: ["text", "html"],
-    include: ["plugins/*/scripts/**"]
+    include: ["skills/*/scripts/**"]
   },
   testTimeout: 30000,
   pool: "forks"

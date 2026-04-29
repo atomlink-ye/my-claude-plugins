@@ -2,12 +2,20 @@
 
 Personal Claude Code plugin marketplace.
 
-## Plugins
+## Companion skills
 
-| Plugin | Description |
-|--------|-------------|
-| [opencode](plugins/opencode/) | Delegate AI coding tasks to OpenCode via its serve API |
+| Skill | Description |
+|-------|-------------|
+| [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
+| [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [task-iteration](skills/task-iteration/) | Orchestrate feature implementation from exec-plans with Plan→Generate→Evaluate workflow |
+
+`opencode` and `daytona` marketplace entries now exist only as deprecated aliases to the companion skills. The old `/opencode:*` and `/daytona:*` slash-command wrappers have been removed/replaced by direct script calls from skills:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new --directory "$WORK_DIR" -- "<prompt>"
+node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" status --directory "$WORK_DIR"
+```
 
 ## Installation
 
@@ -41,12 +49,13 @@ Personal Claude Code plugin marketplace.
 }
 ```
 
-Then enable plugins:
+Then enable companion skills/plugins:
 
 ```json
 {
   "enabledPlugins": {
-    "opencode@my-claude-plugins": true
+    "opencode-companion@my-claude-plugins": true,
+    "daytona-companion@my-claude-plugins": true
   }
 }
 ```

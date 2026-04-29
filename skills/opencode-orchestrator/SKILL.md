@@ -15,7 +15,7 @@ Use it to decide:
 - when a job should become a bounded execution lane instead of an in-chat tool grind
 - which delegation target to pick when multiple generic options exist (built-in sub-agents, other helpers, or OpenCode)
 
-For companion flags, lifecycle commands, and result-handling syntax, rely on the `opencode` runtime skill.
+For companion flags, lifecycle commands, and result-handling syntax, rely on the `opencode-companion` runtime skill and its direct script path under `skills/opencode-companion/scripts/`.
 
 ## Live OpenCode snapshot
 
@@ -208,4 +208,4 @@ This skill does **not** define:
 - background job retrieval syntax
 - direct runtime troubleshooting steps
 
-Those belong in the `opencode` runtime skill and the plugin command wrappers.
+Those belong in the `opencode-companion` runtime skill and direct companion script, not plugin command wrappers.

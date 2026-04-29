@@ -11,21 +11,47 @@
   "plugins": [
     {
       "name": "opencode",
-      "description": "Delegate AI coding tasks to OpenCode via its serve API.",
+      "description": "Deprecated alias for opencode-companion. Slash commands were removed/replaced by the companion skill runtime.",
       "version": "0.1.0",
       "author": {
         "name": "atomlink-ye"
       },
-      "source": "./plugins/opencode"
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/opencode-companion"
+      ]
     },
     {
       "name": "daytona",
-      "description": "Manage Daytona sandboxes from Claude Code with safe project-local state and artifact workflows.",
+      "description": "Deprecated alias for daytona-companion. Slash commands were removed/replaced by the companion skill runtime.",
       "version": "0.1.0",
       "author": {
         "name": "atomlink-ye"
       },
-      "source": "./plugins/daytona"
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/daytona-companion"
+      ]
+    },
+    {
+      "name": "opencode-companion",
+      "description": "OpenCode companion skill for direct serve/session/job/review runtime workflows without slash-command wrappers.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/opencode-companion"
+      ]
+    },
+    {
+      "name": "daytona-companion",
+      "description": "Daytona companion skill for sandbox lifecycle, artifacts, and global project-scoped state without slash-command wrappers.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/daytona-companion"
+      ]
     },
     {
       "name": "google-workspace",

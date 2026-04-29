@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderBackgroundTaskStart, renderTaskSummary } from "../../../../plugins/opencode/scripts/opencode-companion.mjs";
+import { renderBackgroundTaskStart, renderTaskSummary } from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
 
 describe("renderBackgroundTaskStart", () => {
   it("renders the basic case", () => {

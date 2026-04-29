@@ -1,68 +1,68 @@
 {
-  "skill_name": "opencode",
+  "skill_name": "opencode-companion",
   "evals": [
     {
       "id": 1,
       "prompt": "I need to start the OpenCode server for my project at /Users/fan/my-app so I can delegate some work to it later",
-      "expected_output": "Runs ensure-serve via Bash with --directory /Users/fan/my-app. Does NOT spawn an agent subagent.",
+      "expected_output": "Uses the opencode-companion skill and runs the direct companion script serve lifecycle command for /Users/fan/my-app. Does NOT spawn a removed agent wrapper or use removed slash commands.",
       "assertions": [
-        { "id": "a1", "text": "Uses Bash to call opencode-companion.mjs ensure-serve", "type": "behavioral" },
-        { "id": "a2", "text": "Passes --directory /Users/fan/my-app", "type": "behavioral" },
-        { "id": "a3", "text": "Does NOT spawn an Agent or route to opencode-agent", "type": "behavioral" }
+        { "id": "a1", "text": "Uses Bash to call skills/opencode-companion/scripts/opencode-companion.mjs serve status or serve start", "type": "behavioral" },
+        { "id": "a2", "text": "Uses /Users/fan/my-app as the project or server directory as appropriate", "type": "behavioral" },
+        { "id": "a3", "text": "Does NOT route to a removed agent wrapper and does NOT use /opencode:* commands", "type": "behavioral" }
       ]
     },
     {
       "id": 2,
       "prompt": "delegate an analysis of the current project to OpenCode — look at the test coverage and suggest improvements",
-      "expected_output": "Routes through opencode-agent, which ultimately calls opencode-companion.mjs task for the analysis request.",
+      "expected_output": "Uses opencode-companion directly and starts a session with the analysis request via the skill-local companion script.",
       "assertions": [
-        { "id": "b1", "text": "Routes the request through opencode-agent", "type": "behavioral" },
-        { "id": "b1a", "text": "Delegates the first hop to opencode-agent rather than invoking opencode-companion.mjs task directly from the parent", "type": "behavioral" },
-        { "id": "b2", "text": "The agent ultimately calls opencode-companion.mjs task", "type": "behavioral" },
+        { "id": "b1", "text": "Calls skills/opencode-companion/scripts/opencode-companion.mjs session new or session continue directly", "type": "behavioral" },
+        { "id": "b1a", "text": "Does not invoke removed agent or plugin command wrappers", "type": "behavioral" },
+        { "id": "b2", "text": "Uses the session lifecycle surface rather than a removed task command", "type": "behavioral" },
         { "id": "b3", "text": "Prompt forwarded to companion includes the analysis request", "type": "behavioral" }
       ]
     },
     {
       "id": 3,
       "prompt": "continue the previous OpenCode session ses_abcdef123, the project was /Users/fan/my-app — tell it to fix the remaining test failures in auth.test.ts",
-      "expected_output": "Routes through opencode-agent and continues the existing OpenCode session with --session ses_abcdef123 --directory /Users/fan/my-app.",
+      "expected_output": "Uses opencode-companion directly and continues existing session ses_abcdef123 with --directory /Users/fan/my-app.",
       "assertions": [
-        { "id": "c1", "text": "Routes the request through opencode-agent", "type": "behavioral" },
-        { "id": "c1a", "text": "Delegates the first hop to opencode-agent rather than invoking opencode-companion.mjs task directly from the parent", "type": "behavioral" },
-        { "id": "c2", "text": "Passes --session ses_abcdef123", "type": "behavioral" },
+        { "id": "c1", "text": "Calls skills/opencode-companion/scripts/opencode-companion.mjs session continue ses_abcdef123 directly", "type": "behavioral" },
+        { "id": "c1a", "text": "Does not route through removed agent wrappers or old slash commands", "type": "behavioral" },
+        { "id": "c2", "text": "Preserves session id ses_abcdef123", "type": "behavioral" },
         { "id": "c3", "text": "Passes --directory /Users/fan/my-app", "type": "behavioral" },
-        { "id": "c4", "text": "Starts by forwarding to opencode-agent / opencode-companion.mjs task with --session ses_abcdef123 --directory /Users/fan/my-app; does not do a preliminary liveness check or create a fresh session", "type": "behavioral" }
+        { "id": "c4", "text": "Reuses the existing session instead of creating a fresh session", "type": "behavioral" }
       ]
     },
     {
       "id": 4,
       "prompt": "use an agent to handle this OpenCode task: review the API endpoints for security issues",
-      "expected_output": "Routes through opencode-agent and the agent ultimately calls opencode-companion.mjs task.",
+      "expected_output": "Explains that the old agent wrapper was removed and uses direct opencode-companion session or review workflow instead.",
       "assertions": [
-        { "id": "d1", "text": "Routes the request through the opencode-agent wrapper, regardless of the underlying subagent mechanism", "type": "behavioral" },
-        { "id": "d1a", "text": "Delegates the first hop to opencode-agent rather than invoking opencode-companion.mjs task directly from the parent", "type": "behavioral" },
-        { "id": "d2", "text": "The agent ultimately calls opencode-companion.mjs task", "type": "behavioral" }
+        { "id": "d1", "text": "Does not route through the removed agent wrapper", "type": "behavioral" },
+        { "id": "d1a", "text": "Uses direct opencode-companion script invocation", "type": "behavioral" },
+        { "id": "d2", "text": "Chooses session new or review depending on whether the user wants implementation or review", "type": "behavioral" }
       ]
     },
     {
       "id": 5,
       "prompt": "is OpenCode installed and ready? check if the serve is running",
-      "expected_output": "Runs check subcommand via Bash directly.",
+      "expected_output": "Runs serve status via the skill-local companion script directly.",
       "assertions": [
-        { "id": "e1", "text": "Uses Bash to call opencode-companion.mjs check", "type": "behavioral" },
-        { "id": "e2", "text": "Does NOT spawn an Agent subagent", "type": "behavioral" }
+        { "id": "e1", "text": "Uses Bash to call skills/opencode-companion/scripts/opencode-companion.mjs serve status", "type": "behavioral" },
+        { "id": "e2", "text": "Does NOT spawn a removed agent wrapper or use removed slash commands", "type": "behavioral" }
       ]
     },
     {
       "id": 6,
       "prompt": "use the OpenCode agent to run a tiny long-running task: have it sleep for a short time and then report done. Start the initial companion task with an intentionally short timeout so the lifecycle-recovery path is exercised, and do not start a duplicate task if that first wait times out.",
-      "expected_output": "Routes through opencode-agent, starts one OpenCode task session, and if the initial wait times out it continues the same session lifecycle by attaching with a bounded timeout around 5 minutes, re-checking whether that same session is still active, and looping until the original session finishes or clearly fails.",
+      "expected_output": "Uses opencode-companion directly, starts one OpenCode session, and if the initial wait times out it continues the same session lifecycle by attaching with a bounded timeout around 5 minutes, re-checking whether that same session is still active, and looping until the original session finishes or clearly fails.",
       "assertions": [
-        { "id": "f1", "text": "Routes the request through opencode-agent", "type": "behavioral" },
-        { "id": "f2", "text": "Starts the original work with opencode-companion.mjs task", "type": "behavioral" },
-        { "id": "f2a", "text": "The initial opencode-companion.mjs task call uses a deliberately short --timeout to force lifecycle recovery", "type": "behavioral" },
+        { "id": "f1", "text": "Does not route through the removed agent wrapper", "type": "behavioral" },
+        { "id": "f2", "text": "Starts the original work with skills/opencode-companion/scripts/opencode-companion.mjs session new", "type": "behavioral" },
+        { "id": "f2a", "text": "The initial session new call uses a deliberately short --timeout to force lifecycle recovery", "type": "behavioral" },
         { "id": "f3", "text": "If the initial task wait times out, extracts and reuses the same session id instead of starting a duplicate fresh task", "type": "behavioral" },
-        { "id": "f4", "text": "Uses opencode-companion.mjs attach with a short bounded timeout around 5 minutes", "type": "behavioral" },
+        { "id": "f4", "text": "Uses opencode-companion.mjs session attach with a short bounded timeout around 5 minutes", "type": "behavioral" },
         { "id": "f5", "text": "After an attach timeout or drop, re-checks whether the existing session is still active and continues the loop until completion or a clear failure", "type": "behavioral" },
         { "id": "f6", "text": "Returns the final OpenCode output from the original session verbatim once the lifecycle is complete", "type": "behavioral" }
       ]

@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const BOOL_FLAGS = ["--help", "--refresh", "--keep-state"];
-const STRING_FLAGS = ["--directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output"];
+const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
+const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
 
 function flagName(flag) {
   return flag.replace(/^--/, "");
@@ -61,9 +63,13 @@ function sanitizeTaskId(value, source = "task id") {
 
 function resolveProjectPaths(options = {}) {
   const directory = path.resolve(options.directory ?? process.cwd());
-  const stateDir = path.join(directory, ".daytona");
-  const stateFile = path.join(stateDir, "state.json");
-  const state = readState(stateFile);
+  const stateRoot = path.resolve(options["state-directory"] ?? process.env.DAYTONA_STATE_DIR ?? DEFAULT_STATE_ROOT);
+  const projectKey = createHash("sha256").update(directory).digest("hex").slice(0, 16);
+  const stateDir = path.join(stateRoot, "projects");
+  const stateFile = path.join(stateDir, `${projectKey}.json`);
+  const legacyStateDir = path.join(directory, ".daytona");
+  const legacyStateFile = path.join(legacyStateDir, "state.json");
+  const state = readState(stateFile) ?? readState(legacyStateFile);
   const rawTaskId = options["task-id"] ?? state?.taskId;
   const defaultTaskId = path.basename(directory).replace(/[^A-Za-z0-9._-]+/g, "-") || "project";
   const taskId = sanitizeTaskId(rawTaskId ?? defaultTaskId, rawTaskId === undefined ? "default task id" : "task id");
@@ -74,7 +80,7 @@ function resolveProjectPaths(options = {}) {
   if (localArtifactsRelative.startsWith("..") || path.isAbsolute(localArtifactsRelative)) {
     throw new Error("Resolved local artifacts path escapes project directory");
   }
-  return { directory, stateDir, stateFile, taskId, remoteWorkspacePath, remoteArtifactsPath, localArtifactsPath };
+  return { directory, stateRoot, stateDir, stateFile, legacyStateDir, legacyStateFile, projectKey, taskId, remoteWorkspacePath, remoteArtifactsPath, localArtifactsPath };
 }
 
 function loadEnvFile(filePath) {
@@ -127,14 +133,14 @@ function buildUsage() {
     "Usage: node scripts/daytona-manager.mjs <command> [options]",
     "",
     "Commands:",
-    "  up [--directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--env-file FILE]",
-    "  status [--directory DIR] [--refresh] [--env-file FILE]",
-    "  push [--directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle]",
-    "  exec [--directory DIR] [--cwd PATH] -- COMMAND...",
-    "  pull [--directory DIR] [--output DIR] [--remote-path PATH]",
-    "  down [--directory DIR] [--keep-state] [--env-file FILE]",
+    "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--env-file FILE]",
+    "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
+    "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle]",
+    "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] -- COMMAND...",
+    "  pull [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH]",
+    "  down [--directory DIR] [--state-directory DIR] [--keep-state] [--env-file FILE]",
     "",
-    "State defaults to .daytona/state.json under --directory or cwd. Git mode is planned; bundle mode is currently required."
+    "State defaults to ~/.daytona/claude-code/projects/<project-hash>.json keyed by --directory or cwd. Git mode is planned; bundle mode is currently required."
   ].join("\n");
 }
 
@@ -149,6 +155,10 @@ function readState(stateFile) {
 function writeState(paths, state) {
   mkdirSync(paths.stateDir, { recursive: true });
   writeFileSync(paths.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function readProjectState(paths) {
+  return readState(paths.stateFile) ?? readState(paths.legacyStateFile);
 }
 
 async function loadDaytonaSdk() {
@@ -253,7 +263,7 @@ async function downloadFile(sandbox, remotePath, localPath) {
 async function handleUp(options) {
   const paths = resolveProjectPaths(options);
   applyProjectEnv(options, paths);
-  const existing = readState(paths.stateFile);
+  const existing = readProjectState(paths);
   const client = await createClient();
   let sandbox = await getSandbox(client, existing?.sandboxId);
   if (!sandbox) {
@@ -263,14 +273,14 @@ async function handleUp(options) {
   }
   const sandboxId = sandbox.id ?? sandbox.sandboxId ?? sandbox.instanceId;
   const now = new Date().toISOString();
-  const state = { taskId: paths.taskId, sandboxId, remoteWorkspacePath: paths.remoteWorkspacePath, remoteArtifactsPath: paths.remoteArtifactsPath, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  const state = { projectDirectory: paths.directory, taskId: paths.taskId, sandboxId, remoteWorkspacePath: paths.remoteWorkspacePath, remoteArtifactsPath: paths.remoteArtifactsPath, createdAt: existing?.createdAt ?? now, updatedAt: now };
   writeState(paths, state);
   console.log(JSON.stringify(redactStateForDisplay(state), null, 2));
 }
 
 async function handleStatus(options) {
   const paths = resolveProjectPaths(options);
-  const state = readState(paths.stateFile);
+  const state = readProjectState(paths);
   if (!state) { console.log(`No Daytona state at ${paths.stateFile}`); return; }
   const display = redactStateForDisplay({ ...state, stateFile: paths.stateFile });
   if (options.refresh) {
@@ -284,7 +294,7 @@ async function handleStatus(options) {
 
 async function requireSandbox(options) {
   const paths = resolveProjectPaths(options);
-  const state = readState(paths.stateFile);
+  const state = readProjectState(paths);
   if (!state?.sandboxId) throw new Error(`No Daytona sandbox state found. Run up first. Expected: ${paths.stateFile}`);
   applyProjectEnv(options, paths);
   const client = await createClient();
@@ -338,7 +348,7 @@ async function handlePull(options) {
 
 async function handleDown(options) {
   const paths = resolveProjectPaths(options);
-  const state = readState(paths.stateFile);
+  const state = readProjectState(paths);
   if (state?.sandboxId) {
     applyProjectEnv(options, paths);
     const client = await createClient();
@@ -346,7 +356,10 @@ async function handleDown(options) {
     if (sandbox?.delete) await sandbox.delete();
     else await callFirst(client, ["delete", "deleteSandbox", "remove"], state.sandboxId);
   }
-  if (!options["keep-state"]) rmSync(paths.stateDir, { recursive: true, force: true });
+  if (!options["keep-state"]) {
+    rmSync(paths.stateFile, { force: true });
+    rmSync(paths.legacyStateDir, { recursive: true, force: true });
+  }
   console.log(options["keep-state"] ? "Sandbox deleted; state kept." : "Sandbox deleted; state removed.");
 }
 
@@ -365,4 +378,4 @@ async function main(argv = process.argv.slice(2)) {
 const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
-export { applyDaytonaEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, redactStateForDisplay, resolveEnvFile, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };
+export { applyDaytonaEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, readProjectState, redactStateForDisplay, resolveEnvFile, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };

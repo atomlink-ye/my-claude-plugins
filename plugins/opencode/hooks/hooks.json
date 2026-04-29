@@ -1,4 +1,0 @@
-{
-  "description": "OpenCode managed serve is intentionally long-lived; do not auto-stop it on Claude session end.",
-  "hooks": {}
-}

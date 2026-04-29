@@ -1,8 +1,0 @@
-{
-  "name": "daytona",
-  "version": "0.1.0",
-  "description": "Manage Daytona sandboxes from Claude Code with safe project-local state and artifact workflows.",
-  "author": {
-    "name": "atomlink-ye"
-  }
-}

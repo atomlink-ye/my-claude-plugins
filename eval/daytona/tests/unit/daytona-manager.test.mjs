@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -21,7 +21,7 @@ import {
   shellQuote,
   uploadFile,
   validateTarEntries
-} from "../../../../plugins/daytona/scripts/daytona-manager.mjs";
+} from "../../../../skills/daytona-companion/scripts/daytona-manager.mjs";
 
 describe("daytona-manager args", () => {
   it("parses command options and passthrough command", () => {
@@ -188,22 +188,26 @@ describe("daytona-manager shell quoting", () => {
 });
 
 describe("daytona-manager paths", () => {
-  it("resolves project-local state and artifact paths", () => {
+  it("resolves home/global state and project-local artifact paths", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "daytona-path-test-"));
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-state-root-test-"));
     try {
-      const paths = resolveProjectPaths({ directory: dir, "task-id": "task-123" });
+      const paths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot, "task-id": "task-123" });
 
       expect(paths.directory).toBe(path.resolve(dir));
-      expect(paths.stateFile).toBe(path.join(path.resolve(dir), ".daytona", "state.json"));
+      expect(paths.stateRoot).toBe(path.resolve(stateRoot));
+      expect(paths.stateFile).toMatch(new RegExp(`${stateRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/projects/[a-f0-9]{16}\\.json$`));
+      expect(paths.legacyStateFile).toBe(path.join(path.resolve(dir), ".daytona", "state.json"));
       expect(paths.remoteWorkspacePath).toBe("workspace/task-123");
       expect(paths.remoteArtifactsPath).toBe("artifacts/daytona/task-123");
       expect(paths.localArtifactsPath).toBe(path.join(path.resolve(dir), "artifacts", "daytona", "task-123"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
     }
   });
 
-  it("uses sanitized state-loaded task ids for paths", () => {
+  it("uses sanitized legacy state-loaded task ids for paths", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "daytona-state-task-test-"));
     try {
       mkdirSync(path.join(dir, ".daytona"), { recursive: true });
@@ -217,7 +221,7 @@ describe("daytona-manager paths", () => {
     }
   });
 
-  it("rejects unsafe explicit and state-loaded task ids", () => {
+  it("rejects unsafe explicit and legacy state-loaded task ids", () => {
     for (const bad of ["../bad", "a/b", "", ".", "..", "bad task"]) {
       expect(() => sanitizeTaskId(bad)).toThrow("Invalid");
     }
@@ -235,15 +239,13 @@ describe("daytona-manager paths", () => {
   });
 });
 
-describe("daytona command markdown", () => {
-  it("does not directly interpolate raw command arguments in shell substitutions", () => {
-    const commandsDir = path.resolve("plugins/daytona/commands");
-    for (const entry of readdirSync(commandsDir)) {
-      if (!entry.endsWith(".md")) continue;
-      const content = readFileSync(path.join(commandsDir, entry), "utf8");
-      expect(content).not.toMatch(/!`[^`]*\$ARGUMENTS[^`]*`/);
-      expect(content).not.toContain("disable-model-invocation: true");
-    }
+describe("daytona companion skill docs", () => {
+  it("documents direct manager invocation instead of command wrappers", () => {
+    const skillPath = path.resolve("skills/daytona-companion/SKILL.md");
+    const content = readFileSync(skillPath, "utf8");
+    expect(content).toContain("skills/daytona-companion/scripts/daytona-manager.mjs");
+    expect(content).toContain("slash commands are removed/replaced");
+    expect(content).not.toContain("${CLAUDE_PLUGIN_ROOT}/plugins/");
   });
 });
 

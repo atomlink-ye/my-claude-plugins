@@ -143,7 +143,7 @@ Delegate the initial implementation to OpenCode companion.
 
 Use the companion-managed task flow, not raw `opencode run`.
 When the user asks for the concrete GENERATE or FIX LOOP command pattern, answer with these `opencode-companion.mjs` command forms directly rather than inventing extra `/task-iteration` subcommands.
-In this marketplace-level skill, `${CLAUDE_PLUGIN_ROOT}` refers to the marketplace root, so the companion lives under `plugins/opencode/scripts/`.
+In this marketplace-level skill, `${CLAUDE_PLUGIN_ROOT}` refers to the marketplace root, so the companion lives under `skills/opencode-companion/scripts/`.
 
 ### Canonical answer shape for command-pattern questions
 
@@ -156,7 +156,7 @@ When the user asks for task-iteration command patterns, the answer should contai
 Do not answer with made-up commands like `/task-iteration generate` or `/task-iteration fix-loop`.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<generator-prompt>"
@@ -165,7 +165,7 @@ node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" ses
 If you want non-blocking execution, you may use the companion background-job layer:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
   --directory "$WORK_DIR" \
   --background \
   --timeout 60 \
@@ -178,7 +178,7 @@ If you use `--background`, record `GENERATOR_JOB_ID` and later retrieve the sess
 6. If the run times out or the stream drops **after** yielding a session id, prefer:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session attach "$GENERATOR_SID" \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session attach "$GENERATOR_SID" \
   --directory "$WORK_DIR" \
   --timeout 5
 ```
@@ -201,7 +201,7 @@ Run an independent evaluation against the deliverable standard.
 4. Dispatch to a **fresh** companion session (do not reuse `GENERATOR_SID`):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session new \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<reviewer-prompt>"
@@ -239,7 +239,7 @@ while findings == FAIL and round < max_fix_rounds:
 2. Resume the generator session:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session continue "$GENERATOR_SID" \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue "$GENERATOR_SID" \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<fix-prompt>"
@@ -249,7 +249,7 @@ node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" ses
 4. After the generator completes, resume the reviewer session:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" session continue "$REVIEWER_SID" \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue "$REVIEWER_SID" \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<re-eval-prompt>"
@@ -271,23 +271,19 @@ Run the final adversarial gate against the full diff.
 git diff "$BASE_REF"..HEAD --stat
 ```
 
-2. Prefer the plugin review command if available:
+2. Run the direct companion review command; the old `/opencode:adversarial-review` slash command was removed/replaced:
 
 ```bash
-/opencode:adversarial-review --wait --scope branch --base "$BASE_REF"
-```
-
-3. If the plugin command is not available, call the low-level companion review surface directly:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/plugins/opencode/scripts/opencode-companion.mjs" review \
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" review \
+  --directory "$WORK_DIR" \
   --adversarial \
   --scope branch \
-  --base "$BASE_REF"
+  --base "$BASE_REF" \
+  --wait
 ```
 
-4. If neither review surface is available, dispatch to a fresh OpenCode companion session using the **Advisory Review** template from `references/prompt-templates.md`.
-5. If Critical or High findings remain:
+3. If the review surface is unavailable, dispatch to a fresh OpenCode companion session using the **Advisory Review** template from `references/prompt-templates.md`.
+4. If Critical or High findings remain:
    - do one more generator fix round by reusing `GENERATOR_SID`
    - re-run advisory once
    - do not loop forever
@@ -336,6 +332,6 @@ Finalize and verify completeness.
 
 ## Integration notes
 
-- `/opencode:task` can still be used as a simpler manual entrypoint for one-off execution lanes.
-- `/opencode:rescue` is appropriate if a generator thread gets stuck and you need a follow-up intervention.
+- The old `/opencode:task` command is replaced by direct `session new` / `session continue` companion script calls for one-off execution lanes.
+- The old `/opencode:rescue` command is replaced by continuing or attaching to the same companion session with a narrow rescue prompt.
 - This skill should follow the hidden orchestrator skill's ownership rules rather than redefining them.

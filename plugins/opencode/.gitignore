@@ -1,7 +1,0 @@
-.opencode-serve.json
-.opencode-task-history.json
-.opencode-serve.log
-.opencode-jobs.json
-.opencode-job-*.log
-.tmp-state/
-node_modules/

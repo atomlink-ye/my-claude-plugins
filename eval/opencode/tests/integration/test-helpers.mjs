@@ -53,7 +53,7 @@ export async function spawnCompanion(args, { env = {}, cwd = process.cwd(), time
     OPENCODE_MOCK_FETCH_REGISTRY: JSON.stringify(getMockOpenCodeServerRegistrySnapshot())
   };
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
-  const scriptPath = path.join(repoRoot, "plugins", "opencode", "scripts", "opencode-companion.mjs");
+  const scriptPath = path.join(repoRoot, "skills", "opencode-companion", "scripts", "opencode-companion.mjs");
 
   return await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [scriptPath, ...args], {
