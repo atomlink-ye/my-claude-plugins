@@ -56,6 +56,16 @@
       ]
     },
     {
+      "name": "paseo-companion",
+      "description": "Paseo CLI companion skill — neutral reference for run/send/wait/logs/attach/ls plus loops, schedules, terminals, worktrees, chat, permits, and daemon management.",
+      "version": "0.2.0",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/paseo-companion"
+      ]
+    },
+    {
       "name": "google-workspace",
       "description": "Interact with Google Workspace services (Docs, Drive, Sheets, etc.) via the gws CLI.",
       "version": "0.2.0",
