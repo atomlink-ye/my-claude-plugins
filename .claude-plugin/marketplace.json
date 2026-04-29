@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "opencode",
       "description": "Deprecated alias for opencode-companion. Slash commands were removed/replaced by the companion skill runtime.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "atomlink-ye"
       },
@@ -25,7 +25,7 @@
     {
       "name": "daytona",
       "description": "Deprecated alias for daytona-companion. Slash commands were removed/replaced by the companion skill runtime.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": {
         "name": "atomlink-ye"
       },
@@ -38,6 +38,7 @@
     {
       "name": "opencode-companion",
       "description": "OpenCode companion skill for direct serve/session/job/review runtime workflows without slash-command wrappers.",
+      "version": "0.2.0",
       "source": "./",
       "strict": false,
       "skills": [
@@ -47,6 +48,7 @@
     {
       "name": "daytona-companion",
       "description": "Daytona companion skill for sandbox lifecycle, artifacts, and global project-scoped state without slash-command wrappers.",
+      "version": "0.2.0",
       "source": "./",
       "strict": false,
       "skills": [
@@ -56,6 +58,7 @@
     {
       "name": "google-workspace",
       "description": "Interact with Google Workspace services (Docs, Drive, Sheets, etc.) via the gws CLI.",
+      "version": "0.2.0",
       "source": "./",
       "strict": false,
       "skills": [
@@ -65,6 +68,7 @@
     {
       "name": "task-iteration",
       "description": "Orchestrate end-to-end feature implementation from an exec-plan document. Delegates coding to OpenCode, runs independent evaluation, loops fixes until clean, and gates completion on an advisory review.",
+      "version": "0.2.0",
       "source": "./",
       "strict": false,
       "skills": [
