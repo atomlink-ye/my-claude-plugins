@@ -9,7 +9,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 Standalone OpenCode skill install path:
 
 ```bash
-node "$HOME/.agents/skill/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
+node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
 ```
 
 ## Create or reconnect

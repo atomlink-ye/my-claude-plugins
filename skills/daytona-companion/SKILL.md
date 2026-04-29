@@ -12,10 +12,10 @@ The old `/daytona:*` slash commands are removed/replaced. Use this top-level ski
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
 ```
 
-When this skill is installed standalone for OpenCode under `~/.agents/skill/`, use:
+When this skill is installed standalone for OpenCode under `~/.agents/skills/`, use:
 
 ```bash
-node "$HOME/.agents/skill/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
+node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
 ```
 
 ## Quick map from old commands
