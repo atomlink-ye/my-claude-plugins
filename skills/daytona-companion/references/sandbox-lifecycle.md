@@ -6,6 +6,12 @@ Use the manager script from the marketplace root:
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
 ```
 
+Standalone OpenCode skill install path:
+
+```bash
+node "$HOME/.agents/skill/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
+```
+
 ## Create or reconnect
 
 ```bash

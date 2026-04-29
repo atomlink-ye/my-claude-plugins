@@ -12,6 +12,12 @@ The old `/opencode:*` slash commands are removed/replaced. Use this top-level sk
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" <verb> [options]
 ```
 
+When this skill is installed standalone for OpenCode under `~/.agents/skill/`, use:
+
+```bash
+node "$HOME/.agents/skill/opencode-companion/scripts/opencode-companion.mjs" <verb> [options]
+```
+
 ## Quick map from old commands
 
 - `/opencode:task` → `session new` or `session continue`

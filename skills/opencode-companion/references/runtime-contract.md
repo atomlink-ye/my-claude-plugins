@@ -8,6 +8,12 @@ Marketplace-level skills use the marketplace root as `${CLAUDE_PLUGIN_ROOT}`:
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" ...
 ```
 
+Standalone OpenCode skill install path:
+
+```bash
+node "$HOME/.agents/skill/opencode-companion/scripts/opencode-companion.mjs" ...
+```
+
 Do not use the removed plugin path for new guidance; all OpenCode companion calls go through this skill-local script path.
 
 ## Supported verbs
