@@ -25,7 +25,12 @@ For compatibility, the manager may read legacy `$WORK_DIR/.daytona/state.json` i
 
 ## Environment files
 
-`--env-file` may load a project `.env.local`. `DAYTONA_API_TOKEN` is accepted and mapped to `DAYTONA_API_KEY` for SDK use when `DAYTONA_API_KEY` is not already set.
+`--env-file` may load an explicit env file. Without `--env-file`, the manager resolves env in this order:
+
+1. project-local `.env.local`
+2. global `~/.daytona/ENV`
+
+`DAYTONA_API_TOKEN` is accepted and mapped to `DAYTONA_API_KEY` for SDK use when `DAYTONA_API_KEY` is not already set.
 
 ## Secret handling
 

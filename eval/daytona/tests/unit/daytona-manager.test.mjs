@@ -65,6 +65,25 @@ describe("daytona-manager env loading", () => {
     }
   });
 
+  it("falls back to ~/.daytona/ENV when no project env file exists", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "daytona-global-env-project-test-"));
+    const home = mkdtempSync(path.join(tmpdir(), "daytona-global-env-home-test-"));
+    const oldHome = process.env.HOME;
+    try {
+      mkdirSync(path.join(home, ".daytona"), { recursive: true });
+      const globalEnvFile = path.join(home, ".daytona", "ENV");
+      writeFileSync(globalEnvFile, "DAYTONA_API_KEY=test-key\n");
+      process.env.HOME = home;
+
+      expect(resolveEnvFile({}, resolveProjectPaths({ directory: dir }))).toBe(globalEnvFile);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("maps DAYTONA_API_TOKEN to DAYTONA_API_KEY without overriding an existing key", () => {
     const oldKey = process.env.DAYTONA_API_KEY;
     const oldToken = process.env.DAYTONA_API_TOKEN;

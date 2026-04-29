@@ -21,6 +21,22 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
   --env-file "$WORK_DIR/.env.local"
 ```
 
+`up` reconnects to existing project state when present. If the existing sandbox is stopped, the manager starts it and waits for it to become executable before returning.
+
+## Adopt an existing sandbox
+
+If a sandbox was created by the Daytona CLI or another tool, register it into companion state before using `push`, `exec`, or `pull`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" adopt \
+  --directory "$WORK_DIR" \
+  --task-id "$TASK_ID" \
+  --sandbox-id "$SANDBOX_ID" \
+  --remote-path "/workspace/$TASK_ID"
+```
+
+`adopt` verifies the sandbox through the Daytona SDK, starts it if needed, then writes the normal global project state file.
+
 ## Inspect state
 
 ```bash

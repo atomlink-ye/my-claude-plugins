@@ -21,6 +21,7 @@ node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <comma
 ## Quick map from old commands
 
 - `/daytona:up` → `up [--directory DIR] [--task-id ID] ...`
+- Adopt an existing CLI-created sandbox → `adopt --sandbox-id ID [--directory DIR] [--task-id ID]`
 - `/daytona:status` → `status [--directory DIR] [--refresh]`
 - `/daytona:push` → `push --path PATH [--remote-path PATH]`
 - `/daytona:exec` → `exec -- COMMAND...`

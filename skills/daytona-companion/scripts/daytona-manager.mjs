@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 const BOOL_FLAGS = ["--help", "--refresh", "--keep-state"];
-const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output"];
+const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--sandbox-id", "--sandbox-name"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
 
@@ -102,8 +102,20 @@ function loadEnvFile(filePath) {
 
 function resolveEnvFile(options = {}, paths = resolveProjectPaths(options)) {
   if (options["env-file"]) return path.resolve(options["env-file"]);
-  const defaultEnvFile = path.join(paths.directory, ".env.local");
-  return existsSync(defaultEnvFile) ? defaultEnvFile : null;
+  const projectEnvFile = path.join(paths.directory, ".env.local");
+  if (existsSync(projectEnvFile)) return projectEnvFile;
+  const globalEnvFile = path.join(homedir(), ".daytona", "ENV");
+  return existsSync(globalEnvFile) ? globalEnvFile : null;
+}
+
+function resolveEnvFiles(options = {}, paths = resolveProjectPaths(options)) {
+  if (options["env-file"]) return [path.resolve(options["env-file"])];
+  const files = [];
+  const globalEnvFile = path.join(homedir(), ".daytona", "ENV");
+  const projectEnvFile = path.join(paths.directory, ".env.local");
+  if (existsSync(globalEnvFile)) files.push(globalEnvFile);
+  if (existsSync(projectEnvFile)) files.push(projectEnvFile);
+  return files;
 }
 
 function applyDaytonaEnv(env = {}) {
@@ -112,8 +124,7 @@ function applyDaytonaEnv(env = {}) {
 }
 
 function applyProjectEnv(options = {}, paths = resolveProjectPaths(options)) {
-  const envFile = resolveEnvFile(options, paths);
-  applyDaytonaEnv(envFile ? loadEnvFile(envFile) : {});
+  for (const envFile of resolveEnvFiles(options, paths)) applyDaytonaEnv(loadEnvFile(envFile));
 }
 
 function redactStateForDisplay(state = {}) {
@@ -134,6 +145,7 @@ function buildUsage() {
     "",
     "Commands:",
     "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--env-file FILE]",
+    "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
     "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle]",
     "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] -- COMMAND...",
@@ -173,8 +185,36 @@ async function createClient() {
   const sdk = await loadDaytonaSdk();
   const Daytona = sdk.Daytona ?? sdk.default?.Daytona ?? sdk.default;
   if (!Daytona) throw new Error("Could not find Daytona client export in @daytona/sdk.");
-  const options = process.env.DAYTONA_API_KEY ? { apiKey: process.env.DAYTONA_API_KEY } : undefined;
-  return options ? new Daytona(options) : new Daytona();
+  const options = {};
+  if (process.env.DAYTONA_API_KEY) options.apiKey = process.env.DAYTONA_API_KEY;
+  if (process.env.DAYTONA_JWT_TOKEN) options.jwtToken = process.env.DAYTONA_JWT_TOKEN;
+  if (process.env.DAYTONA_ORGANIZATION_ID) options.organizationId = process.env.DAYTONA_ORGANIZATION_ID;
+  if (process.env.DAYTONA_API_URL) options.apiUrl = process.env.DAYTONA_API_URL;
+  else if (process.env.DAYTONA_SERVER_URL) options.serverUrl = process.env.DAYTONA_SERVER_URL;
+  if (process.env.DAYTONA_TARGET) options.target = process.env.DAYTONA_TARGET;
+  // Passing only apiKey disables the SDK's env fallback for apiUrl/target in some SDK versions.
+  // Pass every known Daytona env setting explicitly so CLI-created EU/US sandboxes resolve the same way.
+  return Object.keys(options).length ? new Daytona(options) : new Daytona();
+}
+
+function getErrorStatus(error) {
+  return error?.status ?? error?.statusCode ?? error?.response?.status ?? error?.cause?.status ?? error?.cause?.response?.status;
+}
+
+function isNotFoundError(error) {
+  const status = getErrorStatus(error);
+  if (status === 404) return true;
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return message.includes("not found") || message.includes("404");
+}
+
+function describeDaytonaError(error) {
+  const status = getErrorStatus(error);
+  const parts = [];
+  if (status) parts.push(`status=${status}`);
+  if (error?.name) parts.push(`name=${error.name}`);
+  if (error?.message) parts.push(`message=${error.message}`);
+  return parts.length ? parts.join(" ") : String(error);
 }
 
 async function callFirst(target, names, ...args) {
@@ -182,9 +222,58 @@ async function callFirst(target, names, ...args) {
   throw new Error(`Daytona SDK object does not expose any of: ${names.join(", ")}`);
 }
 
-async function getSandbox(client, sandboxId) {
-  if (!sandboxId) return null;
-  try { return await callFirst(client, ["get", "getSandbox", "findSandbox"], sandboxId); } catch { return null; }
+function sandboxIdentity(sandbox) {
+  return {
+    id: sandbox?.id ?? sandbox?.sandboxId ?? sandbox?.instanceId,
+    name: sandbox?.name ?? sandbox?.info?.name,
+  };
+}
+
+async function findSandboxByList(client, sandboxRef) {
+  if (typeof client?.list !== "function") return null;
+  const sandboxes = await client.list();
+  const items = Array.isArray(sandboxes) ? sandboxes : (sandboxes?.items ?? sandboxes?.data ?? []);
+  return items.find((sandbox) => {
+    const { id, name } = sandboxIdentity(sandbox);
+    return id === sandboxRef || name === sandboxRef;
+  }) ?? null;
+}
+
+async function getSandbox(client, sandboxRef, { allowNotFound = true } = {}) {
+  if (!sandboxRef) return null;
+  try {
+    const sandbox = await callFirst(client, ["get", "getSandbox", "findSandbox"], sandboxRef);
+    if (sandbox) return sandbox;
+    const listed = await findSandboxByList(client, sandboxRef);
+    if (listed) return listed;
+    if (allowNotFound) return null;
+    throw new Error(`Sandbox not found or unavailable: ${sandboxRef}`);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw new Error(`Daytona SDK failed to load sandbox ${sandboxRef}: ${describeDaytonaError(error)}`);
+    try {
+      const listed = await findSandboxByList(client, sandboxRef);
+      if (listed) return listed;
+    } catch (listError) {
+      if (!isNotFoundError(listError)) throw new Error(`Daytona SDK failed to list sandboxes after ${sandboxRef} lookup miss: ${describeDaytonaError(listError)}`);
+    }
+    if (allowNotFound) return null;
+    throw new Error(`Sandbox not found or unavailable: ${sandboxRef}`);
+  }
+}
+
+function sandboxState(sandbox) {
+  return String(sandbox?.state ?? sandbox?.status ?? sandbox?.info?.status ?? "").toLowerCase();
+}
+
+async function ensureSandboxStarted(sandbox) {
+  const state = sandboxState(sandbox);
+  if (!state || ["started", "running"].includes(state)) return sandbox;
+  if (typeof sandbox.start === "function") await sandbox.start();
+  else throw new Error(`Sandbox is ${state} and this @daytona/sdk version does not expose sandbox.start().`);
+  if (typeof sandbox.waitUntilStarted === "function") await sandbox.waitUntilStarted();
+  if (typeof sandbox.refreshDataSafe === "function") await sandbox.refreshDataSafe();
+  else if (typeof sandbox.refreshData === "function") await sandbox.refreshData();
+  return sandbox;
 }
 
 function runTar(args, cwd) {
@@ -271,9 +360,40 @@ async function handleUp(options) {
     for (const key of Object.keys(params)) if (params[key] === undefined) delete params[key];
     sandbox = await callFirst(client, ["create", "createSandbox"], params);
   }
+  sandbox = await ensureSandboxStarted(sandbox);
   const sandboxId = sandbox.id ?? sandbox.sandboxId ?? sandbox.instanceId;
   const now = new Date().toISOString();
   const state = { projectDirectory: paths.directory, taskId: paths.taskId, sandboxId, remoteWorkspacePath: paths.remoteWorkspacePath, remoteArtifactsPath: paths.remoteArtifactsPath, createdAt: existing?.createdAt ?? now, updatedAt: now };
+  writeState(paths, state);
+  console.log(JSON.stringify(redactStateForDisplay(state), null, 2));
+}
+
+async function handleAdopt(options) {
+  const paths = resolveProjectPaths(options);
+  applyProjectEnv(options, paths);
+  const sandboxRef = options["sandbox-id"] ?? options["sandbox-name"];
+  if (!sandboxRef) throw new Error("adopt requires --sandbox-id ID or --sandbox-name NAME");
+  const client = await createClient();
+  const sandbox = await getSandbox(client, sandboxRef, { allowNotFound: false });
+  await ensureSandboxStarted(sandbox);
+  const { id, name } = sandboxIdentity(sandbox);
+  const now = new Date().toISOString();
+  const existing = readProjectState(paths);
+  const remoteWorkspacePath = options["remote-path"] ?? existing?.remoteWorkspacePath ?? paths.remoteWorkspacePath;
+  const remoteArtifactsPath = remoteWorkspacePath.startsWith("/")
+    ? path.posix.join(remoteWorkspacePath, "artifacts", "daytona", paths.taskId)
+    : (existing?.remoteArtifactsPath ?? paths.remoteArtifactsPath);
+  const state = {
+    projectDirectory: paths.directory,
+    taskId: paths.taskId,
+    sandboxId: id ?? sandboxRef,
+    sandboxName: name,
+    remoteWorkspacePath,
+    remoteArtifactsPath,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    adoptedAt: now,
+  };
   writeState(paths, state);
   console.log(JSON.stringify(redactStateForDisplay(state), null, 2));
 }
@@ -288,6 +408,7 @@ async function handleStatus(options) {
     const client = await createClient();
     const sandbox = await getSandbox(client, state.sandboxId);
     display.sandboxKnownToDaytona = Boolean(sandbox);
+    if (sandbox) display.sandboxState = sandboxState(sandbox) || null;
   }
   console.log(JSON.stringify(display, null, 2));
 }
@@ -298,8 +419,8 @@ async function requireSandbox(options) {
   if (!state?.sandboxId) throw new Error(`No Daytona sandbox state found. Run up first. Expected: ${paths.stateFile}`);
   applyProjectEnv(options, paths);
   const client = await createClient();
-  const sandbox = await getSandbox(client, state.sandboxId);
-  if (!sandbox) throw new Error(`Sandbox not found or unavailable: ${state.sandboxId}`);
+  const sandbox = await getSandbox(client, state.sandboxId, { allowNotFound: false });
+  await ensureSandboxStarted(sandbox);
   return { paths, state, sandbox };
 }
 
@@ -325,7 +446,7 @@ async function handleExec(options, command) {
   const cwd = options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath;
   const cmd = command.map(shellQuote).join(" ");
   const wrapped = `mkdir -p ${shellQuote(artifacts)}; { cd ${shellQuote(cwd)} && ${cmd}; } > ${shellQuote(`${artifacts}/stdout.txt`)} 2> ${shellQuote(`${artifacts}/stderr.txt`)}; code=$?; printf '%s\n' "$code" > ${shellQuote(`${artifacts}/exit-code.txt`)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
-  const result = await sandboxExec(sandbox, wrapped, options.cwd);
+  const result = await sandboxExec(sandbox, wrapped);
   if (result?.stdout) process.stdout.write(String(result.stdout));
   if (result?.stderr) process.stderr.write(String(result.stderr));
   if (typeof result?.exitCode === "number") process.exitCode = result.exitCode;
@@ -367,6 +488,7 @@ async function main(argv = process.argv.slice(2)) {
   const parsed = parseArgs(argv);
   if (!parsed.command || parsed.options.help) { console.log(buildUsage()); return; }
   if (parsed.command === "up") return handleUp(parsed.options);
+  if (parsed.command === "adopt" || parsed.command === "import") return handleAdopt(parsed.options);
   if (parsed.command === "status") return handleStatus(parsed.options);
   if (parsed.command === "push") return handlePush(parsed.options);
   if (parsed.command === "exec") return handleExec(parsed.options, parsed.passthrough.length ? parsed.passthrough : parsed.positionals);
@@ -375,7 +497,12 @@ async function main(argv = process.argv.slice(2)) {
   throw new Error(`Unknown command: ${parsed.command}`);
 }
 
-const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);
+function isSameRealPath(a, b) {
+  try { return realpathSync(a) === realpathSync(b); }
+  catch { return a === b; }
+}
+
+const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
 export { applyDaytonaEnv, assertRemoteCommandSuccess, buildUsage, createBundle, downloadFile, listTarEntries, loadEnvFile, parseArgs, readProjectState, redactStateForDisplay, resolveEnvFile, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, uploadFile, validateTarEntries };
