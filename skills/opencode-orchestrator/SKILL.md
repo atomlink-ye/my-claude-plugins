@@ -19,7 +19,9 @@ For companion flags, lifecycle commands, and result-handling syntax, rely on the
 
 ## Live OpenCode snapshot
 
-!`bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"`
+!`bash "${OPENCODE_ORCHESTRATOR_SNAPSHOT:-$HOME/.agents/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh}"`
+
+If the standalone `~/.agents` copy is unavailable, run the marketplace copy directly: `bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"`.
 
 ## Routing authority
 

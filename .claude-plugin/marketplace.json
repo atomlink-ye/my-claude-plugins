@@ -57,7 +57,7 @@
     },
     {
       "name": "paseo-companion",
-      "description": "Paseo CLI companion skill — neutral reference for run/send/wait/logs/attach/ls plus loops, schedules, terminals, worktrees, chat, permits, and daemon management.",
+      "description": "Paseo CLI companion skill — neutral reference for run/send/wait/logs/attach/ls plus loops, schedules, terminals, worktrees, chat, permits, daemon management, and host/port targeting for non-local daemons via `paseo run --host <ip>:<port>`.",
       "version": "0.2.0",
       "source": "./",
       "strict": false,

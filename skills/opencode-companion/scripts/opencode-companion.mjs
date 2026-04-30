@@ -150,7 +150,7 @@ function renderJobHierarchySection(job, hierarchyContext) {
     `- hierarchy size: ${metadata.subtreeSummary.sessionCount}`,
     `- descendants: ${metadata.subtreeSummary.descendantCount}`,
     `- statuses: ${formatHierarchyStatusCounts(metadata.subtreeSummary.statusCounts)}`,
-    `- latest activity: ${metadata.subtreeSummary.latestActivityLabel || "-"}`,
+    `- latest activity: ${formatReadableTimestamp(metadata.subtreeSummary.latestActivityLabel) || "-"}`,
     `- latest activity session: ${metadata.subtreeSummary.latestActivitySessionId || "-"}`,
     "",
     renderSessionHierarchyTable(hierarchyContext, metadata.rootSessionId).trimEnd()
@@ -171,7 +171,7 @@ function renderJobTable(jobs, hierarchyBySessionId = new Map()) {
   for (const job of jobs) {
     const hierarchyMetadata = hierarchyBySessionId.get(job.sessionId) ?? null;
     lines.push(
-      `| ${escapeTableCell(job.id)} | ${escapeTableCell(job.status ?? "")} | ${escapeTableCell(job.sessionId ?? "")} | ${escapeTableCell(hierarchyMetadata?.rootSessionId ?? "")} | ${escapeTableCell(hierarchyMetadata?.hierarchyVerdict ?? "")} | ${escapeTableCell(hierarchyMetadata ? `${hierarchyMetadata.subtreeSummary.sessionCount} / ${formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts)}` : "") } | ${escapeTableCell(job.startedAt ?? "")} | ${escapeTableCell(job.elapsed ?? "")} | ${escapeTableCell(job.model ?? "")} | ${escapeTableCell(job.promptSummary ?? "")} | ${escapeTableCell(job.pid ?? "")} |`
+      `| ${escapeTableCell(job.id)} | ${escapeTableCell(job.status ?? "")} | ${escapeTableCell(job.sessionId ?? "")} | ${escapeTableCell(hierarchyMetadata?.rootSessionId ?? "")} | ${escapeTableCell(hierarchyMetadata?.hierarchyVerdict ?? "")} | ${escapeTableCell(hierarchyMetadata ? `${hierarchyMetadata.subtreeSummary.sessionCount} / ${formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts)}` : "") } | ${escapeTableCell(formatReadableTimestamp(job.startedAt ?? ""))} | ${escapeTableCell(job.elapsed ?? "")} | ${escapeTableCell(job.model ?? "")} | ${escapeTableCell(job.promptSummary ?? "")} | ${escapeTableCell(job.pid ?? "")} |`
     );
   }
 
@@ -186,7 +186,7 @@ function renderJobDetails(job, hierarchyContext = null) {
     `| id | ${escapeTableCell(job.id)} |`,
     `| status | ${escapeTableCell(job.status ?? "")} |`,
     `| directory | ${escapeTableCell(job.directory ?? "")} |`,
-    `| started | ${escapeTableCell(job.startedAt ?? "")} |`,
+    `| started | ${escapeTableCell(formatReadableTimestamp(job.startedAt ?? ""))} |`,
     `| elapsed | ${escapeTableCell(job.elapsed ?? "")} |`,
     `| model | ${escapeTableCell(job.model ?? "")} |`,
     `| pid | ${escapeTableCell(job.pid ?? "")} |`,
@@ -196,14 +196,14 @@ function renderJobDetails(job, hierarchyContext = null) {
     `| hierarchy verdict | ${escapeTableCell(hierarchyMetadata?.hierarchyVerdict ?? "")} |`,
     `| hierarchy size | ${escapeTableCell(hierarchyMetadata?.subtreeSummary.sessionCount ?? "")} |`,
     `| hierarchy statuses | ${escapeTableCell(hierarchyMetadata ? formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts) : "")} |`,
-    `| hierarchy latest activity | ${escapeTableCell(hierarchyMetadata?.subtreeSummary.latestActivityLabel ?? "")} |`,
+    `| hierarchy latest activity | ${escapeTableCell(formatReadableTimestamp(hierarchyMetadata?.subtreeSummary.latestActivityLabel ?? ""))} |`,
     `| hierarchy latest activity session | ${escapeTableCell(hierarchyMetadata?.subtreeSummary.latestActivitySessionId ?? "")} |`,
     `| prompt | ${escapeTableCell(job.prompt ?? job.promptSummary ?? "")} |`,
     `| log file | ${escapeTableCell(job.logFile ?? "")} |`
   ];
 
   if (job.completedAt) {
-    lines.push(`| completed | ${escapeTableCell(job.completedAt)} |`);
+    lines.push(`| completed | ${escapeTableCell(formatReadableTimestamp(job.completedAt))} |`);
   }
   if (job.error) {
     lines.push(`| error | ${escapeTableCell(job.error)} |`);
@@ -257,7 +257,7 @@ function buildJobListView(directory, options = {}) {
       lines.push(`- ${formatJobStatusLine(job)}`);
       const hierarchyMetadata = hierarchyBySessionId.get(job.sessionId) ?? null;
       if (hierarchyMetadata) {
-        lines.push(`  Hierarchy: root ${hierarchyMetadata.rootSessionId} | verdict ${hierarchyMetadata.hierarchyVerdict} | sessions ${hierarchyMetadata.subtreeSummary.sessionCount} | ${formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts)} | latest ${hierarchyMetadata.subtreeSummary.latestActivityLabel || "-"} @ ${hierarchyMetadata.subtreeSummary.latestActivitySessionId || "-"}`);
+        lines.push(`  Hierarchy: root ${hierarchyMetadata.rootSessionId} | verdict ${hierarchyMetadata.hierarchyVerdict} | sessions ${hierarchyMetadata.subtreeSummary.sessionCount} | ${formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts)} | latest ${formatReadableTimestamp(hierarchyMetadata.subtreeSummary.latestActivityLabel) || "-"} @ ${hierarchyMetadata.subtreeSummary.latestActivitySessionId || "-"}`);
       }
       const tail = readLogTail(job.logFile, STATUS_LOG_TAIL_LINES);
       if (tail.length > 0) {
@@ -640,6 +640,179 @@ function parseSessionTimestamp(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function padTimestampPart(value) {
+  return String(value).padStart(2, "0");
+}
+
+function formatReadableTimestamp(value) {
+  if (value == null) {
+    return "";
+  }
+  const parsed = parseSessionTimestamp(value);
+  if (!Number.isFinite(parsed)) {
+    return String(value);
+  }
+  const date = new Date(parsed);
+  return [
+    date.getFullYear(),
+    padTimestampPart(date.getMonth() + 1),
+    padTimestampPart(date.getDate())
+  ].join("-") + ` ${padTimestampPart(date.getHours())}:${padTimestampPart(date.getMinutes())}:${padTimestampPart(date.getSeconds())}`;
+}
+
+function readUsageField(record, keys) {
+  if (!record || typeof record !== "object") {
+    return undefined;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function parseUsageNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().replace(/,/g, "");
+  if (!normalized) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseUsageCost(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().replace(/[$,\s]/g, "");
+  if (!normalized) {
+    return null;
+  }
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeUsageSummary(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? { raw: trimmed } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const inputTokens = parseUsageNumber(readUsageField(value, ["inputTokens", "input_tokens", "InputTokens", "input", "Input"]));
+  const outputTokens = parseUsageNumber(readUsageField(value, ["outputTokens", "output_tokens", "OutputTokens", "output", "Output"]));
+  const cachedTokens = parseUsageNumber(readUsageField(value, ["cachedTokens", "cached_tokens", "CachedTokens", "cached", "Cached"]));
+  const explicitTotalTokens = parseUsageNumber(
+    readUsageField(value, ["totalTokens", "total_tokens", "TotalTokens", "tokenCount", "token_count", "TokenCount", "tokens", "Tokens"])
+  );
+  const costUsd = parseUsageCost(readUsageField(value, ["costUsd", "cost_usd", "CostUsd", "cost", "Cost"]));
+
+  const hasTokenBreakdown = [inputTokens, outputTokens, cachedTokens].some((entry) => entry != null);
+  const totalTokens = explicitTotalTokens ?? (hasTokenBreakdown ? (inputTokens ?? 0) + (outputTokens ?? 0) + (cachedTokens ?? 0) : null);
+
+  if ([inputTokens, outputTokens, cachedTokens, totalTokens, costUsd].every((entry) => entry == null)) {
+    return null;
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    totalTokens,
+    costUsd
+  };
+}
+
+function firstUsageSummary(candidates) {
+  for (const candidate of candidates) {
+    const summary = normalizeUsageSummary(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return null;
+}
+
+function summarizeSessionUsage(session) {
+  const usage = session?.usage ?? null;
+  const lastUsage = firstUsageSummary([
+    session?.lastUsage,
+    session?.last_usage,
+    session?.LastUsage,
+    usage?.lastUsage,
+    usage?.last_usage,
+    usage?.LastUsage,
+    usage?.last,
+    usage?.latest,
+    usage?.recent
+  ]);
+  const totalUsage = firstUsageSummary([
+    session?.totalUsage,
+    session?.total_usage,
+    session?.TotalUsage,
+    usage?.totalUsage,
+    usage?.total_usage,
+    usage?.TotalUsage,
+    usage?.total,
+    usage?.aggregate,
+    usage?.lifetime,
+    usage?.overall,
+    usage
+  ]);
+
+  return { lastUsage, totalUsage };
+}
+
+const usageNumberFormatter = new Intl.NumberFormat("en-US");
+
+function formatUsageCost(costUsd) {
+  if (costUsd == null || !Number.isFinite(costUsd)) {
+    return null;
+  }
+  const fractionDigits = costUsd !== 0 && Math.abs(costUsd) < 0.01 ? 4 : 2;
+  return `$${costUsd.toFixed(fractionDigits)}`;
+}
+
+function formatUsageSummary(usage) {
+  if (!usage) {
+    return "-";
+  }
+  if (usage.raw) {
+    return usage.raw;
+  }
+
+  const parts = [];
+  if (usage.totalTokens != null) {
+    parts.push(`${usageNumberFormatter.format(usage.totalTokens)} total`);
+  }
+  if (usage.inputTokens != null) {
+    parts.push(`in ${usageNumberFormatter.format(usage.inputTokens)}`);
+  }
+  if (usage.outputTokens != null) {
+    parts.push(`out ${usageNumberFormatter.format(usage.outputTokens)}`);
+  }
+  if (usage.cachedTokens != null) {
+    parts.push(`cached ${usageNumberFormatter.format(usage.cachedTokens)}`);
+  }
+  const formattedCost = formatUsageCost(usage.costUsd);
+  if (formattedCost) {
+    parts.push(formattedCost);
+  }
+  return parts.join(", ") || "-";
+}
+
 function summarizeSession(session) {
   const summary =
     session.title ||
@@ -656,6 +829,7 @@ function summarizeSession(session) {
   const parentId = session.parentID || session.parentId || session.parent_id || "";
   const createdAt = session.createdAt || session.created_at || session.startedAt || session.time?.created || "";
   const updatedAt = session.updatedAt || session.updated_at || session.modifiedAt || session.time?.updated || "";
+  const { lastUsage, totalUsage } = summarizeSessionUsage(session);
 
   return {
     id: session.id || session.sessionID || session.sessionId || "unknown",
@@ -665,6 +839,8 @@ function summarizeSession(session) {
     createdAtMs: parseSessionTimestamp(createdAt),
     updatedAt: String(updatedAt || ""),
     updatedAtMs: parseSessionTimestamp(updatedAt),
+    lastUsage,
+    totalUsage,
     summary: String(summary || "")
   };
 }
@@ -677,20 +853,26 @@ function renderStatus(directory, state, healthy, sessions, sessionError) {
     `| managed state file | ${escapeMarkdownCell(stateFilePath(directory))} |`,
     `| managed pid | ${escapeMarkdownCell(state?.pid ?? "none")} |`,
     `| port | ${escapeMarkdownCell(state?.port ?? "none")} |`,
-    `| started at | ${escapeMarkdownCell(state?.startedAt ?? "none")} |`,
+    `| started at | ${escapeMarkdownCell(state?.startedAt ? formatReadableTimestamp(state.startedAt) : "none")} |`,
     `| health | ${escapeMarkdownCell(healthy ? "healthy" : "not reachable")} |`
   ];
 
-  lines.push("", "Recent sessions", "", "| id | status | created | updated | summary |", "| --- | --- | --- | --- | --- |");
+  lines.push(
+    "",
+    "Recent sessions",
+    "",
+    "| id | status | created | updated | last usage | total usage | summary |",
+    "| --- | --- | --- | --- | --- | --- | --- |"
+  );
 
   if (sessionError) {
-    lines.push(`| unavailable | error |  |  | ${escapeMarkdownCell(sessionError)} |`);
+    lines.push(`| unavailable | error |  |  | - | - | ${escapeMarkdownCell(sessionError)} |`);
   } else if (!sessions || sessions.length === 0) {
-    lines.push("| none | - | - | - | No sessions reported by the server. |");
+    lines.push("| none | - | - | - | - | - | No sessions reported by the server. |");
   } else {
     for (const session of sessions.slice(0, STATUS_SESSION_LIMIT).map(summarizeSession)) {
       lines.push(
-        `| ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(session.createdAt)} | ${escapeMarkdownCell(session.updatedAt)} | ${escapeMarkdownCell(session.summary)} |`
+        `| ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(formatReadableTimestamp(session.createdAt))} | ${escapeMarkdownCell(formatReadableTimestamp(session.updatedAt))} | ${escapeMarkdownCell(formatUsageSummary(session.lastUsage))} | ${escapeMarkdownCell(formatUsageSummary(session.totalUsage))} | ${escapeMarkdownCell(session.summary)} |`
       );
     }
   }
@@ -701,12 +883,12 @@ function renderStatus(directory, state, healthy, sessions, sessionError) {
 function renderSessionTable(sessions) {
   const hierarchyContext = buildSessionHierarchyContext(sessions);
   const lines = [
-    "| tree | id | parent | raw | observed | created | updated | summary |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |"
+    "| tree | id | parent | raw | observed | created | updated | last usage | total usage | summary |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   ];
 
   if (!sessions || sessions.length === 0) {
-    lines.push("| none | - | - | - | - | - | - | No sessions reported by the server. |");
+    lines.push("| none | - | - | - | - | - | - | - | - | No sessions reported by the server. |");
     return `${lines.join("\n")}\n`;
   }
 
@@ -720,7 +902,7 @@ function renderSessionTable(sessions) {
       ? deriveHierarchyVerdict(summarizeSessionSubtree(sessionId, hierarchyContext))
       : deriveObservedSessionStatus(session);
     lines.push(
-      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(session.createdAt)} | ${escapeMarkdownCell(session.updatedAt)} | ${escapeMarkdownCell(session.summary)} |`
+      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(formatReadableTimestamp(session.createdAt))} | ${escapeMarkdownCell(formatReadableTimestamp(session.updatedAt))} | ${escapeMarkdownCell(formatUsageSummary(session.lastUsage))} | ${escapeMarkdownCell(formatUsageSummary(session.totalUsage))} | ${escapeMarkdownCell(session.summary)} |`
     );
     for (const childId of hierarchyContext.childrenByParent.get(sessionId) ?? []) {
       appendRows(childId, depth + 1);
@@ -763,11 +945,13 @@ function renderSessionDetails(session, directory, hierarchyContext = null) {
     `| session activity recency | ${escapeMarkdownCell(sessionRecency)} |`,
     `| hierarchy verdict | ${escapeMarkdownCell(hierarchyVerdict)} |`,
     `| recommended next action | ${escapeMarkdownCell(nextAction)} |`,
-    `| created | ${escapeMarkdownCell(details.createdAt)} |`,
-    `| updated | ${escapeMarkdownCell(details.updatedAt)} |`,
+    `| created | ${escapeMarkdownCell(formatReadableTimestamp(details.createdAt))} |`,
+    `| updated | ${escapeMarkdownCell(formatReadableTimestamp(details.updatedAt))} |`,
+    `| last usage | ${escapeMarkdownCell(formatUsageSummary(details.lastUsage))} |`,
+    `| total usage | ${escapeMarkdownCell(formatUsageSummary(details.totalUsage))} |`,
     `| hierarchy size | ${escapeMarkdownCell(subtreeSummary.sessionCount)} |`,
     `| hierarchy statuses | ${escapeMarkdownCell(formatHierarchyStatusCounts(subtreeSummary.statusCounts))} |`,
-    `| hierarchy latest activity | ${escapeMarkdownCell(subtreeSummary.latestActivityLabel || "-")} |`,
+    `| hierarchy latest activity | ${escapeMarkdownCell(formatReadableTimestamp(subtreeSummary.latestActivityLabel) || "-")} |`,
     `| hierarchy latest activity session | ${escapeMarkdownCell(subtreeSummary.latestActivitySessionId || "-")} |`,
     `| summary | ${escapeMarkdownCell(details.summary)} |`
   ];
@@ -1233,8 +1417,8 @@ function summarizeSessionSubtree(rootSessionId, hierarchyContext) {
 
 function renderSessionHierarchyTable(hierarchyContext, rootSessionId) {
   const lines = [
-    "| tree | id | parent | raw | observed | updated | summary |",
-    "| --- | --- | --- | --- | --- | --- | --- |"
+    "| tree | id | parent | raw | observed | updated | last usage | total usage | summary |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   ];
 
   const appendRows = (sessionId, depth = 0) => {
@@ -1247,7 +1431,7 @@ function renderSessionHierarchyTable(hierarchyContext, rootSessionId) {
       ? deriveHierarchyVerdict(summarizeSessionSubtree(sessionId, hierarchyContext))
       : deriveObservedSessionStatus(session);
     lines.push(
-      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(session.updatedAt || session.createdAt || "")} | ${escapeMarkdownCell(session.summary)} |`
+      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(formatReadableTimestamp(session.updatedAt || session.createdAt || ""))} | ${escapeMarkdownCell(formatUsageSummary(session.lastUsage))} | ${escapeMarkdownCell(formatUsageSummary(session.totalUsage))} | ${escapeMarkdownCell(session.summary)} |`
     );
     for (const childId of hierarchyContext.childrenByParent.get(sessionId) ?? []) {
       appendRows(childId, depth + 1);
@@ -2894,6 +3078,7 @@ export {
   buildReviewPrompt,
   classifySessionOutcome,
   deriveResultStatus,
+  formatReadableTimestamp,
   generateJobId,
   formatDuration,
   isBusySessionStatus,

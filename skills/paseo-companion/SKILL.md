@@ -1,6 +1,6 @@
 ---
 name: paseo-companion
-description: "Paseo CLI companion. Load whenever the user mentions paseo, paseo agents, paseo run/send/wait/logs/attach/ls, agent IDs, sending follow-up prompts to a running agent, paseo loops, paseo schedules, paseo terminals, paseo worktrees, paseo chat, paseo permit, paseo daemon, or any question about driving AI coding agents through the paseo CLI."
+description: "Paseo CLI companion. Load whenever the user mentions paseo, paseo agents, paseo run/send/wait/logs/attach/ls, agent IDs, sending follow-up prompts to a running agent, paseo loops, paseo schedules, paseo terminals, paseo worktrees, paseo chat, paseo permit, paseo daemon, host/port targeting, or any question about driving AI coding agents through the paseo CLI. This includes cases where `paseo run --host <ip>:<port>` should point at a non-local daemon explicitly."
 user-invocable: true
 ---
 
@@ -22,11 +22,14 @@ These cover day-to-day usage. For everything else, see the references list at th
 
 Blocks until the agent finishes by default.
 
+If the daemon is not local, pass `--host <ip>:<port>` to point the run at that daemon explicitly.
+
 ```bash
 paseo run "implement the new auth flow"
 paseo run --provider codex/gpt-5.4 "..."         # pick provider/model
 paseo run --worktree feature-x "..."             # isolate in a git worktree
 paseo run --cwd /path/to/repo "..."              # set working directory
+paseo run --host 10.0.0.8:6767 "..."             # target a remote daemon by IP:port
 paseo run --wait-timeout 30m "..."               # cap the blocking wait
 paseo run -d "..."                               # detach; print agent ID and return
 paseo run --json "..."                           # JSON output (machine-readable)

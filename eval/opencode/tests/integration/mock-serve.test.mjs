@@ -2,6 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { formatReadableTimestamp } from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
 import { createMockOpenCodeServer } from "../mocks/opencode-server.mjs";
 import {
   makeTempDir,
@@ -901,6 +902,77 @@ describe("mock serve integration tests", () => {
       expect(status.stdout).not.toContain("| hierarchy verdict | failed |");
     } finally {
       restorePromptRoute();
+    }
+  });
+
+  test("session status shows last and total token usage when available", async () => {
+    const workspace = tempWorkspace("opencode-session-usage-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const sessionId = "ses_usage_demo";
+    const createdAt = "2026-04-30T10:24:42.731Z";
+    const updatedAt = "2026-04-30T10:52:49.916Z";
+    server.setResponse("GET /session", async (ctx) => ({
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: [
+        {
+          id: sessionId,
+          status: "running",
+          createdAt,
+          updatedAt,
+          directory: ctx.directory,
+          summary: "token probe",
+          lastUsage: {
+            InputTokens: 861,
+            OutputTokens: 151,
+            CachedTokens: 85504,
+            CostUsd: "$0.00"
+          },
+          totalUsage: {
+            InputTokens: 1200,
+            OutputTokens: 300,
+            CachedTokens: 90000,
+            CostUsd: "$0.12"
+          }
+        }
+      ]
+    }));
+
+    try {
+      const status = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain(`| created | ${formatReadableTimestamp(createdAt)} |`);
+      expect(status.stdout).toContain(`| updated | ${formatReadableTimestamp(updatedAt)} |`);
+      expect(status.stdout).toContain("| last usage | 86,516 total, in 861, out 151, cached 85,504, $0.00 |");
+      expect(status.stdout).toContain("| total usage | 91,500 total, in 1,200, out 300, cached 90,000, $0.12 |");
+      expect(status.stdout).toContain("| tree | id | parent | raw | observed | updated | last usage | total usage | summary |");
+      expect(status.stdout).not.toContain(createdAt);
+      expect(status.stdout).not.toContain(updatedAt);
+    } finally {
+      server.setResponse("GET /session", null);
     }
   });
 
