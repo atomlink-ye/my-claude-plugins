@@ -13,6 +13,13 @@ export const MAX_STORED_JOBS = 50;
 export const STATUS_RECENT_LIMIT = 5;
 export const STATUS_LOG_TAIL_LINES = 5;
 export const DEFAULT_SESSION_TIMEOUT_MINS = 60;
-export const PROMPT_INLINE_MAX_BYTES_DEFAULT = 65536;
+// Platform-aware ARG_MAX safety thresholds for inlining prompts as argv.
+// macOS ARG_MAX = 1 MB (per-arg comfortably fits 64 KB).
+// Linux ARG_MAX ~= 2 MB; per-arg cap MAX_ARG_STRLEN = 128 KB (64 KB has 2x margin).
+// Windows CreateProcessW caps the *entire* command line at 32,767 wide chars,
+// so the per-prompt budget must stay well below that to leave room for the
+// script path, flags, and shell quoting.
+export const PROMPT_INLINE_MAX_BYTES_DEFAULT_POSIX = 65536;
+export const PROMPT_INLINE_MAX_BYTES_DEFAULT_WIN32 = 16384;
 export const JOB_PROMPT_PREFIX = ".opencode-job-";
 export const JOB_PROMPT_SUFFIX = ".prompt";

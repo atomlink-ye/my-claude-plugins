@@ -9,7 +9,8 @@ import {
   JOB_PROMPT_PREFIX,
   JOB_PROMPT_SUFFIX,
   JOBS_FILE_NAME,
-  PROMPT_INLINE_MAX_BYTES_DEFAULT,
+  PROMPT_INLINE_MAX_BYTES_DEFAULT_POSIX,
+  PROMPT_INLINE_MAX_BYTES_DEFAULT_WIN32,
   RUNTIME_STATE_DIR_NAME,
   STATE_FILE_NAME
 } from "./constants.mjs";
@@ -119,6 +120,12 @@ export function readEnvPositiveInt(name, fallback) {
   return Math.max(1, Math.floor(parsed));
 }
 
+export function promptInlineMaxBytesDefault() {
+  return process.platform === "win32"
+    ? PROMPT_INLINE_MAX_BYTES_DEFAULT_WIN32
+    : PROMPT_INLINE_MAX_BYTES_DEFAULT_POSIX;
+}
+
 export function promptInlineMaxBytes() {
-  return readEnvPositiveInt("OPENCODE_PROMPT_INLINE_MAX_BYTES", PROMPT_INLINE_MAX_BYTES_DEFAULT);
+  return readEnvPositiveInt("OPENCODE_PROMPT_INLINE_MAX_BYTES", promptInlineMaxBytesDefault());
 }

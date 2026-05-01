@@ -365,7 +365,8 @@ export function spawnBackgroundTaskWorker(entryScriptPath, directory, jobId, pro
     child = spawn(process.execPath, childArgs, {
       cwd: directory,
       detached: true,
-      stdio: ["ignore", logFd, logFd]
+      stdio: ["ignore", logFd, logFd],
+      windowsHide: true
     });
   } catch (error) {
     fs.closeSync(logFd);

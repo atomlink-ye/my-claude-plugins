@@ -65,6 +65,10 @@ Quote all paths and user strings. Put prompts after `-- "PROMPT"` so prompt text
 
 1. Inline after `--`: `-- "PROMPT"` — fine for short prompts.
 2. Stdin: pipe text in (foreground only). Background workers re-spawn so stdin is not preserved across the spawn.
-3. `--prompt-file PATH`: companion reads the file. Use this for any prompt that risks crowding the shell ARG_MAX (~1 MB on macOS, ~128 KB per-arg on Linux). Mixing `--prompt-file` with `-- "PROMPT"` is rejected.
+3. `--prompt-file PATH`: companion reads the file. Use this for any prompt that risks crowding the OS argv cap (~1 MB total on macOS, ~128 KB per-arg on Linux, 32,767 wide chars total on Windows). Mixing `--prompt-file` with `-- "PROMPT"` is rejected.
 
-For `--background`, the companion auto-routes prompts above `OPENCODE_PROMPT_INLINE_MAX_BYTES` (default 65536 bytes) through a managed sidecar file: it writes `<work-dir>/.opencode-job-<jobid>.prompt`, passes `--prompt-file` to the worker, and the worker deletes the sidecar after reading. Smaller prompts still go through argv as before. To force file routing for all background prompts, set `OPENCODE_PROMPT_INLINE_MAX_BYTES=1`.
+For `--background`, the companion auto-routes prompts above `OPENCODE_PROMPT_INLINE_MAX_BYTES` through a managed sidecar file: it writes `<work-dir>/.opencode-job-<jobid>.prompt`, passes `--prompt-file` to the worker, and the worker deletes the sidecar after reading. Smaller prompts still go through argv as before. To force file routing for all background prompts, set `OPENCODE_PROMPT_INLINE_MAX_BYTES=1`.
+
+Default threshold is platform-aware:
+- macOS / Linux: 65536 bytes (64 KB) — well below ARG_MAX and per-arg caps.
+- Windows: 16384 bytes (16 KB) — leaves headroom under the 32,767-wide-char `CreateProcessW` total cap for the script path, flags, and quoting.
