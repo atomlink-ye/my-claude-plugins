@@ -13,3 +13,6 @@ export const MAX_STORED_JOBS = 50;
 export const STATUS_RECENT_LIMIT = 5;
 export const STATUS_LOG_TAIL_LINES = 5;
 export const DEFAULT_SESSION_TIMEOUT_MINS = 60;
+export const PROMPT_INLINE_MAX_BYTES_DEFAULT = 65536;
+export const JOB_PROMPT_PREFIX = ".opencode-job-";
+export const JOB_PROMPT_SUFFIX = ".prompt";

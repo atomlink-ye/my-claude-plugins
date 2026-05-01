@@ -6,7 +6,10 @@ import process from "node:process";
 import {
   JOB_LOG_PREFIX,
   JOB_LOG_SUFFIX,
+  JOB_PROMPT_PREFIX,
+  JOB_PROMPT_SUFFIX,
   JOBS_FILE_NAME,
+  PROMPT_INLINE_MAX_BYTES_DEFAULT,
   RUNTIME_STATE_DIR_NAME,
   STATE_FILE_NAME
 } from "./constants.mjs";
@@ -98,4 +101,24 @@ export function jobsFilePath(directory) {
 
 export function jobLogFilePath(directory, jobId) {
   return path.join(directory, `${JOB_LOG_PREFIX}${jobId}${JOB_LOG_SUFFIX}`);
+}
+
+export function jobPromptFilePath(directory, jobId) {
+  return path.join(directory, `${JOB_PROMPT_PREFIX}${jobId}${JOB_PROMPT_SUFFIX}`);
+}
+
+export function readEnvPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(parsed));
+}
+
+export function promptInlineMaxBytes() {
+  return readEnvPositiveInt("OPENCODE_PROMPT_INLINE_MAX_BYTES", PROMPT_INLINE_MAX_BYTES_DEFAULT);
 }

@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { MAX_STORED_JOBS, STATUS_LOG_TAIL_LINES } from "./constants.mjs";
-import { jobLogFilePath, jobsFilePath } from "./config.mjs";
+import { jobLogFilePath, jobPromptFilePath, jobsFilePath, promptInlineMaxBytes } from "./config.mjs";
 import { isPidRunning } from "./process-utils.mjs";
 
 export function nowIso() {
@@ -343,16 +343,37 @@ export function spawnBackgroundTaskWorker(entryScriptPath, directory, jobId, pro
     childArgs.push("--timeout", String(args.timeout));
   }
 
-  childArgs.push("--", prompt);
+  // For prompts above the inline-byte threshold, hand them to the child via a
+  // sidecar file instead of argv. This sidesteps OS ARG_MAX / per-argument caps
+  // and keeps the worker invocation small regardless of prompt length.
+  const promptBytes = Buffer.byteLength(prompt ?? "", "utf8");
+  const inlineMaxBytes = promptInlineMaxBytes();
+  let promptFile = null;
+  if (promptBytes > inlineMaxBytes) {
+    promptFile = jobPromptFilePath(directory, jobId);
+    fs.writeFileSync(promptFile, String(prompt ?? ""), "utf8");
+    childArgs.push("--prompt-file", promptFile);
+  } else {
+    childArgs.push("--", prompt);
+  }
 
   const logFile = jobLogFilePath(directory, jobId);
   const logFd = fs.openSync(logFile, "a");
 
-  const child = spawn(process.execPath, childArgs, {
-    cwd: directory,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
-  });
+  let child;
+  try {
+    child = spawn(process.execPath, childArgs, {
+      cwd: directory,
+      detached: true,
+      stdio: ["ignore", logFd, logFd]
+    });
+  } catch (error) {
+    fs.closeSync(logFd);
+    if (promptFile) {
+      try { fs.unlinkSync(promptFile); } catch {}
+    }
+    throw error;
+  }
 
   fs.closeSync(logFd);
 

@@ -81,8 +81,8 @@ function printUsage() {
       "  node scripts/opencode-companion.mjs serve status [--server-directory SERVER_DIR]",
       "  node scripts/opencode-companion.mjs serve stop [--server-directory SERVER_DIR]",
       "",
-      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] -- \"PROMPT\"",
-      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] -- \"PROMPT\"",
+      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
+      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
       "  node scripts/opencode-companion.mjs session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs session list [--directory WORK_DIR] [--server-directory SERVER_DIR]",
@@ -1718,7 +1718,23 @@ async function abortSession(baseUrl, directory, sessionId) {
   }
 }
 
-function readPrompt(positionals) {
+function readPrompt(positionals, options = {}) {
+  const promptFile = options["prompt-file"] ? String(options["prompt-file"]) : null;
+  if (promptFile) {
+    if (positionals.length > 0) {
+      throw new Error("Cannot combine --prompt-file with an inline prompt after `--`.");
+    }
+    if (!fs.existsSync(promptFile)) {
+      throw new Error(`Prompt file does not exist: ${promptFile}`);
+    }
+    const text = fs.readFileSync(promptFile, "utf8").trim();
+    // Internal background workers pass --prompt-file alongside --job-id; the
+    // sidecar file is a managed temp and should be removed once consumed.
+    if (options["job-id"]) {
+      try { fs.unlinkSync(promptFile); } catch {}
+    }
+    return text;
+  }
   if (positionals.length > 0) {
     return positionals.join(" ").trim();
   }
@@ -2314,12 +2330,21 @@ async function monitorSession({
 async function handleTask(argv) {
   const { options, positionals } = parseArgs(argv, {
     booleanFlags: ["--async", "--background"],
-    stringFlags: ["--directory", "--server-directory", "--model", "--job-id", "--timeout", "--session", "--agent"]
+    stringFlags: [
+      "--directory",
+      "--server-directory",
+      "--model",
+      "--job-id",
+      "--timeout",
+      "--session",
+      "--agent",
+      "--prompt-file"
+    ]
   });
 
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const directory = resolveDirectory(options.directory);
-  const prompt = readPrompt(positionals);
+  const prompt = readPrompt(positionals, options);
   if (!prompt) {
     throw new Error("Task prompt is required.");
   }
@@ -2909,7 +2934,7 @@ async function handleSessionCommand(argv) {
   if (subcommand === "continue" || subcommand === "resume") {
     const { options, positionals } = parseArgs(rest, {
       booleanFlags: ["--async", "--background"],
-      stringFlags: ["--directory", "--server-directory", "--model", "--timeout"]
+      stringFlags: ["--directory", "--server-directory", "--model", "--timeout", "--prompt-file"]
     });
     const sessionId = positionals[0];
     if (!sessionId) {
@@ -2922,6 +2947,7 @@ async function handleSessionCommand(argv) {
     if (options.timeout) taskArgs.push("--timeout", String(options.timeout));
     if (options.async) taskArgs.push("--async");
     if (options.background) taskArgs.push("--background");
+    if (options["prompt-file"]) taskArgs.push("--prompt-file", String(options["prompt-file"]));
     taskArgs.push("--session", String(sessionId));
     if (positionals.length > 1) {
       taskArgs.push("--", ...positionals.slice(1));
