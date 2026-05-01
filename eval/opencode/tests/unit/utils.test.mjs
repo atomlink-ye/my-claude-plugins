@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   classifySessionOutcome,
@@ -6,6 +9,7 @@ import {
   generateJobId,
   isBusySessionStatus,
   isFailedTerminalSessionStatus,
+  isSameRealPath,
   isSuccessfulTerminalSessionStatus,
   summarizePrompt
 } from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
@@ -64,5 +68,21 @@ describe("utility helpers", () => {
       hierarchyVerdict: "quiet_delegated",
       recommendedAction: "session_status_or_attach"
     });
+  });
+
+  it("treats symlinked and real script paths as the same path", () => {
+    const tempRoot = mkdtempSync(path.join(tmpdir(), "opencode-companion-path-"));
+    const realFile = path.join(tempRoot, "real-script.mjs");
+    const symlinkFile = path.join(tempRoot, "linked-script.mjs");
+
+    try {
+      writeFileSync(realFile, "export {};\n");
+      symlinkSync(realFile, symlinkFile);
+
+      expect(isSameRealPath(realFile, symlinkFile)).toBe(true);
+      expect(isSameRealPath(symlinkFile, realFile)).toBe(true);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });

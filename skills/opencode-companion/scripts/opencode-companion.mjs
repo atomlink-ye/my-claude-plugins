@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -3087,7 +3088,15 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url);
+function isSameRealPath(a, b) {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return a === b;
+  }
+}
+
+const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 
 if (isDirectExecution) {
   main()
@@ -3107,6 +3116,7 @@ export {
   formatReadableTimestamp,
   generateJobId,
   formatDuration,
+  isSameRealPath,
   isBusySessionStatus,
   isFailedTerminalSessionStatus,
   isActiveJob,
