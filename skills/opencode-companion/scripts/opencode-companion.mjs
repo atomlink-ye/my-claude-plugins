@@ -1036,12 +1036,18 @@ function isSuccessfulResultStatus(status) {
 }
 
 function isFailedResultStatus(status) {
-  return new Set(["aborted", "cancelled", "canceled", "failed", "error"]).has(normalizeSessionStatus(status));
+  return new Set(["aborted", "cancelled", "canceled", "failed", "error", "question_needed", "permission_needed"]).has(normalizeSessionStatus(status));
 }
 
 function deriveResultStatus({ terminalStatus, abortedBySignal, completionMode }) {
   if (abortedBySignal) {
     return "aborted";
+  }
+  if (completionMode === "question_needed") {
+    return "question_needed";
+  }
+  if (completionMode === "permission_needed") {
+    return "permission_needed";
   }
   if (completionMode === "delegated_settled") {
     return "delegated";
@@ -1073,6 +1079,9 @@ function deriveTaskHierarchyVerdict({
   if (completionMode === "descendant_failed" || hasFailedDescendants) {
     return "descendant_failed";
   }
+  if (completionMode === "question_needed" || completionMode === "permission_needed") {
+    return completionMode;
+  }
   if (pendingToolSessionIds.length > 0 || hasPendingDescendants) {
     return sawDelegatedHierarchy ? "active_descendants" : "active";
   }
@@ -1098,6 +1107,12 @@ function deriveTaskHierarchyVerdict({
 }
 
 function deriveRecommendedTaskAction({ status, completionMode, hierarchyVerdict }) {
+  if (status === "question_needed" || completionMode === "question_needed") {
+    return "answer_question";
+  }
+  if (status === "permission_needed" || completionMode === "permission_needed") {
+    return "approve_or_deny_permission";
+  }
   if (status === "delegated") {
     return "session_status_or_attach";
   }
@@ -1680,6 +1695,104 @@ function messageHasPendingToolCall(messages) {
   return false;
 }
 
+function readObjectField(object, keys) {
+  if (!object || typeof object !== "object") {
+    return undefined;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(object, key)) {
+      return object[key];
+    }
+  }
+  return undefined;
+}
+
+function getToolPartName(part) {
+  return String(readObjectField(part, ["tool", "name", "toolName", "tool_name"]) ?? "").trim().toLowerCase();
+}
+
+function getToolPartState(part) {
+  const state = part?.state;
+  if (typeof state === "string") {
+    return normalizeToolState(state);
+  }
+  return normalizeToolState(readObjectField(state, ["status", "type", "state", "phase"]) ?? readObjectField(part, ["status"]));
+}
+
+function isTaskToolPart(part) {
+  if (!part || typeof part !== "object" || part.type !== "tool") {
+    return false;
+  }
+  return getToolPartName(part) === "task";
+}
+
+function isTerminalToolState(state) {
+  return new Set(["completed", "complete", "done", "success", "failed", "error", "cancelled", "canceled", "aborted"]).has(
+    normalizeToolState(state)
+  );
+}
+
+function isActiveTaskToolPart(part) {
+  if (!isTaskToolPart(part)) {
+    return false;
+  }
+  const state = getToolPartState(part);
+  return !state || !isTerminalToolState(state);
+}
+
+function collectStringsDeep(value, output = []) {
+  if (typeof value === "string") {
+    output.push(value);
+  } else if (Array.isArray(value)) {
+    for (const entry of value) collectStringsDeep(entry, output);
+  } else if (value && typeof value === "object") {
+    for (const entry of Object.values(value)) collectStringsDeep(entry, output);
+  }
+  return output;
+}
+
+function extractSessionIdsFromTaskToolPart(part) {
+  const ids = new Set();
+  const candidates = [
+    readObjectField(part, ["task_id", "taskId", "sessionID", "sessionId"]),
+    readObjectField(part?.state, ["task_id", "taskId", "sessionID", "sessionId"]),
+    readObjectField(part?.state?.output, ["task_id", "taskId", "sessionID", "sessionId"]),
+    readObjectField(part?.state?.result, ["task_id", "taskId", "sessionID", "sessionId"]),
+    readObjectField(part, ["output", "result"]),
+    part?.state?.output,
+    part?.state?.result
+  ];
+  for (const candidate of candidates) {
+    for (const text of collectStringsDeep(candidate)) {
+      for (const match of text.matchAll(/(?:task_id|taskId|sessionID|sessionId)\s*[:=]\s*['"]?([A-Za-z0-9_-]*ses_[A-Za-z0-9_-]+|ses_[A-Za-z0-9_-]+)/g)) {
+        ids.add(match[1]);
+      }
+    }
+  }
+  return [...ids];
+}
+
+function extractBackgroundJobIdsFromText(text) {
+  const ids = new Set();
+  for (const match of String(text ?? "").matchAll(/OpenCode task started in background as\s+(task-[A-Za-z0-9_-]+)/gi)) {
+    ids.add(match[1]);
+  }
+  return [...ids];
+}
+
+function isCompanionJobActive(directory, jobId) {
+  try {
+    refreshStaleRunningJobs(directory);
+    return isActiveJob(readJob(directory, jobId));
+  } catch {
+    return false;
+  }
+}
+
+async function findActiveCompanionJobs(directory, jobIds) {
+  return [...new Set((jobIds ?? []).filter(Boolean))].filter((id) => isCompanionJobActive(directory, id));
+}
+
 async function findHierarchySessionsWithPendingToolCalls(baseUrl, directory, sessionIds) {
   const uniqueSessionIds = [...new Set((sessionIds ?? []).filter(Boolean))];
   if (uniqueSessionIds.length === 0) {
@@ -1811,6 +1924,11 @@ async function monitorSession({
   const directorySessions = new Map(); // sessionId -> { status, lastActivityAt }
   let sessionSummariesById = new Map();
   let hierarchySessionIds = new Set([sessionId]);
+  const explicitChildSessionIds = new Set();
+  const activeTaskToolKeys = new Set();
+  const companionBackgroundJobIds = new Set();
+  const pendingUnscopedInterventions = new Map();
+  let pendingIntervention = null;
   let sawDelegatedHierarchy = false;
   let lastDirectoryActivityAt = Date.now();
   let lastMainSessionActivityAt = Date.now();
@@ -1826,13 +1944,131 @@ async function monitorSession({
   const startTime = Date.now();
   let lastStatusPollAt = 0;
 
+  function trackExplicitChildSession(childSessionId) {
+    if (!childSessionId) return;
+    explicitChildSessionIds.add(childSessionId);
+    if (!directorySessions.has(childSessionId)) {
+      directorySessions.set(childSessionId, { status: "unknown", lastActivityAt: Date.now() });
+    }
+  }
+
+  function trackToolPartSnapshot(eventSessionId, part, fallbackPartId = "task") {
+    if (!part || typeof part !== "object") return;
+    for (const jobId of extractBackgroundJobIdsFromText(collectStringsDeep(part).join("\n"))) {
+      companionBackgroundJobIds.add(jobId);
+    }
+    if (!isTaskToolPart(part)) return;
+    const partKey = `${eventSessionId}:${part.id || fallbackPartId}`;
+    for (const childSessionId of extractSessionIdsFromTaskToolPart(part)) {
+      trackExplicitChildSession(childSessionId);
+    }
+    if (isActiveTaskToolPart(part)) {
+      activeTaskToolKeys.add(partKey);
+      sawDelegatedHierarchy = true;
+    } else {
+      activeTaskToolKeys.delete(partKey);
+    }
+  }
+
+  async function reconcileMessageSnapshots(sessionIds) {
+    const uniqueSessionIds = [...new Set((sessionIds ?? []).filter(Boolean))];
+    const activeKeysFromSnapshots = new Set();
+    await Promise.all(uniqueSessionIds.map(async (currentSessionId) => {
+      let messages = [];
+      try {
+        messages = await listSessionMessages(baseUrl, directory, currentSessionId);
+      } catch {
+        return;
+      }
+      for (const message of normalizeMessageArray(messages)) {
+        for (const jobId of extractBackgroundJobIdsFromText(collectStringsDeep(message).join("\n"))) {
+          companionBackgroundJobIds.add(jobId);
+        }
+        const parts = Array.isArray(message?.parts) ? message.parts : [];
+        for (const part of parts) {
+          if (!part || typeof part !== "object") continue;
+          trackToolPartSnapshot(currentSessionId, part, part.id || message?.info?.id || "snapshot");
+          if (isActiveTaskToolPart(part)) {
+            activeKeysFromSnapshots.add(`${currentSessionId}:${part.id || message?.info?.id || "snapshot"}`);
+          }
+        }
+      }
+    }));
+
+    for (const key of [...activeTaskToolKeys]) {
+      const [keySessionId] = key.split(":");
+      if (uniqueSessionIds.includes(keySessionId) && !activeKeysFromSnapshots.has(key)) {
+        activeTaskToolKeys.delete(key);
+      }
+    }
+  }
+
+  async function getMonitorBlocker({ pendingToolSessionIds = [] } = {}) {
+    if (pendingIntervention) {
+      return { type: pendingIntervention.type };
+    }
+    if (activeTaskToolKeys.size > 0) {
+      return { type: "active_task_tools", ids: [...activeTaskToolKeys] };
+    }
+    const activeCompanionJobIds = await findActiveCompanionJobs(directory, [...companionBackgroundJobIds]);
+    if (activeCompanionJobIds.length > 0) {
+      return { type: "active_companion_jobs", ids: activeCompanionJobIds };
+    }
+    if (pendingToolSessionIds.length > 0) {
+      return { type: "pending_tool_sessions", ids: pendingToolSessionIds };
+    }
+    return null;
+  }
+
+  function interventionResult(type) {
+    log(`OpenCode is waiting for ${type === "question_needed" ? "a question response" : "permission approval"}.`);
+    process.exitCode = 1;
+    return {
+      done: true,
+      completionMode: type,
+      terminalStatus: type,
+      rawSessionStatus: type,
+      hierarchyVerdict: type,
+      hasPendingDescendants: false,
+      hasFailedDescendants: false,
+      pendingToolSessionIds: []
+    };
+  }
+
+  function isMonitoredEventSession(eventSessionId) {
+    return Boolean(
+      eventSessionId &&
+      (eventSessionId === sessionId ||
+        hierarchySessionIds.has(eventSessionId) ||
+        explicitChildSessionIds.has(eventSessionId))
+    );
+  }
+
+  function promotePendingUnscopedInterventions() {
+    if (pendingIntervention) return;
+    for (const [candidateSessionId, candidate] of pendingUnscopedInterventions.entries()) {
+      if (!isMonitoredEventSession(candidateSessionId)) {
+        continue;
+      }
+      pendingIntervention = candidate;
+      pendingUnscopedInterventions.delete(candidateSessionId);
+      return;
+    }
+  }
+
   async function refreshSessionHierarchy() {
     const sessionSummaries = (await listSessions(baseUrl, directory)).map(summarizeSession);
     sessionSummariesById = new Map(sessionSummaries.map((session) => [session.id, session]));
     hierarchySessionIds = collectSessionHierarchyIds(sessionId, sessionSummaries);
+    for (const explicitSessionId of explicitChildSessionIds) {
+      for (const collectedId of collectSessionHierarchyIds(explicitSessionId, sessionSummaries)) {
+        hierarchySessionIds.add(collectedId);
+      }
+    }
     if (hierarchySessionIds.size > 1) {
       sawDelegatedHierarchy = true;
     }
+    promotePendingUnscopedInterventions();
 
     const now = Date.now();
     for (const currentSessionId of hierarchySessionIds) {
@@ -1882,7 +2118,34 @@ async function monitorSession({
         return null;
       }
 
-      const eventSessionId = properties.sessionID;
+      const eventSessionId = properties.sessionID || properties.sessionId;
+
+      if (payload.type === "question.asked" || payload.type === "permission.asked") {
+        const candidate = {
+          type: payload.type === "question.asked" ? "question_needed" : "permission_needed",
+          sessionId: eventSessionId || sessionId
+        };
+        if (!isMonitoredEventSession(eventSessionId)) {
+          if (eventSessionId) {
+            pendingUnscopedInterventions.set(eventSessionId, candidate);
+          }
+          try {
+            await refreshSessionHierarchy();
+          } catch {
+            // Ignore refresh failures; a later poll may still validate this candidate.
+          }
+          if (!isMonitoredEventSession(eventSessionId)) {
+            return null;
+          }
+        }
+        pendingIntervention = candidate;
+        if (eventSessionId) {
+          pendingUnscopedInterventions.delete(eventSessionId);
+        }
+        lastDirectoryActivityAt = Date.now();
+        return null;
+      }
+
       if (eventSessionId) {
         if (!directorySessions.has(eventSessionId)) {
           directorySessions.set(eventSessionId, { status: "unknown", lastActivityAt: Date.now() });
@@ -1902,6 +2165,9 @@ async function monitorSession({
             const partInfo = typeof properties.part === "string" ? JSON.parse(properties.part) : properties.part;
             if (partInfo.id && partInfo.type) {
               partTypes.set(partInfo.id, partInfo.type);
+            }
+            if (isMonitoredEventSession(eventSessionId)) {
+              trackToolPartSnapshot(eventSessionId, partInfo, properties.partID || properties.messageID || "task");
             }
             // Print brief tool call summary
             if (partInfo.type === "tool" && partInfo.state === "completed" && partInfo.name) {
@@ -1926,6 +2192,11 @@ async function monitorSession({
                 lastPrintedSessionId = sessionId;
               }
               printer.handleDelta(properties.delta);
+            }
+            if (isMonitoredEventSession(eventSessionId)) {
+              for (const jobId of extractBackgroundJobIdsFromText(properties.delta)) {
+                companionBackgroundJobIds.add(jobId);
+              }
             }
           }
         }
@@ -1956,6 +2227,7 @@ async function monitorSession({
   const quiescencePromise = (async () => {
     let descendantWaitLogged = false;
     let pendingToolWaitLogged = false;
+    let activeJobWaitLogged = false;
 
     while (!onSignalAbort.triggered) {
       await delay(SETTLING_CHECK_INTERVAL_MS);
@@ -1974,6 +2246,7 @@ async function monitorSession({
         lastStatusPollAt = now;
         try {
           await refreshSessionHierarchy();
+          await reconcileMessageSnapshots([...hierarchySessionIds]);
         } catch {
           // Ignore status polling failures and keep waiting on the event stream.
         }
@@ -2011,7 +2284,26 @@ async function monitorSession({
           [...hierarchySessionIds]
         );
       }
-      if (pendingToolSessionIds.length > 0) {
+      const blocker = await getMonitorBlocker({ pendingToolSessionIds });
+      if (blocker?.type === "question_needed" || blocker?.type === "permission_needed") {
+        return interventionResult(blocker.type);
+      }
+      if (blocker?.type === "active_task_tools") {
+        if (!pendingToolWaitLogged) {
+          log(`Detected pending native task tool call(s); continuing to wait...`);
+          pendingToolWaitLogged = true;
+        }
+        continue;
+      }
+      if (blocker?.type === "active_companion_jobs") {
+        if (!activeJobWaitLogged) {
+          log(`Detected active companion background job(s): ${blocker.ids.join(", ")}; continuing to wait...`);
+          activeJobWaitLogged = true;
+        }
+        continue;
+      }
+      activeJobWaitLogged = false;
+      if (blocker?.type === "pending_tool_sessions") {
         if (!pendingToolWaitLogged) {
           log(
             `Detected pending tool call(s) in ${pendingToolSessionIds.length} session(s); continuing to wait...`
@@ -2114,17 +2406,18 @@ async function monitorSession({
       try {
         if (canUseStatusPolling()) {
           await refreshSessionHierarchy();
+          await reconcileMessageSnapshots([...hierarchySessionIds]);
         }
       } catch {
         // Ignore polling errors while giving the server a brief chance to settle.
       }
 
       const now = Date.now();
+      if (now - startTime > timeoutMs) {
+        throw new Error(`Task timed out after ${timeoutMins} minutes.`);
+      }
       if ((canUseStatusPolling() || directorySessions.size > 0) && settleDeadline == null) {
         settleDeadline = now + STREAM_CLOSE_GRACE_MS;
-      }
-      if (settleDeadline != null && now >= settleDeadline) {
-        break;
       }
       const mainSessionState = directorySessions.get(sessionId);
       const mainSessionStatus = normalizeSessionStatus(
@@ -2147,6 +2440,18 @@ async function monitorSession({
           directory,
           [...hierarchySessionIds]
         );
+      }
+      const blocker = await getMonitorBlocker({ pendingToolSessionIds });
+      if (blocker?.type === "question_needed" || blocker?.type === "permission_needed") {
+        reconciledResult = interventionResult(blocker.type);
+        break;
+      }
+      if (blocker) {
+        await delay(100);
+        continue;
+      }
+      if (settleDeadline != null && now >= settleDeadline) {
+        break;
       }
       const hasSeenActivity = directorySessions.size > 0;
       const msSinceMainActivity = now - lastMainSessionActivityAt;
@@ -2580,7 +2885,10 @@ async function handleTask(argv) {
     if (!result) {
       return;
     }
-    if (!isFailedTerminalSessionStatus(result.status)) {
+    if (!isSuccessfulResultStatus(result.status)) {
+      process.exitCode = 1;
+    }
+    if (isSuccessfulResultStatus(result.status)) {
       shouldExit = true;
     }
   } catch (error) {

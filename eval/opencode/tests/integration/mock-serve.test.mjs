@@ -427,6 +427,90 @@ function installTransportClosedDelegatedScenario(server, {
   };
 }
 
+function installNativeTaskChildScenario(server, { orphan = false, settleDelayMs = 180 } = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const childSessionId = `ses_native_child_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const taskPartId = "prt_task_native";
+    const childSession = {
+      id: childSessionId,
+      slug: orphan ? "orphan-native-child" : "native-child",
+      ...(orphan ? {} : { parentID: sessionId }),
+      status: "busy",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      directory: ctx.directory,
+      summary: "native child running"
+    };
+    ctx.scope.sessions.unshift(childSession);
+    ctx.scope.sessionsById.set(childSessionId, childSession);
+    ctx.scope.messagesBySessionId.set(childSessionId, []);
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+    messages.push({
+      info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+      parts: [{
+        id: taskPartId,
+        type: "tool",
+        tool: "task",
+        state: { status: "running", input: { subagent_type: "explorer", description: "inspect slowly" } }
+      }]
+    });
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+    session.status = "busy";
+    session.summary = "root launched native task";
+    session.updatedAt = new Date().toISOString();
+    ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: taskPartId,
+        part: { id: taskPartId, type: "tool", tool: "task", state: { status: "running", input: { subagent_type: "explorer" } } }
+      }
+    });
+    ctx.pushEvent({ type: "session.status", properties: { sessionID: childSessionId, status: { type: "busy" } } });
+
+    const timer = setTimeout(() => {
+      childSession.status = "idle";
+      childSession.summary = "native child finished";
+      childSession.updatedAt = new Date().toISOString();
+      messages[0].parts[0].state = { status: "completed", output: orphan ? `task_id: ${childSessionId}` : "done" };
+      ctx.pushEvent({
+        type: "message.part.updated",
+        properties: {
+          sessionID: sessionId,
+          messageID: assistantMessageId,
+          partID: taskPartId,
+          part: { id: taskPartId, type: "tool", tool: "task", state: { status: "completed", output: orphan ? `task_id: ${childSessionId}` : "done" } }
+        }
+      });
+      ctx.pushEvent({ type: "session.idle", properties: { sessionID: childSessionId } });
+    }, settleDelayMs);
+    timer.unref?.();
+
+    return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" }, parts: messages[0].parts } };
+  });
+  return () => server.setResponse(promptRoute, null);
+}
+
+function installPendingEventScenario(server, eventType) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    session.status = "busy";
+    session.updatedAt = new Date().toISOString();
+    ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+    ctx.pushEvent({ type: eventType, properties: { sessionID: sessionId, id: `${eventType}-1`, text: "Need input" } });
+    return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: "msg_pending", sessionID: sessionId, role: "assistant" }, parts: [] } };
+  });
+  return () => server.setResponse(promptRoute, null);
+}
+
 describe("mock serve integration tests", () => {
   test("serve status reports the managed serve port without spawning a probe serve", async () => {
     const workspace = tempWorkspace("opencode-check-managed-");
@@ -1066,6 +1150,204 @@ describe("mock serve integration tests", () => {
     }
   });
 
+  test("native task child keeps wait alive after root goes quiet", async () => {
+    const workspace = tempWorkspace("opencode-native-child-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const restore = installNativeTaskChildScenario(server, { settleDelayMs: 180 });
+    try {
+      const startedAt = Date.now();
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "launch native task"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_QUIESCENCE_TIMEOUT_MS: "40" },
+        timeoutMs: 5000
+      });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(160);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: delegated");
+      expect(result.stdout).toContain("Wrapper completion: delegated_settled");
+      expect(result.stderr).not.toContain("Finished (quiescence)");
+    } finally {
+      restore();
+    }
+  });
+
+  test("task tool output can attach an orphan child session to monitoring", async () => {
+    const workspace = tempWorkspace("opencode-orphan-child-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const restore = installNativeTaskChildScenario(server, { orphan: true, settleDelayMs: 180 });
+    try {
+      const startedAt = Date.now();
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "launch orphan native task"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_QUIESCENCE_TIMEOUT_MS: "40" },
+        timeoutMs: 5000
+      });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(160);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: delegated");
+      expect(result.stderr).not.toContain("Finished (quiescence)");
+    } finally {
+      restore();
+    }
+  });
+
+  test("shell-launched companion background job keeps wait alive while active", async () => {
+    const workspace = tempWorkspace("opencode-shell-background-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const jobId = "task-abc123-def456";
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
+      const sessionId = String(ctx.params.id);
+      const session = ctx.scope.sessionsById.get(sessionId);
+      const now = new Date().toISOString();
+      writeJson(path.join(workspace, ".opencode-jobs.json"), [{ id: jobId, status: "running", pid: process.pid, createdAt: now, updatedAt: now, startedAt: now }]);
+      session.status = "busy";
+      session.updatedAt = now;
+      ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+      ctx.pushEvent({ type: "message.part.delta", properties: { sessionID: sessionId, messageID: "msg_shell", partID: "prt_shell", field: "text", delta: `OpenCode task started in background as ${jobId}.` } });
+      const timer = setTimeout(() => writeJson(path.join(workspace, ".opencode-jobs.json"), [{ id: jobId, status: "completed", pid: null, createdAt: now, updatedAt: new Date().toISOString(), startedAt: now, completedAt: new Date().toISOString() }]), 180);
+      timer.unref?.();
+      return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: "msg_shell", sessionID: sessionId, role: "assistant" }, parts: [{ type: "text", text: `OpenCode task started in background as ${jobId}.`, id: "prt_shell" }] } };
+    });
+    try {
+      const startedAt = Date.now();
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "launch background shell job"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_QUIESCENCE_TIMEOUT_MS: "40" },
+        timeoutMs: 5000
+      });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(160);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: completed");
+      expect(result.stderr).toContain("Detected active companion background job");
+    } finally {
+      server.setResponse("POST /session/:id/prompt_async", null);
+    }
+  });
+
+  test("question.asked returns a pending question-needed result", async () => {
+    const workspace = tempWorkspace("opencode-question-needed-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const restore = installPendingEventScenario(server, "question.asked");
+    try {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "ask me"], { cwd: workspace, env: delegatedCompanionEnv(binDir), timeoutMs: 5000 });
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("Status: question_needed");
+      expect(result.stdout).toContain("Recommended action: answer_question");
+      expect(result.stdout).not.toContain("Status: completed");
+    } finally {
+      restore();
+    }
+  });
+
+  test("permission.asked returns a pending permission-needed result", async () => {
+    const workspace = tempWorkspace("opencode-permission-needed-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const restore = installPendingEventScenario(server, "permission.asked");
+    try {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "need permission"], { cwd: workspace, env: delegatedCompanionEnv(binDir), timeoutMs: 5000 });
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("Status: permission_needed");
+      expect(result.stdout).toContain("Recommended action: approve_or_deny_permission");
+      expect(result.stdout).not.toContain("Status: completed");
+    } finally {
+      restore();
+    }
+  });
+
+  test("pending events from unrelated same-directory sessions do not stop the current wait", async () => {
+    const workspace = tempWorkspace("opencode-unrelated-question-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
+      const sessionId = String(ctx.params.id);
+      const session = ctx.scope.sessionsById.get(sessionId);
+      const unrelatedSessionId = `ses_unrelated_${String(++ctx.scope.counter)}`;
+      ctx.scope.sessions.unshift({
+        id: unrelatedSessionId,
+        slug: "unrelated-question",
+        status: "busy",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        directory: ctx.directory,
+        summary: "unrelated session needs input"
+      });
+      session.status = "busy";
+      session.updatedAt = new Date().toISOString();
+      ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+      ctx.pushEvent({ type: "question.asked", properties: { sessionID: unrelatedSessionId, id: "question-unrelated", text: "Ignore me" } });
+      return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: "msg_current", sessionID: sessionId, role: "assistant" }, parts: [] } };
+    });
+    try {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "ignore unrelated question"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_QUIESCENCE_TIMEOUT_MS: "40" },
+        timeoutMs: 5000
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: completed");
+      expect(result.stdout).not.toContain("question_needed");
+    } finally {
+      server.setResponse("POST /session/:id/prompt_async", null);
+    }
+  });
+
+  test("pending events from newly-created child sessions are not missed before polling", async () => {
+    const workspace = tempWorkspace("opencode-child-question-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
+      const sessionId = String(ctx.params.id);
+      const session = ctx.scope.sessionsById.get(sessionId);
+      const childSessionId = `ses_child_question_${String(++ctx.scope.counter)}`;
+      ctx.scope.sessions.unshift({
+        id: childSessionId,
+        slug: "child-question",
+        parentID: sessionId,
+        status: "busy",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        directory: ctx.directory,
+        summary: "child needs input"
+      });
+      session.status = "busy";
+      session.updatedAt = new Date().toISOString();
+      ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+      ctx.pushEvent({ type: "question.asked", properties: { sessionID: childSessionId, id: "question-child", text: "Answer child" } });
+      return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: "msg_child_question", sessionID: sessionId, role: "assistant" }, parts: [] } };
+    });
+    try {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "child asks question"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_STATUS_POLL_INTERVAL_MS: "10000" },
+        timeoutMs: 5000
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("Status: question_needed");
+      expect(result.stdout).toContain("Recommended action: answer_question");
+    } finally {
+      server.setResponse("POST /session/:id/prompt_async", null);
+    }
+  });
+
   test("delegated sessions still settle cleanly when the event stream closes before a terminal root status", async () => {
     const workspace = tempWorkspace("opencode-stream-close-delegated-");
     const binDir = path.join(workspace, "bin");
@@ -1107,6 +1389,49 @@ describe("mock serve integration tests", () => {
       expect(result.stderr).not.toContain("event stream ended before session completion");
     } finally {
       restoreRoutes();
+    }
+  });
+
+  test("stream-close reconciliation waits for active background jobs found in message snapshots", async () => {
+    const workspace = tempWorkspace("opencode-stream-close-background-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), { pid: process.pid, port, startedAt: new Date().toISOString() });
+    const jobId = "task-bcd234-efg567";
+
+    server.setResponse("GET /event", async () => ({ status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" }, body: "" }));
+    server.setResponse("POST /session/:id/prompt_async", async (ctx) => {
+      const sessionId = String(ctx.params.id);
+      const session = ctx.scope.sessionsById.get(sessionId);
+      const now = new Date().toISOString();
+      writeJson(path.join(workspace, ".opencode-jobs.json"), [{ id: jobId, status: "running", pid: process.pid, createdAt: now, updatedAt: now, startedAt: now }]);
+      const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+      messages.push({ info: { id: "msg_stream_bg", sessionID: sessionId, role: "assistant" }, parts: [{ type: "text", id: "prt_stream_bg", text: `OpenCode task started in background as ${jobId}.` }] });
+      ctx.scope.messagesBySessionId.set(sessionId, messages);
+      session.status = "busy";
+      session.summary = "stream closed with background job";
+      session.updatedAt = now;
+      const timer = setTimeout(() => writeJson(path.join(workspace, ".opencode-jobs.json"), [{ id: jobId, status: "completed", pid: null, createdAt: now, updatedAt: new Date().toISOString(), startedAt: now, completedAt: new Date().toISOString() }]), 180);
+      timer.unref?.();
+      return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: messages.at(-1) };
+    });
+
+    try {
+      const startedAt = Date.now();
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "stream close with background"], {
+        cwd: workspace,
+        env: { ...delegatedCompanionEnv(binDir), OPENCODE_STREAM_CLOSE_GRACE_MS: "80", OPENCODE_QUIESCENCE_TIMEOUT_MS: "40" },
+        timeoutMs: 5000
+      });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(160);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Status: completed");
+      expect(result.stderr).toContain("Event stream closed before a terminal root status");
+      expect(result.stderr).not.toContain("event stream ended before session completion");
+    } finally {
+      server.setResponse("GET /event", null);
+      server.setResponse("POST /session/:id/prompt_async", null);
     }
   });
 
