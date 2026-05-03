@@ -437,6 +437,26 @@ async function sandboxExec(sandbox, command, cwd) {
   throw new Error("Sandbox command execution is not supported by this @daytona/sdk version.");
 }
 
+async function readRemoteText(sandbox, remotePath) {
+  const result = await sandboxExec(sandbox, `[ -f ${shellQuote(remotePath)} ] && cat ${shellQuote(remotePath)}`);
+  if (!result) return null;
+  if (typeof result.exitCode === "number" && result.exitCode !== 0) return null;
+  if (result.exitCode === undefined && !result.stdout && !result.stderr) return null;
+  const stdout = result.stdout;
+  const stderr = result.stderr;
+  if (stdout !== undefined) return typeof stdout === "string" ? stdout : String(stdout);
+  if (stderr !== undefined) return typeof stderr === "string" ? stderr : String(stderr);
+  return null;
+}
+
+function parseRemoteInteger(resultText) {
+  if (resultText === null) return undefined;
+  const normalized = String(resultText).trim();
+  if (!normalized) return undefined;
+  const value = Number.parseInt(normalized, 10);
+  return Number.isInteger(value) ? value : undefined;
+}
+
 function assertRemoteCommandSuccess(result, action = "remote command") {
   if (typeof result?.exitCode !== "number" || result.exitCode === 0) return result;
   const details = [];
@@ -585,11 +605,20 @@ async function handleExec(options, command) {
   const artifacts = toRemoteAbsolute(state.remoteArtifactsPath ?? paths.remoteArtifactsPath);
   const cwd = toRemoteAbsolute(options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
   const cmd = command.map(shellQuote).join(" ");
-  const wrapped = `mkdir -p ${shellQuote(artifacts)}; ( cd ${shellQuote(cwd)} && ${cmd}; ) > ${shellQuote(`${artifacts}/stdout.txt`)} 2> ${shellQuote(`${artifacts}/stderr.txt`)}; code=$?; printf '%s\n' "$code" > ${shellQuote(`${artifacts}/exit-code.txt`)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
+  const remoteStdoutPath = `${artifacts}/stdout.txt`;
+  const remoteStderrPath = `${artifacts}/stderr.txt`;
+  const exitCodePath = `${artifacts}/exit-code.txt`;
+  const wrapped = `mkdir -p ${shellQuote(artifacts)}; ( cd ${shellQuote(cwd)} && ${cmd}; ) > ${shellQuote(remoteStdoutPath)} 2> ${shellQuote(remoteStderrPath)}; code=$?; printf '%s\\n' "$code" > ${shellQuote(exitCodePath)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
   const result = await sandboxExec(sandbox, wrapped);
   if (result?.stdout) process.stdout.write(String(result.stdout));
   if (result?.stderr) process.stderr.write(String(result.stderr));
+  const remoteStdout = await readRemoteText(sandbox, remoteStdoutPath);
+  if (remoteStdout) process.stdout.write(remoteStdout);
+  const remoteStderr = await readRemoteText(sandbox, remoteStderrPath);
+  if (remoteStderr) process.stderr.write(remoteStderr);
+  const remoteExitCode = parseRemoteInteger(await readRemoteText(sandbox, exitCodePath));
   if (typeof result?.exitCode === "number") process.exitCode = result.exitCode;
+  else if (typeof remoteExitCode === "number") process.exitCode = remoteExitCode;
 }
 
 async function handlePull(options) {
@@ -732,4 +761,4 @@ function isSameRealPath(a, b) {
 const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
-export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildUsage, collectResources, createBundle, createGitBundle, downloadFile, fetchGitBundleIntoBranch, hasExplicitResourceFlags, listTarEntries, loadEnvFile, parseArgs, parsePort, readProjectState, redactStateForDisplay, remoteEnsureGitCommand, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries };
+export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildUsage, collectResources, createBundle, createGitBundle, downloadFile, fetchGitBundleIntoBranch, hasExplicitResourceFlags, listTarEntries, loadEnvFile, parseArgs, parsePort, parseRemoteInteger, readProjectState, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries };

@@ -14,7 +14,9 @@ import {
   listTarEntries,
   loadEnvFile,
   parseArgs,
+  parseRemoteInteger,
   redactStateForDisplay,
+  readRemoteText,
   resolveEnvFile,
   resolveEnvFiles,
   resolveProjectPaths,
@@ -174,6 +176,23 @@ describe("daytona-manager sdk wrappers", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("reads remote artifact text from stdout when present", async () => {
+    const text = await readRemoteText({ process: { executeCommand: async () => ({ exitCode: 0, stdout: "hello from remote\n" }) } }, "/tmp/stdout.txt");
+    expect(text).toBe("hello from remote\n");
+  });
+
+  it("reads remote artifact text from stderr when stdout is absent", async () => {
+    const text = await readRemoteText({ process: { executeCommand: async () => ({ exitCode: 0, stderr: "fallback stderr\n" }) } }, "/tmp/stderr.txt");
+    expect(text).toBe("fallback stderr\n");
+  });
+
+  it("parses remote integer exit codes and ignores invalid values", () => {
+    expect(parseRemoteInteger("7\n")).toBe(7);
+    expect(parseRemoteInteger(" ")).toBeUndefined();
+    expect(parseRemoteInteger("not-a-number")).toBeUndefined();
+    expect(parseRemoteInteger(null)).toBeUndefined();
   });
 });
 
