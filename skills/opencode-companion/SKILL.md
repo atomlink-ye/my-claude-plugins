@@ -1,45 +1,87 @@
 ---
 name: opencode-companion
-description: "OpenCode runtime companion skill. Load aggressively for old /opencode:* command terms, OpenCode task/review/status/serve/rescue requests, session ids, timeouts, attach/resume decisions, background jobs, and any question about the removed slash-command wrappers. Commands are replaced by direct companion script calls under skills/opencode-companion/scripts."
+description: "OpenCode runtime companion. Load for OpenCode task/review/status/serve/rescue requests, session IDs, timeout recovery, attach/resume decisions, background jobs, and result forwarding."
 user-invocable: true
 ---
 
 # OpenCode Companion
 
-The old `/opencode:*` slash commands are removed/replaced. Use this top-level skill and the companion script directly.
+OpenCode is a headless coding agent runtime. This skill lets you launch coding sessions, run code reviews, manage background jobs, and forward results — all through a single companion script.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" <verb> [options]
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  SCRIPT="$CLAUDE_PLUGIN_ROOT/skills/opencode-companion/scripts/opencode-companion.mjs"
+else
+  SCRIPT="$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs"
+fi
 ```
 
-When this skill is installed standalone for OpenCode under `~/.agents/skills/`, use:
+## Typical workflows
+
+### Delegate a coding task
 
 ```bash
-node "$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs" <verb> [options]
+node "$SCRIPT" session new --directory "$WORK_DIR" --timeout 60 -- "Add input validation to the /users endpoint. Run pnpm test before finishing."
 ```
 
-## Quick map from old commands
+The session blocks until done or timeout. On completion, verify the artifacts directly — don't trust progress output alone.
 
-- `/opencode:task` → `session new` or `session continue`
-- `/opencode:rescue` → continue/attach the same session with a narrow rescue prompt
-- `/opencode:review` and `/opencode:adversarial-review` → `review [--adversarial]`
-- `/opencode:status`, `/opencode:wait`, `/opencode:result`, `/opencode:cancel` → `session ...` or `job ...`
-- `/opencode:serve` → `serve status|start|stop`
+### Continue in the same session
 
-## Read next
+When the result needs a fix or follow-up, reuse the session instead of starting fresh:
 
-- `references/runtime-contract.md` — supported verbs, paths, stdout contract
-- `references/session-lifecycle.md` — reuse, attach, timeout recovery
-- `references/thin-forwarding-workflow.md` — how Claude should invoke/report output
-- `references/background-jobs.md` — `--background` job state and retrieval
-- `references/review-workflows.md` — direct review/adversarial review calls
-- `references/command-migration.md` — old slash-command replacements
-- `references/troubleshooting.md` — serve/session recovery
+```bash
+node "$SCRIPT" session continue "$SID" --directory "$WORK_DIR" --timeout 60 -- "The validation is missing email format check. Add it and re-run tests."
+```
+
+### Run a code review
+
+```bash
+# Review uncommitted changes
+node "$SCRIPT" review --directory "$WORK_DIR" --scope working-tree --wait
+
+# Adversarial review of a branch
+node "$SCRIPT" review --directory "$WORK_DIR" --adversarial --scope branch --base main --wait
+```
+
+Critical/High findings are blockers unless the user explicitly accepts them.
+
+### Run a task in the background
+
+For long-running work that shouldn't block the foreground:
+
+```bash
+node "$SCRIPT" session new --background --directory "$WORK_DIR" -- "Refactor the payment module to use the new SDK."
+# Returns a job ID immediately
+
+node "$SCRIPT" job status "$JOB_ID"
+node "$SCRIPT" job wait "$JOB_ID"
+node "$SCRIPT" job result "$JOB_ID"
+```
+
+### Check or restart the serve
+
+```bash
+node "$SCRIPT" serve status
+node "$SCRIPT" serve start    # if not running
+node "$SCRIPT" serve stop
+```
+
+## When to read references
+
+| You need to... | Read |
+|---|---|
+| Know every verb, flag, and path convention | `references/runtime-contract.md` |
+| Decide reuse vs. fresh session; recover from timeout | `references/session-lifecycle.md` |
+| Structure a good delegation prompt; handle ambiguous output | `references/thin-forwarding-workflow.md` |
+| Manage background jobs (status, wait, cancel, partial results) | `references/background-jobs.md` |
+| Run reviews or adversarial reviews | `references/review-workflows.md` |
+| Debug "serve unreachable", stale sessions, shell quoting | `references/troubleshooting.md` |
 
 ## Non-negotiables
 
-- Reuse before relaunch when a session id and working directory exist.
-- Timeout or dropped stream is ambiguous; attach/verify before retrying.
-- Preserve companion stdout verbatim when forwarding results.
-- Keep shell arguments quoted; use `-- "prompt"` for prompt text.
-- Verify artifacts directly; progress output is not completion.
+- **Reuse before relaunch.** If a session ID and working directory exist, continue or attach — don't start a new session.
+- **Timeout is not failure.** Attach and verify before retrying: `session attach "$SID" --directory "$WORK_DIR" --timeout 5`.
+- **Forward output verbatim.** Don't summarize or reinterpret companion stdout when the user asked for runtime output.
+- **Quote everything.** Paths and prompts must be quoted; prompt text goes after `--`.
+- **Verify artifacts directly.** Progress output and partial logs are not proof of completion.

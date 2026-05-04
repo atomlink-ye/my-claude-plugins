@@ -10,7 +10,7 @@ Personal Claude Code plugin marketplace.
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [task-iteration](skills/task-iteration/) | Orchestrate feature implementation from exec-plans with Plan→Generate→Evaluate workflow |
 
-`opencode` and `daytona` marketplace entries now exist only as deprecated aliases to the companion skills. The old `/opencode:*` and `/daytona:*` slash-command wrappers have been removed/replaced by direct script calls from skills:
+Companion skills expose direct script entrypoints:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new --directory "$WORK_DIR" -- "<prompt>"
