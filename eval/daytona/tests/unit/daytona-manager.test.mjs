@@ -21,6 +21,7 @@ import {
   resolveEnvFile,
   resolveEnvFiles,
   resolveProjectPaths,
+  resolveRemoteHome,
   sandboxExec,
   sanitizeTaskId,
   shellQuote,
@@ -195,6 +196,37 @@ describe("daytona-manager sdk wrappers", () => {
     expect(parseRemoteInteger(" ")).toBeUndefined();
     expect(parseRemoteInteger("not-a-number")).toBeUndefined();
     expect(parseRemoteInteger(null)).toBeUndefined();
+  });
+
+  it("resolves remote home from passwd fallback when HOME is unset", async () => {
+    const commands = [];
+    const sandbox = {
+      process: {
+        executeCommand: async (command) => {
+          commands.push(command);
+          if (command.includes("${HOME:-}")) return { exitCode: 0, stdout: "\n" };
+          if (command.includes("getent passwd")) return { exitCode: 127, stderr: "getent not found" };
+          if (command.includes("/etc/passwd")) return { exitCode: 0, stdout: "/home/dev\n" };
+          return { exitCode: 1, stdout: "" };
+        }
+      }
+    };
+
+    await expect(resolveRemoteHome(sandbox)).resolves.toBe("/home/dev");
+    expect(commands.some((command) => command.includes("/etc/passwd"))).toBe(true);
+  });
+
+  it("resolves remote home from username fallback when HOME and passwd lookups fail", async () => {
+    const sandbox = {
+      process: {
+        executeCommand: async (command) => {
+          if (command.includes("/home/$user")) return { exitCode: 0, stdout: "/home/dev\n" };
+          return { exitCode: 0, stdout: "\n" };
+        }
+      }
+    };
+
+    await expect(resolveRemoteHome(sandbox)).resolves.toBe("/home/dev");
   });
 });
 

@@ -7,6 +7,7 @@ import {
   collectResources,
   parseArgs,
   parsePort,
+  resolveRemoteHome,
   sanitizeTaskId,
   shellQuote,
   toRemoteAbsolute,
@@ -62,4 +63,18 @@ test("validates class, task id, port, remote paths, and tar entries", () => {
 
 test("shellQuote safely quotes single quotes", () => {
   assert.equal(shellQuote("a'b"), "'a'\"'\"'b'");
+});
+
+test("remote home detection falls back when HOME is unset", async () => {
+  const sandbox = {
+    process: {
+      executeCommand: async (command) => {
+        if (command.includes("${HOME:-}")) return { exitCode: 0, stdout: "\n" };
+        if (command.includes("getent passwd")) return { exitCode: 127, stderr: "getent not found" };
+        if (command.includes("/etc/passwd")) return { exitCode: 0, stdout: "/home/dev\n" };
+        return { exitCode: 1, stdout: "" };
+      },
+    },
+  };
+  assert.equal(await resolveRemoteHome(sandbox), "/home/dev");
 });

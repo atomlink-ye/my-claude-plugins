@@ -141,12 +141,25 @@ function assertSafeDestructiveRemoteWorkspace(remotePath, remoteHome = process.e
 }
 
 async function resolveRemoteHome(sandbox) {
-  const result = await sandboxExec(sandbox, "printf '%s\\n' \"$HOME\"");
-  assertRemoteCommandSuccess(result, "remote home detection");
-  const remoteHome = String(result?.stdout ?? "").split(/\r?\n/, 1)[0]?.trim();
-  const normalized = normalizeRemoteHome(remoteHome);
-  if (!normalized) throw new Error("Could not determine sandbox remote home from $HOME");
-  return normalized;
+  const commands = [
+    "printf '%s\\n' \"${HOME:-}\"",
+    "command -v getent >/dev/null 2>&1 && getent passwd \"$(id -u)\" | cut -d: -f6",
+    "[ -r /etc/passwd ] && awk -F: -v uid=\"$(id -u)\" '$3 == uid { print $6; exit }' /etc/passwd",
+    "user=$(id -un 2>/dev/null || whoami 2>/dev/null || true); [ -n \"$user\" ] && [ -d \"/home/$user\" ] && printf '%s\\n' \"/home/$user\"",
+    "[ \"$(id -u)\" = 0 ] && [ -d /root ] && printf '%s\\n' /root",
+  ];
+  for (const command of commands) {
+    const result = await sandboxExec(sandbox, command);
+    if (typeof result?.exitCode === "number" && result.exitCode !== 0) continue;
+    const remoteHome = String(result?.stdout ?? "").split(/\r?\n/, 1)[0]?.trim();
+    try {
+      const normalized = normalizeRemoteHome(remoteHome);
+      if (normalized) return normalized;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("Could not determine sandbox remote home from environment or passwd database");
 }
 
 function validateGitBranch(branch) {
@@ -787,4 +800,4 @@ function isSameRealPath(a, b) {
 const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
 if (isDirectExecution) main().catch((error) => { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); });
 
-export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildUsage, collectResources, createBundle, createGitBundle, downloadFile, fetchGitBundleIntoBranch, hasExplicitResourceFlags, listTarEntries, loadEnvFile, parseArgs, parsePort, parseRemoteInteger, readProjectState, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries };
+export { applyDaytonaEnv, applyProjectEnv, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildUsage, collectResources, createBundle, createGitBundle, downloadFile, fetchGitBundleIntoBranch, hasExplicitResourceFlags, listTarEntries, loadEnvFile, parseArgs, parsePort, parseRemoteInteger, readProjectState, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries };
