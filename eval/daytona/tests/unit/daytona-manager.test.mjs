@@ -326,11 +326,12 @@ describe("daytona-manager paths", () => {
 });
 
 describe("daytona companion skill docs", () => {
-  it("documents direct manager invocation instead of command wrappers", () => {
+  it("documents direct manager invocation without command wrapper migration language", () => {
     const skillPath = path.resolve("skills/daytona-companion/SKILL.md");
     const content = readFileSync(skillPath, "utf8");
     expect(content).toContain("skills/daytona-companion/scripts/daytona-manager.mjs");
-    expect(content).toContain("slash commands are removed/replaced");
+    expect(content).not.toContain("/daytona:");
+    expect(content).not.toMatch(/slash-command|slash commands|removed\/replaced|migration/i);
     expect(content).not.toContain("${CLAUDE_PLUGIN_ROOT}/plugins/");
   });
 });

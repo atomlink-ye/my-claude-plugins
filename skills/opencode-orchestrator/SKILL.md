@@ -210,4 +210,4 @@ This skill does **not** define:
 - background job retrieval syntax
 - direct runtime troubleshooting steps
 
-Those belong in the `opencode-companion` runtime skill and direct companion script, not plugin command wrappers.
+Those belong in the `opencode-companion` runtime skill and direct companion script, not this routing skill.

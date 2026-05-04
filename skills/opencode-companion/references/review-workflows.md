@@ -1,6 +1,6 @@
 # Review Workflows
 
-The old `/opencode:review` and `/opencode:adversarial-review` command wrappers are replaced by the direct `review` verb.
+Use the direct `review` verb for working-tree and branch reviews.
 
 ## Working tree review
 

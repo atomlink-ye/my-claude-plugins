@@ -1,99 +1,59 @@
 ---
 name: paseo-companion
-description: "Paseo CLI companion. Load whenever the user mentions paseo, paseo agents, paseo run/send/wait/logs/attach/ls, agent IDs, sending follow-up prompts to a running agent, paseo loops, paseo schedules, paseo terminals, paseo worktrees, paseo chat, paseo permit, paseo daemon, host/port targeting, or any question about driving AI coding agents through the paseo CLI. This includes cases where `paseo run --host <ip>:<port>` should point at a non-local daemon explicitly."
+description: "Paseo CLI companion. Load whenever the user mentions paseo, paseo agents, paseo run/send/wait/logs/attach/ls, agent IDs, sending follow-ups to a running agent, loops, schedules, terminals, worktrees, chat, permits, daemon operations, or host/port targeting."
 user-invocable: true
 ---
 
 # Paseo Companion
 
-`paseo` is a daemon-managed CLI for launching, observing, and steering AI coding agents from the shell. Every agent has a stable ID — that ID is also the handle for sending follow-ups, reading logs, waiting, and archiving.
+Paseo is a daemon-managed CLI for launching, observing, and steering AI coding agents. Every agent gets a stable ID that serves as the handle for all subsequent operations — follow-ups, logs, waiting, archiving.
 
 ```bash
 paseo <command> [options]
 ```
 
-This skill documents the CLI. It does not pick providers, models, modes, or worktree policies — those are caller decisions.
+## Typical workflows
 
-## The common commands
-
-These cover day-to-day usage. For everything else, see the references list at the bottom.
-
-### `paseo run "<prompt>"` — launch an agent
-
-Blocks until the agent finishes by default.
-
-If the daemon is not local, pass `--host <ip>:<port>` to point the run at that daemon explicitly.
+### Run a single task and wait for completion
 
 ```bash
 paseo run "implement the new auth flow"
-paseo run --provider codex/gpt-5.4 "..."         # pick provider/model
-paseo run --worktree feature-x "..."             # isolate in a git worktree
-paseo run --cwd /path/to/repo "..."              # set working directory
-paseo run --host 10.0.0.8:6767 "..."             # target a remote daemon by IP:port
-paseo run --wait-timeout 30m "..."               # cap the blocking wait
-paseo run -d "..."                               # detach; print agent ID and return
-paseo run --json "..."                           # JSON output (machine-readable)
 ```
 
-**Detached + wait pattern** (parallel work, then join):
+Blocks until the agent finishes. Add `--wait-timeout 30m` to cap the wait.
+
+### Send a follow-up to the same agent
+
+Reuse before relaunch — if an agent already exists for related work, continue it:
+
+```bash
+paseo send <id> "now add tests for the new endpoint"
+```
+
+`<id>` accepts a unique prefix or the agent name, not just the full UUID.
+
+### Run multiple agents in parallel
+
+Detach agents, do other work, then join:
+
 ```bash
 api_id=$(paseo run -d --json "implement the API" | jq -r .id)
 ui_id=$(paseo run -d --json "implement the UI"  | jq -r .id)
+
+# ... do other work ...
+
 paseo wait "$api_id"
 paseo wait "$ui_id"
 ```
 
-### `paseo send <id> "<prompt>"` — continue the same agent
-
-This is the continuation primitive. The agent ID is stable across calls, so sending a follow-up reuses the same conversation context. Do this instead of launching a new agent when the work is a follow-up to something already in flight.
+### Isolate work in a git worktree
 
 ```bash
-paseo send <id> "now add tests for the new endpoint"
-paseo send <id> --no-wait "..."                  # queue and return immediately
-paseo send <id> --image screenshot.png "..."     # attach an image
-paseo send <id> --prompt-file ./long-task.md     # read prompt from file
+paseo run --worktree feature-x "implement feature X"
+paseo run --worktree experiment-y --base develop "try approach Y"
 ```
 
-`<id>` accepts a unique prefix or the agent's name, not just the full UUID.
-
-### `paseo ls` — list agents
-
-```bash
-paseo ls                       # active agents
-paseo ls -a                    # include archived
-paseo ls --json                # JSON output
-paseo ls -q                    # IDs only (scripting)
-```
-
-Top-level flags `-q`, `--no-headers`, and `-o table|json|yaml` apply to every list command.
-
-### `paseo wait <id>` — block until idle
-
-```bash
-paseo wait <id>
-paseo wait <id> --timeout 60   # cap in seconds
-```
-
-No timeout by default. If a wait times out, the agent is **still running** — re-run `paseo wait`, do not relaunch.
-
-### `paseo logs <id>` — view activity
-
-```bash
-paseo logs <id>                # full timeline
-paseo logs <id> -f             # follow (stream)
-paseo logs <id> --tail 20      # last N entries
-paseo logs <id> --filter tools # only tool calls (also: text, errors, permissions)
-```
-
-### `paseo attach <id>` — stream live output interactively
-
-```bash
-paseo attach <id>              # Ctrl+C detaches without stopping the agent
-```
-
-### `paseo loop run "<prompt>" --verify "..."` — iterate worker/verifier
-
-Run a worker, judge with the verifier, repeat until done or limits hit.
+### Iterate until tests pass
 
 ```bash
 paseo loop run "fix the failing tests" \
@@ -101,29 +61,68 @@ paseo loop run "fix the failing tests" \
   --max-iterations 10
 ```
 
-Use `--verify "<prompt>"` for a verifier agent, `--verify-check "<command>"` for a shell exit-0 check (repeatable), `--sleep <duration>` to pace iterations, `--max-time <duration>` for a hard cap.
+Use `--verify "<prompt>"` for an agent-based verifier instead of a shell command.
 
-## Continuation rule
+### Monitor a running agent
 
-Reuse before relaunch. If an agent already exists for related work, send to it (`paseo send`) rather than spinning up a new one. The agent ID **is** the session handle.
+```bash
+paseo logs <id> -f            # stream live output
+paseo attach <id>             # interactive stream (Ctrl+C detaches, doesn't stop)
+paseo inspect <id>            # detailed metadata snapshot
+```
 
-## Common gotchas
+### List and manage agents
 
-- `paseo run` blocks forever by default — that is intentional. Set `--wait-timeout` only if you need a cap.
-- Never poll a running agent in a loop with `paseo ls` / `paseo inspect`. Use `paseo wait` (it blocks efficiently) or `paseo logs -f` (it streams).
-- Provider strings with shell-special characters need quoting: `--provider 'claude/...'`.
-- Quote the prompt argument. For multi-line or escape-heavy prompts, use `--prompt-file`.
-- A timeout on `wait` does not stop the agent. Use `paseo stop <id>` to interrupt.
+```bash
+paseo ls                      # active agents
+paseo ls -a                   # include archived
+paseo stop <id>               # interrupt a running agent
+paseo archive <id>            # soft-delete
+paseo delete <id>             # hard-delete
+```
 
-## Reference files
+## Common options
 
-Read the matching file when the task goes beyond the common commands above.
+```bash
+--provider codex/gpt-5.4      # pick provider/model
+--cwd /path/to/repo            # set working directory
+--host 10.0.0.8:6767           # target a remote daemon
+--json                         # machine-readable output
+-d                             # detach (return immediately, print agent ID)
+--prompt-file ./task.md        # read prompt from file (for long/complex prompts)
+--image screenshot.png         # attach an image to the prompt
+```
 
-- `references/agent-management.md` — `inspect`, `stop`, `archive`, `delete`, `agent mode/update/reload`, labels.
-- `references/providers-and-modes.md` — `provider ls`, `provider models`, `--provider`, `--model`, `--mode`, `--thinking`.
-- `references/worktree-and-cwd.md` — `--worktree`, `--base`, `--cwd`, `paseo worktree ls/archive`.
-- `references/loop-and-schedule.md` — full `loop run` options, `schedule create/ls/inspect/logs/pause/resume/delete`.
-- `references/terminal.md` — `terminal create/ls/kill/capture/send-keys` and key-token reference.
-- `references/chat-and-permit.md` — `chat` rooms (`create/post/read/wait`) and `permit ls/allow/deny`.
-- `references/daemon-and-onboarding.md` — `onboard`, `daemon start/stop/restart/status/pair`, `--host`.
-- `references/output-formats.md` — `--json`, `-q`, `--no-headers`, `--no-color`, `--output-schema`.
+## Command map
+
+| Goal | Command |
+|---|---|
+| Launch and wait | `paseo run "PROMPT"` |
+| Launch detached | `paseo run -d "PROMPT"` |
+| Continue an agent | `paseo send <id> "PROMPT"` |
+| Wait for completion | `paseo wait <id>` |
+| Stream logs | `paseo logs <id> -f` |
+| Attach interactively | `paseo attach <id>` |
+| List agents | `paseo ls [-a]` |
+| Stop/archive/delete | `paseo stop|archive|delete <id>` |
+| Target remote daemon | add `--host <ip>:<port>` |
+
+## When to read references
+
+| You need to... | Read |
+|---|---|
+| Inspect, stop, archive, delete agents; update metadata or labels | `references/agent-management.md` |
+| Discover providers/models, select a provider, switch modes, enable thinking | `references/providers-and-modes.md` |
+| Use git worktrees for isolation, manage Paseo-created worktrees | `references/worktree-and-cwd.md` |
+| Set up verification loops or recurring scheduled tasks | `references/loop-and-schedule.md` |
+| Create persistent terminals, send keystrokes, capture output | `references/terminal.md` |
+| Set up inter-agent chat rooms or handle permission requests | `references/chat-and-permit.md` |
+| First-time setup, daemon start/stop/restart, connect to remote daemon | `references/daemon-and-onboarding.md` |
+| Script/automate Paseo output, JSON/YAML formats, schema validation | `references/output-formats.md` |
+
+## Non-negotiables
+
+- **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one.
+- **Wait, don't poll.** Never loop on `paseo ls` / `paseo inspect`. Use `paseo wait <id>` (blocks efficiently) or `paseo logs <id> -f` (streams).
+- **Timeout doesn't stop.** If `wait` times out, the agent is still running. Use `paseo stop <id>` to actually interrupt.
+- **Quote prompts.** For multi-line or escape-heavy prompts, use `--prompt-file`.
