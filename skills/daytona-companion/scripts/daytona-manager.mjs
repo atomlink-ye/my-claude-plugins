@@ -107,22 +107,46 @@ function hasExplicitResourceFlags(options = {}) {
   return ["cpu", "memory", "disk", "gpu"].some((key) => options[key] !== undefined);
 }
 
-function toRemoteAbsolute(remotePath) {
+function normalizeRemoteHome(remoteHome) {
+  if (remoteHome === undefined || remoteHome === null || remoteHome === "") return undefined;
+  const normalized = path.posix.normalize(String(remoteHome).replaceAll("\\", "/"));
+  if (!normalized.startsWith("/") || normalized === "/" || normalized.split("/").includes("..")) {
+    throw new Error(`Invalid remote home: ${remoteHome}`);
+  }
+  return normalized;
+}
+
+function toRemoteAbsolute(remotePath, remoteHome = process.env.DAYTONA_REMOTE_HOME) {
   const normalized = String(remotePath ?? "").replaceAll("\\", "/");
   if (!normalized) throw new Error("Remote path must not be empty");
   const segments = normalized.split("/").filter(Boolean);
   if (segments.includes("..")) throw new Error(`Unsafe remote path rejected: ${remotePath}`);
-  const absolute = normalized.startsWith("/") ? path.posix.normalize(normalized) : path.posix.normalize(path.posix.join("/home/daytona", normalized));
+  const base = normalizeRemoteHome(remoteHome);
+  if (!normalized.startsWith("/") && !base) {
+    throw new Error("Relative remote paths require a remote home; resolve sandbox $HOME or set DAYTONA_REMOTE_HOME");
+  }
+  const absolute = normalized.startsWith("/") ? path.posix.normalize(normalized) : path.posix.normalize(path.posix.join(base, normalized));
   return absolute;
 }
 
-function assertSafeDestructiveRemoteWorkspace(remotePath) {
-  const absolute = toRemoteAbsolute(remotePath);
-  const allowed = ["/home/daytona/workspace/", "/workspace/"];
-  if (!allowed.some((prefix) => absolute.startsWith(prefix)) || ["/", "/home", "/home/daytona", "/home/daytona/workspace", "/workspace", "/tmp"].includes(absolute)) {
+function assertSafeDestructiveRemoteWorkspace(remotePath, remoteHome = process.env.DAYTONA_REMOTE_HOME) {
+  const absolute = toRemoteAbsolute(remotePath, remoteHome);
+  const home = normalizeRemoteHome(remoteHome);
+  const allowed = home ? [`${home}/workspace/`, "/workspace/"] : ["/workspace/"];
+  const blocked = ["/", "/home", home, home ? `${home}/workspace` : undefined, "/workspace", "/tmp"].filter(Boolean);
+  if (!allowed.some((prefix) => absolute.startsWith(prefix)) || blocked.includes(absolute)) {
     throw new Error(`Refusing destructive operation on unsafe remote path: ${absolute}`);
   }
   return absolute;
+}
+
+async function resolveRemoteHome(sandbox) {
+  const result = await sandboxExec(sandbox, "printf '%s\\n' \"$HOME\"");
+  assertRemoteCommandSuccess(result, "remote home detection");
+  const remoteHome = String(result?.stdout ?? "").split(/\r?\n/, 1)[0]?.trim();
+  const normalized = normalizeRemoteHome(remoteHome);
+  if (!normalized) throw new Error("Could not determine sandbox remote home from $HOME");
+  return normalized;
 }
 
 function validateGitBranch(branch) {
@@ -558,7 +582,7 @@ async function handleStatus(options) {
   console.log(JSON.stringify(display, null, 2));
 }
 
-async function requireSandbox(options) {
+async function requireSandbox(options, { includeRemoteHome = false } = {}) {
   const paths = resolveProjectPaths(options);
   const state = readProjectState(paths);
   if (!state?.sandboxId) throw new Error(`No Daytona sandbox state found. Run up first. Expected: ${paths.stateFile}`);
@@ -566,18 +590,20 @@ async function requireSandbox(options) {
   const client = await createClient();
   const sandbox = await getSandbox(client, state.sandboxId, { allowNotFound: false });
   await ensureSandboxStarted(sandbox);
-  return { paths, state, sandbox };
+  const result = { paths, state, sandbox };
+  if (includeRemoteHome) result.remoteHome = await resolveRemoteHome(sandbox);
+  return result;
 }
 
 async function handlePush(options) {
   if (!options.path) throw new Error("push requires --path PATH");
   const mode = options.mode ?? "bundle";
   if (!["bundle", "git"].includes(mode)) throw new Error("push --mode must be bundle or git");
-  const { paths, state, sandbox } = await requireSandbox(options);
-  const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
+  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
+  const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
   if (mode === "git") {
     const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
-    const safeRemoteWorkspace = assertSafeDestructiveRemoteWorkspace(remoteWorkspace);
+    const safeRemoteWorkspace = assertSafeDestructiveRemoteWorkspace(remoteWorkspace, remoteHome);
     const { bundlePath, cleanup } = createGitBundle(options.path, paths.taskId);
     try {
       const remoteBundle = `/tmp/daytona-git-input-${paths.taskId}.bundle`;
@@ -601,9 +627,9 @@ async function handlePush(options) {
 
 async function handleExec(options, command) {
   if (!command.length) throw new Error("exec requires a command after --");
-  const { paths, state, sandbox } = await requireSandbox(options);
-  const artifacts = toRemoteAbsolute(state.remoteArtifactsPath ?? paths.remoteArtifactsPath);
-  const cwd = toRemoteAbsolute(options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
+  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
+  const artifacts = toRemoteAbsolute(state.remoteArtifactsPath ?? paths.remoteArtifactsPath, remoteHome);
+  const cwd = toRemoteAbsolute(options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
   const cmd = command.map(shellQuote).join(" ");
   const remoteStdoutPath = `${artifacts}/stdout.txt`;
   const remoteStderrPath = `${artifacts}/stderr.txt`;
@@ -622,12 +648,12 @@ async function handleExec(options, command) {
 }
 
 async function handlePull(options) {
-  const { paths, state, sandbox } = await requireSandbox(options);
+  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const mode = options.mode ?? "bundle";
   if (!["bundle", "git"].includes(mode)) throw new Error("pull --mode must be bundle or git");
   if (mode === "git") {
     const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
-    const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath);
+    const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
     const remoteBundle = `/tmp/daytona-git-output-${paths.taskId}.bundle`;
     const commitMessage = `sync from Daytona companion ${new Date().toISOString()}`;
     const gitResult = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && cd ${shellQuote(remoteWorkspace)} && git config user.name ${shellQuote("Daytona Companion")} && git config user.email ${shellQuote("daytona-companion@example.invalid")} && git add -A && (git diff --cached --quiet || git commit -m ${shellQuote(commitMessage)}) && git bundle create ${shellQuote(remoteBundle)} HEAD`);
@@ -642,7 +668,7 @@ async function handlePull(options) {
     } finally { rmSync(tempDir, { recursive: true, force: true }); }
     return;
   }
-  const remotePath = toRemoteAbsolute(options["remote-path"] ?? state.remoteArtifactsPath ?? paths.remoteArtifactsPath);
+  const remotePath = toRemoteAbsolute(options["remote-path"] ?? state.remoteArtifactsPath ?? paths.remoteArtifactsPath, remoteHome);
   const output = path.resolve(options.output ?? paths.localArtifactsPath);
   mkdirSync(output, { recursive: true });
   const remoteBundle = `/tmp/daytona-artifacts-${paths.taskId}.tar.gz`;

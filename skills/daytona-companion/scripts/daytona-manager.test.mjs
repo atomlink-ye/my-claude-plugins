@@ -39,16 +39,20 @@ test("small class maps to observed self-hosted small resources", () => {
 });
 
 test("validates class, task id, port, remote paths, and tar entries", () => {
+  const remoteHome = "/home/dev";
   assert.equal(validateSandboxClass("SMALL"), "small");
   assert.throws(() => validateSandboxClass("tiny"), /Invalid class/);
   assert.equal(sanitizeTaskId("abc_123"), "abc_123");
   assert.throws(() => sanitizeTaskId("../bad"), /Invalid/);
   assert.equal(parsePort("3000"), 3000);
   assert.throws(() => parsePort("70000"), /Invalid port/);
-  assert.equal(toRemoteAbsolute("workspace/demo"), "/home/daytona/workspace/demo");
+  assert.equal(toRemoteAbsolute("workspace/demo", remoteHome), "/home/dev/workspace/demo");
   assert.equal(toRemoteAbsolute("/tmp/demo"), "/tmp/demo");
+  assert.throws(() => toRemoteAbsolute("workspace/demo"), /Relative remote paths require a remote home/);
   assert.throws(() => toRemoteAbsolute("workspace/../demo"), /Unsafe remote path/);
-  assert.equal(assertSafeDestructiveRemoteWorkspace("workspace/demo"), "/home/daytona/workspace/demo");
+  assert.equal(assertSafeDestructiveRemoteWorkspace("workspace/demo", remoteHome), "/home/dev/workspace/demo");
+  assert.equal(assertSafeDestructiveRemoteWorkspace("/workspace/demo", remoteHome), "/workspace/demo");
+  assert.throws(() => assertSafeDestructiveRemoteWorkspace("/home/daytona/workspace/demo", remoteHome), /Refusing destructive/);
   assert.throws(() => assertSafeDestructiveRemoteWorkspace("/"), /Refusing destructive/);
   assert.equal(validateGitBranch("daytona/demo"), "daytona/demo");
   assert.throws(() => validateGitBranch("main"), /under daytona/);

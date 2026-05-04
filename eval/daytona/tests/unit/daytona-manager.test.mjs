@@ -8,6 +8,7 @@ import {
   applyDaytonaEnv,
   applyProjectEnv,
   assertRemoteCommandSuccess,
+  assertSafeDestructiveRemoteWorkspace,
   buildUsage,
   createBundle,
   downloadFile,
@@ -23,6 +24,7 @@ import {
   sandboxExec,
   sanitizeTaskId,
   shellQuote,
+  toRemoteAbsolute,
   uploadFile,
   validateTarEntries
 } from "../../../../skills/daytona-companion/scripts/daytona-manager.mjs";
@@ -258,6 +260,20 @@ describe("daytona-manager shell quoting", () => {
 });
 
 describe("daytona-manager paths", () => {
+  it("resolves relative remote paths against the detected sandbox home", () => {
+    expect(toRemoteAbsolute("workspace/demo", "/home/dev")).toBe("/home/dev/workspace/demo");
+    expect(toRemoteAbsolute("/tmp/demo")).toBe("/tmp/demo");
+    expect(() => toRemoteAbsolute("workspace/demo")).toThrow("Relative remote paths require a remote home");
+    expect(() => toRemoteAbsolute("workspace/../demo", "/home/dev")).toThrow("Unsafe remote path rejected");
+  });
+
+  it("limits destructive workspace syncs to the detected home workspace", () => {
+    expect(assertSafeDestructiveRemoteWorkspace("workspace/demo", "/home/dev")).toBe("/home/dev/workspace/demo");
+    expect(assertSafeDestructiveRemoteWorkspace("/workspace/demo", "/home/dev")).toBe("/workspace/demo");
+    expect(() => assertSafeDestructiveRemoteWorkspace("/home/daytona/workspace/demo", "/home/dev")).toThrow("Refusing destructive operation");
+    expect(() => assertSafeDestructiveRemoteWorkspace("/home/dev/workspace", "/home/dev")).toThrow("Refusing destructive operation");
+  });
+
   it("resolves home/global state and project-local artifact paths", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "daytona-path-test-"));
     const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-state-root-test-"));
