@@ -69,9 +69,24 @@ test("remote home detection falls back when HOME is unset", async () => {
   const sandbox = {
     process: {
       executeCommand: async (command) => {
+        assert.match(command, /sh -lc/);
         if (command.includes("${HOME:-}")) return { exitCode: 0, stdout: "\n" };
         if (command.includes("getent passwd")) return { exitCode: 127, stderr: "getent not found" };
         if (command.includes("/etc/passwd")) return { exitCode: 0, stdout: "/home/dev\n" };
+        return { exitCode: 1, stdout: "" };
+      },
+    },
+  };
+  assert.equal(await resolveRemoteHome(sandbox), "/home/dev");
+});
+
+test("remote home detection ignores shell warning lines", async () => {
+  const sandbox = {
+    process: {
+      executeCommand: async (command) => {
+        if (command.includes("${HOME:-}")) {
+          return { exitCode: 0, result: "/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8): No such file or directory\n/home/dev\n" };
+        }
         return { exitCode: 1, stdout: "" };
       },
     },

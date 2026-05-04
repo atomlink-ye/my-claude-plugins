@@ -204,6 +204,7 @@ describe("daytona-manager sdk wrappers", () => {
       process: {
         executeCommand: async (command) => {
           commands.push(command);
+          expect(command).toContain("sh -lc");
           if (command.includes("${HOME:-}")) return { exitCode: 0, stdout: "\n" };
           if (command.includes("getent passwd")) return { exitCode: 127, stderr: "getent not found" };
           if (command.includes("/etc/passwd")) return { exitCode: 0, stdout: "/home/dev\n" };
@@ -222,6 +223,34 @@ describe("daytona-manager sdk wrappers", () => {
         executeCommand: async (command) => {
           if (command.includes("/home/$user")) return { exitCode: 0, stdout: "/home/dev\n" };
           return { exitCode: 0, stdout: "\n" };
+        }
+      }
+    };
+
+    await expect(resolveRemoteHome(sandbox)).resolves.toBe("/home/dev");
+  });
+
+  it("resolves remote home by scanning /home when account metadata is unavailable", async () => {
+    const sandbox = {
+      process: {
+        executeCommand: async (command) => {
+          if (command.includes("for d in /home/*")) return { exitCode: 0, output: "/home/dev\n" };
+          return { exitCode: 0, stdout: "\n" };
+        }
+      }
+    };
+
+    await expect(resolveRemoteHome(sandbox)).resolves.toBe("/home/dev");
+  });
+
+  it("ignores shell warning lines when parsing remote home output", async () => {
+    const sandbox = {
+      process: {
+        executeCommand: async (command) => {
+          if (command.includes("${HOME:-}")) {
+            return { exitCode: 0, result: "/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8): No such file or directory\n/home/dev\n" };
+          }
+          return { exitCode: 1, stdout: "" };
         }
       }
     };

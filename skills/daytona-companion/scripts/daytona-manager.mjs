@@ -110,7 +110,7 @@ function hasExplicitResourceFlags(options = {}) {
 function normalizeRemoteHome(remoteHome) {
   if (remoteHome === undefined || remoteHome === null || remoteHome === "") return undefined;
   const normalized = path.posix.normalize(String(remoteHome).replaceAll("\\", "/"));
-  if (!normalized.startsWith("/") || normalized === "/" || normalized.split("/").includes("..")) {
+  if (!normalized.startsWith("/") || normalized === "/" || normalized.split("/").includes("..") || /\s/.test(normalized)) {
     throw new Error(`Invalid remote home: ${remoteHome}`);
   }
   return normalized;
@@ -146,17 +146,22 @@ async function resolveRemoteHome(sandbox) {
     "command -v getent >/dev/null 2>&1 && getent passwd \"$(id -u)\" | cut -d: -f6",
     "[ -r /etc/passwd ] && awk -F: -v uid=\"$(id -u)\" '$3 == uid { print $6; exit }' /etc/passwd",
     "user=$(id -un 2>/dev/null || whoami 2>/dev/null || true); [ -n \"$user\" ] && [ -d \"/home/$user\" ] && printf '%s\\n' \"/home/$user\"",
+    "for d in /home/*; do [ -d \"$d\" ] && printf '%s\\n' \"$d\" && break; done",
     "[ \"$(id -u)\" = 0 ] && [ -d /root ] && printf '%s\\n' /root",
   ];
   for (const command of commands) {
-    const result = await sandboxExec(sandbox, command);
+    const result = await sandboxExec(sandbox, `sh -lc ${shellQuote(command)}`);
     if (typeof result?.exitCode === "number" && result.exitCode !== 0) continue;
-    const remoteHome = String(result?.stdout ?? "").split(/\r?\n/, 1)[0]?.trim();
-    try {
-      const normalized = normalizeRemoteHome(remoteHome);
-      if (normalized) return normalized;
-    } catch {
-      continue;
+    const output = result?.stdout ?? result?.output ?? result?.result ?? result?.data ?? result?.artifacts?.stdout ?? "";
+    for (const line of String(output).split(/\r?\n/)) {
+      const remoteHome = line.trim();
+      if (!remoteHome || /warning:|cannot change locale/i.test(remoteHome)) continue;
+      try {
+        const normalized = normalizeRemoteHome(remoteHome);
+        if (normalized) return normalized;
+      } catch {
+        continue;
+      }
     }
   }
   throw new Error("Could not determine sandbox remote home from environment or passwd database");
