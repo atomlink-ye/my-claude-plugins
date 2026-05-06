@@ -44,12 +44,26 @@ Top-level shortcuts exist for the most common actions:
 Most paseo commands accept `--host <host>` to target a remote or non-default daemon. Without it, the CLI prefers the local socket/pipe and falls back to `localhost:6767`.
 
 ```bash
-paseo --host localhost:6767 ls
 paseo run --host my-host:6767 "..."
+paseo wait --host my-host:6767 <id>
+paseo logs --host my-host:6767 <id>
 ```
+
+Use the same `--host` for every later command that references an agent created on that daemon.
+
+## Remote listener startup
+
+For remote sandboxes or containers, bind the daemon to a non-localhost listener:
+
+```bash
+PASEO_DAEMON_LISTEN=0.0.0.0:6767 paseo daemon start --listen 0.0.0.0:6767 --hostnames true --no-relay
+```
+
+If a restart appears to ignore `--listen`, stop the daemon and start it again with `PASEO_DAEMON_LISTEN` set. Stale daemon config or pid state can otherwise preserve the old listener.
 
 ## Troubleshooting
 
 - `paseo run` errors with a connection failure → check `paseo daemon status`. Run `paseo daemon start` (or `paseo start`) if the daemon is not running.
 - Auth errors from the underlying provider → the daemon shells out to the provider's CLI and inherits its env. Make sure the relevant provider auth is in place in the same shell that started the daemon.
 - After updating paseo or its providers → `paseo daemon restart` to reload.
+- Remote agent ID appears missing → repeat the command with the same `--host` used at launch.

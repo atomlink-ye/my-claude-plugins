@@ -24,6 +24,27 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
 
 Do not restart serve or submit duplicate work just because a foreground stream dropped.
 
+## Orchestrator reported done too early
+
+If a manager/orchestrator prompt returned after a short quiet period, inspect the session tree and the worktree before retrying:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session list --directory "$WORK_DIR"
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session status "$SID" --directory "$WORK_DIR"
+git -C "$WORKTREE_OR_REPO" status -s
+```
+
+Use `OPENCODE_QUIESCENCE_TIMEOUT_MS=120000` or a longer value for future orchestrator launches. See `orchestrator-subagent-tracking.md`.
+
+## Keychain/auth unavailable in child commands
+
+On macOS, a managed serve started before the user's keychain or provider auth is available can keep spawning child commands with the stale auth environment. If commands such as provider CLIs or workspace CLIs fail with keychain/auth errors even though they work in the current shell, restart the serve:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" serve stop --server-directory "$SERVER_DIR"
+node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" serve start --server-directory "$SERVER_DIR"
+```
+
 ## Wrong directory
 
 Sessions are tied to `--directory`. Reusing only a session id is unsafe; carry forward the original working directory.

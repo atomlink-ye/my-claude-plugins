@@ -42,6 +42,6 @@ Notes:
 Every command that talks to the daemon accepts `--host <host>`. Without it, the CLI prefers the local socket/pipe and falls back to `localhost:6767`. Most users never set this.
 
 ```bash
-paseo --host my-remote:6767 ls
-paseo run --host localhost:6767 "..."
+paseo ls --host my-remote:6767
+paseo run --host my-remote:6767 "..."
 ```

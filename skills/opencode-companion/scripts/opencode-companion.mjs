@@ -528,7 +528,8 @@ function buildTaskResult({
   completionMode = "terminal",
   rawSessionStatus = status,
   hierarchyVerdict = null,
-  recommendedAction = null
+  recommendedAction = null,
+  sessionSummary = null
 }) {
   const assistantNodes = collectAssistantNodes(messages);
   const preferredNode = assistantNodes.at(-1) ?? normalizeMessageArray(messages).at(-1) ?? messages;
@@ -544,6 +545,9 @@ function buildTaskResult({
     raw_session_status: normalizeSessionStatus(rawSessionStatus),
     hierarchy_verdict: hierarchyVerdict,
     recommended_action: recommendedAction,
+    main_session_last_usage: sessionSummary?.lastUsage ?? null,
+    main_session_total_usage: sessionSummary?.totalUsage ?? null,
+    main_session_context: sessionSummary?.contextSummary ?? null,
     text_parts: textParts,
     combined_text: combinedText,
     file_changes: fileChanges,
@@ -573,6 +577,18 @@ function renderTaskSummary(result) {
   }
   if (result.recommended_action) {
     lines.push(`Recommended action: ${result.recommended_action}`);
+  }
+  const lastUsage = formatUsageSummary(result.main_session_last_usage);
+  if (lastUsage !== "-") {
+    lines.push(`Main session last usage: ${lastUsage}`);
+  }
+  const totalUsage = formatUsageSummary(result.main_session_total_usage);
+  if (totalUsage !== "-") {
+    lines.push(`Main session total usage: ${totalUsage}`);
+  }
+  const contextSummary = formatContextSummary(result.main_session_context);
+  if (contextSummary !== "-") {
+    lines.push(`Main session context: ${contextSummary}`);
   }
 
   if (result.completion_mode === "delegated_settled") {
@@ -746,6 +762,74 @@ function firstUsageSummary(candidates) {
   return null;
 }
 
+function normalizeContextSummary(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? { raw: trimmed } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const usedTokens = parseUsageNumber(readUsageField(value, [
+    "usedTokens",
+    "used_tokens",
+    "UsedTokens",
+    "currentTokens",
+    "current_tokens",
+    "CurrentTokens",
+    "contextTokens",
+    "context_tokens",
+    "ContextTokens",
+    "tokens",
+    "Tokens",
+    "tokenCount",
+    "token_count",
+    "TokenCount"
+  ]));
+  const limitTokens = parseUsageNumber(readUsageField(value, [
+    "limitTokens",
+    "limit_tokens",
+    "LimitTokens",
+    "maxTokens",
+    "max_tokens",
+    "MaxTokens",
+    "contextLimit",
+    "context_limit",
+    "ContextLimit",
+    "contextWindow",
+    "context_window",
+    "ContextWindow",
+    "windowTokens",
+    "window_tokens",
+    "WindowTokens"
+  ]));
+  const remainingTokens = parseUsageNumber(readUsageField(value, [
+    "remainingTokens",
+    "remaining_tokens",
+    "RemainingTokens",
+    "availableTokens",
+    "available_tokens",
+    "AvailableTokens"
+  ]));
+
+  if ([usedTokens, limitTokens, remainingTokens].every((entry) => entry == null)) {
+    return null;
+  }
+
+  return { usedTokens, limitTokens, remainingTokens };
+}
+
+function firstContextSummary(candidates) {
+  for (const candidate of candidates) {
+    const summary = normalizeContextSummary(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return null;
+}
+
 function summarizeSessionUsage(session) {
   const usage = session?.usage ?? null;
   const lastUsage = firstUsageSummary([
@@ -774,6 +858,33 @@ function summarizeSessionUsage(session) {
   ]);
 
   return { lastUsage, totalUsage };
+}
+
+function summarizeSessionContext(session) {
+  const usage = session?.usage ?? null;
+  const context = session?.context ?? null;
+  return firstContextSummary([
+    session?.contextUsage,
+    session?.context_usage,
+    session?.ContextUsage,
+    session?.contextWindowUsage,
+    session?.context_window_usage,
+    session?.ContextWindowUsage,
+    context?.usage,
+    context?.windowUsage,
+    context?.window_usage,
+    context,
+    usage?.context,
+    usage?.contextUsage,
+    usage?.context_usage,
+    usage?.contextWindow,
+    usage?.context_window,
+    {
+      contextTokens: session?.contextTokens ?? session?.context_tokens ?? session?.contextLength ?? session?.context_length,
+      contextLimit: session?.contextLimit ?? session?.context_limit ?? session?.contextWindow ?? session?.context_window,
+      remainingTokens: session?.remainingContextTokens ?? session?.remaining_context_tokens
+    }
+  ]);
 }
 
 const usageNumberFormatter = new Intl.NumberFormat("en-US");
@@ -814,6 +925,28 @@ function formatUsageSummary(usage) {
   return parts.join(", ") || "-";
 }
 
+function formatContextSummary(context) {
+  if (!context) {
+    return "-";
+  }
+  if (context.raw) {
+    return context.raw;
+  }
+  const parts = [];
+  if (context.usedTokens != null && context.limitTokens != null) {
+    const percentage = context.limitTokens > 0 ? ` (${((context.usedTokens / context.limitTokens) * 100).toFixed(1)}%)` : "";
+    parts.push(`${usageNumberFormatter.format(context.usedTokens)} / ${usageNumberFormatter.format(context.limitTokens)}${percentage}`);
+  } else if (context.usedTokens != null) {
+    parts.push(`${usageNumberFormatter.format(context.usedTokens)} used`);
+  } else if (context.limitTokens != null) {
+    parts.push(`${usageNumberFormatter.format(context.limitTokens)} limit`);
+  }
+  if (context.remainingTokens != null) {
+    parts.push(`${usageNumberFormatter.format(context.remainingTokens)} remaining`);
+  }
+  return parts.join(", ") || "-";
+}
+
 function summarizeSession(session) {
   const summary =
     session.title ||
@@ -831,6 +964,7 @@ function summarizeSession(session) {
   const createdAt = session.createdAt || session.created_at || session.startedAt || session.time?.created || "";
   const updatedAt = session.updatedAt || session.updated_at || session.modifiedAt || session.time?.updated || "";
   const { lastUsage, totalUsage } = summarizeSessionUsage(session);
+  const contextSummary = summarizeSessionContext(session);
 
   return {
     id: session.id || session.sessionID || session.sessionId || "unknown",
@@ -842,6 +976,7 @@ function summarizeSession(session) {
     updatedAtMs: parseSessionTimestamp(updatedAt),
     lastUsage,
     totalUsage,
+    contextSummary,
     summary: String(summary || "")
   };
 }
@@ -950,6 +1085,7 @@ function renderSessionDetails(session, directory, hierarchyContext = null) {
     `| updated | ${escapeMarkdownCell(formatReadableTimestamp(details.updatedAt))} |`,
     `| last usage | ${escapeMarkdownCell(formatUsageSummary(details.lastUsage))} |`,
     `| total usage | ${escapeMarkdownCell(formatUsageSummary(details.totalUsage))} |`,
+    `| context | ${escapeMarkdownCell(formatContextSummary(details.contextSummary))} |`,
     `| hierarchy size | ${escapeMarkdownCell(subtreeSummary.sessionCount)} |`,
     `| hierarchy statuses | ${escapeMarkdownCell(formatHierarchyStatusCounts(subtreeSummary.statusCounts))} |`,
     `| hierarchy latest activity | ${escapeMarkdownCell(formatReadableTimestamp(subtreeSummary.latestActivityLabel) || "-")} |`,
@@ -2571,6 +2707,15 @@ async function monitorSession({
   } catch (error) {
     // If we can't fetch messages, at least return what we have
   }
+
+  let sessionSummary = null;
+  try {
+    const sessions = await listSessions(baseUrl, directory);
+    const session = sessions.find((entry) => summarizeSession(entry).id === sessionId) ?? null;
+    sessionSummary = session ? summarizeSession(session) : null;
+  } catch {
+    // Usage/context metadata is best-effort; task result should still render without it.
+  }
   
   const classifiedOutcome = classifySessionOutcome({
     sessionId,
@@ -2594,7 +2739,8 @@ async function monitorSession({
     completionMode: classifiedOutcome.completionMode,
     rawSessionStatus: classifiedOutcome.rawSessionStatus,
     hierarchyVerdict: classifiedOutcome.hierarchyVerdict,
-    recommendedAction: classifiedOutcome.recommendedAction
+    recommendedAction: classifiedOutcome.recommendedAction,
+    sessionSummary
   });
 
   const streamedLength = printer.getOutput().trim().length;

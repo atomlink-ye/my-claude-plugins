@@ -37,14 +37,29 @@ paseo send <id> "now add tests for the new endpoint"
 Detach agents, do other work, then join:
 
 ```bash
-api_id=$(paseo run -d --json "implement the API" | jq -r .id)
-ui_id=$(paseo run -d --json "implement the UI"  | jq -r .id)
+api_id=$(paseo run -d --json --title api-lane "implement the API" | jq -r .id)
+ui_id=$(paseo run -d --json --title ui-lane "implement the UI"  | jq -r .id)
 
 # ... do other work ...
 
 paseo wait "$api_id"
 paseo wait "$ui_id"
 ```
+
+If `wait` times out, the agent is still running. Inspect state or wait again; do not relaunch the same work.
+
+### Target a remote daemon
+
+When a remote daemon is exposed through a tunnel or Daytona preview, pass `--host` to every command that should address that daemon:
+
+```bash
+paseo provider ls --host "$REMOTE_PASEO_HOST"
+paseo run --host "$REMOTE_PASEO_HOST" -d --provider opencode --mode orchestrator --cwd /workspace --prompt-file ./task.md
+paseo wait --host "$REMOTE_PASEO_HOST" --timeout 1800 <id>
+paseo logs --host "$REMOTE_PASEO_HOST" <id> --tail 20
+```
+
+Use the host:port form, not a full `http://...` preview URL.
 
 ### Isolate work in a git worktree
 
@@ -89,6 +104,8 @@ paseo delete <id>             # hard-delete
 --host 10.0.0.8:6767           # target a remote daemon
 --json                         # machine-readable output
 -d                             # detach (return immediately, print agent ID)
+--title auth-lane              # stable human name for tracking
+--label area=backend           # metadata for filtering
 --prompt-file ./task.md        # read prompt from file (for long/complex prompts)
 --image screenshot.png         # attach an image to the prompt
 ```
@@ -118,6 +135,7 @@ paseo delete <id>             # hard-delete
 | Create persistent terminals, send keystrokes, capture output | `references/terminal.md` |
 | Set up inter-agent chat rooms or handle permission requests | `references/chat-and-permit.md` |
 | First-time setup, daemon start/stop/restart, connect to remote daemon | `references/daemon-and-onboarding.md` |
+| Drive agents on a remote daemon through preview/tunnel host routing | `references/remote-host-orchestration.md` |
 | Script/automate Paseo output, JSON/YAML formats, schema validation | `references/output-formats.md` |
 
 ## Non-negotiables
@@ -125,4 +143,5 @@ paseo delete <id>             # hard-delete
 - **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one.
 - **Wait, don't poll.** Never loop on `paseo ls` / `paseo inspect`. Use `paseo wait <id>` (blocks efficiently) or `paseo logs <id> -f` (streams).
 - **Timeout doesn't stop.** If `wait` times out, the agent is still running. Use `paseo stop <id>` to actually interrupt.
+- **Carry `--host` through.** A remote agent ID is only useful when later `wait`, `logs`, `send`, and `inspect` target the same daemon host.
 - **Quote prompts.** For multi-line or escape-heavy prompts, use `--prompt-file`.
