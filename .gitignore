@@ -12,3 +12,6 @@ node_modules/
 # Tool build artifacts
 tools/*/dist/
 tools/*/node_modules/
+# Python build artifacts
+__pycache__/
+*.pyc

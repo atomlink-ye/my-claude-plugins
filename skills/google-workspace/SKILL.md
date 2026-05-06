@@ -111,6 +111,8 @@ Run `gws schema docs.documents.batchUpdate --resolve-refs` to explore the
 full set of request types (`insertText`, `deleteContentRange`,
 `updateTextStyle`, etc.).
 
+- **Markdown conversion helper** — Convert Markdown to a structurally-native Google Doc: run `uv run scripts/md_to_gdoc.py <file.md>` (CLI) or `from md_to_gdoc import convert` (library). See `references/markdown-to-google-docs.md` for mapping rules.
+
 ### Gotchas
 
 - **Keyring preamble** — `gws` may print `Using keyring backend: ...` to
