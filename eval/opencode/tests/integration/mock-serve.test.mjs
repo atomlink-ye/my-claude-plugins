@@ -60,6 +60,7 @@ function delegatedCompanionEnv(binDir) {
   return {
     PATH: `${binDir}:${process.env.PATH || ""}`,
     OPENCODE_FORCE_QUIESCENCE_TIMEOUT_MS: "80",
+    OPENCODE_HIERARCHY_PENDING_GRACE_MS: "80",
     OPENCODE_STATUS_POLL_INTERVAL_MS: "10",
     OPENCODE_SETTLING_CHECK_INTERVAL_MS: "10"
   };

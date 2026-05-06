@@ -1936,7 +1936,14 @@ async function monitorSession({
   const partTypes = new Map(); // partID -> part type (e.g. "text", "reasoning", "tool")
   const QUIESCENCE_TIMEOUT_MS = readEnvDurationMs("OPENCODE_QUIESCENCE_TIMEOUT_MS", 5000);
   const FORCE_QUIESCENCE_TIMEOUT_MS = readEnvDurationMs("OPENCODE_FORCE_QUIESCENCE_TIMEOUT_MS", 30000);
-  const HIERARCHY_PENDING_GRACE_MS = FORCE_QUIESCENCE_TIMEOUT_MS;
+  // Decoupled from FORCE_QUIESCENCE_TIMEOUT_MS so subagent silence does not auto-mark a session as
+  // not-pending the moment the directory-level fallback would also fire. Default 5 minutes; never
+  // shorter than FORCE_QUIESCENCE_TIMEOUT_MS to keep prior intent (a busy session won't be considered
+  // settled before the directory itself is).
+  const HIERARCHY_PENDING_GRACE_MS = Math.max(
+    FORCE_QUIESCENCE_TIMEOUT_MS,
+    readEnvDurationMs("OPENCODE_HIERARCHY_PENDING_GRACE_MS", 300000)
+  );
   const STATUS_POLL_INTERVAL_MS = readEnvDurationMs("OPENCODE_STATUS_POLL_INTERVAL_MS", 1500);
   const STREAM_CLOSE_GRACE_MS = readEnvDurationMs("OPENCODE_STREAM_CLOSE_GRACE_MS", 4000);
   const SETTLING_CHECK_INTERVAL_MS = readEnvDurationMs("OPENCODE_SETTLING_CHECK_INTERVAL_MS", 1000);
