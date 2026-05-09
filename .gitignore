@@ -15,3 +15,7 @@ tools/*/node_modules/
 # Python build artifacts
 __pycache__/
 *.pyc
+
+# Skill Creator / ad-hoc skill evaluation artifacts
+skills/*/evals/
+.skill-evals/
