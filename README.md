@@ -2,13 +2,20 @@
 
 Personal Claude Code plugin marketplace.
 
-## Companion skills
+## Skills
+
+All skills are bundled under a single plugin (`my-skills`).
 
 | Skill | Description |
 |-------|-------------|
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
+| [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
 | [task-iteration](skills/task-iteration/) | Orchestrate feature implementation from exec-plans with Plan→Generate→Evaluate workflow |
+| [opencode-orchestrator](skills/opencode-orchestrator/) | Routing rules for delegating to OpenCode vs. handling work locally |
+| [debug-workflow](skills/debug-workflow/) | Real-world issue reproduction (browser/UI/Web3) with Playwright/CDP/agent-wallet |
+| [google-workspace](skills/google-workspace/) | Google Docs/Drive/Sheets via the `gws` CLI |
+| [mcp-skill](skills/mcp-skill/) | On-demand MCP server invocation via MCPorter |
 
 Companion skills expose direct script entrypoints:
 
@@ -49,13 +56,12 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 }
 ```
 
-Then enable companion skills/plugins:
+Then enable the bundled plugin:
 
 ```json
 {
   "enabledPlugins": {
-    "opencode-companion@my-claude-plugins": true,
-    "daytona-companion@my-claude-plugins": true
+    "my-skills@my-claude-plugins": true
   }
 }
 ```

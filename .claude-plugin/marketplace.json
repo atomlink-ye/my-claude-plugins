@@ -6,82 +6,26 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
-      "name": "opencode",
-      "description": "Deprecated alias for opencode-companion. Slash commands were removed/replaced by the companion skill runtime.",
-      "version": "0.2.0",
+      "name": "my-skills",
+      "description": "Bundle of all skills in this marketplace: companion runtimes (opencode, daytona, paseo), orchestration (task-iteration, opencode-orchestrator), workflows (debug-workflow, google-workspace), and helpers (mcp-skill).",
+      "version": "0.3.0",
       "author": {
         "name": "atomlink-ye"
       },
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/opencode-companion"
-      ]
-    },
-    {
-      "name": "daytona",
-      "description": "Deprecated alias for daytona-companion. Slash commands were removed/replaced by the companion skill runtime.",
-      "version": "0.2.0",
-      "author": {
-        "name": "atomlink-ye"
-      },
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/daytona-companion"
-      ]
-    },
-    {
-      "name": "opencode-companion",
-      "description": "OpenCode companion skill for direct serve/session/job/review runtime workflows without slash-command wrappers.",
-      "version": "0.2.0",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/opencode-companion"
-      ]
-    },
-    {
-      "name": "daytona-companion",
-      "description": "Daytona companion skill for sandbox lifecycle, artifacts, and global project-scoped state without slash-command wrappers.",
-      "version": "0.2.0",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/daytona-companion"
-      ]
-    },
-    {
-      "name": "paseo-companion",
-      "description": "Paseo CLI companion skill — neutral reference for run/send/wait/logs/attach/ls plus loops, schedules, terminals, worktrees, chat, permits, daemon management, and host/port targeting for non-local daemons via `paseo run --host <ip>:<port>`.",
-      "version": "0.2.0",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/paseo-companion"
-      ]
-    },
-    {
-      "name": "google-workspace",
-      "description": "Interact with Google Workspace services (Docs, Drive, Sheets, etc.) via the gws CLI.",
-      "version": "0.2.0",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/google-workspace"
-      ]
-    },
-    {
-      "name": "task-iteration",
-      "description": "Orchestrate end-to-end feature implementation from an exec-plan document. Delegates coding to OpenCode, runs independent evaluation, loops fixes until clean, and gates completion on an advisory review.",
-      "version": "0.2.0",
-      "source": "./",
-      "strict": false,
-      "skills": [
+        "./skills/daytona-companion",
+        "./skills/debug-workflow",
+        "./skills/google-workspace",
+        "./skills/mcp-skill",
+        "./skills/opencode-companion",
+        "./skills/opencode-orchestrator",
+        "./skills/paseo-companion",
         "./skills/task-iteration"
       ]
     }
