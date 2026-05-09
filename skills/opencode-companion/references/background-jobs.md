@@ -1,10 +1,18 @@
 # Background Jobs
 
-There are two ways to avoid blocking the caller.
+This page is about the **companion-managed** `--background` flow — the case where the companion script detaches immediately and returns a job ID. For the more common case (blocking `session new` run via the host's own background mode, e.g. Claude Code's `Bash` `run_in_background: true`), see SKILL.md → "Host-background note" / "Default path".
 
-Preferred when the host agent supports background shell/tool execution: run a normal blocking `session new`, `session attach`, or `job wait` command in that host background mode. The command stays attached until OpenCode exits, and the host agent gets a completion notification.
+## When to use `--background`
 
-Use companion-managed `--background` when you want the companion script itself to detach immediately and manage a job record.
+Use this flow when you specifically need any of:
+
+- a job ID you can inspect, cancel, or hand off independently of the calling shell,
+- the companion process itself to return immediately (e.g., the host has no long-lived background mode),
+- decoupling the lifetime of the work from the lifetime of the orchestrator's session.
+
+If you only want notification-driven waiting, prefer the host-background path — it's simpler and OpenCode stays attached the whole time.
+
+## Launching
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
@@ -14,7 +22,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
   -- "<prompt>"
 ```
 
-For manager/orchestrator prompts that may delegate to subagents, increase the quiescence timeout in either mode:
+For manager/orchestrator prompts that may delegate to subagents, raise the quiescence window so a brief parent silence isn't mistaken for completion:
 
 ```bash
 OPENCODE_QUIESCENCE_TIMEOUT_MS=120000 \
@@ -26,19 +34,25 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
   --prompt-file ./task.md
 ```
 
-The job id is the source of truth until the result is retrieved.
+## Job lifecycle
+
+Until you retrieve and verify a result, the job ID is the source of truth — not stream snippets, not the launching command's exit code.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job status "$JOB_ID" --directory "$WORK_DIR"
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job wait "$JOB_ID" --directory "$WORK_DIR" --timeout 60
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job result "$JOB_ID" --directory "$WORK_DIR"
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job cancel "$JOB_ID" --directory "$WORK_DIR"
+node "$SCRIPT" job status "$JOB_ID" --directory "$WORK_DIR"
+node "$SCRIPT" job wait   "$JOB_ID" --directory "$WORK_DIR" --timeout 60
+node "$SCRIPT" job result "$JOB_ID" --directory "$WORK_DIR"
+node "$SCRIPT" job cancel "$JOB_ID" --directory "$WORK_DIR"
 ```
 
-`job result` may contain partial logs for incomplete work. Retrieve and verify the session id and artifacts before entering a fix loop or reporting completion.
+`job wait` itself is a long blocking call — run it via the host's background mode so completion arrives by notification rather than polling.
 
-`--background` is the companion-managed job layer. It is not the same as shelling out with `&`.
+## Treat results as reports, not proof
 
-If the goal is notification-driven waiting, run `job wait` itself in the host agent's background mode.
+`job result` may return partial logs for incomplete work. Pull the session ID and inspect artifacts before entering a fix loop or claiming success.
 
-If `job wait` returns with a quiet/delegated result but the prompt launched subagents, check `session list`, child session statuses, and `git status -s` before accepting completion.
+If the prompt could have spawned subagents, a "quiet" job result is especially suspect: check `session list`, child session statuses, and `git status -s` in the assigned worktree before accepting completion. See `orchestrator-subagent-tracking.md`.
+
+## What `--background` is not
+
+`--background` is the companion's own job layer. It is **not** the same as appending `&` to the shell command — that just detaches the OS process and loses the stream entirely.

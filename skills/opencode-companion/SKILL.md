@@ -18,9 +18,18 @@ fi
 
 ## Typical workflows
 
-### Best practice: run the blocking session command in the background
+### Host-background note
 
-Prefer a normal blocking `session new` command, but run that shell/tool invocation in the host agent's background mode. This keeps OpenCode's stream attached to the task, and the host agent receives a task-completion notification when the command exits.
+Several patterns below say "run this in the host agent's background mode." That phrase has a concrete mapping per host:
+
+- **Claude Code** — call the `Bash` tool with `run_in_background: true`. The shell stays alive until OpenCode exits; Claude Code emits a task-completion notification with an `output-file` path. Read that file to recover stdout (Session ID, status, etc.).
+- **Other hosts** — use whatever lets a shell command run detached and notify on completion (e.g., a long-running task tool that returns on exit). The point is: keep OpenCode's stream attached, but free the orchestrator to do other work without polling.
+
+Why this matters: OpenCode streams progress over an HTTP connection. If the orchestrator blocks on it, you lose parallelism; if you poll status, you waste tokens and risk treating partial logs as completion. Background-execution-with-notification gives both: continuous attachment + non-blocking caller.
+
+### Default path: blocking `session new`, run via host-background
+
+Use a normal blocking `session new` and let the host put the shell call itself in the background.
 
 ```bash
 OPENCODE_QUIESCENCE_TIMEOUT_MS=120000 \
@@ -30,11 +39,11 @@ node "$SCRIPT" session new \
   --prompt-file ./task.md
 ```
 
-Use this for substantial coding work. On completion, read the notification output, note the `Session ID`, then verify files/tests directly.
+Use this for substantial coding work. When the completion notification fires, read the notification's output file, capture the `Session ID`, then verify files/tests directly. Don't claim done from the stream alone.
 
-### First run or uncertain serve: use a companion background job
+### Fallback: companion-managed `--background` job
 
-If this is the first OpenCode run in a workspace, or you are not sure the managed serve is healthy, start with the companion-managed background job path. It returns quickly with a job ID; then run `job wait` or `session attach` as a background shell/tool invocation so completion still arrives by notification rather than polling.
+Reach for `--background` only when you specifically need the **companion script itself** to detach immediately and hand back a job record — for example, you want to inspect or cancel by job ID, or the host can't keep a long-lived shell open. The auto-managed serve already starts on demand, so first-run is *not* by itself a reason to use `--background`.
 
 ```bash
 OPENCODE_QUIESCENCE_TIMEOUT_MS=120000 \
@@ -44,18 +53,12 @@ node "$SCRIPT" session new \
   --timeout 60 \
   --prompt-file ./task.md
 
-node "$SCRIPT" job status "$JOB_ID" --directory "$WORK_DIR"
+# Then wait for completion via host-background:
 node "$SCRIPT" job wait "$JOB_ID" --directory "$WORK_DIR" --timeout 60
 node "$SCRIPT" job result "$JOB_ID" --directory "$WORK_DIR"
 ```
 
-If the job output gives a `Session ID`, you can also attach to that session:
-
-```bash
-node "$SCRIPT" session attach "$SID" --directory "$WORK_DIR" --timeout 15
-```
-
-Run `job wait` or `session attach` in the host agent's background mode for long waits.
+If the job result gives a `Session ID`, `session attach "$SID" --timeout 15` is also valid. Long waits (`job wait`, `session attach`) should themselves run in host-background.
 
 ### Continue an existing session
 
@@ -100,13 +103,15 @@ When OpenCode exposes usage/context metadata, `session status` and task result s
 | Track orchestrator sessions that spawn subagents or appear quiet too early | `references/orchestrator-subagent-tracking.md` |
 | Debug "serve unreachable", stale sessions, shell quoting | `references/troubleshooting.md` |
 
-## Non-negotiables
+## Operating principles
 
-- **Reuse before relaunch.** If a session ID and working directory exist, continue or attach — don't start a new session.
-- **But watch context.** Continue is efficient only while the existing context is still useful and not near its limit.
-- **Timeout is not failure.** Attach and verify before retrying: `session attach "$SID" --directory "$WORK_DIR" --timeout 5`.
-- **Quiet is not done for orchestrators.** If the prompt can spawn subagents, check `session list`, `session status`, and the worktree diff before accepting a quiescence result.
-- **Prefer notification-driven waits.** Put blocking `session new`, `session attach`, or `job wait` invocations in the host agent's background mode instead of polling.
-- **Forward output verbatim.** Don't summarize or reinterpret companion stdout when the user asked for runtime output.
-- **Quote everything.** Paths and prompts must be quoted; prompt text goes after `--`.
-- **Verify artifacts directly.** Progress output and partial logs are not proof of completion.
+These are the rules that keep the runtime honest. Each one exists because of a real failure mode:
+
+- **Reuse before relaunch.** A session ID + working directory is a warm context. Starting a new session throws away repo state and forces re-explanation. Use `session continue` or `session attach`.
+- **But watch context.** Reuse stops paying off once the context is near its limit or the topic has shifted — at that point the model gets distracted by stale history. Check `session status` for usage/context lines first, and start fresh when warranted.
+- **Timeout is not failure.** A dropped stream or `--timeout` exit doesn't mean OpenCode died. Run `session attach "$SID" --timeout 5` to verify before retrying. Submitting duplicate work is the worst recovery.
+- **Quiet is not done for orchestrators.** When the prompt can spawn subagents, the parent session can go quiet while children are still writing files. Check `session list`, child statuses, and `git status -s` in the worktree before accepting a quiescence result.
+- **Prefer notification-driven waits.** Long-running `session new`, `session attach`, `job wait` should run via host-background (see top of Workflows). Polling in a loop wastes tokens and tempts premature completion calls.
+- **Forward output verbatim.** When the user asked for runtime output, don't summarize companion stdout. Session IDs, job IDs, and error messages are load-bearing.
+- **Quote everything.** Paths and prompts must be quoted; prompt text goes after `--` so it isn't parsed as flags.
+- **Verify artifacts directly.** Progress logs and quiescence verdicts are *signals*, not proof. Read the file, run the test, check the diff.
