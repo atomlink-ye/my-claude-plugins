@@ -230,6 +230,7 @@ function installDelegatedPromptScenario(server, {
   };
 }
 
+
 function installQuietRootPromptScenario(server, {
   rootText = "quiet root response"
 } = {}) {
@@ -428,6 +429,145 @@ function installTransportClosedDelegatedScenario(server, {
   };
 }
 
+function installRichLoggingPromptScenario(server, {
+  reasoningText = "Plan:\n- inspect logs\n- run tests\n",
+  commandText = "pnpm vitest run eval/opencode/tests/unit/render.test.mjs",
+  toolOutputText = "1 file passed",
+  finalText = "Done with logging review."
+} = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const userMessageId = `msg_user_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const promptText = String(ctx.body?.parts?.[0]?.text ?? "").trim();
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+
+    messages.push(
+      {
+        info: { id: userMessageId, sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: promptText, id: "prt_user" }]
+      },
+      {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [
+          { type: "reasoning", text: reasoningText, id: "prt_reasoning" },
+          {
+            type: "tool",
+            id: "prt_tool_bash",
+            tool: { name: "bash" },
+            state: {
+              status: "completed",
+              input: { command: commandText },
+              output: { text: toolOutputText },
+              result: { ok: true }
+            }
+          },
+          { type: "text", text: finalText, id: "prt_text" }
+        ]
+      }
+    );
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "idle";
+    session.summary = finalText;
+    session.updatedAt = new Date().toISOString();
+
+    ctx.pushEvent({
+      type: "session.status",
+      properties: {
+        sessionID: sessionId,
+        status: { type: "busy" }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_reasoning",
+        part: {
+          id: "prt_reasoning",
+          type: "reasoning"
+        }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_reasoning",
+        field: "text",
+        delta: reasoningText
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_tool_bash",
+        part: {
+          id: "prt_tool_bash",
+          type: "tool",
+          tool: { name: "bash" },
+          state: {
+            status: "completed",
+            input: { command: commandText },
+            output: { text: toolOutputText },
+            result: { ok: true }
+          }
+        }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: "prt_text",
+        field: "text",
+        delta: finalText
+      }
+    });
+    ctx.pushEvent({
+      type: "session.idle",
+      properties: {
+        sessionID: sessionId
+      }
+    });
+
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: [
+          { type: "reasoning", text: reasoningText, id: "prt_reasoning" },
+          {
+            type: "tool",
+            id: "prt_tool_bash",
+            tool: { name: "bash" },
+            state: {
+              status: "completed",
+              input: { command: commandText },
+              output: { text: toolOutputText },
+              result: { ok: true }
+            }
+          },
+          { type: "text", text: finalText, id: "prt_text" }
+        ]
+      }
+    };
+  });
+
+  return () => {
+    server.setResponse(promptRoute, null);
+  };
+}
+
 function installNativeTaskChildScenario(server, { orphan = false, settleDelayMs = 180 } = {}) {
   const promptRoute = "POST /session/:id/prompt_async";
   server.setResponse(promptRoute, async (ctx) => {
@@ -494,6 +634,199 @@ function installNativeTaskChildScenario(server, { orphan = false, settleDelayMs 
     timer.unref?.();
 
     return { status: 200, headers: { "content-type": "application/json; charset=utf-8" }, body: { info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" }, parts: messages[0].parts } };
+  });
+  return () => server.setResponse(promptRoute, null);
+}
+
+function installRichTraceScenario(server, { settleDelayMs = 30 } = {}) {
+  const promptRoute = "POST /session/:id/prompt_async";
+  server.setResponse(promptRoute, async (ctx) => {
+    const sessionId = String(ctx.params.id);
+    const session = ctx.scope.sessionsById.get(sessionId);
+    const childSessionId = `ses_trace_child_${String(++ctx.scope.counter)}`;
+    const assistantMessageId = `msg_assistant_${String(++ctx.scope.counter)}`;
+    const reasoningPartId = "prt_reasoning_trace";
+    const bashPartId = "prt_bash_trace";
+    const taskPartId = "prt_task_trace";
+    const reasoningText = "Inspect current session logs\nCompare delegated child activity";
+    const bashCommand = "git status --short\npnpm test eval/opencode/tests/unit/render.test.mjs";
+    const childSession = {
+      id: childSessionId,
+      slug: "trace-child",
+      parentID: sessionId,
+      status: "busy",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      directory: ctx.directory,
+      summary: "child trace collecting workspace details"
+    };
+    ctx.scope.sessions.unshift(childSession);
+    ctx.scope.sessionsById.set(childSessionId, childSession);
+    ctx.scope.messagesBySessionId.set(childSessionId, []);
+
+    const messages = ctx.scope.messagesBySessionId.get(sessionId) ?? [];
+    messages.push({
+      info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+      parts: [
+        {
+          id: reasoningPartId,
+          type: "reasoning",
+          text: reasoningText
+        },
+        {
+          id: bashPartId,
+          type: "tool",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: bashCommand },
+            output: {
+              exitCode: 0,
+              stdout: " M skills/opencode-companion/scripts/opencode-companion.mjs\n"
+            }
+          }
+        },
+        {
+          id: taskPartId,
+          type: "tool",
+          tool: "task",
+          state: {
+            status: "completed",
+            input: { subagent_type: "explorer", description: "inspect repo structure" },
+            output: `task_id: ${childSessionId}`
+          }
+        },
+        {
+          id: "prt_text_trace",
+          type: "text",
+          text: "Trace collection complete."
+        }
+      ]
+    });
+    ctx.scope.messagesBySessionId.set(sessionId, messages);
+
+    session.status = "busy";
+    session.summary = "trace collection running";
+    session.updatedAt = new Date().toISOString();
+
+    ctx.pushEvent({ type: "session.status", properties: { sessionID: sessionId, status: { type: "busy" } } });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: reasoningPartId,
+        part: { id: reasoningPartId, type: "reasoning", text: reasoningText }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: reasoningPartId,
+        field: "text",
+        delta: "Inspect current session logs\n"
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.delta",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: reasoningPartId,
+        field: "text",
+        delta: "Compare delegated child activity"
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: bashPartId,
+        part: {
+          id: bashPartId,
+          type: "tool",
+          tool: "bash",
+          state: { status: "running", input: { command: bashCommand } }
+        }
+      }
+    });
+    ctx.pushEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        partID: taskPartId,
+        part: {
+          id: taskPartId,
+          type: "tool",
+          tool: "task",
+          state: { status: "running", input: { subagent_type: "explorer", description: "inspect repo structure" } }
+        }
+      }
+    });
+    ctx.pushEvent({ type: "session.status", properties: { sessionID: childSessionId, status: { type: "busy" } } });
+
+    const timer = setTimeout(() => {
+      childSession.status = "idle";
+      childSession.summary = "child trace finished";
+      childSession.updatedAt = new Date().toISOString();
+      session.status = "idle";
+      session.updatedAt = new Date().toISOString();
+      ctx.pushEvent({
+        type: "message.part.updated",
+        properties: {
+          sessionID: sessionId,
+          messageID: assistantMessageId,
+          partID: bashPartId,
+          part: {
+            id: bashPartId,
+            type: "tool",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: { command: bashCommand },
+              output: {
+                exitCode: 0,
+                stdout: " M skills/opencode-companion/scripts/opencode-companion.mjs\n"
+              }
+            }
+          }
+        }
+      });
+      ctx.pushEvent({
+        type: "message.part.updated",
+        properties: {
+          sessionID: sessionId,
+          messageID: assistantMessageId,
+          partID: taskPartId,
+          part: {
+            id: taskPartId,
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              input: { subagent_type: "explorer", description: "inspect repo structure" },
+              output: `task_id: ${childSessionId}`
+            }
+          }
+        }
+      });
+      ctx.pushEvent({ type: "session.idle", properties: { sessionID: childSessionId } });
+      ctx.pushEvent({ type: "session.idle", properties: { sessionID: sessionId } });
+    }, settleDelayMs);
+    timer.unref?.();
+
+    return {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: {
+        info: { id: assistantMessageId, sessionID: sessionId, role: "assistant" },
+        parts: messages[0].parts
+      }
+    };
   });
   return () => server.setResponse(promptRoute, null);
 }
@@ -889,13 +1222,36 @@ describe("mock serve integration tests", () => {
           },
           timeoutMs: 10000
         });
-        return status.stdout.includes("| status | delegated |") ? status : null;
+        return status.stdout.includes("Status: delegated") ? status : null;
       }, { description: "background delegated job to settle informationally", timeoutMs: 10000, intervalMs: 50 });
 
-      expect(delegatedStatus.stdout).toContain("| status | delegated |");
-      expect(delegatedStatus.stdout).not.toContain("| status | failed |");
+      expect(delegatedStatus.stdout).toContain("Status: delegated");
+      expect(delegatedStatus.stdout).not.toContain("Status: failed");
 
       const result = await spawnCompanion([
+        "job",
+        "wait",
+        jobId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Delegating to @explorer...");
+      expect(result.stdout).not.toContain("Status: delegated");
+      expect(result.stdout).not.toContain("Delegation to subagents is normal");
+      expect(result.stdout).not.toContain("## Recent execution trace");
+      expect(result.stdout).not.toContain("Error:");
+
+      const quietResult = await spawnCompanion([
         "job",
         "result",
         jobId,
@@ -911,10 +1267,10 @@ describe("mock serve integration tests", () => {
         timeoutMs: 10000
       });
 
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Status: delegated");
-      expect(result.stdout).toContain("Delegation to subagents is normal");
-      expect(result.stdout).not.toContain("Error:");
+      expect(quietResult.exitCode).toBe(0);
+      expect(quietResult.stdout).toContain("Delegating to @explorer...");
+      expect(quietResult.stdout).not.toContain("Status: delegated");
+      expect(quietResult.stdout).not.toContain("Delegation to subagents is normal");
     } finally {
       restorePromptRoute();
     }
@@ -979,8 +1335,6 @@ describe("mock serve integration tests", () => {
       expect(status.exitCode).toBe(0);
       expect(status.stdout).toContain("## Session Hierarchy");
       expect(status.stdout).toContain("Root delegated to @manager...");
-      expect(status.stdout).toContain("manager lane finished");
-      expect(status.stdout).toContain("explorer leaf finished");
       expect(status.stdout).toContain("descendant count | 2");
       expect(status.stdout).toContain("root");
       expect(status.stdout).toContain("child");
@@ -1053,11 +1407,228 @@ describe("mock serve integration tests", () => {
       expect(status.stdout).toContain(`| updated | ${formatReadableTimestamp(updatedAt)} |`);
       expect(status.stdout).toContain("| last usage | 86,516 total, in 861, out 151, cached 85,504, $0.00 |");
       expect(status.stdout).toContain("| total usage | 91,500 total, in 1,200, out 300, cached 90,000, $0.12 |");
-      expect(status.stdout).toContain("| tree | id | parent | raw | observed | updated | last usage | total usage | summary |");
+      expect(status.stdout).toContain("| tree | id | parent | raw | observed | updated |");
       expect(status.stdout).not.toContain(createdAt);
       expect(status.stdout).not.toContain(updatedAt);
     } finally {
       server.setResponse("GET /session", null);
+    }
+  });
+
+  test("session status avoids wait guidance when a completed root only has recently-settled descendants", async () => {
+    const workspace = tempWorkspace("opencode-session-finished-guidance-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const sessionId = "ses_finished_root";
+    const createdAt = new Date(Date.now() - 30_000).toISOString();
+    const updatedAt = new Date(Date.now() - 8_000).toISOString();
+    const descendantUpdatedAt = new Date(Date.now() - 3_000).toISOString();
+    server.setResponse("GET /session", async (ctx) => ({
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: [
+        {
+          id: sessionId,
+          status: "completed",
+          createdAt,
+          updatedAt,
+          directory: ctx.directory,
+          summary: "final answer ready"
+        },
+        {
+          id: "ses_finished_child",
+          parentID: sessionId,
+          status: "unknown",
+          createdAt: updatedAt,
+          updatedAt: descendantUpdatedAt,
+          directory: ctx.directory,
+          summary: "child bookkeeping settled"
+        }
+      ]
+    }));
+
+    try {
+      const status = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("| raw status | completed |");
+      expect(status.stdout).toContain(
+        `| recommended next action | read final result or inspect artifacts; session continue ${sessionId} only if reuse still makes sense |`
+      );
+      expect(status.stdout).not.toContain(`wait or session attach ${sessionId}`);
+    } finally {
+      server.setResponse("GET /session", null);
+    }
+  });
+
+  test("session status avoids wait guidance for a simple recently-finished root when trace shows the last bash tool completed", async () => {
+    const workspace = tempWorkspace("opencode-session-trace-finished-guidance-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const sessionId = "ses_trace_finished_root";
+    const createdAt = new Date(Date.now() - 30_000).toISOString();
+    const updatedAt = new Date(Date.now() - 8_000).toISOString();
+    server.setResponse("GET /session", async (ctx) => ({
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: [
+        {
+          id: sessionId,
+          status: "unknown",
+          createdAt,
+          updatedAt,
+          directory: ctx.directory,
+          summary: "bash command finished"
+        }
+      ]
+    }));
+    server.setResponse(`GET /session/${sessionId}/message`, async () => ({
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: [
+        {
+          info: { id: "msg_trace_finished", sessionID: sessionId, role: "assistant" },
+          parts: [
+            {
+              id: "prt_trace_finished_bash",
+              type: "tool",
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { command: "pnpm exec vitest run eval/opencode/tests/unit/render.test.mjs" },
+                output: {
+                  exitCode: 0,
+                  stdout: "1 file passed"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }));
+
+    try {
+      const status = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("| raw status | unknown |");
+      expect(status.stdout).toContain("| observed session status | active_recent |");
+      expect(status.stdout).toContain("| hierarchy verdict | active |");
+      expect(status.stdout).toContain("bash [completed]");
+      expect(status.stdout).toContain(
+        `| recommended next action | read final result or inspect artifacts; session continue ${sessionId} only if reuse still makes sense |`
+      );
+      expect(status.stdout).not.toContain(`wait or session attach ${sessionId}`);
+    } finally {
+      server.setResponse("GET /session", null);
+      server.setResponse(`GET /session/${sessionId}/message`, null);
+    }
+  });
+
+  test("streaming output and session status expose reasoning, bash traces, and delegated tool activity", async () => {
+    const workspace = tempWorkspace("opencode-rich-trace-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restore = installRichTraceScenario(server);
+    try {
+      const result = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "show rich trace output"
+      ], {
+        cwd: workspace,
+        env: delegatedCompanionEnv(binDir),
+        timeoutMs: 10000
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("Inspect current session logs");
+      expect(result.stdout).toContain("Compare delegated child activity");
+      expect(result.stdout).toContain("git status --short");
+      expect(result.stdout).toContain("inspect repo structure");
+
+      const sessionId = result.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
+      expect(sessionId).toBeTruthy();
+
+      const status = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("## Recent execution trace");
+      expect(status.stdout).toContain("Inspect current session logs");
+      expect(status.stdout).toContain("Compare delegated child activity");
+      expect(status.stdout).toContain("git status --short");
+      expect(status.stdout).toContain("inspect repo structure");
+      expect(status.stdout).toContain("ses_trace_child_");
+    } finally {
+      restore();
     }
   });
 
@@ -1532,6 +2103,30 @@ describe("mock serve integration tests", () => {
 
     expect(completedStatus).toContain("completed");
 
+    const artifactRoot = path.join(workspace, ".opencode-companion", "jobs");
+    const jobDir = path.join(artifactRoot, jobId);
+    expect(fs.existsSync(path.join(artifactRoot, "index.json"))).toBe(true);
+    expect(fs.existsSync(jobDir)).toBe(true);
+    expect(fs.existsSync(path.join(jobDir, "events.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(jobDir, "snapshot.json"))).toBe(true);
+    expect(fs.existsSync(path.join(jobDir, "snapshot.md"))).toBe(true);
+    expect(fs.existsSync(path.join(jobDir, "compat.log"))).toBe(true);
+    expect(fs.existsSync(path.join(workspace, ".opencode-jobs.json"))).toBe(false);
+    expect(fs.existsSync(path.join(workspace, `.opencode-job-${jobId}.log`))).toBe(false);
+
+    const waitResult = await spawnCompanion(["job", "wait", jobId, "--directory", workspace, "--server-directory", workspace], {
+      cwd: workspace,
+      env: {
+        PATH: `${binDir}:${process.env.PATH || ""}`
+      },
+      timeoutMs: 10000
+    });
+
+    expect(waitResult.exitCode).toBe(0);
+    expect(waitResult.stdout).toContain("mock response");
+    expect(waitResult.stdout).not.toContain("## Recent execution trace");
+    expect(waitResult.stdout).not.toContain("OpenCode Job Status");
+
     const result = await spawnCompanion(["job", "result", jobId, "--directory", workspace], {
       cwd: workspace,
       env: {
@@ -1542,6 +2137,348 @@ describe("mock serve integration tests", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("mock response");
+  });
+
+  test("job status is liveness-first by default and verbose restores hierarchy and trace details", async () => {
+    const workspace = tempWorkspace("opencode-liveness-status-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installRichLoggingPromptScenario(server, {
+      finalText: "Final answer only."
+    });
+
+    try {
+      const backgroundStart = await spawnCompanion([
+        "session",
+        "new",
+        "--background",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "show me liveness-first status"
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(backgroundStart.exitCode).toBe(0);
+      const jobId = backgroundStart.stdout.match(/started in background as (task-[a-f0-9-]+)/i)?.[1];
+      expect(jobId).toBeTruthy();
+
+      const status = await waitFor(async () => {
+        const nextStatus = await spawnCompanion([
+          "job",
+          "status",
+          jobId,
+          "--directory",
+          workspace,
+          "--server-directory",
+          workspace
+        ], {
+          cwd: workspace,
+          env: {
+            PATH: `${binDir}:${process.env.PATH || ""}`
+          },
+          timeoutMs: 10000
+        });
+        return nextStatus.stdout.includes("Verdict:") ? nextStatus : null;
+      }, { description: "liveness-first status snapshot", timeoutMs: 15000, intervalMs: 50 });
+
+      expect(status.exitCode).toBe(0);
+      expect(status.stdout).toContain("Verdict:");
+      expect(status.stdout).toContain("Recommended action:");
+      expect(status.stdout).toContain("Latest activity:");
+      expect(status.stdout).not.toContain("## Recent execution trace");
+      expect(status.stdout).not.toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+
+      const verboseStatus = await waitFor(async () => {
+        const nextStatus = await spawnCompanion([
+          "job",
+          "status",
+          jobId,
+          "--verbose",
+          "--directory",
+          workspace,
+          "--server-directory",
+          workspace
+        ], {
+          cwd: workspace,
+          env: {
+            PATH: `${binDir}:${process.env.PATH || ""}`
+          },
+          timeoutMs: 10000
+        });
+        return nextStatus.stdout.includes("## Session Hierarchy") && nextStatus.stdout.includes("## Recent execution trace")
+          ? nextStatus
+          : null;
+      }, { description: "verbose job status with hierarchy and trace", timeoutMs: 15000, intervalMs: 50 });
+
+      expect(verboseStatus.exitCode).toBe(0);
+      expect(verboseStatus.stdout).toContain("## Session Hierarchy");
+      expect(verboseStatus.stdout).toContain("## Recent execution trace");
+      expect(verboseStatus.stdout).toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect((verboseStatus.stdout.match(/## Session Hierarchy/g) ?? [])).toHaveLength(1);
+      expect((verboseStatus.stdout.match(/## Recent execution trace/g) ?? [])).toHaveLength(1);
+      expect(verboseStatus.stdout).not.toContain("Log tail for");
+
+      const waitResult = await spawnCompanion([
+        "job",
+        "wait",
+        jobId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(waitResult.exitCode).toBe(0);
+      expect(waitResult.stdout).toContain("Final answer only.");
+      expect(waitResult.stdout).not.toContain("Plan:");
+      expect(waitResult.stdout).not.toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("artifact root precedence prefers cli flag over env var and env var over default", async () => {
+    const workspace = tempWorkspace("opencode-artifact-root-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const cliStart = await spawnCompanion([
+      "session",
+      "new",
+      "--background",
+      "--artifact-root",
+      ".cli-artifacts",
+      "--directory",
+      workspace,
+      "--server-directory",
+      workspace,
+      "--",
+      "cli root wins"
+    ], {
+      cwd: workspace,
+      env: {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        OPENCODE_ARTIFACT_ROOT: ".env-artifacts"
+      },
+      timeoutMs: 10000
+    });
+
+    const cliJobId = cliStart.stdout.match(/started in background as (task-[a-f0-9-]+)/i)?.[1];
+    expect(cliJobId).toBeTruthy();
+
+    await waitFor(async () => {
+      const result = await spawnCompanion([
+        "job",
+        "wait",
+        cliJobId,
+        "--artifact-root",
+        ".cli-artifacts",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          OPENCODE_ARTIFACT_ROOT: ".env-artifacts"
+        },
+        timeoutMs: 10000
+      });
+      return result.exitCode === 0 ? result : null;
+    }, { description: "cli artifact-root job completion", timeoutMs: 15000, intervalMs: 50 });
+
+    expect(fs.existsSync(path.join(workspace, ".cli-artifacts", "jobs", cliJobId, "snapshot.json"))).toBe(true);
+    expect(fs.existsSync(path.join(workspace, ".env-artifacts", "jobs", cliJobId, "snapshot.json"))).toBe(false);
+
+    const envStart = await spawnCompanion([
+      "session",
+      "new",
+      "--background",
+      "--directory",
+      workspace,
+      "--server-directory",
+      workspace,
+      "--",
+      "env root wins over default"
+    ], {
+      cwd: workspace,
+      env: {
+        PATH: `${binDir}:${process.env.PATH || ""}`,
+        OPENCODE_ARTIFACT_ROOT: ".env-only-artifacts"
+      },
+      timeoutMs: 10000
+    });
+
+    const envJobId = envStart.stdout.match(/started in background as (task-[a-f0-9-]+)/i)?.[1];
+    expect(envJobId).toBeTruthy();
+
+    await waitFor(async () => {
+      const result = await spawnCompanion([
+        "job",
+        "wait",
+        envJobId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`,
+          OPENCODE_ARTIFACT_ROOT: ".env-only-artifacts"
+        },
+        timeoutMs: 10000
+      });
+      return result.exitCode === 0 ? result : null;
+    }, { description: "env artifact-root job completion", timeoutMs: 15000, intervalMs: 50 });
+
+    expect(fs.existsSync(path.join(workspace, ".env-only-artifacts", "jobs", envJobId, "snapshot.json"))).toBe(true);
+    expect(fs.existsSync(path.join(workspace, ".opencode-companion", "jobs", envJobId, "snapshot.json"))).toBe(false);
+  });
+
+  test("logging surfaces readable reasoning, bash execution details, and recent trace sections", async () => {
+    const workspace = tempWorkspace("opencode-rich-logging-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restorePromptRoute = installRichLoggingPromptScenario(server);
+
+    try {
+      const foreground = await spawnCompanion([
+        "session",
+        "new",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "show me rich logging"
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(foreground.exitCode).toBe(0);
+      expect(foreground.stdout).toContain("Plan:");
+      expect(foreground.stdout).toContain("- inspect logs");
+      expect(foreground.stdout).toContain("bash");
+      expect(foreground.stdout).toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(foreground.stdout).toContain("1 file passed");
+      expect(foreground.stdout).not.toContain("[tool: bash]");
+
+      const sessionId = foreground.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
+      expect(sessionId).toBeTruthy();
+
+      const sessionStatus = await spawnCompanion([
+        "session",
+        "status",
+        sessionId,
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(sessionStatus.exitCode).toBe(0);
+      expect(sessionStatus.stdout).toContain("## Recent execution trace");
+      expect(sessionStatus.stdout).toContain("Plan:");
+      expect(sessionStatus.stdout).toContain("bash [completed]");
+      expect(sessionStatus.stdout).toContain("command: pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(sessionStatus.stdout).toContain("output: 1 file passed");
+
+      const backgroundStart = await spawnCompanion([
+        "session",
+        "new",
+        "--background",
+        "--directory",
+        workspace,
+        "--server-directory",
+        workspace,
+        "--",
+        "show me rich logging in a background job"
+      ], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+
+      expect(backgroundStart.exitCode).toBe(0);
+      const jobId = backgroundStart.stdout.match(/started in background as (task-[a-f0-9-]+)/i)?.[1];
+      expect(jobId).toBeTruthy();
+
+      const jobStatus = await waitFor(async () => {
+        const status = await spawnCompanion([
+          "job",
+          "status",
+          jobId,
+          "--verbose",
+          "--directory",
+          workspace,
+          "--server-directory",
+          workspace
+        ], {
+          cwd: workspace,
+          env: {
+            PATH: `${binDir}:${process.env.PATH || ""}`
+          },
+          timeoutMs: 10000
+        });
+        return status.stdout.includes("1 file passed") ? status : null;
+      }, { description: "background rich logging output to appear in job status", timeoutMs: 15000, intervalMs: 50 });
+
+      expect(jobStatus.exitCode).toBe(0);
+      expect(jobStatus.stdout).toContain("## Recent execution trace");
+      expect(jobStatus.stdout).toContain("Plan:");
+      expect(jobStatus.stdout).toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(jobStatus.stdout).toContain("1 file passed");
+    } finally {
+      restorePromptRoute();
+    }
   });
 
   test("job cancel stops a background task and status shows cancelled", async () => {

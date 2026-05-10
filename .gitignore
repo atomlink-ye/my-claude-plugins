@@ -3,6 +3,7 @@
 .opencode-serve.log
 .opencode-jobs.json
 .opencode-job-*.log
+.opencode-companion/
 .tmp-state/
 node_modules/
 .opencode-state/

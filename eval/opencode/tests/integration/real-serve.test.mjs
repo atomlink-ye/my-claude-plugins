@@ -11,7 +11,7 @@ const TEST_MODEL = process.env.OPENCODE_TEST_MODEL || "openai:gpt-5.4-mini";
 const INTEGRATION_ENABLED = process.env.OPENCODE_INTEGRATION === "true";
 const HOSTNAME = "127.0.0.1";
 const STATE_FILE_NAME = ".opencode-serve.json";
-const JOBS_FILE_NAME = ".opencode-jobs.json";
+const JOBS_FILE_NAME = path.join(".opencode-companion", "jobs", "index.json");
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
 const companionScript = path.join(repoRoot, "plugins", "opencode", "scripts", "opencode-companion.mjs");
@@ -41,6 +41,7 @@ function setupGitWorkspace(directory) {
     path.join(directory, ".gitignore"),
     [
       ".opencode-state/",
+      ".opencode-companion/",
       ".opencode-serve.json",
       ".opencode-jobs.json",
       ".opencode-job-*.log"

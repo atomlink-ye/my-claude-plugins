@@ -4,11 +4,15 @@ import path from "node:path";
 import process from "node:process";
 
 import {
+  DEFAULT_ARTIFACT_ROOT,
+  JOB_COMPAT_LOG_FILE_NAME,
+  JOB_EVENTS_FILE_NAME,
+  JOB_PROMPT_FILE_NAME,
+  JOBS_DIR_NAME,
   JOB_LOG_PREFIX,
-  JOB_LOG_SUFFIX,
-  JOB_PROMPT_PREFIX,
-  JOB_PROMPT_SUFFIX,
   JOBS_FILE_NAME,
+  JOB_SNAPSHOT_MARKDOWN_FILE_NAME,
+  JOB_SNAPSHOT_STATE_FILE_NAME,
   PROMPT_INLINE_MAX_BYTES_DEFAULT_POSIX,
   PROMPT_INLINE_MAX_BYTES_DEFAULT_WIN32,
   RUNTIME_STATE_DIR_NAME,
@@ -96,16 +100,52 @@ export function runtimeStateDirectory(directory) {
   return path.join(directory, RUNTIME_STATE_DIR_NAME);
 }
 
-export function jobsFilePath(directory) {
-  return path.join(directory, JOBS_FILE_NAME);
+export function resolveArtifactRoot(directory, input = null) {
+  const rawInput = input == null || String(input).trim() === ""
+    ? process.env.OPENCODE_ARTIFACT_ROOT ?? DEFAULT_ARTIFACT_ROOT
+    : input;
+  return path.resolve(directory, String(rawInput));
 }
 
-export function jobLogFilePath(directory, jobId) {
-  return path.join(directory, `${JOB_LOG_PREFIX}${jobId}${JOB_LOG_SUFFIX}`);
+export function jobsDirectoryPath(directory, artifactRoot = null) {
+  return path.join(resolveArtifactRoot(directory, artifactRoot), JOBS_DIR_NAME);
 }
 
-export function jobPromptFilePath(directory, jobId) {
-  return path.join(directory, `${JOB_PROMPT_PREFIX}${jobId}${JOB_PROMPT_SUFFIX}`);
+export function jobsFilePath(directory, artifactRoot = null) {
+  return path.join(jobsDirectoryPath(directory, artifactRoot), JOBS_FILE_NAME);
+}
+
+export function jobDirectoryPath(directory, jobId, artifactRoot = null) {
+  return path.join(jobsDirectoryPath(directory, artifactRoot), jobId);
+}
+
+export function jobEventsFilePath(directory, jobId, artifactRoot = null) {
+  return path.join(jobDirectoryPath(directory, jobId, artifactRoot), JOB_EVENTS_FILE_NAME);
+}
+
+export function jobSnapshotStateFilePath(directory, jobId, artifactRoot = null) {
+  return path.join(jobDirectoryPath(directory, jobId, artifactRoot), JOB_SNAPSHOT_STATE_FILE_NAME);
+}
+
+export function jobSnapshotMarkdownFilePath(directory, jobId, artifactRoot = null) {
+  return path.join(jobDirectoryPath(directory, jobId, artifactRoot), JOB_SNAPSHOT_MARKDOWN_FILE_NAME);
+}
+
+export function jobCompatLogFilePath(directory, jobId, artifactRoot = null) {
+  return path.join(jobDirectoryPath(directory, jobId, artifactRoot), JOB_COMPAT_LOG_FILE_NAME);
+}
+
+export function jobPromptFilePath(directory, jobId, artifactRoot = null) {
+  return path.join(jobDirectoryPath(directory, jobId, artifactRoot), JOB_PROMPT_FILE_NAME);
+}
+
+// Legacy helpers kept only for compatibility reads/migrations.
+export function legacyJobsFilePath(directory) {
+  return path.join(directory, `${JOB_LOG_PREFIX.replace(/-$/, "")}s.json`);
+}
+
+export function legacyJobLogFilePath(directory, jobId) {
+  return path.join(directory, `${JOB_LOG_PREFIX}${jobId}.log`);
 }
 
 export function readEnvPositiveInt(name, fallback) {

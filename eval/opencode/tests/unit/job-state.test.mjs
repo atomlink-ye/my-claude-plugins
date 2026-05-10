@@ -2,7 +2,28 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isActiveJob, readJobs, refreshStaleRunningJobs, upsertJob } from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
+import {
+  buildJobLivenessEvent,
+  formatReadableTimestamp,
+  isActiveJob,
+  readJobs,
+  refreshStaleRunningJobs,
+  upsertJob
+} from "../../../../skills/opencode-companion/scripts/opencode-companion.mjs";
+import {
+  createJobLogFile,
+  readJobSnapshot,
+  recordJobEvent,
+  renderJobSnapshotMarkdown
+} from "../../../../skills/opencode-companion/scripts/opencode-companion/jobs.mjs";
+import {
+  jobCompatLogFilePath,
+  jobEventsFilePath,
+  jobSnapshotMarkdownFilePath,
+  jobSnapshotStateFilePath,
+  jobsFilePath,
+  resolveArtifactRoot
+} from "../../../../skills/opencode-companion/scripts/opencode-companion/config.mjs";
 
 const { mkdtempSync, rmSync, writeFileSync } = fs;
 const { tmpdir } = os;
@@ -36,10 +57,158 @@ describe("job state helpers", () => {
     });
     expect(job.createdAt).toBe("2024-01-01T00:00:00.000Z");
     expect(job.updatedAt).toBe("2024-01-01T00:00:00.000Z");
-    expect(job.directory).toBeUndefined();
+    expect(job.directory).toBe(directory);
     expect(job.startedAt).toBeUndefined();
     expect(job.completedAt).toBeUndefined();
     expect(readJobs(directory)).toHaveLength(1);
+  });
+
+  it("stores job records under the default .opencode-companion artifact root", () => {
+    upsertJob(directory, {
+      id: "task-layout",
+      status: "queued",
+      prompt: "hello world"
+    });
+
+    expect(jobsFilePath(directory)).toBe(path.join(directory, ".opencode-companion", "jobs", "index.json"));
+    expect(fs.existsSync(jobsFilePath(directory))).toBe(true);
+  });
+
+  it("resolves artifact root precedence as cli flag, then env var, then default", () => {
+    const previous = process.env.OPENCODE_ARTIFACT_ROOT;
+
+    process.env.OPENCODE_ARTIFACT_ROOT = "env-artifacts";
+    expect(resolveArtifactRoot(directory)).toBe(path.join(directory, "env-artifacts"));
+    expect(resolveArtifactRoot(directory, "cli-artifacts")).toBe(path.join(directory, "cli-artifacts"));
+
+    delete process.env.OPENCODE_ARTIFACT_ROOT;
+    expect(resolveArtifactRoot(directory)).toBe(path.join(directory, ".opencode-companion"));
+
+    if (previous == null) {
+      delete process.env.OPENCODE_ARTIFACT_ROOT;
+    } else {
+      process.env.OPENCODE_ARTIFACT_ROOT = previous;
+    }
+  });
+
+  it("records durable events and derived snapshots in each job artifact directory", () => {
+    const jobId = "task-snapshot";
+    const logFile = createJobLogFile(directory, jobId);
+
+    expect(logFile).toBe(path.join(directory, ".opencode-companion", "jobs", jobId, "compat.log"));
+    expect(fs.existsSync(jobCompatLogFilePath(directory, jobId))).toBe(true);
+
+    recordJobEvent(directory, jobId, {
+      type: "job.lifecycle",
+      status: "running",
+      summary: "Background worker started",
+      sessionId: "ses_demo",
+      activityKind: "worker_started"
+    });
+    recordJobEvent(directory, jobId, {
+      type: "job.result",
+      status: "completed",
+      summary: "Final answer ready",
+      final: { combinedText: "final answer" },
+      activityKind: "result_ready"
+    });
+
+    expect(fs.existsSync(jobEventsFilePath(directory, jobId))).toBe(true);
+    expect(fs.existsSync(jobSnapshotStateFilePath(directory, jobId))).toBe(true);
+    expect(fs.existsSync(jobSnapshotMarkdownFilePath(directory, jobId))).toBe(true);
+
+    const snapshot = readJobSnapshot(directory, jobId);
+    expect(snapshot.status).toBe("completed");
+    expect(snapshot.latestActivity.kind).toBe("result_ready");
+    expect(snapshot.final.combinedText).toBe("final answer");
+  });
+
+  it("default liveness snapshot surfaces active descendant sessions from the session hierarchy", () => {
+    const jobId = "task-descendant-liveness";
+    upsertJob(directory, {
+      id: jobId,
+      status: "running",
+      sessionId: "ses_root",
+      prompt: "show me descendant liveness",
+      promptSummary: "show me descendant liveness"
+    });
+
+    const hierarchyContext = {
+      summariesById: new Map([
+        [
+          "ses_root",
+          {
+            id: "ses_root",
+            status: "busy",
+            createdAt: "2026-05-10T00:00:00.000Z",
+            updatedAt: "2026-05-10T00:00:10.000Z"
+          }
+        ],
+        [
+          "ses_child",
+          {
+            id: "ses_child",
+            parentId: "ses_root",
+            status: "busy",
+            createdAt: "2026-05-10T00:00:05.000Z",
+            updatedAt: "2026-05-10T00:00:20.000Z"
+          }
+        ]
+      ]),
+      childrenByParent: new Map([["ses_root", ["ses_child"]]])
+    };
+
+    recordJobEvent(
+      directory,
+      jobId,
+      buildJobLivenessEvent(
+        {
+          id: jobId,
+          status: "running",
+          sessionId: "ses_root",
+          promptSummary: "show me descendant liveness"
+        },
+        hierarchyContext,
+        []
+      )
+    );
+
+    const snapshot = readJobSnapshot(directory, jobId);
+    expect(snapshot.latestActivity.kind).toBe("descendant_activity");
+    expect(snapshot.active.descendantSessionIds).toEqual(["ses_child"]);
+    expect(renderJobSnapshotMarkdown(snapshot)).toContain("Current focus: active descendant sessions: ses_child");
+  });
+
+  it("renders readable latest-activity timestamps in default and verbose job status views", () => {
+    const latestActivityAt = 1778399738319;
+    const readableAt = formatReadableTimestamp(latestActivityAt);
+    const snapshot = {
+      jobId: "task-readable-time",
+      status: "running",
+      latestActivity: {
+        at: latestActivityAt,
+        kind: "descendant_activity",
+        sessionId: "ses_demo",
+        summary: "Child session emitted progress"
+      },
+      hierarchy: {
+        rootSessionId: "ses_demo",
+        verdict: "active_descendants",
+        statusCounts: { busy: 1 },
+        sessionCount: 1,
+        descendantCount: 0,
+        latestActivityAt,
+        latestActivitySessionId: "ses_demo"
+      }
+    };
+
+    const compactView = renderJobSnapshotMarkdown(snapshot);
+    const verboseView = renderJobSnapshotMarkdown(snapshot, { verbose: true });
+
+    expect(compactView).toContain(`Latest activity: ${readableAt}`);
+    expect(compactView).not.toContain(`Latest activity: ${latestActivityAt}`);
+    expect(verboseView).toContain(`- latest hierarchy activity: ${readableAt}`);
+    expect(verboseView).not.toContain(`- latest hierarchy activity: ${latestActivityAt}`);
   });
 
   it("upsertJob updates an existing job by merging fields", () => {
@@ -77,8 +246,9 @@ describe("job state helpers", () => {
   });
 
   it("refreshStaleRunningJobs marks a dead running job as failed", () => {
+    fs.mkdirSync(path.dirname(jobsFilePath(directory)), { recursive: true });
     writeFileSync(
-      path.join(directory, ".opencode-jobs.json"),
+      jobsFilePath(directory),
       JSON.stringify(
         [
           {
@@ -87,7 +257,7 @@ describe("job state helpers", () => {
             startedAt: "2024-01-01T00:00:00.000Z",
             pid: 999999,
             directory,
-            logFile: path.join(directory, ".opencode-job-task-dead.log")
+            logFile: jobCompatLogFilePath(directory, "task-dead")
           }
         ],
         null,
@@ -112,8 +282,9 @@ describe("job state helpers", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2024-01-01T00:01:00.000Z"));
 
+    fs.mkdirSync(path.dirname(jobsFilePath(directory)), { recursive: true });
     writeFileSync(
-      path.join(directory, ".opencode-jobs.json"),
+      jobsFilePath(directory),
       JSON.stringify(
         [
           {
@@ -122,7 +293,7 @@ describe("job state helpers", () => {
             startedAt: "2024-01-01T00:00:00.000Z",
             pid: null,
             directory,
-            logFile: path.join(directory, ".opencode-job-task-queued.log")
+            logFile: jobCompatLogFilePath(directory, "task-queued")
           }
         ],
         null,
@@ -145,8 +316,9 @@ describe("job state helpers", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2024-01-01T00:01:00.000Z"));
 
+    fs.mkdirSync(path.dirname(jobsFilePath(directory)), { recursive: true });
     writeFileSync(
-      path.join(directory, ".opencode-jobs.json"),
+      jobsFilePath(directory),
       JSON.stringify(
         [
           {
@@ -155,7 +327,7 @@ describe("job state helpers", () => {
             startedAt: "2024-01-01T00:00:00.000Z",
             pid: process.pid,
             directory,
-            logFile: path.join(directory, ".opencode-job-task-live.log")
+            logFile: jobCompatLogFilePath(directory, "task-live")
           }
         ],
         null,

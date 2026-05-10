@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   makeTempDir,
@@ -32,6 +34,38 @@ describe("companion CLI smoke tests", () => {
     const result = await spawnCompanion(["job", "list", "--directory", cwd], { cwd });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("No jobs recorded");
+  });
+
+  test("job list keeps default output compact and only shows log tail in verbose mode", async () => {
+    const cwd = tempWorkspace();
+    const jobsDir = path.join(cwd, ".opencode-companion", "jobs");
+    const jobId = "task-list-verbose";
+    const jobDir = path.join(jobsDir, jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, "index.json"), JSON.stringify([
+      {
+        id: jobId,
+        status: "running",
+        startedAt: "2026-05-10T00:00:00.000Z",
+        updatedAt: "2026-05-10T00:00:05.000Z",
+        directory: cwd,
+        promptSummary: "inspect logs",
+        logFile: path.join(jobDir, "compat.log")
+      }
+    ], null, 2));
+    fs.writeFileSync(path.join(jobDir, "compat.log"), "first line\nsecond line\n", "utf8");
+
+    const compact = await spawnCompanion(["job", "list", "--directory", cwd], { cwd });
+    expect(compact.exitCode).toBe(0);
+    expect(compact.stdout).toContain("Running jobs:");
+    expect(compact.stdout).not.toContain("Log tail:");
+    expect(compact.stdout).not.toContain("second line");
+
+    const verbose = await spawnCompanion(["job", "list", "--verbose", "--directory", cwd], { cwd });
+    expect(verbose.exitCode).toBe(0);
+    expect(verbose.stdout).toContain("Running jobs:");
+    expect(verbose.stdout).toContain("Log tail:");
+    expect(verbose.stdout).toContain("second line");
   });
 
   test("serve stop with no state file exits 0", async () => {
