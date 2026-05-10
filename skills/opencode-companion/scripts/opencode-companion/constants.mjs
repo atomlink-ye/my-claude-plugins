@@ -1,8 +1,14 @@
 export const HOSTNAME = "127.0.0.1";
 export const STATE_FILE_NAME = ".opencode-serve.json";
-export const JOBS_FILE_NAME = ".opencode-jobs.json";
+export const DEFAULT_ARTIFACT_ROOT = ".opencode-companion";
+export const JOBS_DIR_NAME = "jobs";
+export const JOBS_FILE_NAME = "index.json";
 export const JOB_LOG_PREFIX = ".opencode-job-";
 export const JOB_LOG_SUFFIX = ".log";
+export const JOB_EVENTS_FILE_NAME = "events.jsonl";
+export const JOB_SNAPSHOT_STATE_FILE_NAME = "snapshot.json";
+export const JOB_SNAPSHOT_MARKDOWN_FILE_NAME = "snapshot.md";
+export const JOB_COMPAT_LOG_FILE_NAME = "compat.log";
 export const RUNTIME_STATE_DIR_NAME = ".opencode-state";
 export const STARTUP_TIMEOUT_MS = 10000;
 export const HEALTH_TIMEOUT_MS = 1200;
@@ -21,5 +27,4 @@ export const DEFAULT_SESSION_TIMEOUT_MINS = 60;
 // script path, flags, and shell quoting.
 export const PROMPT_INLINE_MAX_BYTES_DEFAULT_POSIX = 65536;
 export const PROMPT_INLINE_MAX_BYTES_DEFAULT_WIN32 = 16384;
-export const JOB_PROMPT_PREFIX = ".opencode-job-";
-export const JOB_PROMPT_SUFFIX = ".prompt";
+export const JOB_PROMPT_FILE_NAME = "prompt.txt";

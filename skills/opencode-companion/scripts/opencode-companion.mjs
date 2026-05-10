@@ -13,7 +13,6 @@ import {
   STATUS_SESSION_LIMIT
 } from "./opencode-companion/constants.mjs";
 import {
-  jobLogFilePath,
   parseArgs,
   readEnvDurationMs,
   resolveDirectory,
@@ -45,11 +44,14 @@ import {
   normalizePromptText,
   nowIso,
   readJob,
+  readJobSnapshot,
   readJobs,
   readLogText,
   readLogTail,
+  recordJobEvent,
   refreshStaleRunningJobs,
   renderBackgroundTaskStart,
+  renderJobSnapshotMarkdown,
   sortJobsNewestFirst,
   spawnBackgroundTaskWorker,
   summarizePrompt,
@@ -82,18 +84,18 @@ function printUsage() {
       "  node scripts/opencode-companion.mjs serve status [--server-directory SERVER_DIR]",
       "  node scripts/opencode-companion.mjs serve stop [--server-directory SERVER_DIR]",
       "",
-      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
-      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
+      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
+      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
       "  node scripts/opencode-companion.mjs session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
       "  node scripts/opencode-companion.mjs session list [--directory WORK_DIR] [--server-directory SERVER_DIR]",
       "  node scripts/opencode-companion.mjs session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
       "",
-      "  node scripts/opencode-companion.mjs job list [--directory WORK_DIR] [--server-directory SERVER_DIR] [--all]",
-      "  node scripts/opencode-companion.mjs job status <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs job wait <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
-      "  node scripts/opencode-companion.mjs job result <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs job cancel <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
+      "  node scripts/opencode-companion.mjs job list [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--all] [--verbose]",
+      "  node scripts/opencode-companion.mjs job status <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
+      "  node scripts/opencode-companion.mjs job wait <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--timeout MINS] [--verbose]",
+      "  node scripts/opencode-companion.mjs job result <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
+      "  node scripts/opencode-companion.mjs job cancel <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH]",
       "",
       `  Default session timeout: ${DEFAULT_SESSION_TIMEOUT_MINS} minutes`,
       "  SERVER_DIR: where .opencode-serve.json lives (default: ~)",
@@ -118,6 +120,14 @@ function formatJobStatusLine(job) {
     parts.push(job.promptSummary);
   }
   return parts.join(" | ");
+}
+
+function readHierarchyPendingGraceMs() {
+  const forceQuiescenceTimeoutMs = readEnvDurationMs("OPENCODE_FORCE_QUIESCENCE_TIMEOUT_MS", 30000);
+  return Math.max(
+    forceQuiescenceTimeoutMs,
+    readEnvDurationMs("OPENCODE_HIERARCHY_PENDING_GRACE_MS", 300000)
+  );
 }
 
 function buildJobHierarchyMetadata(job, hierarchyContext) {
@@ -227,7 +237,7 @@ function renderJobTailSection(job) {
 }
 
 function buildJobListView(directory, options = {}) {
-  const jobs = sortJobsNewestFirst(refreshStaleRunningJobs(directory));
+  const jobs = sortJobsNewestFirst(refreshStaleRunningJobs(directory, { artifactRoot: options.artifactRoot ?? null }));
   const selected = options.all ? jobs : jobs.slice(0, STATUS_RECENT_LIMIT);
   const enriched = selected.map((job) => ({
     ...job,
@@ -260,11 +270,13 @@ function buildJobListView(directory, options = {}) {
       if (hierarchyMetadata) {
         lines.push(`  Hierarchy: root ${hierarchyMetadata.rootSessionId} | verdict ${hierarchyMetadata.hierarchyVerdict} | sessions ${hierarchyMetadata.subtreeSummary.sessionCount} | ${formatHierarchyStatusCounts(hierarchyMetadata.subtreeSummary.statusCounts)} | latest ${formatReadableTimestamp(hierarchyMetadata.subtreeSummary.latestActivityLabel) || "-"} @ ${hierarchyMetadata.subtreeSummary.latestActivitySessionId || "-"}`);
       }
-      const tail = readLogTail(job.logFile, STATUS_LOG_TAIL_LINES);
-      if (tail.length > 0) {
-        lines.push("  Log tail:");
-        for (const line of tail) {
-          lines.push(`    ${line}`);
+      if (options.verbose) {
+        const tail = readLogTail(job.logFile, STATUS_LOG_TAIL_LINES);
+        if (tail.length > 0) {
+          lines.push("  Log tail:");
+          for (const line of tail) {
+            lines.push(`    ${line}`);
+          }
         }
       }
     }
@@ -273,7 +285,7 @@ function buildJobListView(directory, options = {}) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-function buildSingleJobView(job, sessionHierarchyContext = null) {
+function buildSingleJobView(job, sessionHierarchyContext = null, recentTraceEntries = []) {
   const enriched = {
     ...job,
     elapsed:
@@ -281,16 +293,121 @@ function buildSingleJobView(job, sessionHierarchyContext = null) {
         ? formatDuration(job.startedAt)
         : formatDuration(job.startedAt, job.completedAt)
   };
-  const tail = readLogTail(job.logFile, STATUS_LOG_TAIL_LINES);
   const sections = ["# OpenCode Job Status", "", renderJobDetails(enriched, sessionHierarchyContext).trimEnd()];
   const hierarchySection = renderJobHierarchySection(enriched, sessionHierarchyContext).trimEnd();
   if (hierarchySection) {
     sections.push(hierarchySection);
   }
-  if (tail.length > 0) {
-    sections.push(renderJobTailSection(enriched).trimEnd());
+  const traceSection = renderExecutionTraceSection(recentTraceEntries, sessionHierarchyContext, {
+    primarySessionId: job.sessionId ?? null,
+    childSessionLimit: 12
+  }).trimEnd();
+  if (traceSection) {
+    sections.push(traceSection);
   }
   return `${sections.filter(Boolean).join("\n\n").trimEnd()}\n`;
+}
+
+function collectActiveToolHints(recentTraceEntries = []) {
+  return normalizeRecentTraceEntriesInput(recentTraceEntries)
+    .filter((entry) => entry?.type === "tool")
+    .map((entry) => String(entry.label ?? "").trim())
+    .filter(Boolean)
+    .slice(-3);
+}
+
+function buildJobLivenessEvent(job, hierarchyContext = null, recentTraceEntries = []) {
+  const hierarchyMetadata = buildJobHierarchyMetadata(job, hierarchyContext);
+  const activeDescendantSessionIds = hierarchyMetadata
+    ? hierarchyMetadata.subtreeSummary.pendingSessionIds?.filter((id) => id && id !== job.sessionId) ?? []
+    : [];
+  const toolHints = collectActiveToolHints(recentTraceEntries);
+  const latestActivityAt = hierarchyMetadata?.subtreeSummary.latestActivityLabel ?? job.updatedAt ?? job.startedAt ?? nowIso();
+  const latestActivitySessionId = hierarchyMetadata?.subtreeSummary.latestActivitySessionId ?? job.sessionId ?? null;
+  const latestActivityKind = toolHints[0]
+    ? `tool:${toolHints[0]}`
+    : activeDescendantSessionIds.length > 0
+      ? "descendant_activity"
+      : job.status === "completed" || job.status === "delegated"
+        ? "job_completed"
+        : job.status === "failed"
+          ? "job_failed"
+          : "job_status";
+  const hints = {
+    stale: false,
+    blocked: job.status === "failed",
+    interventionNeeded: job.status === "failed" || job.status === "cancelled",
+    reason: job.error ?? null
+  };
+
+  return {
+    at: latestActivityAt,
+    type: "job.activity",
+    status: job.status,
+    sessionId: latestActivitySessionId,
+    summary: toolHints[0] ?? job.promptSummary ?? job.error ?? job.status,
+    activityKind: latestActivityKind,
+    active: {
+      descendantSessionIds: activeDescendantSessionIds,
+      toolHints
+    },
+    hints,
+    hierarchy: hierarchyMetadata
+      ? {
+          rootSessionId: hierarchyMetadata.rootSessionId,
+          verdict: hierarchyMetadata.hierarchyVerdict,
+          sessionCount: hierarchyMetadata.subtreeSummary.sessionCount,
+          descendantCount: hierarchyMetadata.subtreeSummary.descendantCount,
+          statusCounts: hierarchyMetadata.subtreeSummary.statusCounts,
+          latestActivityAt: hierarchyMetadata.subtreeSummary.latestActivityLabel,
+          latestActivitySessionId: hierarchyMetadata.subtreeSummary.latestActivitySessionId
+        }
+      : null,
+    traceEntry: normalizeRecentTraceEntriesInput(recentTraceEntries).at(-1) ?? null
+  };
+}
+
+function buildQuietJobResult(job, snapshot) {
+  if (snapshot?.final?.combinedText) {
+    return `${snapshot.final.combinedText.trimEnd()}\n`;
+  }
+  if (job.status === "delegated") {
+    return renderJobSnapshotMarkdown(snapshot ?? readJobSnapshot(job.directory, job.id, { artifactRoot: job.artifactRoot ?? null }));
+  }
+  if (job.status === "failed" && (snapshot?.final?.error || job.error)) {
+    return `Error: ${snapshot?.final?.error ?? job.error}\n`;
+  }
+  return renderJobSnapshotMarkdown(snapshot ?? readJobSnapshot(job.directory, job.id, { artifactRoot: job.artifactRoot ?? null }));
+}
+
+function buildDefaultJobStatusView(job, snapshot) {
+  return renderJobSnapshotMarkdown(snapshot ?? readJobSnapshot(job.directory, job.id, { artifactRoot: job.artifactRoot ?? null }));
+}
+
+function buildVerboseJobStatusView(job, snapshot, hierarchyContext = null, recentTraceEntries = []) {
+  const resolvedSnapshot = snapshot ?? readJobSnapshot(job.directory, job.id, { artifactRoot: job.artifactRoot ?? null });
+  const summaryMarkdown = renderJobSnapshotMarkdown(resolvedSnapshot).trimEnd();
+  const verboseSnapshotMarkdown = renderJobSnapshotMarkdown(resolvedSnapshot, { verbose: true }).trimEnd();
+  const sections = [summaryMarkdown];
+  const hierarchySection = renderJobHierarchySection(job, hierarchyContext).trimEnd();
+  if (hierarchySection) {
+    sections.push(hierarchySection);
+  }
+  const traceSection = renderExecutionTraceSection(
+    recentTraceEntries.length > 0 ? recentTraceEntries : (resolvedSnapshot?.recentTrace ?? []),
+    hierarchyContext,
+    {
+      primarySessionId: job.sessionId ?? null,
+      childSessionLimit: 12
+    }
+  ).trimEnd();
+  if (traceSection) {
+    sections.push(traceSection);
+  }
+  if (!hierarchySection && !traceSection) {
+    return `${verboseSnapshotMarkdown}\n`;
+  }
+  return `${sections.filter(Boolean).join("\n\n")}\n`;
 }
 
 function formatUnexpectedTaskAbort(model) {
@@ -373,22 +490,63 @@ function looksLikePath(value) {
   );
 }
 
+const TEXT_CANDIDATE_KEYS = new Set(["text", "delta", "content", "value", "message", "markdown", "body", "reasoning", "analysis", "summary"]);
+const TEXT_CANDIDATE_EXCLUDED_KEYS = new Set(["id", "type", "status", "state", "phase", "name", "tool", "toolname", "tool_name", "sessionid", "parentid", "slug"]);
+const MAX_RENDERED_TRACE_ENTRIES = 12;
+const DEFAULT_CHILD_TRACE_ENTRY_LIMIT = 5;
+const MAX_RENDERED_TRACE_TEXT_CHARS = 1200;
+const MAX_RENDERED_TRACE_DETAIL_CHARS = 600;
+
+function normalizeMultilineText(value) {
+  return String(value ?? "")
+    .replace(/\r/g, "")
+    .trim();
+}
+
+function collectKeyedText(value, allowedKeys, parts = [], seen = new Set(), hintKey = "", active = false) {
+  if (typeof value === "string") {
+    if (!active) {
+      return parts;
+    }
+    const normalized = normalizeMultilineText(value);
+    if (normalized && !seen.has(normalized)) {
+      parts.push(normalized);
+      seen.add(normalized);
+    }
+    return parts;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectKeyedText(entry, allowedKeys, parts, seen, hintKey, active);
+    }
+    return parts;
+  }
+
+  if (!value || typeof value !== "object") {
+    return parts;
+  }
+
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = String(key).toLowerCase();
+    if (TEXT_CANDIDATE_EXCLUDED_KEYS.has(normalizedKey)) {
+      continue;
+    }
+    collectKeyedText(entry, allowedKeys, parts, seen, normalizedKey, active || allowedKeys.has(normalizedKey));
+  }
+  return parts;
+}
+
 function collectTextParts(value, parts = [], seen = new Set(), hintKey = "", parentType = "") {
   if (typeof value === "string") {
-    const trimmed = value.trim();
+    const trimmed = normalizeMultilineText(value);
     if (!trimmed) {
       return parts;
     }
     const normalizedKey = hintKey.toLowerCase();
     const normalizedType = parentType.toLowerCase();
     const shouldInclude =
-      normalizedKey === "text" ||
-      normalizedKey === "delta" ||
-      normalizedKey === "content" ||
-      normalizedKey === "value" ||
-      normalizedKey === "message" ||
-      normalizedKey === "markdown" ||
-      normalizedKey === "body" ||
+      TEXT_CANDIDATE_KEYS.has(normalizedKey) ||
       normalizedType.includes("text");
 
     if (shouldInclude && !seen.has(trimmed)) {
@@ -410,11 +568,13 @@ function collectTextParts(value, parts = [], seen = new Set(), hintKey = "", par
   }
 
   const nextType = typeof value.type === "string" ? value.type : parentType;
-  // Skip reasoning/thinking and structural parts — only extract actual text output
-  if (nextType === "reasoning" || nextType === "step-start" || nextType === "step-finish") {
+  if (nextType === "step-start" || nextType === "step-finish") {
     return parts;
   }
   for (const [key, entry] of Object.entries(value)) {
+    if (TEXT_CANDIDATE_EXCLUDED_KEYS.has(String(key).toLowerCase())) {
+      continue;
+    }
     collectTextParts(entry, parts, seen, key, nextType);
   }
   return parts;
@@ -422,6 +582,457 @@ function collectTextParts(value, parts = [], seen = new Set(), hintKey = "", par
 
 function extractTextCandidates(value) {
   return collectTextParts(value, [], new Set());
+}
+
+function extractReadablePartText(part, allowedKeys = TEXT_CANDIDATE_KEYS) {
+  return collectKeyedText(part, allowedKeys, [], new Set()).join("\n\n").trim();
+}
+
+function normalizeTraceTextForRender(text) {
+  return String(text ?? "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function truncateTraceText(text, maxChars = MAX_RENDERED_TRACE_TEXT_CHARS) {
+  const normalized = normalizeTraceTextForRender(text);
+  if (!normalized || normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function truncateTraceHead(text, maxChars = MAX_RENDERED_TRACE_TEXT_CHARS) {
+  const normalized = normalizeTraceTextForRender(text);
+  if (!normalized || normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars)).trimEnd()}\n[truncated, showing first ${maxChars} chars of ${normalized.length}]`;
+}
+
+function truncateTraceTail(text, maxChars = MAX_RENDERED_TRACE_DETAIL_CHARS) {
+  const normalized = normalizeTraceTextForRender(text);
+  if (!normalized || normalized.length <= maxChars) {
+    return normalized;
+  }
+  const rawTail = normalized.slice(-maxChars);
+  const alignedTail = rawTail.includes("\n")
+    ? rawTail.slice(rawTail.indexOf("\n") + 1).trimStart()
+    : rawTail.trimStart();
+  return `[truncated, showing last ${maxChars} chars of ${normalized.length}]\n${alignedTail}`;
+}
+
+function renderIndentedMultiline(text, indent = "  ") {
+  return normalizeTraceTextForRender(text)
+    .split("\n")
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
+
+function summarizeScalarValue(value) {
+  if (typeof value === "string") {
+    return normalizeTraceTextForRender(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => summarizeScalarValue(entry))
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join(" ") : "";
+  }
+  if (value && typeof value === "object") {
+    const text = extractReadablePartText(value, new Set(["text", "message", "content", "body", "output", "stdout", "stderr", "summary", "result"]));
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function extractToolCommand(part) {
+  const directCandidates = [
+    part?.command,
+    part?.cmd,
+    part?.script,
+    part?.input?.command,
+    part?.input?.cmd,
+    part?.input?.script,
+    part?.state?.command,
+    part?.state?.cmd,
+    part?.state?.script,
+    part?.state?.input?.command,
+    part?.state?.input?.cmd,
+    part?.state?.input?.script,
+    part?.arguments?.command,
+    part?.arguments?.cmd,
+    part?.arguments?.script,
+    part?.state?.arguments?.command,
+    part?.state?.arguments?.cmd,
+    part?.state?.arguments?.script,
+    part?.argv,
+    part?.input?.argv,
+    part?.state?.argv,
+    part?.state?.input?.argv
+  ];
+  for (const candidate of directCandidates) {
+    const summary = summarizeScalarValue(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return "";
+}
+
+function extractToolInputSummary(part) {
+  const inputCandidates = [part?.input, part?.state?.input, part?.arguments, part?.state?.arguments];
+  for (const candidate of inputCandidates) {
+    const summary = extractReadablePartText(
+      candidate,
+      new Set(["description", "prompt", "query", "command", "cmd", "script", "path", "paths", "pattern", "subagent_type", "subagent", "agent", "task_id", "taskid", "sessionid", "session_id"])
+    );
+    if (summary) {
+      return summary;
+    }
+  }
+  return "";
+}
+
+function extractToolOutputSummary(part) {
+  const directCandidates = [
+    part?.output,
+    part?.state?.output,
+    part?.state?.result,
+    part?.result,
+    part?.state?.message,
+    part?.state?.text,
+    part?.message,
+    part?.text
+  ];
+  for (const candidate of directCandidates) {
+    const summary = summarizeScalarValue(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return "";
+}
+
+function extractToolDescription(part) {
+  const directCandidates = [
+    part?.description,
+    part?.summary,
+    part?.input?.description,
+    part?.input?.summary,
+    part?.state?.description,
+    part?.state?.summary,
+    part?.state?.input?.description,
+    part?.state?.input?.summary,
+    part?.arguments?.description,
+    part?.arguments?.summary,
+    part?.state?.arguments?.description,
+    part?.state?.arguments?.summary
+  ];
+  for (const candidate of directCandidates) {
+    const summary = summarizeScalarValue(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return "";
+}
+
+function extractToolSubagent(part) {
+  const directCandidates = [
+    part?.subagent_type,
+    part?.subagentType,
+    part?.input?.subagent_type,
+    part?.input?.subagentType,
+    part?.state?.subagent_type,
+    part?.state?.subagentType,
+    part?.state?.input?.subagent_type,
+    part?.state?.input?.subagentType,
+    part?.arguments?.subagent_type,
+    part?.arguments?.subagentType,
+    part?.state?.arguments?.subagent_type,
+    part?.state?.arguments?.subagentType
+  ];
+  for (const candidate of directCandidates) {
+    const summary = summarizeScalarValue(candidate);
+    if (summary) {
+      return summary;
+    }
+  }
+  return "";
+}
+
+function extractToolExitCode(part) {
+  const directCandidates = [
+    part?.exitCode,
+    part?.exit_code,
+    part?.code,
+    part?.state?.exitCode,
+    part?.state?.exit_code,
+    part?.state?.code,
+    part?.output?.exitCode,
+    part?.output?.exit_code,
+    part?.output?.code,
+    part?.state?.output?.exitCode,
+    part?.state?.output?.exit_code,
+    part?.state?.output?.code,
+    part?.result?.exitCode,
+    part?.state?.result?.exitCode
+  ];
+  for (const candidate of directCandidates) {
+    if (candidate == null || candidate === "") {
+      continue;
+    }
+    return String(candidate).trim();
+  }
+  return "";
+}
+
+function describeToolSessionIds(part, hierarchyContext = null) {
+  const sessionIds = extractSessionIdsFromTaskToolPart(part);
+  if (sessionIds.length === 0) {
+    return "";
+  }
+  return sessionIds
+    .map((sessionId) => {
+      const summary = hierarchyContext?.summariesById?.get?.(sessionId) ?? null;
+      if (!summary) {
+        return sessionId;
+      }
+      const summaryText = summary.summary ? ` — ${summary.summary}` : "";
+      return `${sessionId} (${summary.status})${summaryText}`;
+    })
+    .join(", ");
+}
+
+function buildTraceEntryKey(entry) {
+  return [entry.sessionId ?? "", entry.type ?? "", entry.label ?? "", entry.text ?? "", ...(entry.detailLines ?? [])].join("::");
+}
+
+function buildReasoningTraceEntry(part, sessionId = null) {
+  const text = extractReadablePartText(part, new Set(["text", "reasoning", "analysis", "content", "delta", "message", "body", "markdown", "summary"]));
+  if (!text) {
+    return null;
+  }
+  return {
+    sessionId,
+    type: "reasoning",
+    label: "thinking",
+    text: truncateTraceHead(text, MAX_RENDERED_TRACE_TEXT_CHARS)
+  };
+}
+
+function buildTextTraceEntry(part, sessionId = null) {
+  const text = extractReadablePartText(part, new Set(["text", "content", "delta", "message", "body", "markdown", "summary"]));
+  if (!text) {
+    return null;
+  }
+  return {
+    sessionId,
+    type: "text",
+    label: "assistant",
+    text: truncateTraceHead(text, MAX_RENDERED_TRACE_TEXT_CHARS)
+  };
+}
+
+function buildToolTraceEntry(part, sessionId = null, hierarchyContext = null, options = {}) {
+  const name = getToolPartName(part) || String(readObjectField(part, ["name", "toolName", "tool_name"]) ?? "tool").trim().toLowerCase() || "tool";
+  const state = getToolPartState(part);
+  const detailLines = [];
+  const command = extractToolCommand(part);
+  if (command) {
+    detailLines.push(`command: ${truncateTraceHead(command, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
+  }
+  const description = extractToolDescription(part);
+  if (description && description !== command) {
+    detailLines.push(`description: ${truncateTraceHead(description, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
+  }
+  const subagent = extractToolSubagent(part);
+  if (subagent) {
+    detailLines.push(`subagent: ${truncateTraceHead(subagent, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
+  }
+  const inputSummary = extractToolInputSummary(part);
+  if (inputSummary && inputSummary !== command && inputSummary !== description) {
+    detailLines.push(`input: ${truncateTraceHead(inputSummary, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
+  }
+  if (options.includeOutput !== false) {
+    const output = extractToolOutputSummary(part);
+    if (output) {
+      detailLines.push(`output: ${truncateTraceTail(output, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
+    }
+  }
+  const exitCode = extractToolExitCode(part);
+  if (exitCode) {
+    detailLines.push(`exit: ${exitCode}`);
+  }
+  const sessions = describeToolSessionIds(part, hierarchyContext);
+  if (sessions) {
+    detailLines.push(`sessions: ${sessions}`);
+  }
+  return {
+    sessionId,
+    type: "tool",
+    label: state ? `${name} [${state}]` : name,
+    detailLines
+  };
+}
+
+function buildTraceEntriesFromPart(part, sessionId = null, options = {}) {
+  if (!part || typeof part !== "object") {
+    return [];
+  }
+  const type = String(part.type ?? "").trim().toLowerCase();
+  const entries = [];
+  if (type === "reasoning") {
+    const entry = buildReasoningTraceEntry(part, sessionId);
+    if (entry) {
+      entries.push(entry);
+    }
+  } else if (type === "tool") {
+    const entry = buildToolTraceEntry(part, sessionId, options.hierarchyContext ?? null, options);
+    if (entry) {
+      entries.push(entry);
+    }
+  } else if (type === "text" && options.includeText !== false) {
+    const entry = buildTextTraceEntry(part, sessionId);
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+function buildTraceEntriesFromMessages(messages, options = {}) {
+  const entries = [];
+  const seen = new Set();
+  for (const message of normalizeMessageArray(messages)) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+    const messageSessionId = String(message?.info?.sessionID || message?.info?.sessionId || options.sessionId || "").trim() || null;
+    const parts = Array.isArray(message.parts) ? message.parts : [];
+    for (const part of parts) {
+      for (const entry of buildTraceEntriesFromPart(part, messageSessionId, options)) {
+        const key = buildTraceEntryKey(entry);
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        entries.push(entry);
+      }
+    }
+  }
+  return entries;
+}
+
+function renderTraceEntriesAsText(entries) {
+  return entries
+    .map((entry) => {
+      const segments = [];
+      if (entry.type === "reasoning" || entry.type === "tool") {
+        segments.push(`${entry.label}`);
+      }
+      if (entry.text) {
+        segments.push(entry.text);
+      }
+      if (entry.detailLines?.length) {
+        segments.push(entry.detailLines.join("\n"));
+      }
+      return segments.filter(Boolean).join("\n").trim();
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function normalizeRecentTraceEntriesInput(recentTraceEntries, hierarchyContext = null) {
+  if (Array.isArray(recentTraceEntries)) {
+    return recentTraceEntries;
+  }
+  if (recentTraceEntries instanceof Map) {
+    const entries = [];
+    for (const [sessionId, messages] of recentTraceEntries.entries()) {
+      entries.push(...buildTraceEntriesFromMessages(messages, { sessionId, includeText: false, hierarchyContext }));
+    }
+    return entries;
+  }
+  return [];
+}
+
+function renderExecutionTraceSection(entries, hierarchyContext = null, options = {}) {
+  const normalizedEntries = normalizeRecentTraceEntriesInput(entries, hierarchyContext);
+  if (!Array.isArray(normalizedEntries) || normalizedEntries.length === 0) {
+    return "";
+  }
+  const primarySessionId = options.primarySessionId ? String(options.primarySessionId).trim() : null;
+  const childSessionLimit = Number.isInteger(options.childSessionLimit) && options.childSessionLimit > 0
+    ? options.childSessionLimit
+    : null;
+  const skippedEntryCount = !primarySessionId && !childSessionLimit
+    ? Math.max(0, normalizedEntries.length - MAX_RENDERED_TRACE_ENTRIES)
+    : 0;
+  const boundedEntries = skippedEntryCount > 0 ? normalizedEntries.slice(-MAX_RENDERED_TRACE_ENTRIES) : normalizedEntries;
+
+  const grouped = new Map();
+  for (const entry of boundedEntries) {
+    const sessionKey = entry.sessionId || "__unknown__";
+    if (!grouped.has(sessionKey)) {
+      grouped.set(sessionKey, []);
+    }
+    grouped.get(sessionKey).push(entry);
+  }
+
+  const sessionIds = [...grouped.keys()];
+  const orderedSessionIds = primarySessionId && sessionIds.includes(primarySessionId)
+    ? [primarySessionId, ...sessionIds.filter((sessionId) => sessionId !== primarySessionId)]
+    : sessionIds;
+
+  const lines = ["## Recent execution trace", ""];
+  const multipleSessions = grouped.size > 1;
+  for (const sessionId of orderedSessionIds) {
+    const sessionEntries = grouped.get(sessionId) ?? [];
+    const limitedEntries = childSessionLimit != null && sessionId !== primarySessionId && sessionEntries.length > childSessionLimit
+      ? sessionEntries.slice(-childSessionLimit)
+      : sessionEntries;
+    const omittedSessionEntries = Math.max(0, sessionEntries.length - limitedEntries.length);
+    if (multipleSessions) {
+      const summary = sessionId !== "__unknown__" && hierarchyContext?.summariesById?.has(sessionId)
+        ? hierarchyContext.summariesById.get(sessionId)
+        : null;
+      const statusSuffix = summary?.status ? ` (${summary.status})` : "";
+      lines.push(`### ${sessionId === "__unknown__" ? "session" : sessionId}${statusSuffix}`);
+      lines.push("");
+    }
+    for (const entry of limitedEntries) {
+      lines.push(`- ${entry.label}`);
+      if (entry.text) {
+        lines.push(renderIndentedMultiline(entry.text));
+      }
+      for (const detailLine of entry.detailLines ?? []) {
+        lines.push(renderIndentedMultiline(detailLine));
+      }
+      lines.push("");
+    }
+    if (omittedSessionEntries > 0) {
+      lines.push(`- … ${omittedSessionEntries} earlier trace entr${omittedSessionEntries === 1 ? "y" : "ies"} omitted`, "");
+    }
+  }
+
+  while (lines.length > 0 && !lines.at(-1)) {
+    lines.pop();
+  }
+  if (skippedEntryCount > 0) {
+    lines.push("", `- … ${skippedEntryCount} earlier trace entr${skippedEntryCount === 1 ? "y" : "ies"} omitted`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function collectAssistantNodes(value, nodes = []) {
@@ -533,8 +1144,18 @@ function buildTaskResult({
 }) {
   const assistantNodes = collectAssistantNodes(messages);
   const preferredNode = assistantNodes.at(-1) ?? normalizeMessageArray(messages).at(-1) ?? messages;
-  const textParts = extractTextCandidates(preferredNode);
-  const combinedText = textParts.join("\n\n").trim() || String(streamedText ?? "").trim();
+  const traceEntries = buildTraceEntriesFromMessages([preferredNode], { sessionId, includeText: true });
+  const finalText = (Array.isArray(preferredNode?.parts) ? preferredNode.parts : [])
+    .filter((part) => part?.type === "text" && typeof part?.text === "string")
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+  const fallbackText = extractTextCandidates(preferredNode).join("\n\n").trim();
+  const textParts = traceEntries
+    .flatMap((entry) => [entry.text, ...(entry.detailLines ?? [])])
+    .filter(Boolean);
+  const combinedText = renderTraceEntriesAsText(traceEntries) || fallbackText || String(streamedText ?? "").trim();
   const fileChanges = extractFileChanges(messages);
 
   return {
@@ -550,6 +1171,7 @@ function buildTaskResult({
     main_session_context: sessionSummary?.contextSummary ?? null,
     text_parts: textParts,
     combined_text: combinedText,
+    final_text: finalText || fallbackText || String(streamedText ?? "").trim(),
     file_changes: fileChanges,
     message_count: normalizeMessageArray(messages).length,
     messages: normalizeMessageArray(messages)
@@ -1052,7 +1674,7 @@ function renderSessionTable(sessions) {
   return `${lines.join("\n")}\n`;
 }
 
-function renderSessionDetails(session, directory, hierarchyContext = null) {
+function renderSessionDetails(session, directory, hierarchyContext = null, recentTraceEntries = []) {
   const details = summarizeSession(session);
   const effectiveHierarchyContext = hierarchyContext ?? buildSessionHierarchyContext([session]);
   const rootSessionId = findSessionRootId(details.id, effectiveHierarchyContext);
@@ -1064,7 +1686,7 @@ function renderSessionDetails(session, directory, hierarchyContext = null) {
   const observedStatus = deriveObservedSessionStatus(details);
   const sessionRecency = deriveActivityRecency(latestKnownSessionActivityAt(details, null));
   const hierarchyVerdict = deriveHierarchyVerdict(subtreeSummary);
-  const nextAction = recommendHierarchyAction(hierarchyVerdict, details.id);
+  const nextAction = recommendHierarchyAction(hierarchyVerdict, details.id, details, subtreeSummary, recentTraceEntries);
   const lines = [
     "| field | value |",
     "| --- | --- |",
@@ -1104,19 +1726,27 @@ function buildSessionListView(directory, sessions) {
   return `${lines.join("\n")}\n`;
 }
 
-function buildSingleSessionView(directory, session, hierarchyContext = null) {
+function buildSingleSessionView(directory, session, hierarchyContext = null, recentTraceEntries = []) {
   const effectiveHierarchyContext = hierarchyContext ?? buildSessionHierarchyContext([session]);
   const details = summarizeSession(session);
   const rootSessionId = findSessionRootId(details.id, effectiveHierarchyContext);
-  return [
+  const sections = [
     "# OpenCode Session Status",
     "",
-    renderSessionDetails(session, directory, effectiveHierarchyContext).trimEnd(),
+    renderSessionDetails(session, directory, effectiveHierarchyContext, recentTraceEntries).trimEnd(),
     "",
     "## Session Hierarchy",
     "",
     renderSessionHierarchyTable(effectiveHierarchyContext, rootSessionId).trimEnd()
-  ].join("\n") + "\n";
+  ];
+  const traceSection = renderExecutionTraceSection(recentTraceEntries, effectiveHierarchyContext, {
+    primarySessionId: details.id,
+    childSessionLimit: DEFAULT_CHILD_TRACE_ENTRY_LIMIT
+  }).trimEnd();
+  if (traceSection) {
+    sections.push("", traceSection);
+  }
+  return sections.join("\n") + "\n";
 }
 
 function normalizeSessionStatus(status) {
@@ -1143,12 +1773,48 @@ function recommendSessionAction(sessionId, status) {
     return `wait or session attach ${sessionId}`;
   }
   if (verdict === "reusable_or_finished") {
-    return `session continue ${sessionId} or inspect artifacts`;
+    return `read final result or inspect artifacts; session continue ${sessionId} only if reuse still makes sense`;
   }
   if (verdict === "failed") {
     return `inspect artifacts, then consider session new if reuse is no longer useful`;
   }
   return `session attach ${sessionId} to determine whether reuse is still viable`;
+}
+
+function looksRecentlyFinishedSession(details, subtreeSummary) {
+  if (!isSuccessfulTerminalSessionStatus(details?.status)) {
+    return false;
+  }
+  const statusCounts = subtreeSummary?.statusCounts;
+  if (!statusCounts || typeof statusCounts !== "object") {
+    return false;
+  }
+  const busyCount = countStatuses(statusCounts, ["busy", "active", "running", "working"]);
+  const failedCount = countStatuses(statusCounts, ["aborted", "cancelled", "canceled", "failed", "error"]);
+  return busyCount === 0 && failedCount === 0;
+}
+
+function isCompletedToolTraceEntry(entry) {
+  if (!entry || entry.type !== "tool") {
+    return false;
+  }
+  return /\[(completed|complete|done|success)\]$/i.test(String(entry.label ?? "").trim());
+}
+
+function looksTraceCompleteRecentlyFinishedSession(details, subtreeSummary, recentTraceEntries = []) {
+  const normalizedStatus = normalizeSessionStatus(details?.status || "unknown");
+  if (isBusySessionStatus(normalizedStatus) || isFailedTerminalSessionStatus(normalizedStatus)) {
+    return false;
+  }
+  if ((subtreeSummary?.descendantCount ?? 0) !== 0) {
+    return false;
+  }
+  const recency = deriveActivityRecency(subtreeSummary?.latestActivityMs ?? latestKnownSessionActivityAt(details, null));
+  if (!new Set(["active_recent", "recently_active"]).has(recency)) {
+    return false;
+  }
+  const primaryEntries = normalizeRecentTraceEntriesInput(recentTraceEntries).filter((entry) => entry?.sessionId === details?.id);
+  return isCompletedToolTraceEntry(primaryEntries.at(-1));
 }
 
 function isSuccessfulTerminalSessionStatus(status) {
@@ -1520,12 +2186,18 @@ function deriveHierarchyVerdict(subtreeSummary, now = Date.now()) {
   return "quiet_unknown";
 }
 
-function recommendHierarchyAction(verdict, sessionId) {
+function recommendHierarchyAction(verdict, sessionId, details = null, subtreeSummary = null, recentTraceEntries = []) {
+  if (
+    looksRecentlyFinishedSession(details, subtreeSummary)
+    || looksTraceCompleteRecentlyFinishedSession(details, subtreeSummary, recentTraceEntries)
+  ) {
+    return `read final result or inspect artifacts; session continue ${sessionId} only if reuse still makes sense`;
+  }
   if (["active", "active_descendants", "recently_active", "settling_descendants", "failed_with_recent_activity"].includes(verdict)) {
     return `wait or session attach ${sessionId}`;
   }
   if (["completed", "completed_tree"].includes(verdict)) {
-    return `inspect artifacts or session continue ${sessionId}`;
+    return `read final result or inspect artifacts; session continue ${sessionId} only if reuse still makes sense`;
   }
   if (verdict === "failed") {
     return `inspect artifacts/logs, then decide whether to resume or start a fresh session`;
@@ -1537,16 +2209,24 @@ function summarizeSessionSubtree(rootSessionId, hierarchyContext) {
   const subtreeSessionIds = [rootSessionId, ...collectDescendantIds(rootSessionId, hierarchyContext)].filter((id) =>
     hierarchyContext.summariesById.has(id)
   );
+  const pendingSessionIds = [];
   const statusCounts = {};
   let latestActivityMs = null;
   let latestActivityLabel = "";
   let latestActivitySessionId = null;
+  const pendingGraceMs = readHierarchyPendingGraceMs();
 
   for (const sessionId of subtreeSessionIds) {
     const session = hierarchyContext.summariesById.get(sessionId);
     const normalizedStatus = normalizeSessionStatus(session?.status || "unknown");
     statusCounts[normalizedStatus] = (statusCounts[normalizedStatus] ?? 0) + 1;
     const activityMs = latestKnownSessionActivityAt(session, null);
+    const isTerminal = isSuccessfulTerminalSessionStatus(normalizedStatus) || isFailedTerminalSessionStatus(normalizedStatus);
+    const isPendingForStatus = isBusySessionStatus(normalizedStatus)
+      || (!isTerminal && (!Number.isFinite(activityMs) || Date.now() - activityMs < pendingGraceMs));
+    if (isPendingForStatus) {
+      pendingSessionIds.push(sessionId);
+    }
     if (Number.isFinite(activityMs) && (latestActivityMs == null || activityMs > latestActivityMs)) {
       latestActivityMs = activityMs;
       latestActivityLabel = session?.updatedAt || session?.createdAt || "";
@@ -1560,6 +2240,7 @@ function summarizeSessionSubtree(rootSessionId, hierarchyContext) {
     sessionCount: subtreeSessionIds.length,
     descendantCount: Math.max(0, subtreeSessionIds.length - 1),
     directChildCount: (hierarchyContext.childrenByParent.get(rootSessionId) ?? []).length,
+    pendingSessionIds,
     statusCounts,
     latestActivityMs,
     latestActivityLabel,
@@ -1569,8 +2250,8 @@ function summarizeSessionSubtree(rootSessionId, hierarchyContext) {
 
 function renderSessionHierarchyTable(hierarchyContext, rootSessionId) {
   const lines = [
-    "| tree | id | parent | raw | observed | updated | last usage | total usage | summary |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    "| tree | id | parent | raw | observed | updated |",
+    "| --- | --- | --- | --- | --- | --- |"
   ];
 
   const appendRows = (sessionId, depth = 0) => {
@@ -1583,7 +2264,7 @@ function renderSessionHierarchyTable(hierarchyContext, rootSessionId) {
       ? deriveHierarchyVerdict(summarizeSessionSubtree(sessionId, hierarchyContext))
       : deriveObservedSessionStatus(session);
     lines.push(
-      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(formatReadableTimestamp(session.updatedAt || session.createdAt || ""))} | ${escapeMarkdownCell(formatUsageSummary(session.lastUsage))} | ${escapeMarkdownCell(formatUsageSummary(session.totalUsage))} | ${escapeMarkdownCell(session.summary)} |`
+      `| ${escapeMarkdownCell(treeLabel)} | ${escapeMarkdownCell(session.id)} | ${escapeMarkdownCell(session.parentId || "-")} | ${escapeMarkdownCell(session.status)} | ${escapeMarkdownCell(observedStatus)} | ${escapeMarkdownCell(formatReadableTimestamp(session.updatedAt || session.createdAt || ""))} |`
     );
     for (const childId of hierarchyContext.childrenByParent.get(sessionId) ?? []) {
       appendRows(childId, depth + 1);
@@ -1594,7 +2275,7 @@ function renderSessionHierarchyTable(hierarchyContext, rootSessionId) {
   return `${lines.join("\n")}\n`;
 }
 
-async function tryGetLiveSessionHierarchyContext(serverDirectory, directory) {
+async function tryGetHealthyBaseUrl(serverDirectory) {
   const managedState = normalizeState(readState(serverDirectory));
   if (!managedState || !isPidRunning(managedState.pid)) {
     return null;
@@ -1603,11 +2284,63 @@ async function tryGetLiveSessionHierarchyContext(serverDirectory, directory) {
   if (!(await checkHealth(baseUrl))) {
     return null;
   }
+  return baseUrl;
+}
+
+async function tryGetLiveSessionHierarchyContext(serverDirectory, directory) {
+  const baseUrl = await tryGetHealthyBaseUrl(serverDirectory);
+  if (!baseUrl) {
+    return null;
+  }
   try {
     const sessions = await listSessions(baseUrl, directory);
     return buildSessionHierarchyContext(sessions);
   } catch {
     return null;
+  }
+}
+
+async function listHierarchyTraceEntries(baseUrl, directory, rootSessionId, hierarchyContext) {
+  const sessionIds = [...new Set([rootSessionId, ...collectDescendantIds(rootSessionId, hierarchyContext)].filter(Boolean))];
+  const traceEntries = [];
+  await Promise.all(
+    sessionIds.map(async (currentSessionId) => {
+      try {
+        const messages = await listSessionMessages(baseUrl, directory, currentSessionId);
+        traceEntries.push(...buildTraceEntriesFromMessages(messages, {
+          sessionId: currentSessionId,
+          includeText: false,
+          hierarchyContext
+        }));
+      } catch {
+        // Best-effort only.
+      }
+    })
+  );
+  return traceEntries;
+}
+
+async function tryCollectLiveSessionTraceEntries(serverDirectory, directory, sessionId, hierarchyContext = null) {
+  const baseUrl = await tryGetHealthyBaseUrl(serverDirectory);
+  if (!baseUrl) {
+    return [];
+  }
+
+  let effectiveHierarchyContext = hierarchyContext;
+  if (!effectiveHierarchyContext) {
+    try {
+      const sessions = await listSessions(baseUrl, directory);
+      effectiveHierarchyContext = buildSessionHierarchyContext(sessions);
+    } catch {
+      return [];
+    }
+  }
+
+  const rootSessionId = findSessionRootId(sessionId, effectiveHierarchyContext);
+  try {
+    return await listHierarchyTraceEntries(baseUrl, directory, rootSessionId, effectiveHierarchyContext);
+  } catch {
+    return [];
   }
 }
 
@@ -1680,6 +2413,8 @@ function summarizeHierarchyProgress({
 
 function createTextStreamPrinter() {
   let output = "";
+  let lastBlockType = null;
+  const seenReasoningParts = new Set();
 
   function printDelta(snippet) {
     const normalized = String(snippet ?? "").replace(/\r/g, "");
@@ -1691,9 +2426,60 @@ function createTextStreamPrinter() {
     output += normalized;
   }
 
+  function ensureLineBreak() {
+    if (output && !output.endsWith("\n")) {
+      printDelta("\n");
+    }
+  }
+
+  function ensureBlankLine() {
+    if (!output) {
+      return;
+    }
+    if (output.endsWith("\n\n")) {
+      return;
+    }
+    if (!output.endsWith("\n")) {
+      printDelta("\n");
+    }
+    printDelta("\n");
+  }
+
   return {
-    handleDelta(delta) {
+    handleTextDelta(delta) {
+      if (lastBlockType && lastBlockType !== "text") {
+        ensureBlankLine();
+      }
+      lastBlockType = "text";
       printDelta(delta);
+    },
+    handleReasoningDelta(partId, delta) {
+      const normalized = String(delta ?? "").replace(/\r/g, "");
+      if (!normalized) {
+        return;
+      }
+      if (!seenReasoningParts.has(partId)) {
+        ensureBlankLine();
+        printDelta("Thinking:\n");
+        seenReasoningParts.add(partId);
+      }
+      lastBlockType = "reasoning";
+      printDelta(normalized);
+      ensureLineBreak();
+    },
+    handleToolEvent(entry) {
+      if (!entry) {
+        return;
+      }
+      ensureBlankLine();
+      printDelta(`${entry.label}\n`);
+      for (const detailLine of entry.detailLines ?? []) {
+        printDelta(`${renderIndentedMultiline(detailLine)}\n`);
+      }
+      lastBlockType = "tool";
+    },
+    handleDelta(delta) {
+      this.handleTextDelta(delta);
     },
     getOutput() {
       return output;
@@ -1844,7 +2630,17 @@ function readObjectField(object, keys) {
 }
 
 function getToolPartName(part) {
-  return String(readObjectField(part, ["tool", "name", "toolName", "tool_name"]) ?? "").trim().toLowerCase();
+  const directValue = readObjectField(part, ["tool", "name", "toolName", "tool_name"]);
+  if (typeof directValue === "string") {
+    return directValue.trim().toLowerCase();
+  }
+  if (directValue && typeof directValue === "object") {
+    const nestedValue = readObjectField(directValue, ["name", "toolName", "tool_name", "id"]);
+    if (typeof nestedValue === "string") {
+      return nestedValue.trim().toLowerCase();
+    }
+  }
+  return "";
 }
 
 function getToolPartState(part) {
@@ -2070,16 +2866,14 @@ async function monitorSession({
   let lastMainSessionActivityAt = Date.now();
   let lastPrintedSessionId = null;
   const partTypes = new Map(); // partID -> part type (e.g. "text", "reasoning", "tool")
+  const printedToolSignatures = new Map();
   const QUIESCENCE_TIMEOUT_MS = readEnvDurationMs("OPENCODE_QUIESCENCE_TIMEOUT_MS", 5000);
   const FORCE_QUIESCENCE_TIMEOUT_MS = readEnvDurationMs("OPENCODE_FORCE_QUIESCENCE_TIMEOUT_MS", 30000);
   // Decoupled from FORCE_QUIESCENCE_TIMEOUT_MS so subagent silence does not auto-mark a session as
   // not-pending the moment the directory-level fallback would also fire. Default 5 minutes; never
   // shorter than FORCE_QUIESCENCE_TIMEOUT_MS to keep prior intent (a busy session won't be considered
   // settled before the directory itself is).
-  const HIERARCHY_PENDING_GRACE_MS = Math.max(
-    FORCE_QUIESCENCE_TIMEOUT_MS,
-    readEnvDurationMs("OPENCODE_HIERARCHY_PENDING_GRACE_MS", 300000)
-  );
+  const HIERARCHY_PENDING_GRACE_MS = readHierarchyPendingGraceMs();
   const STATUS_POLL_INTERVAL_MS = readEnvDurationMs("OPENCODE_STATUS_POLL_INTERVAL_MS", 1500);
   const STREAM_CLOSE_GRACE_MS = readEnvDurationMs("OPENCODE_STREAM_CLOSE_GRACE_MS", 4000);
   const SETTLING_CHECK_INTERVAL_MS = readEnvDurationMs("OPENCODE_SETTLING_CHECK_INTERVAL_MS", 1000);
@@ -2312,11 +3106,20 @@ async function monitorSession({
             if (isMonitoredEventSession(eventSessionId)) {
               trackToolPartSnapshot(eventSessionId, partInfo, properties.partID || properties.messageID || "task");
             }
-            // Print brief tool call summary
-            if (partInfo.type === "tool" && partInfo.state === "completed" && partInfo.name) {
-              const toolSummary = `[tool: ${partInfo.name}${partInfo.result ? " ✓" : ""}]\n`;
-              if (eventSessionId === sessionId) {
-                printer.handleDelta(toolSummary);
+            if (partInfo.type === "tool" && isMonitoredEventSession(eventSessionId)) {
+              const entry = buildToolTraceEntry(partInfo, eventSessionId, null, {
+                includeOutput: isTerminalToolState(getToolPartState(partInfo))
+              });
+              if (entry) {
+                const displayEntry = eventSessionId && eventSessionId !== sessionId
+                  ? { ...entry, label: `${eventSessionId} · ${entry.label}` }
+                  : entry;
+                const signature = buildTraceEntryKey(displayEntry);
+                const toolPartKey = `${eventSessionId}:${partInfo.id || properties.partID || properties.messageID || "tool"}`;
+                if (printedToolSignatures.get(toolPartKey) !== signature) {
+                  printedToolSignatures.set(toolPartKey, signature);
+                  printer.handleToolEvent(displayEntry);
+                }
               }
             }
           } catch {
@@ -2326,15 +3129,16 @@ async function monitorSession({
 
         if (payload.type === "message.part.delta") {
           if (properties.field === "text") {
-            // Skip reasoning/thinking parts — only stream actual text output
             const knownType = properties.partID ? partTypes.get(properties.partID) : null;
             if (knownType === "reasoning") {
-              // Don't stream reasoning content
+              if (eventSessionId === sessionId) {
+                printer.handleReasoningDelta(properties.partID || properties.messageID || "reasoning", properties.delta);
+              }
             } else if (eventSessionId === sessionId) {
               if (lastPrintedSessionId !== sessionId) {
                 lastPrintedSessionId = sessionId;
               }
-              printer.handleDelta(properties.delta);
+              printer.handleTextDelta(properties.delta);
             }
             if (isMonitoredEventSession(eventSessionId)) {
               for (const jobId of extractBackgroundJobIdsFromText(properties.delta)) {
@@ -2743,8 +3547,13 @@ async function monitorSession({
     sessionSummary
   });
 
+  const recentTraceEntries = buildTraceEntriesFromMessages(messages, { sessionId, includeText: false, hierarchyContext: null });
+  const recentTraceText = renderTraceEntriesAsText(recentTraceEntries);
   const streamedLength = printer.getOutput().trim().length;
   const resultLength = (result.combined_text || "").length;
+  if (recentTraceText && !printer.getOutput().includes(recentTraceText)) {
+    process.stdout.write(`\n${recentTraceText}\n`);
+  }
   // Print combined_text if streaming missed significant content (>50% longer from API)
   // or if nothing was streamed at all
   if (result.combined_text && (!streamedLength || resultLength > streamedLength * 1.5)) {
@@ -2754,29 +3563,45 @@ async function monitorSession({
   const resultIsSuccessful = isSuccessfulResultStatus(result.status);
   const resultIsFailed = isFailedResultStatus(result.status);
   if (jobId) {
+    const finalPayload = {
+      status: result.status,
+      completionMode: result.completion_mode,
+      rawSessionStatus: result.raw_session_status,
+      hierarchyVerdict: result.hierarchy_verdict,
+      combinedText: result.final_text,
+      summary: summarizePrompt(result.final_text),
+      error: resultIsFailed ? `OpenCode session ended with status ${result.status}.` : null
+    };
     if (result.status === "completed") {
       markJobFinished(directory, jobId, "completed", {
         sessionId,
         model: rawModel,
-        error: null
+        error: null,
+        final: finalPayload
       });
     } else if (result.status === "delegated") {
       markJobFinished(directory, jobId, "delegated", {
         sessionId,
         model: rawModel,
-        error: null
+        error: null,
+        final: finalPayload
       });
     } else if (resultIsFailed) {
       markJobFinished(directory, jobId, "failed", {
         sessionId,
         model: rawModel,
-        error: `OpenCode session ended with status ${result.status}.`
+        error: `OpenCode session ended with status ${result.status}.`,
+        final: finalPayload
       });
     } else {
       markJobFinished(directory, jobId, "failed", {
         sessionId,
         model: rawModel,
-        error: `OpenCode session settled without a terminal status (${result.status}).`
+        error: `OpenCode session settled without a terminal status (${result.status}).`,
+        final: {
+          ...finalPayload,
+          error: `OpenCode session settled without a terminal status (${result.status}).`
+        }
       });
     }
   }
@@ -2792,6 +3617,7 @@ async function handleTask(argv) {
     stringFlags: [
       "--directory",
       "--server-directory",
+      "--artifact-root",
       "--model",
       "--job-id",
       "--timeout",
@@ -2814,6 +3640,11 @@ async function handleTask(argv) {
 
   const rawModel = options.model == null ? null : String(options.model);
   const model = parseModelOption(options.model);
+  const artifactRootOption = options["artifact-root"] ? String(options["artifact-root"]).trim() : null;
+  const artifactRootDisplay = artifactRootOption || (process.env.OPENCODE_ARTIFACT_ROOT ? String(process.env.OPENCODE_ARTIFACT_ROOT).trim() : null);
+  if (artifactRootOption) {
+    process.env.OPENCODE_ARTIFACT_ROOT = artifactRootOption;
+  }
   const requestedAgent = options.agent ? String(options.agent).trim() : null;
   const jobId = options["job-id"] ?? null;
   const existingSessionId = options.session ? String(options.session).trim() : null;
@@ -2830,21 +3661,30 @@ async function handleTask(argv) {
   if (options.background) {
     const entryScriptPath = fileURLToPath(import.meta.url);
     const backgroundJobId = generateJobId();
-    const logFile = createJobLogFile(directory, backgroundJobId);
+    const logFile = createJobLogFile(directory, backgroundJobId, { artifactRoot: artifactRootOption });
     appendLogLine(logFile, "Queued for background execution.");
     upsertJob(
       directory,
       buildJobRecord(directory, backgroundJobId, prompt, {
         status: "queued",
         model: rawModel,
-        logFile
-      })
+        logFile,
+        artifactRoot: artifactRootOption
+      }),
+      { artifactRoot: artifactRootOption }
     );
+    recordJobEvent(directory, backgroundJobId, {
+      type: "job.lifecycle",
+      status: "queued",
+      summary: "Queued for background execution.",
+      activityKind: "job_queued"
+    }, { artifactRoot: artifactRootOption });
 
     let child;
     try {
       child = spawnBackgroundTaskWorker(entryScriptPath, directory, backgroundJobId, prompt, {
         serverDirectory,
+        artifactRoot: artifactRootOption,
         model: rawModel,
         agent: requestedAgent,
         timeout: timeoutMins
@@ -2852,7 +3692,8 @@ async function handleTask(argv) {
     } catch (error) {
       markJobFinished(directory, backgroundJobId, "failed", {
         model: rawModel,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        artifactRoot: artifactRootOption
       });
       throw error;
     }
@@ -2861,7 +3702,8 @@ async function handleTask(argv) {
       markJobRunning(directory, backgroundJobId, {
         pid: child.pid ?? null,
         model: rawModel,
-        logFile
+        logFile,
+        artifactRoot: artifactRootOption
       });
       child.unref();
     } catch (error) {
@@ -2874,25 +3716,26 @@ async function handleTask(argv) {
       }
       markJobFinished(directory, backgroundJobId, "failed", {
         model: rawModel,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        artifactRoot: artifactRootOption
       });
       throw error;
     }
 
-    process.stdout.write(renderBackgroundTaskStart(backgroundJobId, entryScriptPath, directory));
+    process.stdout.write(renderBackgroundTaskStart(backgroundJobId, entryScriptPath, directory, artifactRootDisplay));
     return;
   }
 
   if (jobId) {
-    const existing = readJob(directory, jobId);
+    const existing = readJob(directory, jobId, { artifactRoot: artifactRootOption });
     if (existing?.status === "cancelled") {
       return;
     }
-    const logFile = existing?.logFile ?? jobLogFilePath(directory, jobId);
+    const logFile = existing?.logFile ?? createJobLogFile(directory, jobId, { artifactRoot: artifactRootOption });
     if (!fs.existsSync(logFile)) {
       fs.writeFileSync(logFile, "", "utf8");
     }
-    const current = readJob(directory, jobId);
+    const current = readJob(directory, jobId, { artifactRoot: artifactRootOption });
     if (current?.status === "cancelled") {
       return;
     }
@@ -2904,8 +3747,10 @@ async function handleTask(argv) {
         model: rawModel ?? existing?.model ?? null,
         pid: process.pid,
         logFile,
-        sessionId: existing?.sessionId ?? null
-      })
+        sessionId: existing?.sessionId ?? null,
+        artifactRoot: artifactRootOption ?? existing?.artifactRoot ?? null
+      }),
+      { artifactRoot: artifactRootOption ?? existing?.artifactRoot ?? null }
     );
   }
 
@@ -2952,7 +3797,7 @@ async function handleTask(argv) {
     }
 
     if (jobId) {
-      const currentJob = readJob(directory, jobId);
+      const currentJob = readJob(directory, jobId, { artifactRoot: artifactRootOption });
       if (currentJob?.status === "cancelled") {
         log(`Job ${jobId} was cancelled before startup; exiting worker.`);
         return;
@@ -2960,17 +3805,17 @@ async function handleTask(argv) {
       upsertJob(directory, {
         ...buildJobRecord(directory, jobId, prompt, {
           status: "running",
-          startedAt: readJob(directory, jobId)?.startedAt ?? nowIso(),
+          startedAt: readJob(directory, jobId, { artifactRoot: artifactRootOption })?.startedAt ?? nowIso(),
           model: rawModel ?? null,
           pid: process.pid,
           sessionId,
-          logFile: jobLogFilePath(directory, jobId)
+          artifactRoot: artifactRootOption ?? currentJob?.artifactRoot ?? null
         }),
         sessionId,
         status: "running",
         pid: process.pid,
         error: null
-      });
+      }, { artifactRoot: artifactRootOption ?? currentJob?.artifactRoot ?? null });
     }
 
     if (options.async) {
@@ -2990,7 +3835,8 @@ async function handleTask(argv) {
         markJobFinished(directory, jobId, "completed", {
           sessionId,
           model: rawModel,
-          error: null
+          error: null,
+          artifactRoot: artifactRootOption
         });
       }
       return;
@@ -3050,7 +3896,8 @@ async function handleTask(argv) {
         markJobFinished(directory, jobId, "failed", {
           sessionId,
           model: rawModel,
-          error: "OpenCode aborted the task request before it completed."
+          error: "OpenCode aborted the task request before it completed.",
+          artifactRoot: artifactRootOption
         });
       }
       throw formatUnexpectedTaskAbort(model);
@@ -3059,7 +3906,8 @@ async function handleTask(argv) {
       markJobFinished(directory, jobId, "failed", {
         sessionId,
         model: rawModel,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        artifactRoot: artifactRootOption
       });
     }
     throw error;
@@ -3218,77 +4066,89 @@ async function handleAttach(argv) {
 
 async function handleStatus(argv) {
   const { options, positionals } = parseArgs(argv, {
-    booleanFlags: ["--all"],
-    stringFlags: ["--directory", "--server-directory"]
+    booleanFlags: ["--all", "--verbose"],
+    stringFlags: ["--directory", "--server-directory", "--artifact-root"]
   });
   const directory = resolveDirectory(options.directory);
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const hierarchyContext = await tryGetLiveSessionHierarchyContext(serverDirectory, directory);
+  const artifactRoot = options["artifact-root"] ? String(options["artifact-root"]).trim() : null;
+  if (artifactRoot) {
+    process.env.OPENCODE_ARTIFACT_ROOT = artifactRoot;
+  }
   const jobId = positionals[0] ?? null;
 
   if (jobId) {
-    const job = refreshStaleRunningJobs(directory).find((entry) => entry.id === jobId) ?? null;
+    const job = refreshStaleRunningJobs(directory, { artifactRoot }).find((entry) => entry.id === jobId) ?? null;
     if (!job) {
       throw new Error(`No job found for ${jobId}.`);
     }
-    process.stdout.write(buildSingleJobView(job, hierarchyContext));
+    const recentTraceEntries = job.sessionId
+      ? await tryCollectLiveSessionTraceEntries(serverDirectory, directory, job.sessionId, hierarchyContext)
+      : [];
+    recordJobEvent(directory, jobId, buildJobLivenessEvent(job, hierarchyContext, recentTraceEntries), { artifactRoot: artifactRoot ?? job.artifactRoot ?? null });
+    const snapshot = readJobSnapshot(directory, jobId, { artifactRoot: artifactRoot ?? job.artifactRoot ?? null });
+    process.stdout.write(
+      options.verbose
+        ? buildVerboseJobStatusView(job, snapshot, hierarchyContext, recentTraceEntries)
+        : buildDefaultJobStatusView(job, snapshot)
+    );
     return;
   }
 
-  process.stdout.write(buildJobListView(directory, { all: Boolean(options.all), sessionHierarchyContext: hierarchyContext }));
+  process.stdout.write(buildJobListView(directory, { all: Boolean(options.all), verbose: Boolean(options.verbose), sessionHierarchyContext: hierarchyContext, artifactRoot }));
 }
 
 async function handleResult(argv) {
   const { options, positionals } = parseArgs(argv, {
-    stringFlags: ["--directory", "--server-directory"]
+    booleanFlags: ["--verbose"],
+    stringFlags: ["--directory", "--server-directory", "--artifact-root"]
   });
   const directory = resolveDirectory(options.directory);
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
   const hierarchyContext = await tryGetLiveSessionHierarchyContext(serverDirectory, directory);
+  const artifactRoot = options["artifact-root"] ? String(options["artifact-root"]).trim() : null;
+  if (artifactRoot) {
+    process.env.OPENCODE_ARTIFACT_ROOT = artifactRoot;
+  }
   const jobId = positionals[0];
   if (!jobId) {
     throw new Error("Missing job id for result.");
   }
 
-  const job = readJob(directory, jobId);
+  const job = readJob(directory, jobId, { artifactRoot });
   if (!job) {
     throw new Error(`No job found for ${jobId}.`);
   }
-
-  const logText = readLogText(job.logFile);
-  const hierarchySection = renderJobHierarchySection(job, hierarchyContext).trimEnd();
-  if (job.status === "running" || job.status === "queued") {
-    process.stdout.write(`Job ${job.id} is still in progress. Showing current log.\n`);
+  const recentTraceEntries = job.sessionId
+    ? await tryCollectLiveSessionTraceEntries(serverDirectory, directory, job.sessionId, hierarchyContext)
+    : [];
+  if (recentTraceEntries.length > 0 || hierarchyContext) {
+    recordJobEvent(directory, jobId, buildJobLivenessEvent(job, hierarchyContext, recentTraceEntries), { artifactRoot: artifactRoot ?? job.artifactRoot ?? null });
   }
-  if (hierarchySection) {
-    process.stdout.write(`${hierarchySection}\n\n`);
+  const snapshot = readJobSnapshot(directory, jobId, { artifactRoot: artifactRoot ?? job.artifactRoot ?? null });
+  if (options.verbose) {
+    process.stdout.write(buildVerboseJobStatusView(job, snapshot, hierarchyContext, recentTraceEntries));
+    return;
   }
-
-  if (logText.trim()) {
-    process.stdout.write(logText.endsWith("\n") ? logText : `${logText}\n`);
-  } else {
-    process.stdout.write("No log output captured for this job.\n");
-  }
-
-  if (job.status === "failed" && job.error) {
-    process.stdout.write(`Error: ${job.error}\n`);
-  }
-  if (job.status === "cancelled") {
-    process.stdout.write(`Job ${job.id} was cancelled.\n`);
-  }
+  process.stdout.write(buildQuietJobResult(job, snapshot));
 }
 
 async function handleCancel(argv) {
   const { options, positionals } = parseArgs(argv, {
-    stringFlags: ["--directory", "--server-directory"]
+    stringFlags: ["--directory", "--server-directory", "--artifact-root"]
   });
   const directory = resolveDirectory(options.directory);
+  const artifactRoot = options["artifact-root"] ? String(options["artifact-root"]).trim() : null;
+  if (artifactRoot) {
+    process.env.OPENCODE_ARTIFACT_ROOT = artifactRoot;
+  }
   const jobId = positionals[0];
   if (!jobId) {
     throw new Error("Missing job id for cancel.");
   }
 
-  const job = readJob(directory, jobId);
+  const job = readJob(directory, jobId, { artifactRoot });
   if (!job) {
     throw new Error(`No job found for ${jobId}.`);
   }
@@ -3303,8 +4163,9 @@ async function handleCancel(argv) {
 
   appendLogLine(job.logFile, "Cancelled by user.");
   markJobFinished(directory, jobId, "cancelled", {
-    error: null
-  });
+    error: null,
+    artifactRoot: artifactRoot ?? job.artifactRoot ?? null
+  }, { artifactRoot: artifactRoot ?? job.artifactRoot ?? null });
 
   if (pid) {
     await delay(150);
@@ -3378,7 +4239,8 @@ async function handleSessionStatus(argv) {
   if (!session) {
     throw new Error(`No session found for ${sessionId} in ${directory}.`);
   }
-  process.stdout.write(buildSingleSessionView(directory, session, hierarchyContext));
+  const recentTraceEntries = await tryCollectLiveSessionTraceEntries(serverDirectory, directory, sessionId, hierarchyContext);
+  process.stdout.write(buildSingleSessionView(directory, session, hierarchyContext, recentTraceEntries));
 }
 
 async function handleSessionCommand(argv) {
@@ -3396,7 +4258,7 @@ async function handleSessionCommand(argv) {
   if (subcommand === "continue" || subcommand === "resume") {
     const { options, positionals } = parseArgs(rest, {
       booleanFlags: ["--async", "--background"],
-      stringFlags: ["--directory", "--server-directory", "--model", "--timeout", "--prompt-file"]
+      stringFlags: ["--directory", "--server-directory", "--artifact-root", "--model", "--timeout", "--prompt-file"]
     });
     const sessionId = positionals[0];
     if (!sessionId) {
@@ -3405,6 +4267,7 @@ async function handleSessionCommand(argv) {
     const taskArgs = [];
     if (options.directory) taskArgs.push("--directory", String(options.directory));
     if (options["server-directory"]) taskArgs.push("--server-directory", String(options["server-directory"]));
+    if (options["artifact-root"]) taskArgs.push("--artifact-root", String(options["artifact-root"]));
     if (options.model) taskArgs.push("--model", String(options.model));
     if (options.timeout) taskArgs.push("--timeout", String(options.timeout));
     if (options.async) taskArgs.push("--async");
@@ -3493,10 +4356,15 @@ async function handleJobCommand(argv) {
 
 async function handleJobWait(argv) {
   const { options, positionals } = parseArgs(argv, {
-    stringFlags: ["--directory", "--server-directory", "--timeout"]
+    booleanFlags: ["--verbose"],
+    stringFlags: ["--directory", "--server-directory", "--artifact-root", "--timeout"]
   });
   const directory = resolveDirectory(options.directory);
   const serverDirectory = resolveServerDirectory(options["server-directory"]);
+  const artifactRoot = options["artifact-root"] ? String(options["artifact-root"]).trim() : null;
+  if (artifactRoot) {
+    process.env.OPENCODE_ARTIFACT_ROOT = artifactRoot;
+  }
   const jobId = positionals[0];
   if (!jobId) {
     throw new Error("Missing job id for job wait.");
@@ -3508,17 +4376,32 @@ async function handleJobWait(argv) {
 
   const deadline = Date.now() + timeoutMins * 60 * 1000;
   while (Date.now() < deadline) {
-    const job = refreshStaleRunningJobs(directory).find((entry) => entry.id === jobId) ?? null;
+    const job = refreshStaleRunningJobs(directory, { artifactRoot }).find((entry) => entry.id === jobId) ?? null;
     if (!job) {
       throw new Error(`No job found for ${jobId}.`);
     }
     if (!isActiveJob(job)) {
-      await handleResult([jobId, "--directory", directory, "--server-directory", serverDirectory]);
+      const resultArgs = [jobId, "--directory", directory, "--server-directory", serverDirectory];
+      if (artifactRoot) {
+        resultArgs.push("--artifact-root", artifactRoot);
+      }
+      if (options.verbose) {
+        resultArgs.push("--verbose");
+      }
+      await handleResult(resultArgs);
       return;
     }
     await delay(1500);
   }
 
+  const statusArgs = [jobId, "--directory", directory, "--server-directory", serverDirectory];
+  if (artifactRoot) {
+    statusArgs.push("--artifact-root", artifactRoot);
+  }
+  if (options.verbose) {
+    statusArgs.push("--verbose");
+  }
+  await handleStatus(statusArgs);
   throw new Error(`Timed out after ${timeoutMins} minutes waiting for job ${jobId}.`);
 }
 
@@ -3571,6 +4454,8 @@ if (isDirectExecution) {
 }
 
 export {
+  buildJobLivenessEvent,
+  buildTaskResult,
   buildReviewPrompt,
   classifySessionOutcome,
   deriveResultStatus,
