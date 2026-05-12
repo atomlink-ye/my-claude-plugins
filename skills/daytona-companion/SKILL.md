@@ -17,6 +17,7 @@ SCRIPT="${SKILL_ROOT}/scripts/daytona-manager.mjs"
 ```
 
 `${SKILL_ROOT}` is the path to this `daytona-companion` skill directory. Set it from the loaded skill path; do not prepend another install root.
+From the marketplace root, the direct manager entrypoint is `skills/daytona-companion/scripts/daytona-manager.mjs`.
 
 ## Typical workflows
 
