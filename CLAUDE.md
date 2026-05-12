@@ -25,6 +25,12 @@ This repo is loaded by other users as a plugin marketplace. Shipping tests or ev
 
 Evaluation run results, logs, transcripts, and generated outputs should not be committed under `./eval`. Keep only the original eval inputs and metadata needed to rerun the evaluation.
 
+### Planning and working notes are not repository docs
+
+Do not commit implementation plans, design drafts, independent reviews, agent transcripts, status logs, or other working notes under `./docs`. This marketplace is installed by other users, so `docs/` should not accumulate transient planning records from local agent work.
+
+Keep working notes outside the repository, or in a local ignored scratch area. Only commit documentation that is intended to ship as durable user-facing or maintainer-facing reference material. Reproducible eval inputs still belong under `./eval/<name>/evals/`; eval run outputs and generated reports should remain uncommitted.
+
 ### Running tests
 
 ```bash
