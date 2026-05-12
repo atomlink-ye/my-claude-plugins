@@ -8,13 +8,13 @@ user-invocable: true
 
 Daytona provides remote cloud sandboxes for running code, tests, and services in isolation. This skill manages the full sandbox lifecycle — create, push code, execute, pull results, preview, and tear down.
 
+Set the manager script path from this skill path:
+
 ```bash
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  SCRIPT="$CLAUDE_PLUGIN_ROOT/skills/daytona-companion/scripts/daytona-manager.mjs"
-else
-  SCRIPT="$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs"
-fi
+SCRIPT="${SKILL_ROOT}/scripts/daytona-manager.mjs"
 ```
+
+`${SKILL_ROOT}` is the path to this `daytona-companion` skill directory. Set it from the loaded skill path; do not prepend another install root.
 
 ## Typical workflows
 

@@ -3,7 +3,7 @@
 ## Push local files or directories
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" push \
+node "$SCRIPT" push \
   --directory "$WORK_DIR" \
   --path "$LOCAL_PATH" \
   --remote-path "$REMOTE_PATH"
@@ -14,7 +14,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 ## Pull artifacts
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" pull \
+node "$SCRIPT" pull \
   --directory "$WORK_DIR" \
   --remote-path "$REMOTE_ARTIFACTS" \
   --output "$WORK_DIR/artifacts/daytona/$TASK_ID"
@@ -27,13 +27,13 @@ Artifact paths are project-local by default under `artifacts/daytona/<task-id>`.
 For repositories with committed history, use git mode to mirror local `HEAD` into the sandbox and fetch remote changes back into an isolated local branch:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" push \
+node "$SCRIPT" push \
   --directory "$WORK_DIR" \
   --path "$WORK_DIR" \
   --mode git \
   --branch "daytona/$TASK_ID"
 
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" pull \
+node "$SCRIPT" pull \
   --directory "$WORK_DIR" \
   --mode git \
   --branch "daytona/$TASK_ID"

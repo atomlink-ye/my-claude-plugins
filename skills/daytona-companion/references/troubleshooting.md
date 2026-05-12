@@ -17,7 +17,7 @@ Stop and treat this as a bug. Status output must redact secret values and summar
 Pass remote commands after `--`:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" exec --directory "$WORK_DIR" -- pnpm test
+node "$SCRIPT" exec --directory "$WORK_DIR" -- pnpm test
 ```
 
 Do not interpolate raw user command strings into shell substitutions.
@@ -31,7 +31,7 @@ Move state under `~/.daytona/claude-code/projects/` or pass `--state-directory D
 Some sandbox images use `/workspace`, while `up` may reset the companion state to a relative path such as `workspace/<task-id>`. If `exec`, `push`, or `pull` resolves paths under the wrong remote home, adopt the sandbox with the actual workspace path:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" adopt \
+node "$SCRIPT" adopt \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --sandbox-id "$SANDBOX_ID" \
@@ -40,15 +40,14 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 
 ## Remote daemon stale after sandbox restart
 
-After a sandbox restart, remote daemon state can point at old PIDs. Restart remote Paseo and OpenCode serve from the sandbox:
+After a sandbox restart, remote daemon state can point at old PIDs. Restart remote Paseo from the sandbox:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
+node "$SCRIPT" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
   sh -lc 'paseo daemon stop || true; PASEO_DAEMON_LISTEN=0.0.0.0:6767 paseo daemon start --listen 0.0.0.0:6767 --hostnames true --no-relay'
-
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
-  sh -lc 'node /home/dev/.agents/skills/opencode-companion/scripts/opencode-companion.mjs serve start'
 ```
+
+Then use the OpenCode Companion skill inside the sandbox to start or refresh its serve process.
 
 ## Remote agents are invisible locally
 

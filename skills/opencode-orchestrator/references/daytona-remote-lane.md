@@ -72,30 +72,28 @@ Instead:
 
 ```bash
 WORK_DIR="/path/to/repo"
-DAYTONA_MGR="$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs"
+# Load Daytona Companion and use its SCRIPT value as DAYTONA_SCRIPT for this flow.
 
 # 1) Start or reconnect one sandbox
-node "$DAYTONA_MGR" up \
+node "$DAYTONA_SCRIPT" up \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --class large
 
 # 2) Pin the remote workspace
-node "$DAYTONA_MGR" adopt \
+node "$DAYTONA_SCRIPT" adopt \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --sandbox-id "$SANDBOX_ID" \
   --remote-path "/workspace"
 
-# 3) Bootstrap remote paseo + opencode
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
+# 3) Bootstrap remote paseo
+node "$DAYTONA_SCRIPT" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
   sh -lc 'paseo daemon stop || true; paseo daemon start --listen 0.0.0.0:6767 --hostnames true --no-relay'
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
-  sh -lc 'node /home/dev/.agents/skills/opencode-companion/scripts/opencode-companion.mjs serve start'
 
 # 4) Expose the daemon and derive host:port
 HOST="$({
-  node "$DAYTONA_MGR" preview --directory "$WORK_DIR" --port 6767 --expires-in 3600
+  node "$DAYTONA_SCRIPT" preview --directory "$WORK_DIR" --port 6767 --expires-in 3600
 } | node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => console.log(new URL(JSON.parse(s).url).host))')"
 
 # 5) Dispatch the remote lane from local
@@ -112,6 +110,8 @@ paseo run --host "$HOST" \
 paseo wait --host "$HOST" --timeout 1800 <agent-id>
 paseo send --host "$HOST" --no-wait --prompt-file ./fix-round.md <agent-id>
 ```
+
+If the remote lane needs OpenCode serve inside the sandbox, use the OpenCode Companion skill in that sandbox to start or refresh it before dispatching agents.
 
 Run waits in host background when possible so the local team lead can keep orchestrating.
 

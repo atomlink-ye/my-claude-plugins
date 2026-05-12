@@ -37,13 +37,14 @@ Core rule: **keep the thinking, scoping, and acceptance in the team lead; push b
 
 ## Live local OpenCode snapshot
 
-!`bash "${OPENCODE_ORCHESTRATOR_SNAPSHOT:-$HOME/.agents/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh}"`
-
-If the standalone `~/.agents` copy is unavailable, run the marketplace copy directly:
+Set the snapshot helper path from this skill path when you need a quick local runtime check:
 
 ```bash
-bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"
+SNAPSHOT_SCRIPT="${SKILL_ROOT}/scripts/check-opencode-snapshot.sh"
+bash "$SNAPSHOT_SCRIPT"
 ```
+
+`${SKILL_ROOT}` is the path to this `opencode-orchestrator` skill directory. The helper uses OpenCode Companion to inspect the local runtime.
 
 ## When to use
 
@@ -78,7 +79,7 @@ Daytona is an **opt-in expansion path**, not the main workflow.
 1. **Set the bar in manager context.** Define success, non-goals, scope, and the checks that actually matter.
 2. **Gather only task-relevant context.** Pick the exact docs, files, and paths the execution lane must read first.
 3. **Choose the execution boundary.** If the work is not ultra-trivial, create one bounded OpenCode lane instead of doing a long in-chat tool grind.
-4. **Launch the lane locally.** Prefer the direct OpenCode Companion script when the user wants a TL-owned local workflow.
+4. **Launch the lane locally.** Prefer OpenCode Companion's direct session workflow when the user wants a TL-owned local workflow.
 5. **Wait notification-first.** Do not babysit a foreground stream or poll in loops when the host can notify on completion.
 6. **Inspect outputs directly.** Read the report, diff, and gate artifacts yourself.
 7. **Route fix rounds back to the same session** when the topic is continuous.
@@ -86,15 +87,7 @@ Daytona is an **opt-in expansion path**, not the main workflow.
 
 ## Local environment quickstart
 
-Resolve the script path like this:
-
-```bash
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  SCRIPT="$CLAUDE_PLUGIN_ROOT/skills/opencode-companion/scripts/opencode-companion.mjs"
-else
-  SCRIPT="$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs"
-fi
-```
+Use the OpenCode Companion skill for local execution. Load that skill and use the `SCRIPT` value defined at its start, then run the session commands below.
 
 Recommended launch pattern for substantial implementation work:
 

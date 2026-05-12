@@ -28,12 +28,12 @@ Use another sandbox only when the operator explicitly approves that exception.
 WORK_DIR="/path/to/repo"
 TASK_ID="my-iteration"
 
-node "$DAYTONA_MGR" up \
+node "$SCRIPT" up \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --class large
 
-node "$DAYTONA_MGR" adopt \
+node "$SCRIPT" adopt \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --sandbox-id "$SANDBOX_ID" \
@@ -45,18 +45,11 @@ Some images default to a relative remote path after `up`. If the actual workspac
 Start or refresh remote Paseo:
 
 ```bash
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
+node "$SCRIPT" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
   sh -lc 'paseo daemon stop || true; PASEO_DAEMON_LISTEN=0.0.0.0:6767 paseo daemon start --listen 0.0.0.0:6767 --hostnames true --no-relay'
 ```
 
-Start or refresh remote OpenCode Companion serve:
-
-```bash
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
-  sh -lc 'node /home/dev/.agents/skills/opencode-companion/scripts/opencode-companion.mjs serve start'
-```
-
-Adjust the remote skill path if the image installs skills somewhere else.
+Start or refresh remote OpenCode Companion serve by using the OpenCode Companion skill's serve workflow inside the sandbox.
 
 ## Preview host extraction
 
@@ -64,7 +57,7 @@ Adjust the remote skill path if the image installs skills somewhere else.
 
 ```bash
 REMOTE_PASEO_HOST="$(
-  node "$DAYTONA_MGR" preview --directory "$WORK_DIR" --port 6767 --expires-in 3600 |
+  node "$SCRIPT" preview --directory "$WORK_DIR" --port 6767 --expires-in 3600 |
   node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const u = new URL(JSON.parse(s).url); console.log(u.host); })'
 )"
 ```
@@ -103,12 +96,11 @@ After a sandbox restart, expect stale daemon state:
 Recovery:
 
 ```bash
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
+node "$SCRIPT" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
   sh -lc 'paseo daemon stop || true; PASEO_DAEMON_LISTEN=0.0.0.0:6767 paseo daemon start --listen 0.0.0.0:6767 --hostnames true --no-relay'
-
-node "$DAYTONA_MGR" exec --directory "$WORK_DIR" --cwd "/workspace" -- \
-  sh -lc 'node /home/dev/.agents/skills/opencode-companion/scripts/opencode-companion.mjs serve start'
 ```
+
+Then use the OpenCode Companion skill inside the sandbox to refresh OpenCode serve before launching more remote agents.
 
 ## Evidence discipline
 

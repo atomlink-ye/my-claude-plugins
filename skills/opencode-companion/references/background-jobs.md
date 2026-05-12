@@ -15,7 +15,7 @@ If you only want notification-driven waiting, prefer the host-background path â€
 ## Launching
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --background \
   --timeout 60 \
@@ -26,7 +26,7 @@ For manager/orchestrator prompts that may delegate to subagents, raise the quies
 
 ```bash
 OPENCODE_QUIESCENCE_TIMEOUT_MS=120000 \
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --background \
   --timeout 60 \

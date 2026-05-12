@@ -142,8 +142,8 @@ Delegate the initial implementation to OpenCode companion.
 ### Preferred companion pattern
 
 Use the companion-managed task flow, not raw `opencode run`.
-When the user asks for the concrete GENERATE or FIX LOOP command pattern, answer with these `opencode-companion.mjs` command forms directly rather than inventing extra phase-specific entrypoints.
-In this marketplace-level skill, `${CLAUDE_PLUGIN_ROOT}` refers to the marketplace root, so the companion lives under `skills/opencode-companion/scripts/`.
+When the user asks for the concrete GENERATE or FIX LOOP command pattern, answer with OpenCode Companion `session new` / `session continue` forms rather than inventing extra phase-specific entrypoints.
+Before showing shell commands, load OpenCode Companion and use the `SCRIPT` value defined at its start.
 
 ### Canonical answer shape for command-pattern questions
 
@@ -156,7 +156,7 @@ When the user asks for task-iteration command patterns, the answer should contai
 Do not answer with made-up phase-specific commands.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<generator-prompt>"
@@ -165,7 +165,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
 If you want non-blocking execution, you may use the companion background-job layer:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --background \
   --timeout 60 \
@@ -178,7 +178,7 @@ If you use `--background`, record `GENERATOR_JOB_ID` and later retrieve the sess
 6. If the run times out or the stream drops **after** yielding a session id, prefer:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session attach "$GENERATOR_SID" \
+node "$SCRIPT" session attach "$GENERATOR_SID" \
   --directory "$WORK_DIR" \
   --timeout 5
 ```
@@ -201,7 +201,7 @@ Run an independent evaluation against the deliverable standard.
 4. Dispatch to a **fresh** companion session (do not reuse `GENERATOR_SID`):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<reviewer-prompt>"
@@ -239,7 +239,7 @@ while findings == FAIL and round < max_fix_rounds:
 2. Resume the generator session:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue "$GENERATOR_SID" \
+node "$SCRIPT" session continue "$GENERATOR_SID" \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<fix-prompt>"
@@ -249,7 +249,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
 4. After the generator completes, resume the reviewer session:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue "$REVIEWER_SID" \
+node "$SCRIPT" session continue "$REVIEWER_SID" \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<re-eval-prompt>"
@@ -274,7 +274,7 @@ git diff "$BASE_REF"..HEAD --stat
 2. Run the direct companion review command:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" review \
+node "$SCRIPT" review \
   --directory "$WORK_DIR" \
   --adversarial \
   --scope branch \
@@ -314,7 +314,7 @@ Finalize and verify completeness.
 
 ## Runtime safety rules
 
-- There are no phase-specific task-iteration entrypoints. When the user asks for command patterns, show direct companion script calls.
+- There are no phase-specific task-iteration entrypoints. When the user asks for command patterns, show direct OpenCode Companion session calls.
 - When the user asks for phase command patterns, show the actual companion `session new` / `session continue` / `session attach` patterns from this skill.
 - Do not use raw `opencode run` in this workflow.
 - Prefer companion-managed `session` / `job` flows.
@@ -332,6 +332,6 @@ Finalize and verify completeness.
 
 ## Integration notes
 
-- Use direct `session new` / `session continue` companion script calls for one-off execution lanes.
+- Use direct `session new` / `session continue` companion session calls for one-off execution lanes.
 - Continue or attach to the same companion session with a narrow rescue prompt for rescue flows.
 - This skill should follow the hidden orchestrator skill's ownership rules rather than redefining them.

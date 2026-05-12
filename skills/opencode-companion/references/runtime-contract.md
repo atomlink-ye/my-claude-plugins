@@ -2,41 +2,35 @@
 
 ## Script path
 
-Marketplace-level skills use the marketplace root as `${CLAUDE_PLUGIN_ROOT}`:
+Set the companion script path from this skill path:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" ...
+SCRIPT="${SKILL_ROOT}/scripts/opencode-companion.mjs"
 ```
 
-Standalone OpenCode skill install path:
-
-```bash
-node "$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs" ...
-```
-
-Do not use the removed plugin path for new guidance; all OpenCode companion calls go through this skill-local script path.
+Use `node "$SCRIPT" ...` for all calls. `${SKILL_ROOT}` is the path to this `opencode-companion` skill directory.
 
 ## Supported verbs
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" serve status [--server-directory SERVER_DIR]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" serve start [--port N] [--server-directory SERVER_DIR]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" serve stop [--server-directory SERVER_DIR]
+node "$SCRIPT" serve status [--server-directory SERVER_DIR]
+node "$SCRIPT" serve start [--port N] [--server-directory SERVER_DIR]
+node "$SCRIPT" serve stop [--server-directory SERVER_DIR]
 
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- "PROMPT"]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- "PROMPT"]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session list [--directory WORK_DIR] [--server-directory SERVER_DIR]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]
+node "$SCRIPT" session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- "PROMPT"]
+node "$SCRIPT" session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- "PROMPT"]
+node "$SCRIPT" session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
+node "$SCRIPT" session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]
+node "$SCRIPT" session list [--directory WORK_DIR] [--server-directory SERVER_DIR]
+node "$SCRIPT" session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]
 
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job list [--directory WORK_DIR] [--all]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job status <job-id> [--directory WORK_DIR]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job wait <job-id> [--directory WORK_DIR] [--timeout MINS]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job result <job-id> [--directory WORK_DIR]
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" job cancel <job-id> [--directory WORK_DIR]
+node "$SCRIPT" job list [--directory WORK_DIR] [--all]
+node "$SCRIPT" job status <job-id> [--directory WORK_DIR]
+node "$SCRIPT" job wait <job-id> [--directory WORK_DIR] [--timeout MINS]
+node "$SCRIPT" job result <job-id> [--directory WORK_DIR]
+node "$SCRIPT" job cancel <job-id> [--directory WORK_DIR]
 
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" review [--directory WORK_DIR] [--scope auto|working-tree|branch] [--base REF] [--wait|--background] [--adversarial] [FOCUS_TEXT]
+node "$SCRIPT" review [--directory WORK_DIR] [--scope auto|working-tree|branch] [--base REF] [--wait|--background] [--adversarial] [FOCUS_TEXT]
 ```
 
 ## State boundaries

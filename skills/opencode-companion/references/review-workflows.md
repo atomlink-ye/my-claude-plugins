@@ -5,7 +5,7 @@ Use the direct `review` verb for working-tree and branch reviews.
 ## Working tree review
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" review \
+node "$SCRIPT" review \
   --directory "$WORK_DIR" \
   --scope working-tree \
   --wait
@@ -14,7 +14,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion
 ## Branch adversarial review
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" review \
+node "$SCRIPT" review \
   --directory "$WORK_DIR" \
   --adversarial \
   --scope branch \

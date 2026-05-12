@@ -2,14 +2,11 @@
 set -euo pipefail
 DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Prefer the standalone agent-skill install when present; fall back to the
-# marketplace skill-local script. The old plugins/opencode/... path was removed.
-COMPANION="${OPENCODE_COMPANION:-$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SKILLS_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+COMPANION="${OPENCODE_COMPANION:-$SKILLS_DIR/opencode-companion/scripts/opencode-companion.mjs}"
 if [ ! -f "$COMPANION" ]; then
-  COMPANION="$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-companion/scripts/opencode-companion.mjs"
-fi
-if [ ! -f "$COMPANION" ]; then
-  echo "OpenCode companion not found at standalone or marketplace skill-local paths"
+  echo "OpenCode Companion script not found. Set OPENCODE_COMPANION or install opencode-companion next to this skill."
   exit 0
 fi
 {

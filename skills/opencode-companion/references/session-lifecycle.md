@@ -5,14 +5,14 @@
 Use `session new` for a new work thread and `session continue` for follow-up work in the same thread.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new \
+node "$SCRIPT" session new \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<prompt>"
 ```
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session continue "$SID" \
+node "$SCRIPT" session continue "$SID" \
   --directory "$WORK_DIR" \
   --timeout 60 \
   -- "<follow-up prompt>"
@@ -27,7 +27,7 @@ This is a capability, not a hard rule. The caller decides when continuity is wor
 Check the session before a long follow-up:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session status "$SID" \
+node "$SCRIPT" session status "$SID" \
   --directory "$WORK_DIR"
 ```
 
@@ -38,7 +38,7 @@ If OpenCode reports usage/context metadata, the status output includes it.
 A dropped stream, timeout, or exit-1 can be a false negative. If a session id exists:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session attach "$SID" \
+node "$SCRIPT" session attach "$SID" \
   --directory "$WORK_DIR" \
   --timeout 5
 ```

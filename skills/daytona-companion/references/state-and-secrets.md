@@ -19,7 +19,7 @@ Each state file may contain:
 
 This state does not include API tokens or env-file contents, so global storage is acceptable. Local output artifacts remain project-local under `$WORK_DIR/artifacts/daytona/<task-id>`.
 
-Do not store sandbox state in `${CLAUDE_PLUGIN_ROOT}`, project `.daytona/` directories for new runs, removed plugin directories, or `skills/daytona-companion`.
+Do not store sandbox state in plugin or skill source directories, project `.daytona/` directories for new runs, or removed plugin directories.
 
 For compatibility, the manager may read legacy `$WORK_DIR/.daytona/state.json` if no global state exists, but new writes go to the global project registry.
 

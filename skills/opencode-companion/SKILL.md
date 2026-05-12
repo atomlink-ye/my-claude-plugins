@@ -8,13 +8,13 @@ user-invocable: true
 
 OpenCode is a headless coding agent runtime. This skill lets you launch coding sessions, continue existing sessions, attach/wait for results, manage the serve process, and forward outputs through a single companion script.
 
+Set the companion script path from this skill path:
+
 ```bash
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  SCRIPT="$CLAUDE_PLUGIN_ROOT/skills/opencode-companion/scripts/opencode-companion.mjs"
-else
-  SCRIPT="$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs"
-fi
+SCRIPT="${SKILL_ROOT}/scripts/opencode-companion.mjs"
 ```
+
+`${SKILL_ROOT}` is the path to this `opencode-companion` skill directory. Set it from the loaded skill path; do not prepend another install root.
 
 ## Typical workflows
 

@@ -1,21 +1,16 @@
 # Daytona Sandbox Lifecycle
 
-Use the manager script from the marketplace root:
+Set the manager script path from this skill path before running these examples:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
-```
-
-Standalone OpenCode skill install path:
-
-```bash
-node "$HOME/.agents/skills/daytona-companion/scripts/daytona-manager.mjs" <command> [options]
+SCRIPT="${SKILL_ROOT}/scripts/daytona-manager.mjs"
+node "$SCRIPT" <command> [options]
 ```
 
 ## Create or reconnect
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" up \
+node "$SCRIPT" up \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --class small \
@@ -31,7 +26,7 @@ Use `--class small|medium|large` to request a Daytona class. `small` also maps t
 If a sandbox was created by the Daytona CLI or another tool, register it into companion state before using `push`, `exec`, or `pull`:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" adopt \
+node "$SCRIPT" adopt \
   --directory "$WORK_DIR" \
   --task-id "$TASK_ID" \
   --sandbox-id "$SANDBOX_ID" \
@@ -43,7 +38,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 ## Inspect state
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" status --directory "$WORK_DIR"
+node "$SCRIPT" status --directory "$WORK_DIR"
 ```
 
 `status` should use local state only unless `--refresh` is explicit.
@@ -59,7 +54,7 @@ Use `--state-directory DIR` only for tests or explicit isolation.
 ## Execute remotely
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" exec \
+node "$SCRIPT" exec \
   --directory "$WORK_DIR" \
   --cwd "/workspace/$TASK_ID" \
   -- pnpm test
@@ -72,7 +67,7 @@ Pass commands after `--` so arguments are quoted as literal remote command argum
 ## Preview URLs
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" preview \
+node "$SCRIPT" preview \
   --directory "$WORK_DIR" \
   --port 3000
 ```
@@ -82,7 +77,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs
 ## Real smoke test
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" smoke-test \
+node "$SCRIPT" smoke-test \
   --class small \
   --include-git \
   --include-preview
@@ -93,7 +88,7 @@ The smoke test creates a temporary project, runs `up`, `status --refresh`, bundl
 ## Delete
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" down --directory "$WORK_DIR"
+node "$SCRIPT" down --directory "$WORK_DIR"
 ```
 
 Use `--keep-state` only when preserving local metadata is intentional.
