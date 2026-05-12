@@ -1,0 +1,15 @@
+[
+  {"query": "paseo ag_abc123 这个 agent 还在跑吗，logs 跟一下", "should_trigger": true},
+  {"query": "我之前 detach 的那个 paseo agent，怎么 follow up 一个新的 prompt 让它接着改 tests", "should_trigger": true},
+  {"query": "在 remote daemon 6767-example.proxy.example.test:4000 上跑一个 implementation lane，--cwd /workspace，prompt 在 ./task.md", "should_trigger": true},
+  {"query": "paseo wait --timeout 30m 那个 agent 怎么操作，超时之后还活着吗", "should_trigger": true},
+  {"query": "想用 paseo loop 跑 vitest 直到 pass，verify-check 怎么写", "should_trigger": true},
+  {"query": "paseo run 起一个独立 worktree 的 lane 跑 feature-x，base develop", "should_trigger": true},
+
+  {"query": "OpenCode session 超时怎么 attach 回去", "should_trigger": false},
+  {"query": "Daytona sandbox preview 怎么暴露 6767 端口", "should_trigger": false},
+  {"query": "claude --dangerously-skip-permissions 跟 codex -s 在权限模型上有啥区别", "should_trigger": false},
+  {"query": "怎么用 cron 起一个每天 9 点的 task", "should_trigger": false},
+  {"query": "exec-plan 里这个 feature 怎么 parse 出来", "should_trigger": false},
+  {"query": "我笔记本风扇起飞了，pnpm test 占内存 12G，能不能 limit", "should_trigger": false}
+]

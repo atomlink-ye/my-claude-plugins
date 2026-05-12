@@ -6,27 +6,25 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of the main skills in this marketplace: companion runtimes (opencode, daytona, paseo), orchestration (task-iteration, opencode-orchestrator), workflows (debug-workflow, google-workspace), and helpers (mcp-skill).",
-      "version": "0.3.0",
+      "description": "Bundle of skills in this marketplace: companion runtimes (opencode, daytona, paseo), generic orchestration (agentic-orchestration), and helpers (google-workspace, mcp-skill).",
+      "version": "0.4.0",
       "author": {
         "name": "atomlink-ye"
       },
       "source": "./",
       "strict": false,
       "skills": [
+        "./skills/agentic-orchestration",
         "./skills/daytona-companion",
-        "./skills/debug-workflow",
         "./skills/google-workspace",
         "./skills/mcp-skill",
         "./skills/opencode-companion",
-        "./skills/opencode-orchestrator",
-        "./skills/paseo-companion",
-        "./skills/task-iteration"
+        "./skills/paseo-companion"
       ]
     },
     {

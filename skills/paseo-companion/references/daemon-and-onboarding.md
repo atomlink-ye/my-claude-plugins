@@ -65,5 +65,13 @@ If a restart appears to ignore `--listen`, stop the daemon and start it again wi
 
 - `paseo run` errors with a connection failure → check `paseo daemon status`. Run `paseo daemon start` (or `paseo start`) if the daemon is not running.
 - Auth errors from the underlying provider → the daemon shells out to the provider's CLI and inherits its env. Make sure the relevant provider auth is in place in the same shell that started the daemon.
+- Claude-specific pitfall: a stale `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` in the daemon's process environment can override a valid local Claude Max OAuth login and produce `401 Invalid bearer token`, even when `claude auth status` says logged in. Verify the daemon env with `ps eww -p $(pgrep -f paseo.*supervisor-entrypoint | head -1)` or equivalent, then restart the daemon from a clean environment, for example:
+
+```bash
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY paseo daemon stop
+env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY paseo daemon start
+```
+
+  Also verify the local CLI separately with the same env cleanup if you need to distinguish a shell-env problem from a daemon-env problem: `env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p "Reply with exactly OK" --max-turns 1`.
 - After updating paseo or its providers → `paseo daemon restart` to reload.
 - Remote agent ID appears missing → repeat the command with the same `--host` used at launch.

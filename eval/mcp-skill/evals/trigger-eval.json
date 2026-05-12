@@ -1,0 +1,19 @@
+[
+  {"query": "用 Playwright 打开 example.com 截一张图 — OpenCode 里好像没启 playwright MCP，怎么搞", "should_trigger": true},
+  {"query": "context7 上拉一份 React hooks 最新文档进来给我看一下", "should_trigger": true},
+  {"query": "想搜一下 'OpenCode SSE early-close grace window' 相关的 issue 和讨论，用 web search 找一下", "should_trigger": true},
+  {"query": "用 chrome-devtools 那个 MCP 连一下我本地 :9222 那个调试端口", "should_trigger": true},
+  {"query": "zread 这个 github 仓库 README 给我，repo 是 owner/foo", "should_trigger": true},
+  {"query": "我们 OpenCode 没装常驻 MCP，临时调用一下 web-reader 拉一下这个 URL https://example.com/spec.html 的纯文本", "should_trigger": true},
+  {"query": "mcporter 怎么 list 一下当前 config 里有哪些 server", "should_trigger": true},
+  {"query": "zai-mcp-server 怎么调用，schema 长什么样", "should_trigger": true},
+
+  {"query": "OpenCode session 怎么 attach 回去", "should_trigger": false},
+  {"query": "我想把这个 React 组件用 storybook 起来，npm install 之后怎么 dev", "should_trigger": false},
+  {"query": "Daytona 里跑一遍 e2e", "should_trigger": false},
+  {"query": "我要给 paseo agent 发一个 follow-up prompt", "should_trigger": false},
+  {"query": "exec-plan 里 'feature-3: search' 这一段帮我拆 task", "should_trigger": false},
+  {"query": "Google Docs 这个 doc 帮我加一段 changelog 在文末", "should_trigger": false},
+  {"query": "gh-cli 怎么列出我所有 open 的 PR", "should_trigger": false},
+  {"query": "我的 API token 在 shell rc 文件里过期了，环境变量怎么换", "should_trigger": false}
+]

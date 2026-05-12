@@ -8,12 +8,10 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 
 | Skill | Description |
 |-------|-------------|
+| [agentic-orchestration](skills/agentic-orchestration/) | Runtime-neutral principles for lead-agent orchestration, bounded execution lanes, and acceptance gates |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
-| [task-iteration](skills/task-iteration/) | Orchestrate feature implementation from exec-plans with Plan→Generate→Evaluate workflow |
-| [opencode-orchestrator](skills/opencode-orchestrator/) | Routing rules for delegating to OpenCode vs. handling work locally |
-| [debug-workflow](skills/debug-workflow/) | Real-world issue reproduction (browser/UI/Web3) with Playwright/CDP/agent-wallet |
 | [google-workspace](skills/google-workspace/) | Google Docs/Drive/Sheets via the `gws` CLI |
 | [mcp-skill](skills/mcp-skill/) | On-demand MCP server invocation via MCPorter |
 
@@ -90,3 +88,19 @@ To enable the standalone optional skill creator plugin instead of (or in additio
 pnpm install
 pnpm test
 ```
+
+## Evaluating skills
+
+Per-skill triggers, outcomes, smoke and unit tests live under [`eval/<skill>/`](eval/). The repo follows the skill-creator eval schema.
+
+```bash
+# Trigger eval for one skill (default runner: `claude`)
+eval/_shared/run-trigger-eval.sh opencode-companion
+
+# Smoke tests (offline-safe)
+eval/opencode/tests/smoke.sh
+eval/daytona/tests/smoke.sh
+eval/paseo/tests/smoke.sh
+```
+
+If you want eval runs to use a different Anthropic-compatible endpoint (e.g. an overflow-quota wrapper), point `EVAL_RUNNER` at your own wrapper executable. See [`eval/_shared/README.md`](eval/_shared/README.md) for the layout, the runner contract, and the coverage plan across skills.

@@ -27,25 +27,6 @@ Several patterns below say "run this in the host agent's background mode." That 
 
 Why this matters: OpenCode streams progress over an HTTP connection. If the orchestrator blocks on it, you lose parallelism; if you poll status, you waste tokens and risk treating partial logs as completion. Background-execution-with-notification gives both: continuous attachment + non-blocking caller.
 
-### Team-lead orchestration bias on this machine
-
-When Link explicitly wants Hermes/Claude to stay in a **team-lead** role — understanding the task, writing the brief, dispatching work, and only reviewing outputs — prefer the **direct OpenCode Companion script** over `paseo run` for new work.
-
-Use this pattern:
-1. `serve start` once if needed
-2. launch bounded jobs with `session new --background ... --prompt-file ...`
-3. monitor with `job status` / `job wait`
-4. if the host supports it, put `job wait` itself in the host background with completion notification
-
-Why this bias exists:
-- `paseo` is fine for interactive agent driving, but here it added unnecessary indirection when the user wanted direct Companion execution.
-- The direct companion path makes the split clearer: **Hermes = TL**, **OpenCode = executor**.
-- It also pairs naturally with notification-driven `job wait`, so the TL can keep orchestrating instead of babysitting a foreground stream.
-
-Practical rule:
-- If the user says some version of **"后面不要用 paseo，直接用 OpenCode Companion"** or asks you to stay as TL while OpenCode executes, switch immediately to the direct companion script and do not start new work with `paseo run`.
-- If a `paseo` run is already in flight, you can leave it alone and simply stop using `paseo` for subsequent tasks.
-
 ### Default path: blocking `session new`, run via host-background
 
 Use a normal blocking `session new` and let the host put the shell call itself in the background.
@@ -79,26 +60,21 @@ node "$SCRIPT" job result "$JOB_ID" --directory "$WORK_DIR"
 
 If the job result gives a `Session ID`, `session attach "$SID" --timeout 15` is also valid. Long waits (`job wait`, `session attach`) should themselves run in host-background.
 
-**Machine-specific bias for substantial implementation work:** on this machine, when you want OpenCode to actually implement a non-trivial change rather than just discuss the approach, a reliable pattern is:
+### Pinning an agent or model
+
+When the goal is to consume a specific quota or prevent fallback drift, pass `--agent` and `--model` explicitly so the run does not drift through the slim role chain:
 
 ```bash
 node "$SCRIPT" session new \
   --background \
   --directory "$WORK_DIR" \
   --agent orchestrator \
-  --model openai/gpt-5.4 \
+  --model <provider/model> \
   --timeout 60 \
   --prompt-file ./task.md
 ```
 
-Then wait with `job wait` and inspect with `job status` / `job result`.
-
-Why this matters: a foreground run (or an open-ended prompt) can sometimes stop after returning a design/proposal instead of executing the code changes. If that happens, prefer reusing the same session with a hard follow-up such as:
-- execute now
-- do not stop for design confirmation
-- add/update failing tests first, then implement, then run tests
-
-In other words: **reuse the same session, tighten the prompt, then continue**. Do not assume you need a fresh relaunch just because the first response stayed at the design stage.
+A common failure mode: an open-ended prompt produces a design/proposal instead of executing the change. The reliable recovery is to **reuse the same session** and send a tighter follow-up (e.g. "execute now, do not stop for confirmation; add failing tests first, then implement, then run tests"). Do not relaunch a fresh session just because the first response stayed at the design stage. Specific provider/model preferences belong in the caller's local routing profile, not in this adapter skill.
 
 ### Continue an existing session
 
@@ -151,9 +127,9 @@ These are the rules that keep the runtime honest. Each one exists because of a r
 - **But watch context.** Reuse stops paying off once the context is near its limit or the topic has shifted — at that point the model gets distracted by stale history. Check `session status` for usage/context lines first, and start fresh when warranted.
 - **Timeout is not failure.** A dropped stream or `--timeout` exit doesn't mean OpenCode died. Run `session attach "$SID" --timeout 5` to verify before retrying. Submitting duplicate work is the worst recovery.
 - **Quiet is not done for orchestrators.** When the prompt can spawn subagents, the parent session can go quiet while children are still writing files. Check `session list`, child statuses, and `git status -s` in the worktree before accepting a quiescence result.
-- **Current OpenCode completion wrinkle:** on current OpenCode versions observed on this machine (notably `1.14.46`), the SSE event stream can close **before** a session reaches a visible `idle`/terminal session-status update, even though the exported session already contains a completed assistant reply with `finish: "stop"` and a `step-finish` part. Treat stream-close-without-idle as ambiguous, not automatically failed.
-- **Recovery rule for premature stream close:** after SSE closes without a terminal root status, keep polling a bit longer and also inspect persisted session messages. If the latest assistant message has final text plus completion markers like `info.time.completed`, `finish: "stop"`, or `step-finish`, treat the run as completed when there are no pending descendants or pending tool calls.
-- **Grace window matters:** a short stream-close grace period can cause false failures. On this machine, extending the post-stream-close reconciliation window from ~4s to ~10s was enough for `OpenCode Companion` to recover successful `build` and `orchestrator` runs that previously ended with `OpenCode event stream ended before session completion.`
+- **Stream-close-without-idle is ambiguous, not failed.** On some OpenCode versions the SSE event stream can close before a session reaches a visible `idle`/terminal status, even though the exported session already contains a completed assistant reply with `finish: "stop"` and a `step-finish` part. Treat this state as ambiguous and verify before retrying.
+- **Recovery rule for premature stream close:** after SSE closes without a terminal root status, keep polling a bit longer and inspect persisted session messages. If the latest assistant message has final text plus completion markers like `info.time.completed`, `finish: "stop"`, or `step-finish`, treat the run as completed when there are no pending descendants or pending tool calls.
+- **Grace window matters:** a too-short stream-close grace period can cause false failures. A reconciliation window in the ~10s range is generally enough to recover successful `build` and `orchestrator` runs that would otherwise be reported as "event stream ended before session completion".
 - **Prefer notification-driven waits.** Long-running `session new`, `session attach`, `job wait` should run via host-background (see top of Workflows). Polling in a loop wastes tokens and tempts premature completion calls.
 - **Forward output verbatim.** When the user asked for runtime output, don't summarize companion stdout. Session IDs, job IDs, and error messages are load-bearing.
 - **Quote everything.** Paths and prompts must be quoted; prompt text goes after `--` so it isn't parsed as flags.
