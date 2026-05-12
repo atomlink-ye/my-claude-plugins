@@ -74,27 +74,6 @@ describe("job state helpers", () => {
     expect(fs.existsSync(jobsFilePath(directory))).toBe(true);
   });
 
-  it("migrates legacy root job records into the .opencode-companion artifact root", () => {
-    const jobId = "task-legacy";
-    writeFileSync(path.join(directory, ".opencode-jobs.json"), JSON.stringify([
-      {
-        id: jobId,
-        status: "completed",
-        prompt: "legacy prompt",
-        logFile: path.join(directory, `.opencode-job-${jobId}.log`)
-      }
-    ]));
-    writeFileSync(path.join(directory, `.opencode-job-${jobId}.log`), "legacy log\n");
-
-    const jobs = readJobs(directory);
-
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].artifactRoot).toBe(path.join(directory, ".opencode-companion"));
-    expect(jobs[0].logFile).toBe(path.join(directory, ".opencode-companion", "jobs", jobId, "compat.log"));
-    expect(fs.existsSync(jobsFilePath(directory))).toBe(true);
-    expect(fs.readFileSync(jobCompatLogFilePath(directory, jobId), "utf8")).toBe("legacy log\n");
-  });
-
   it("resolves artifact root precedence as cli flag, then env var, then default", () => {
     const previous = process.env.OPENCODE_ARTIFACT_ROOT;
 

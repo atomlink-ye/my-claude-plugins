@@ -9,7 +9,6 @@ import {
   jobCompatLogFilePath,
   jobDirectoryPath,
   jobEventsFilePath,
-  legacyJobLogFilePath,
   jobPromptFilePath,
   jobsFilePath,
   jobSnapshotMarkdownFilePath,
@@ -530,107 +529,13 @@ function readLegacyJobs(directory) {
   return normalizeJobsValue(safeReadJsonFile(legacyFile, []));
 }
 
-function jobUpdatedAtMs(job) {
-  const candidates = [job?.updatedAt, job?.completedAt, job?.startedAt, job?.createdAt];
-  for (const candidate of candidates) {
-    const parsed = Date.parse(String(candidate ?? ""));
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
-  }
-  return 0;
-}
-
-function shouldUseLegacyJob(legacyJob, existingJob) {
-  if (!existingJob) {
-    return true;
-  }
-  if (["completed", "failed", "cancelled"].includes(String(legacyJob.status ?? "")) && isActiveJob(existingJob)) {
-    return true;
-  }
-  return jobUpdatedAtMs(legacyJob) > jobUpdatedAtMs(existingJob);
-}
-
-function normalizeLegacyJob(directory, job, artifactRoot = null) {
-  const paths = ensureJobArtifacts(directory, job.id, artifactRoot);
-  const legacyLogFile = job.logFile ?? legacyJobLogFilePath(directory, job.id);
-  if (legacyLogFile && fs.existsSync(legacyLogFile) && !fs.existsSync(paths.logFile)) {
-    fs.copyFileSync(legacyLogFile, paths.logFile);
-  }
-  return normalizeJobRecord({
-    ...job,
-    artifactRoot: paths.artifactRoot,
-    jobDir: paths.jobDir,
-    logFile: paths.logFile,
-    eventsFile: paths.eventsFile,
-    snapshotFile: paths.snapshotFile,
-    snapshotMarkdownFile: paths.snapshotMarkdownFile,
-    promptFile: paths.promptFile
-  }, directory, paths.artifactRoot);
-}
-
-function mergeLegacyJobs(directory, currentJobs, legacyJobs, artifactRoot = null) {
-  const jobsById = new Map(currentJobs.map((job) => [job.id, job]));
-  for (const legacyJob of legacyJobs) {
-    if (!legacyJob?.id) {
-      continue;
-    }
-    const existingJob = jobsById.get(legacyJob.id);
-    if (!shouldUseLegacyJob(legacyJob, existingJob)) {
-      continue;
-    }
-    const migratedJob = normalizeLegacyJob(directory, legacyJob, artifactRoot);
-    jobsById.set(legacyJob.id, migratedJob);
-    if (!fs.existsSync(migratedJob.snapshotFile) || migratedJob.status !== existingJob?.status) {
-      writeJobSnapshot(migratedJob.snapshotFile, createJobSnapshot(migratedJob));
-    }
-  }
-  const mergedJobs = pruneOldJobs([...jobsById.values()]);
-  writeJsonAtomic(jobsFilePath(directory, artifactRoot), mergedJobs);
-  return mergedJobs;
-}
-
-function migrateLegacyJobs(directory, legacyJobs, artifactRoot = null) {
-  const migratedJobs = legacyJobs.filter((job) => job?.id).map((job) => {
-    const paths = ensureJobArtifacts(directory, job.id, artifactRoot);
-    const legacyLogFile = job.logFile ?? legacyJobLogFilePath(directory, job.id);
-    if (legacyLogFile && fs.existsSync(legacyLogFile) && !fs.existsSync(paths.logFile)) {
-      fs.copyFileSync(legacyLogFile, paths.logFile);
-    }
-    return normalizeJobRecord({
-      ...job,
-      artifactRoot: paths.artifactRoot,
-      jobDir: paths.jobDir,
-      logFile: paths.logFile,
-      eventsFile: paths.eventsFile,
-      snapshotFile: paths.snapshotFile,
-      snapshotMarkdownFile: paths.snapshotMarkdownFile,
-      promptFile: paths.promptFile
-    }, directory, paths.artifactRoot);
-  });
-  writeJsonAtomic(jobsFilePath(directory, artifactRoot), pruneOldJobs(migratedJobs));
-  for (const job of migratedJobs) {
-    if (!fs.existsSync(job.snapshotFile)) {
-      writeJobSnapshot(job.snapshotFile, createJobSnapshot(job));
-    }
-  }
-  return migratedJobs;
-}
-
 export function readJobs(directory, options = {}) {
   ensureDirectoryExists(directory);
   const indexPath = jobsFilePath(directory, options.artifactRoot ?? null);
-  const legacyJobs = readLegacyJobs(directory);
   if (fs.existsSync(indexPath)) {
-    const currentJobs = normalizeJobsValue(safeReadJsonFile(indexPath, []));
-    return legacyJobs.length
-      ? mergeLegacyJobs(directory, currentJobs, legacyJobs, options.artifactRoot ?? null)
-      : currentJobs;
+    return normalizeJobsValue(safeReadJsonFile(indexPath, []));
   }
-  if (!legacyJobs.length) {
-    return [];
-  }
-  return migrateLegacyJobs(directory, legacyJobs, options.artifactRoot ?? null);
+  return readLegacyJobs(directory);
 }
 
 export function writeJobs(directory, jobs, options = {}) {
