@@ -1,2 +1,5 @@
 iteration-*/
 response.md
+**/results/
+**/logs/
+*.log

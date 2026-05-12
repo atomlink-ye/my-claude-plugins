@@ -19,9 +19,11 @@ Personal Claude Code plugin marketplace. Contains reusable plugins, tools, and s
 
 ### Tests and evaluations live under `./eval`, not alongside source
 
-All tests, e2e scripts, and evaluation harnesses for every tool or plugin go in `./eval/<tool-name>/`. Source artifacts under `tools/` and `skills/` must not contain test files.
+All tests, e2e scripts, and evaluation harnesses for every tool, plugin, or skill go in `./eval/<name>/`. Evaluation definitions, source inputs, fixtures, and metadata go in the matching `./eval/<name>/evals/` directory. Source artifacts under `tools/` and `skills/` must not contain test or evaluation files.
 
-This repo is loaded by other users as a plugin marketplace. Shipping tests inside the artifacts would be confusing and add unnecessary weight. Keep `tools/` clean — only production source code.
+This repo is loaded by other users as a plugin marketplace. Shipping tests or evals inside the artifacts would be confusing and add unnecessary weight. Keep `tools/` and `skills/` clean — only production source code and runtime skill assets.
+
+Evaluation run results, logs, transcripts, and generated outputs should not be committed under `./eval`. Keep only the original eval inputs and metadata needed to rerun the evaluation.
 
 ### Running tests
 
@@ -37,4 +39,5 @@ pnpm test
 
 1. Create source under `tools/<name>/`
 2. Create tests under `eval/<name>/tests/`
-3. Point the tool's `vitest.config.ts` (if any) to `../../eval/<name>/tests/`
+3. Create evaluation inputs and metadata under `eval/<name>/evals/`
+4. Point the tool's `vitest.config.ts` (if any) to `../../eval/<name>/tests/`

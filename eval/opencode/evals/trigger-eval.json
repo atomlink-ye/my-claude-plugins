@@ -1,0 +1,23 @@
+[
+  {"query": "我刚那个 opencode session 跑了 60 分钟超时退出了，session id 是 ses_20295655effeWzF12ljl2BbhDk，现在怎么恢复？是 attach 还是直接重跑一遍 session new", "should_trigger": true},
+  {"query": "把 src/auth 下面那一坨旧的 token-store.go 全部换成 internal/jwtv2 那套新接口，大概 7-8 个文件改动外加一个数据库迁移脚本，请用 opencode 后台跑掉，跑完通知我看 git diff", "should_trigger": true},
+  {"query": "上次给我的那个 ses_2029abc 的会话，能不能继续 follow up，让它把 user_repository_test.go 里没覆盖的 edge case 补一下，prompt 我写在 ./follow-up.md 了", "should_trigger": true},
+  {"query": "OpenCode serve 现在端口 49965 还活着吗？我担心今早 keychain 解锁前起的，provider auth 可能拿不到", "should_trigger": true},
+  {"query": "这个 feature/payment-refactor 分支改动挺大，能不能用 opencode 跑一遍 adversarial review，base 是 origin/main，主要看 race condition 和 idempotency", "should_trigger": true},
+  {"query": "想看一下我刚 kick off 的那个 opencode job 现在 context 用到多少了，会不会撑不到改完 admin 模块就爆 200k token", "should_trigger": true},
+  {"query": "opencode session list 给我看一下当前 /Users/fanye/repos/api 下还有哪些没结束的会话，我怀疑前天那个还在偷偷跑", "should_trigger": true},
+  {"query": "帮我把 ./refactor-plan.md 那个 prompt 丢给 opencode，--directory 设到 /tmp/wt-refactor 这个 worktree，超时给 90 分钟，跑完直接收通知就行", "should_trigger": true},
+  {"query": "刚那个 background job 返回得太快了，verdict 是 completed_tree 但 git status 一片空，是不是 orchestrator quiescence 又骗我了？", "should_trigger": true},
+  {"query": "我之前 spawn 了一个 manager prompt 让它去 dispatch 三个 reviewer subagent，现在父 session 已经 idle 了，我能信吗，还是需要再 attach 看看子 session 是不是还在写文件", "should_trigger": true},
+
+  {"query": "帮我用 codex 跑一下这个 jsonschema 校验的修复，prompt 我贴下面：'修 internal/validator 里 oneOf 嵌套 anyOf 时被 short-circuit 的 bug'", "should_trigger": false},
+  {"query": "这个 npm run build:ci 大概要跑 8 分钟，能不能在后台跑掉跑完叫我，别一直占着 stdout", "should_trigger": false},
+  {"query": "开个新 session 跟我聊聊我们 Q3 是先做 webhooks 重写还是先把那个 search index 上 elastic，纯产品向讨论别动代码", "should_trigger": false},
+  {"query": "看一下 paseo agent 那边 ag_xxxxx 这个还在跑吗，我让它去做一个 import 整理已经过去 20 分钟了", "should_trigger": false},
+  {"query": "刚那个 GitHub Actions job 取消一下，build-and-deploy 那条线，commit sha 是 a1b2c3d", "should_trigger": false},
+  {"query": "帮我把这段 React 组件里的 useEffect 重写成 useMemo + useCallback，文件在 web/src/components/UserCard.tsx 第 40-80 行", "should_trigger": false},
+  {"query": "我在 daytona sandbox 里跑 pytest 卡在 collection 阶段，能帮我看下 logs 吗，sandbox id 是 sb_aaaa", "should_trigger": false},
+  {"query": "/Users/fanye/repos/playground 这个仓库 git status 现在干净吗？分支 ahead/behind 多少", "should_trigger": false},
+  {"query": "cron 里那个 daily-digest 的 schedule 还有效吗，上次跑是什么时候，下次什么时候触发", "should_trigger": false},
+  {"query": "我有个 long-running 的 python 训练脚本，想 nohup 丢到后台然后用 tail -f 看 log，正确写法是啥", "should_trigger": false}
+]
