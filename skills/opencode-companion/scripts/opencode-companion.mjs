@@ -702,26 +702,6 @@ function extractToolInputSummary(part) {
   return "";
 }
 
-function extractToolOutputSummary(part) {
-  const directCandidates = [
-    part?.output,
-    part?.state?.output,
-    part?.state?.result,
-    part?.result,
-    part?.state?.message,
-    part?.state?.text,
-    part?.message,
-    part?.text
-  ];
-  for (const candidate of directCandidates) {
-    const summary = summarizeScalarValue(candidate);
-    if (summary) {
-      return summary;
-    }
-  }
-  return "";
-}
-
 function extractToolDescription(part) {
   const directCandidates = [
     part?.description,
@@ -817,6 +797,53 @@ function buildTraceEntryKey(entry) {
   return [entry.sessionId ?? "", entry.type ?? "", entry.label ?? "", entry.text ?? "", ...(entry.detailLines ?? [])].join("::");
 }
 
+function compactSingleLineText(value) {
+  return String(value ?? "")
+    .replace(/\r/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactTraceSummaryText(value) {
+  return String(value ?? "")
+    .replace(/\r/g, "")
+    .split(/\n+/)
+    .map((segment) => compactSingleLineText(segment))
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function stripSimpleMarkdown(value) {
+  return String(value ?? "")
+    .replace(/[`*_#~]+/g, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1");
+}
+
+function formatLiveReasoningText(value, maxChars = 160) {
+  const compact = compactTraceSummaryText(stripSimpleMarkdown(value));
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+function formatTraceEntryInline(entry) {
+  if (!entry) {
+    return "";
+  }
+  const detailSuffix = Array.isArray(entry.detailLines) && entry.detailLines.length > 0
+    ? ` — ${entry.detailLines.join(" — ")}`
+    : "";
+  if (entry.type === "reasoning") {
+    const text = compactTraceSummaryText(entry.text);
+    return text ? `${entry.label}: ${text}${detailSuffix}` : `${entry.label}${detailSuffix}`;
+  }
+  if (entry.text) {
+    return `${entry.label ? `${entry.label}: ` : ""}${compactTraceSummaryText(entry.text)}${detailSuffix}`.trim();
+  }
+  return `${entry.label ?? ""}${detailSuffix}`.trim();
+}
+
 function buildReasoningTraceEntry(part, sessionId = null) {
   const text = extractReadablePartText(part, new Set(["text", "reasoning", "analysis", "content", "delta", "message", "body", "markdown", "summary"]));
   if (!text) {
@@ -826,7 +853,7 @@ function buildReasoningTraceEntry(part, sessionId = null) {
     sessionId,
     type: "reasoning",
     label: "thinking",
-    text: truncateTraceHead(text, MAX_RENDERED_TRACE_TEXT_CHARS)
+    text: truncateTraceHead(compactTraceSummaryText(text), MAX_RENDERED_TRACE_TEXT_CHARS)
   };
 }
 
@@ -847,31 +874,21 @@ function buildToolTraceEntry(part, sessionId = null, hierarchyContext = null, op
   const name = getToolPartName(part) || String(readObjectField(part, ["name", "toolName", "tool_name"]) ?? "tool").trim().toLowerCase() || "tool";
   const state = getToolPartState(part);
   const detailLines = [];
-  const command = extractToolCommand(part);
-  if (command) {
-    detailLines.push(`command: ${truncateTraceHead(command, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
-  }
-  const description = extractToolDescription(part);
-  if (description && description !== command) {
-    detailLines.push(`description: ${truncateTraceHead(description, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
-  }
-  const subagent = extractToolSubagent(part);
-  if (subagent) {
-    detailLines.push(`subagent: ${truncateTraceHead(subagent, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
-  }
-  const inputSummary = extractToolInputSummary(part);
-  if (inputSummary && inputSummary !== command && inputSummary !== description) {
-    detailLines.push(`input: ${truncateTraceHead(inputSummary, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
-  }
-  if (options.includeOutput !== false) {
-    const output = extractToolOutputSummary(part);
-    if (output) {
-      detailLines.push(`output: ${truncateTraceTail(output, MAX_RENDERED_TRACE_DETAIL_CHARS)}`);
-    }
-  }
   const exitCode = extractToolExitCode(part);
-  if (exitCode) {
-    detailLines.push(`exit: ${exitCode}`);
+  const command = compactSingleLineText(extractToolCommand(part));
+  const description = compactSingleLineText(extractToolDescription(part));
+  const subagent = compactSingleLineText(extractToolSubagent(part));
+  const inputSummary = compactSingleLineText(extractToolInputSummary(part));
+  const compactCommand = command ? truncateTraceHead(command, MAX_RENDERED_TRACE_DETAIL_CHARS) : "";
+  const compactDescription = description ? truncateTraceHead(description, MAX_RENDERED_TRACE_DETAIL_CHARS) : "";
+  const compactSubagent = subagent ? truncateTraceHead(subagent, MAX_RENDERED_TRACE_DETAIL_CHARS) : "";
+  const compactInputSummary = inputSummary ? truncateTraceHead(inputSummary, MAX_RENDERED_TRACE_DETAIL_CHARS) : "";
+  const primaryDetail = compactCommand
+    || [compactSubagent, compactDescription && compactDescription !== compactSubagent ? compactDescription : ""].filter(Boolean).join(" — ")
+    || compactDescription
+    || compactInputSummary;
+  if (exitCode && exitCode !== "0") {
+    detailLines.push(`exit ${exitCode}`);
   }
   const sessions = describeToolSessionIds(part, hierarchyContext);
   if (sessions) {
@@ -880,7 +897,7 @@ function buildToolTraceEntry(part, sessionId = null, hierarchyContext = null, op
   return {
     sessionId,
     type: "tool",
-    label: state ? `${name} [${state}]` : name,
+    label: `${name}${state ? ` [${state}]` : ""}${primaryDetail ? `: ${primaryDetail}` : ""}`,
     detailLines
   };
 }
@@ -935,21 +952,9 @@ function buildTraceEntriesFromMessages(messages, options = {}) {
 
 function renderTraceEntriesAsText(entries) {
   return entries
-    .map((entry) => {
-      const segments = [];
-      if (entry.type === "reasoning" || entry.type === "tool") {
-        segments.push(`${entry.label}`);
-      }
-      if (entry.text) {
-        segments.push(entry.text);
-      }
-      if (entry.detailLines?.length) {
-        segments.push(entry.detailLines.join("\n"));
-      }
-      return segments.filter(Boolean).join("\n").trim();
-    })
+    .map((entry) => formatTraceEntryInline(entry))
     .filter(Boolean)
-    .join("\n\n")
+    .join("\n")
     .trim();
 }
 
@@ -1012,17 +1017,16 @@ function renderExecutionTraceSection(entries, hierarchyContext = null, options =
       lines.push("");
     }
     for (const entry of limitedEntries) {
-      lines.push(`- ${entry.label}`);
-      if (entry.text) {
-        lines.push(renderIndentedMultiline(entry.text));
+      const inlineEntry = formatTraceEntryInline(entry);
+      if (inlineEntry) {
+        lines.push(`- ${inlineEntry}`);
       }
-      for (const detailLine of entry.detailLines ?? []) {
-        lines.push(renderIndentedMultiline(detailLine));
-      }
-      lines.push("");
     }
     if (omittedSessionEntries > 0) {
-      lines.push(`- … ${omittedSessionEntries} earlier trace entr${omittedSessionEntries === 1 ? "y" : "ies"} omitted`, "");
+      lines.push(`- … ${omittedSessionEntries} earlier trace entr${omittedSessionEntries === 1 ? "y" : "ies"} omitted`);
+    }
+    if (multipleSessions) {
+      lines.push("");
     }
   }
 
@@ -1030,7 +1034,7 @@ function renderExecutionTraceSection(entries, hierarchyContext = null, options =
     lines.pop();
   }
   if (skippedEntryCount > 0) {
-    lines.push("", `- … ${skippedEntryCount} earlier trace entr${skippedEntryCount === 1 ? "y" : "ies"} omitted`);
+    lines.push(`- … ${skippedEntryCount} earlier trace entr${skippedEntryCount === 1 ? "y" : "ies"} omitted`);
   }
   return `${lines.join("\n")}\n`;
 }
@@ -1213,7 +1217,6 @@ function buildTaskResult({
 
 function renderTaskSummary(result) {
   const lines = [
-    "",
     "",
     "--- OpenCode Result ---",
     `Session ID: ${result.session_id}`,
@@ -1831,7 +1834,7 @@ function isCompletedToolTraceEntry(entry) {
   if (!entry || entry.type !== "tool") {
     return false;
   }
-  return /\[(completed|complete|done|success)\]$/i.test(String(entry.label ?? "").trim());
+  return /\[(completed|complete|done|success)\](?::|$)/i.test(String(entry.label ?? "").trim());
 }
 
 function looksTraceCompleteRecentlyFinishedSession(details, subtreeSummary, recentTraceEntries = []) {
@@ -2448,6 +2451,9 @@ function createTextStreamPrinter() {
   let output = "";
   let lastBlockType = null;
   const seenReasoningParts = new Set();
+  const reasoningBuffers = new Map();
+  const reasoningPrinted = new Map();
+  let hasTraceOutput = false;
 
   function printDelta(snippet) {
     const normalized = String(snippet ?? "").replace(/\r/g, "");
@@ -2465,23 +2471,10 @@ function createTextStreamPrinter() {
     }
   }
 
-  function ensureBlankLine() {
-    if (!output) {
-      return;
-    }
-    if (output.endsWith("\n\n")) {
-      return;
-    }
-    if (!output.endsWith("\n")) {
-      printDelta("\n");
-    }
-    printDelta("\n");
-  }
-
   return {
     handleTextDelta(delta) {
       if (lastBlockType && lastBlockType !== "text") {
-        ensureBlankLine();
+        ensureLineBreak();
       }
       lastBlockType = "text";
       printDelta(delta);
@@ -2491,24 +2484,39 @@ function createTextStreamPrinter() {
       if (!normalized) {
         return;
       }
+      const nextBuffer = `${reasoningBuffers.get(partId) ?? ""}${normalized}`;
+      reasoningBuffers.set(partId, nextBuffer);
+      const compactText = formatLiveReasoningText(nextBuffer);
+      if (!compactText) {
+        return;
+      }
       if (!seenReasoningParts.has(partId)) {
-        ensureBlankLine();
-        printDelta("Thinking:\n");
+        ensureLineBreak();
+        printDelta("thinking: ");
         seenReasoningParts.add(partId);
       }
+      const previousPrinted = reasoningPrinted.get(partId) ?? "";
+      if (compactText.startsWith(previousPrinted)) {
+        const suffix = compactText.slice(previousPrinted.length);
+        if (suffix) {
+          printDelta(suffix);
+        }
+      }
+      reasoningPrinted.set(partId, compactText);
+      hasTraceOutput = true;
       lastBlockType = "reasoning";
-      printDelta(normalized);
-      ensureLineBreak();
     },
     handleToolEvent(entry) {
       if (!entry) {
         return;
       }
-      ensureBlankLine();
-      printDelta(`${entry.label}\n`);
-      for (const detailLine of entry.detailLines ?? []) {
-        printDelta(`${renderIndentedMultiline(detailLine)}\n`);
+      const inlineEntry = formatTraceEntryInline(entry);
+      if (!inlineEntry) {
+        return;
       }
+      ensureLineBreak();
+      printDelta(`${inlineEntry}\n`);
+      hasTraceOutput = true;
       lastBlockType = "tool";
     },
     handleDelta(delta) {
@@ -2516,6 +2524,12 @@ function createTextStreamPrinter() {
     },
     getOutput() {
       return output;
+    },
+    hasTraceOutput() {
+      return hasTraceOutput;
+    },
+    ensureLineBreak() {
+      ensureLineBreak();
     }
   };
 }
@@ -3143,16 +3157,20 @@ async function monitorSession({
               trackToolPartSnapshot(eventSessionId, partInfo, properties.partID || properties.messageID || "task");
             }
             if (partInfo.type === "tool" && isMonitoredEventSession(eventSessionId)) {
-              const entry = buildToolTraceEntry(partInfo, eventSessionId, null, {
-                includeOutput: isTerminalToolState(getToolPartState(partInfo))
-              });
+              const entry = buildToolTraceEntry(partInfo, eventSessionId, null);
               if (entry) {
                 const displayEntry = eventSessionId && eventSessionId !== sessionId
                   ? { ...entry, label: `${eventSessionId} · ${entry.label}` }
                   : entry;
                 const signature = buildTraceEntryKey(displayEntry);
                 const toolPartKey = `${eventSessionId}:${partInfo.id || properties.partID || properties.messageID || "tool"}`;
-                if (printedToolSignatures.get(toolPartKey) !== signature) {
+                const priorSignature = printedToolSignatures.get(toolPartKey);
+                const toolState = getToolPartState(partInfo);
+                const toolExitCode = extractToolExitCode(partInfo);
+                const shouldPrintToolEvent = !priorSignature
+                  ? toolState !== "pending"
+                  : toolState === "failed" || (toolState === "completed" && toolExitCode && toolExitCode !== "0" && priorSignature !== signature);
+                if (shouldPrintToolEvent) {
                   printedToolSignatures.set(toolPartKey, signature);
                   printer.handleToolEvent(displayEntry);
                 }
@@ -3170,7 +3188,7 @@ async function monitorSession({
               if (eventSessionId === sessionId) {
                 printer.handleReasoningDelta(properties.partID || properties.messageID || "reasoning", properties.delta);
               }
-            } else if (eventSessionId === sessionId) {
+            } else if (knownType !== "tool" && eventSessionId === sessionId) {
               if (lastPrintedSessionId !== sessionId) {
                 lastPrintedSessionId = sessionId;
               }
@@ -3298,6 +3316,7 @@ async function monitorSession({
       pendingToolWaitLogged = false;
 
       if (isMainFailedTerminal) {
+        printer.ensureLineBreak();
         log(`Finished (session status ${mainSessionStatus}) in directory ${directory}.`);
         return {
           done: true,
@@ -3311,6 +3330,7 @@ async function monitorSession({
       }
 
       if (hierarchyProgress.hasFailedDescendants) {
+        printer.ensureLineBreak();
         log("Finished (descendant session status failed) in directory " + directory + ".");
         return {
           done: true,
@@ -3325,6 +3345,7 @@ async function monitorSession({
       }
 
       if (isMainSuccessfulTerminal && !hierarchyProgress.hasPendingDescendants) {
+        printer.ensureLineBreak();
         log(`Finished (session status ${mainSessionStatus}) in directory ${directory}.`);
         return {
           done: true,
@@ -3345,6 +3366,7 @@ async function monitorSession({
         hierarchyProgress.pendingSessionIds.length === 0 &&
         msSinceMainActivity >= QUIESCENCE_TIMEOUT_MS;
       if (reachedQuiescenceFallback) {
+        printer.ensureLineBreak();
         log(`Finished (quiescence) in directory ${directory}.`);
         return {
           done: true,
@@ -3364,6 +3386,7 @@ async function monitorSession({
         hierarchyProgress.pendingSessionIds.length === 0 &&
         msSinceDirectoryActivity >= FORCE_QUIESCENCE_TIMEOUT_MS;
       if (reachedDelegatedFallback) {
+        printer.ensureLineBreak();
         log(`Finished (settled after delegated activity) in directory ${directory}.`);
         return {
           done: true,
@@ -3624,7 +3647,7 @@ async function monitorSession({
   const recentTraceText = renderTraceEntriesAsText(recentTraceEntries);
   const streamedLength = printer.getOutput().trim().length;
   const resultLength = (result.combined_text || "").length;
-  if (recentTraceText && !printer.getOutput().includes(recentTraceText)) {
+  if (recentTraceText && !printer.hasTraceOutput()) {
     process.stdout.write(`\n${recentTraceText}\n`);
   }
   // Print combined_text if streaming missed significant content (>50% longer from API)
