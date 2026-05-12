@@ -1001,6 +1001,9 @@ function renderExecutionTraceSection(entries, hierarchyContext = null, options =
     : sessionIds;
 
   const lines = ["## Recent execution trace", ""];
+  if (skippedEntryCount > 0) {
+    lines.push(`- … ${skippedEntryCount} earlier trace entr${skippedEntryCount === 1 ? "y" : "ies"} omitted`);
+  }
   const multipleSessions = grouped.size > 1;
   for (const sessionId of orderedSessionIds) {
     const sessionEntries = grouped.get(sessionId) ?? [];
@@ -1016,14 +1019,14 @@ function renderExecutionTraceSection(entries, hierarchyContext = null, options =
       lines.push(`### ${sessionId === "__unknown__" ? "session" : sessionId}${statusSuffix}`);
       lines.push("");
     }
+    if (omittedSessionEntries > 0) {
+      lines.push(`- … ${omittedSessionEntries} earlier trace entr${omittedSessionEntries === 1 ? "y" : "ies"} omitted`);
+    }
     for (const entry of limitedEntries) {
       const inlineEntry = formatTraceEntryInline(entry);
       if (inlineEntry) {
         lines.push(`- ${inlineEntry}`);
       }
-    }
-    if (omittedSessionEntries > 0) {
-      lines.push(`- … ${omittedSessionEntries} earlier trace entr${omittedSessionEntries === 1 ? "y" : "ies"} omitted`);
     }
     if (multipleSessions) {
       lines.push("");
@@ -1032,9 +1035,6 @@ function renderExecutionTraceSection(entries, hierarchyContext = null, options =
 
   while (lines.length > 0 && !lines.at(-1)) {
     lines.pop();
-  }
-  if (skippedEntryCount > 0) {
-    lines.push(`- … ${skippedEntryCount} earlier trace entr${skippedEntryCount === 1 ? "y" : "ies"} omitted`);
   }
   return `${lines.join("\n")}\n`;
 }

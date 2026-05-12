@@ -308,6 +308,8 @@ describe("session usage rendering", () => {
     expect(view).toContain("Child activity 5");
     expect(view).toContain("Child activity 4");
     expect(view).toContain("Child activity 3");
+    expect(view).toContain("- … 2 earlier trace entries omitted");
+    expect(view.indexOf("- … 2 earlier trace entries omitted")).toBeLessThan(view.indexOf("Child activity 3"));
     expect(view).not.toContain("Child activity 2");
     expect(view).not.toContain("Child activity 1");
   });
