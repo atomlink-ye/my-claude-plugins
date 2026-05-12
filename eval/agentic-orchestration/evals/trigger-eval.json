@@ -1,0 +1,15 @@
+[
+  {"query": "这个 feature 改动跨 6 个文件，外加要跑两轮 test，我应该自己干还是切一个独立 lane 出去？怎么判断", "should_trigger": true},
+  {"query": "我让一个 agent 跑 implementation，跑完后能不能让同一个 agent review 自己写的代码，还是必须独立 reviewer", "should_trigger": true},
+  {"query": "你能不能把 lead/lane split、独立 review、acceptance gate 这套原则讲一下我打算照着搭一个 orchestration 流程", "should_trigger": true},
+  {"query": "我 fix 完之后是不是要再 advisory review 一次，advisory 用同一个 session 还是必须 fresh", "should_trigger": true},
+  {"query": "什么时候应该 reuse 一个 OpenCode/Paseo session 做 fix round，什么时候应该 fresh 起一个新 lane，给我一个判断规则", "should_trigger": true},
+  {"query": "我现在有 4 个并行任务可以丢出去做，但 acceptance 要不要每个都自己挨个看 diff，能不能 batch 接收", "should_trigger": true},
+
+  {"query": "把这个 session 的 attach 命令再贴一下，我要 reconnect 那个 ses_xxxx 看一下进度", "should_trigger": false},
+  {"query": "openai/gpt-5.4 跟 claude-opus 在 review 任务上谁更适合，能给个对比吗", "should_trigger": false},
+  {"query": "我的 Daytona sandbox 是不是挂了，preview 401 半天", "should_trigger": false},
+  {"query": "帮我看一下这段 typescript 的类型错误为啥推断不出 Result<T,E> 的 narrow", "should_trigger": false},
+  {"query": "下周一前要把 onboarding 流程做完，我先列个 todo 再说", "should_trigger": false},
+  {"query": "git rebase -i 时怎么把中间两个 commit squash 掉", "should_trigger": false}
+]

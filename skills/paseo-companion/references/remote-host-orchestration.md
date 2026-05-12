@@ -35,7 +35,7 @@ Use detached agents for long remote work:
 agent_id="$(
   paseo run --host "$REMOTE_PASEO_HOST" \
     --provider opencode \
-    --model openai/gpt-5.4 \
+    --model <provider/model> \
     --mode orchestrator \
     --thinking high \
     --cwd /workspace \

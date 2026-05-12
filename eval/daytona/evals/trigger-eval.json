@@ -1,0 +1,15 @@
+[
+  {"query": "起一个 daytona sandbox，把当前目录 push 上去，远程跑 pnpm test 然后 pull artifacts 回来", "should_trigger": true},
+  {"query": "daytona status 一下我现在这个项目对应的 sandbox 还活着不", "should_trigger": true},
+  {"query": "我有一个外部 sandbox_id 是 sb_aaaa，怎么 adopt 进 manager 然后继续 exec", "should_trigger": true},
+  {"query": "daytona sandbox 里有一个 6767 端口的 paseo daemon，能 preview 出来给本地用吗", "should_trigger": true},
+  {"query": "想用 daytona git-mode push 把当前分支 commit 全部 sync 过去，分支名 daytona/task-001", "should_trigger": true},
+  {"query": "跑一遍 daytona smoke-test 看 lifecycle 完不完整，包含 git + preview", "should_trigger": true},
+
+  {"query": "本地 pnpm test 内存炸了，我有什么办法在不动代码的前提下让它过", "should_trigger": false},
+  {"query": "ssh 到我那台 EC2 上把 pm2 list 看一下", "should_trigger": false},
+  {"query": "OpenCode session attach 命令是哪个", "should_trigger": false},
+  {"query": "paseo daemon 起在 6767 端口怎么验证", "should_trigger": false},
+  {"query": "Railway 这个 service 怎么改 env var", "should_trigger": false},
+  {"query": "Docker 的 buildx 怎么 cross-compile arm64", "should_trigger": false}
+]

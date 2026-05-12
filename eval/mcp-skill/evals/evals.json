@@ -1,0 +1,27 @@
+{
+  "skill_name": "mcp-skill",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "用 mcporter 列一下当前 config 里有哪些 MCP server，给我一个简短的清单",
+      "expected_output": "A response that runs (or prepares to run) `mcporter list --config ~/.mcporter/mcporter.json` and reports the resulting server names. The assistant should NOT propose installing a global MCP server, NOT propose adding entries to opencode.json, and NOT skip the --config flag.",
+      "expectations": [
+        "The response invokes or quotes the exact command `mcporter list --config ~/.mcporter/mcporter.json`",
+        "The response references the SKILL.md rule that the --config flag is always required",
+        "The response does not propose modifying opencode.json or adding servers globally",
+        "The response respects the principle 'do not print secrets or inspect credential files'"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "我想用 context7 拉 react hooks 的最新文档给我看一下",
+      "expected_output": "A response that calls context7 through mcporter, first resolving the library id, then fetching the docs. Should use --config and quote the actual mcporter call syntax. Should prefer HTTP MCPs over stdio MCPs for this task.",
+      "expectations": [
+        "The response uses `mcporter call context7.resolve-library-id` before `context7.get-library-docs`",
+        "Every mcporter call includes `--config ~/.mcporter/mcporter.json`",
+        "The response prefers the HTTP MCP path over a local stdio path",
+        "The response does not start a long-lived MCP daemon"
+      ]
+    }
+  ]
+}

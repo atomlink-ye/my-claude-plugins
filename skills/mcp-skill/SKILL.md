@@ -1,6 +1,7 @@
 ---
 name: mcp-skill
-description: Use MCPorter to call MCP servers on demand without keeping MCP servers running in OpenCode.
+description: "On-demand MCP capability invocation via MCPorter. Use when the task needs browser automation (Playwright), documentation lookup (Context7), repository reading (zread), web search (web-search-prime), remote URL reading (web-reader), or any other MCP server. Use whenever you would otherwise want a persistent MCP server but the runtime is configured with no global MCP servers, so each MCP call must go through MCPorter."
+user-invocable: false
 ---
 
 # MCP Skill
