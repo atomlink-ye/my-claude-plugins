@@ -1072,6 +1072,39 @@ function collectAssistantNodes(value, nodes = []) {
   return nodes;
 }
 
+function inferCompletedAssistantReply(messages) {
+  const assistantNode = collectAssistantNodes(messages).at(-1);
+  if (!assistantNode || typeof assistantNode !== "object") {
+    return null;
+  }
+
+  const info = assistantNode.info && typeof assistantNode.info === "object" ? assistantNode.info : {};
+  const parts = Array.isArray(assistantNode.parts) ? assistantNode.parts : [];
+  const finish = String(info.finish ?? "").trim().toLowerCase();
+  const completedAt = Number.isFinite(info?.time?.completed) ? info.time.completed : null;
+  const textParts = parts
+    .filter((part) => part?.type === "text" && typeof part?.text === "string")
+    .map((part) => part.text.trim())
+    .filter(Boolean);
+  const hasStepFinish = parts.some((part) => String(part?.type ?? "").trim().toLowerCase() === "step-finish");
+  const hasTerminalFinish = new Set(["stop", "length", "content_filter", "max_tokens"]).has(finish);
+
+  if (!textParts.length) {
+    return null;
+  }
+
+  if ((completedAt || hasStepFinish) && (hasTerminalFinish || hasStepFinish)) {
+    return {
+      completedAt,
+      finish: finish || null,
+      hasStepFinish,
+      text: textParts.join("\n\n")
+    };
+  }
+
+  return null;
+}
+
 function extractFileChanges(value) {
   const results = [];
   const seen = new Set();
@@ -2875,7 +2908,10 @@ async function monitorSession({
   // settled before the directory itself is).
   const HIERARCHY_PENDING_GRACE_MS = readHierarchyPendingGraceMs();
   const STATUS_POLL_INTERVAL_MS = readEnvDurationMs("OPENCODE_STATUS_POLL_INTERVAL_MS", 1500);
-  const STREAM_CLOSE_GRACE_MS = readEnvDurationMs("OPENCODE_STREAM_CLOSE_GRACE_MS", 4000);
+  // OpenCode 1.14.46 can close the SSE event stream several seconds before the
+  // session reaches a terminal idle/completed state in persistence. Keep polling
+  // long enough to let session/message state catch up before declaring failure.
+  const STREAM_CLOSE_GRACE_MS = readEnvDurationMs("OPENCODE_STREAM_CLOSE_GRACE_MS", 10000);
   const SETTLING_CHECK_INTERVAL_MS = readEnvDurationMs("OPENCODE_SETTLING_CHECK_INTERVAL_MS", 1000);
   const timeoutMs = timeoutMins * 60 * 1000;
   const startTime = Date.now();
@@ -3349,6 +3385,7 @@ async function monitorSession({
     log("Event stream closed before a terminal root status; reconciling via session polling...");
     let settleDeadline = null;
     let reconciledResult = null;
+    let lastReconcileSnapshot = null;
     while (!onSignalAbort.triggered) {
       try {
         if (canUseStatusPolling()) {
@@ -3403,6 +3440,14 @@ async function monitorSession({
       const hasSeenActivity = directorySessions.size > 0;
       const msSinceMainActivity = now - lastMainSessionActivityAt;
       const msSinceDirectoryActivity = now - lastDirectoryActivityAt;
+      lastReconcileSnapshot = {
+        mainSessionStatus,
+        hierarchyProgress,
+        pendingToolSessionIds,
+        hasSeenActivity,
+        msSinceMainActivity,
+        msSinceDirectoryActivity
+      };
 
       if (isMainFailedTerminal) {
         reconciledResult = {
@@ -3483,6 +3528,34 @@ async function monitorSession({
       }
 
       await delay(100);
+    }
+
+    if (!reconciledResult && lastReconcileSnapshot) {
+      try {
+        const finalMessages = await listSessionMessages(baseUrl, directory, sessionId);
+        const completionEvidence = inferCompletedAssistantReply(finalMessages);
+        const pendingDescendants = lastReconcileSnapshot.hierarchyProgress?.hasPendingDescendants === true;
+        const pendingToolSessionIds = Array.isArray(lastReconcileSnapshot.pendingToolSessionIds)
+          ? lastReconcileSnapshot.pendingToolSessionIds
+          : [];
+        if (completionEvidence && !pendingDescendants && pendingToolSessionIds.length === 0) {
+          log(
+            `Recovered completion from persisted assistant reply after stream close${completionEvidence.finish ? ` (finish=${completionEvidence.finish})` : ""}.`
+          );
+          reconciledResult = {
+            done: true,
+            completionMode: "message_completion",
+            terminalStatus: "completed",
+            rawSessionStatus: lastReconcileSnapshot.mainSessionStatus,
+            hierarchyVerdict: "message_completed",
+            hasPendingDescendants: false,
+            hasFailedDescendants: lastReconcileSnapshot.hierarchyProgress?.hasFailedDescendants === true,
+            pendingToolSessionIds
+          };
+        }
+      } catch {
+        // Ignore message fetch failures and fall through to the original error.
+      }
     }
 
     if (!reconciledResult) {

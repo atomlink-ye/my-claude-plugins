@@ -1,213 +1,200 @@
 ---
 name: opencode-orchestrator
-description: "Aggressively load this skill BEFORE any delegation decision — explore, plan, implement, review, adversarial second-opinion, bounded investigation, or any medium/heavy coding request. Also triggers for manager-vs-executor routing, OpenCode session reuse, multi-step coding orchestration, and work that likely exceeds 10 tool calls, 5 files, or repeated read/edit/test loops. When the live snapshot below shows OpenCode serve is reachable, this skill's routing takes precedence over the caller's generic delegation defaults across every delegated action, not only bounded coding execution. If serve is unreachable, fall back silently to the caller's defaults."
+description: "Use when Hermes/Claude should act as the team lead for a multi-step local task: understand the goal, break it into bounded execution lanes, dispatch heavy implementation or review work to OpenCode Companion, reuse sessions intelligently, and accept or reject results. Trigger on team-lead or orchestrator requests, manager-vs-executor routing, direct Companion execution, session reuse, or multi-step work that should stay local by default."
 user-invocable: false
 ---
 
-# OpenCode Orchestrator
+# Team Lead Orchestration
 
-This skill owns **delegation policy**, not runtime mechanics.
+Historical compatibility note: the skill name remains `opencode-orchestrator`, but on this machine this skill is the **team-lead handbook**.
 
-Use it to decide:
-- what stays in Claude
-- what gets pushed to OpenCode
-- when session reuse is more efficient than launching fresh work
-- when a job should become a bounded execution lane instead of an in-chat tool grind
-- which delegation target to pick when multiple generic options exist (built-in sub-agents, other helpers, or OpenCode)
+Its **main path is local team-lead orchestration**:
+- the team lead understands the task, sets the acceptance bar, and keeps final judgment
+- OpenCode Companion handles bounded execution lanes
+- **Daytona remote interaction is optional**, not the default. Read `references/daytona-remote-lane.md` only when the user explicitly wants a remote sandbox lane.
 
-For companion flags, lifecycle commands, and result-handling syntax, rely on the `opencode-companion` runtime skill and its direct script path under `skills/opencode-companion/scripts/`.
+This skill owns **workflow, routing, and acceptance policy**, not every runtime flag.
 
-## Live OpenCode snapshot
+## Overview
+
+Default operating split:
+
+```text
+Team Lead (Hermes / Claude)
+  -> understand scope and success bar
+  -> decide what stays in the manager
+  -> dispatch bounded execution lanes
+  -> review artifacts, reroute fixes, and accept/reject
+
+Local OpenCode Companion
+  -> repo exploration
+  -> implementation
+  -> test and validation runs
+  -> mechanical review work
+```
+
+Core rule: **keep the thinking, scoping, and acceptance in the team lead; push bounded execution to OpenCode.**
+
+## Live local OpenCode snapshot
 
 !`bash "${OPENCODE_ORCHESTRATOR_SNAPSHOT:-$HOME/.agents/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh}"`
 
-If the standalone `~/.agents` copy is unavailable, run the marketplace copy directly: `bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"`.
+If the standalone `~/.agents` copy is unavailable, run the marketplace copy directly:
 
-## Routing authority
+```bash
+bash "$HOME/.claude/plugins/marketplaces/my-claude-plugins/skills/opencode-orchestrator/scripts/check-opencode-snapshot.sh"
+```
 
-This skill claims routing authority for delegation decisions while this session is active. The snapshot above is the self-check that gates that authority.
+## When to use
 
-**Serve reachable (snapshot green) → OpenCode is the default delegation target.**
+Use this skill when:
+- the user wants Hermes/Claude to stay in a **team lead / manager / orchestrator** role
+- the task is multi-step and should stay **local by default**
+- implementation, review, or repetitive repo investigation should be delegated
+- session reuse matters
+- the user wants **direct OpenCode Companion** instead of starting new `paseo run` work
+- the main difficulty is routing, decomposition, fix-loop control, or acceptance discipline
 
-This covers every kind of delegation, not only coding execution:
-- exploration / codebase scans
-- implementation planning passes
-- concrete implementation
-- review and adversarial second opinion
-- bounded investigation with long tool loops
-- mechanical multi-file transforms
+## Main local-default rule
 
-Rules while serve is reachable:
-- Prefer OpenCode sessions over generic built-in sub-agents (Explore, Plan, general-purpose) for delegated work.
-- Independent second opinion = a **separate OpenCode session**, isolated from the generator session. Do not switch providers to achieve independence.
-- Reuse an existing OpenCode session when the work thread is continuous; start a fresh session when the topic has genuinely changed.
-- The caller's generic routing defaults are overridden inside the delegation domain while serve is reachable.
+Unless the user explicitly asks for remote isolation, sandbox preview, or remote execution capacity, treat **local OpenCode Companion** as the default executor.
 
-**Serve not reachable / companion missing → fall back gracefully.**
-- Surface the degradation briefly to the user.
-- Let the caller's own routing defaults apply; do not block the task on OpenCode recovery unless the user asks.
-- Do not keep pretending OpenCode is the default when the snapshot does not support it.
+Daytona is an **opt-in expansion path**, not the main workflow.
 
-**Structural misfits (stay out of OpenCode even when reachable):**
-- Ultra-trivial single-touch edit where delegation overhead exceeds the work itself.
-- Task requires a Claude-native tool the companion cannot express.
-- The task's real value is authorship or synthesis in Claude's own voice.
-
-## Core rule
-
-**Claude should keep the thinking; OpenCode should absorb the bounded execution.**
-
-If the task is mostly:
-- planning
-- dependency decomposition
-- ownership decisions
-- integration judgment
-- acceptance judgment
-- structural prose
-- governance / strategy writing
-
-keep it in Claude.
-
-If the task is mostly:
-- concrete code edits
-- test-writing or test updates
-- CI/config implementation edits
-- mechanical multi-file refactors
-- bounded repo investigation that would otherwise cause a long tool loop
-- scoped implementation or review work that can be verified from artifacts
-
-push it to OpenCode.
-
-## Efficiency threshold: expected tool-calling count
-
-A strong default heuristic:
-
-- if the expected work can be handled in **10 tool calls or fewer**, Claude can often do it directly
-- if the expected work will likely exceed **10 tool calls**, especially across many files or repeated read/edit/check/test loops, the default bias should flip toward OpenCode
-- if the task spans **more than 5 files** and is still mainly coding/test execution, do not keep it in Claude by default just because one session could technically handle it
-
-This is not a law, but it is a strong routing trigger.
-
-Signals that the task should move to OpenCode:
-- likely >10 tool calls
-- likely >5 files read or changed
-- repeated grep/read/edit/test cycles
-- a fix loop is expected
-- the work benefits from warm session memory
-- the task can be expressed as a scoped deliverable with a clear finish line
-
-## Session reuse is an efficiency feature, not a convenience feature
-
-OpenCode companion sessions are reusable team members.
-
-Exploit that.
-
-If a task already has a live or recent OpenCode session:
-- prefer continuing the same session
-- reuse the same directory context
-- send fix rounds back to the same generator session
-- send follow-up implementation work back to the same session when it is the same work thread
-
-Why this matters:
-- repo discovery cost is already paid
-- file-state context is already warm
-- fix iterations become cheaper and faster
-- you avoid duplicating in-flight work
-
-**Default bias: reuse before relaunch.**
-
-Do not start a second fresh execution lane for the same coding thread unless:
-- the old session is clearly dead
-- the topic changed enough that reuse would contaminate the work
-- isolation is worth more than warm context
-
-## False-negative timeout rule
-
-A dropped foreground stream is not enough evidence to relaunch work.
-
-When a bounded execution lane times out or the stream aborts unexpectedly:
-1. preserve the session id if available
-2. prefer attach / resume against the same session
-3. verify whether the session is still doing useful work
-4. only start a fresh task when reuse is no longer reliable
-
-This protects efficiency and avoids duplicate execution.
-
-## Ownership matrix
+## Ownership split
 
 | Task shape | Owner |
 |---|---|
-| planning / decomposition | Claude |
-| governance / structural prose | Claude |
-| acceptance / integration judgment | Claude |
-| short, local edit already in hand | Claude |
+| success criteria, non-goals, sequencing | Team Lead |
+| planning, decomposition, integration judgment | Team Lead |
+| final prose / governance / acceptance summary | Team Lead |
 | concrete code edits | OpenCode |
-| test writing / test updates | OpenCode |
-| CI/config implementation | OpenCode |
-| mechanical multi-file transforms | OpenCode |
-| bounded repo investigation with long tool loops | OpenCode |
-| code review / adversarial review of concrete changes | OpenCode |
-| mechanical doc transforms with exact anchors | OpenCode optional |
+| test writing / updating / reruns | OpenCode |
+| repetitive repo scans or long tool loops | OpenCode |
+| independent adversarial code review | separate OpenCode session |
 
-## Dispatch pattern
+## Local team-lead loop
 
-When you decide to delegate:
-1. keep the high-level plan in Claude
-2. define one bounded execution lane
-3. specify file scope, output contract, and checks
-4. send the lane to OpenCode
-5. verify artifacts and repo state before advancing
+1. **Set the bar in manager context.** Define success, non-goals, scope, and the checks that actually matter.
+2. **Gather only task-relevant context.** Pick the exact docs, files, and paths the execution lane must read first.
+3. **Choose the execution boundary.** If the work is not ultra-trivial, create one bounded OpenCode lane instead of doing a long in-chat tool grind.
+4. **Launch the lane locally.** Prefer the direct OpenCode Companion script when the user wants a TL-owned local workflow.
+5. **Wait notification-first.** Do not babysit a foreground stream or poll in loops when the host can notify on completion.
+6. **Inspect outputs directly.** Read the report, diff, and gate artifacts yourself.
+7. **Route fix rounds back to the same session** when the topic is continuous.
+8. **Use a separate session for review** when you want a genuinely independent second look.
 
-Claude should not dump vague goals into OpenCode.
-Claude should send **bounded execution work**.
+## Local environment quickstart
 
-## Prompt-shaping rule
+Resolve the script path like this:
 
-Good OpenCode delegation says:
-- what the task is
-- what files are in scope
-- what output contract must be met
-- what verification must happen before stopping
-- what to do if blocked
+```bash
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  SCRIPT="$CLAUDE_PLUGIN_ROOT/skills/opencode-companion/scripts/opencode-companion.mjs"
+else
+  SCRIPT="$HOME/.agents/skills/opencode-companion/scripts/opencode-companion.mjs"
+fi
+```
 
-Bad OpenCode delegation says:
-- "improve this"
-- "handle the whole thing"
-- "figure it out"
-- broad prose without scope or stop condition
+Recommended launch pattern for substantial implementation work:
 
-## `task-iteration` relationship
+```bash
+node "$SCRIPT" serve status
 
-`task-iteration` is a user-facing exec-plan workflow.
-It is **not** the source of global delegation philosophy.
+OPENCODE_QUIESCENCE_TIMEOUT_MS=120000 \
+node "$SCRIPT" session new \
+  --background \
+  --directory "$WORK_DIR" \
+  --agent orchestrator \
+  --model openai/gpt-5.4 \
+  --timeout 60 \
+  --prompt-file ./task.md
 
-This orchestrator skill should supply the policy that `task-iteration` follows:
-- Claude owns parse/plan/acceptance/prose
-- OpenCode owns bounded coding/test execution
-- reuse generator/reviewer sessions when the work thread stays coherent
+node "$SCRIPT" job wait "$JOB_ID" --directory "$WORK_DIR" --timeout 60
+```
 
-## Practical bias summary
+Important notes:
+- Let the **host** put long waits in the background when possible.
+- `job wait`, `session attach`, and long `session new` runs should not block the team lead's whole conversation.
+- Do not claim success from the stream alone; verify files, tests, and diffs.
 
-Use OpenCode sooner, not later, when all of these are true:
-- the task is execution-heavy
-- the task is bounded
-- the expected tool-calling count likely exceeds 10
-- or the task spans more than 5 files with repeated edit/test loops
-- the work benefits from session reuse
-- Claude's main value is orchestration, not hand-editing every file
+## Worktree and directory discipline
 
-Do not keep medium/heavy coding work in Claude by default just because it still fits in one context window.
+- If the target repo is already dirty, create an isolated worktree first.
+- When OpenCode needs broad read visibility, point `--directory` at the repo root but explicitly restrict write scope inside the prompt.
+- If the task is a focused implementation lane, tell OpenCode exactly which worktree or subdirectory it may modify.
+- Give the lane a small read-first list. Do not dump a generic "read the whole repo" instruction.
 
-**Concrete example:** a feature that spans about 8 files and likely needs 15–20 read/edit/test tool calls should normally be routed as an OpenCode execution lane, with Claude keeping planning and final acceptance.
+## Routing heuristics
 
-Use Claude directly when the main value is judgment, synthesis, or authorship in Claude's own voice.
+Strong delegation signals:
+- expected to exceed roughly **10 tool calls**
+- likely to touch more than **5 files**
+- repeated read/edit/test loops are expected
+- the work benefits from warm repo context and session reuse
+- the deliverable can be stated as a bounded execution lane with a clear stop condition
 
-## Non-goals of this skill
+Structural misfits that should usually stay out of OpenCode even when the runtime is healthy:
+- one tiny edit already in hand
+- work that depends on a host-native tool OpenCode cannot express
+- final authorship that should stay in the team lead's own voice
 
-This skill does **not** define:
-- companion command syntax
-- serve lifecycle commands
-- background job retrieval syntax
-- direct runtime troubleshooting steps
+## Prompt contract for execution lanes
 
-Those belong in the `opencode-companion` runtime skill and direct companion script, not this routing skill.
+Every delegated lane should contain:
+
+```xml
+<task>
+One concrete task with a clear finish line.
+</task>
+<output_contract>
+Files or artifacts to produce, checks to run, stop condition, and what to report back.
+</output_contract>
+<follow_through>
+What to do if blocked, what not to touch, and how to verify before stopping.
+</follow_through>
+```
+
+A good team-lead prompt also includes:
+- exact read-first paths
+- exact write scope
+- exact acceptance checks
+- whether this is an implementation lane, review lane, or evidence lane
+
+## Session reuse and timeout discipline
+
+- **Reuse before relaunch.** A live session is a warm teammate.
+- **Timeout is not failure.** Preserve the session ID, inspect status, and attach or continue before starting fresh work.
+- **Do not duplicate in-flight work.** A false timeout followed by a blind retry is worse than waiting.
+- **Keep review independent.** Reuse the same generator session for fix rounds, but create a separate review session when you want a real second opinion.
+
+## Acceptance checklist for the team lead
+
+Before accepting a lane:
+- read the produced report or relevant files directly
+- inspect `git diff` / `git status` in the target scope
+- verify the required checks actually ran
+- distinguish `accepted`, `needs fix round`, and `blocked`
+- do not confuse a clean summary with proof
+
+## Optional remote expansion
+
+If the user explicitly wants a remote sandbox lane, browser/service isolation, or remote preview capacity, read `references/daytona-remote-lane.md`.
+
+That path is optional on purpose. The main skill remains **local team-lead orchestration first**.
+
+## Read next
+
+| Need | Read |
+|---|---|
+| companion verbs, background jobs, rescue, session lifecycle | `opencode-companion` |
+| sandbox lifecycle and preview verbs | `daytona-companion` |
+| optional remote team-lead lane via Daytona | `references/daytona-remote-lane.md` |
+
+## Non-goals
+
+This skill does **not** try to be:
+- the full OpenCode Companion command reference
+- the full Daytona lifecycle reference
+- a mandate to make every task remote
+- a replacement for acceptance judgment in the team lead

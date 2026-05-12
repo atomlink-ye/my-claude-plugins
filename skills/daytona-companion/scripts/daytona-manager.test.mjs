@@ -7,6 +7,7 @@ import {
   collectResources,
   parseArgs,
   parsePort,
+  readRemoteText,
   resolveRemoteHome,
   sanitizeTaskId,
   shellQuote,
@@ -92,4 +93,22 @@ test("remote home detection ignores shell warning lines", async () => {
     },
   };
   assert.equal(await resolveRemoteHome(sandbox), "/home/dev");
+});
+
+test("readRemoteText accepts SDK result/artifact stdout fields", async () => {
+  const sandbox = {
+    process: {
+      executeCommand: async (command) => {
+        assert.match(command, /cat '\/tmp\/stdout.txt'/);
+        return {
+          exitCode: 0,
+          result: "/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8): No such file or directory\nREMOTE_OUTPUT\n",
+          artifacts: {
+            stdout: "/usr/bin/bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8): No such file or directory\nREMOTE_OUTPUT\n",
+          },
+        };
+      },
+    },
+  };
+  assert.equal(await readRemoteText(sandbox, "/tmp/stdout.txt"), "REMOTE_OUTPUT\n");
 });

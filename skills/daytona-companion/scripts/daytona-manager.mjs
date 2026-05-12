@@ -483,12 +483,19 @@ async function readRemoteText(sandbox, remotePath) {
   const result = await sandboxExec(sandbox, `[ -f ${shellQuote(remotePath)} ] && cat ${shellQuote(remotePath)}`);
   if (!result) return null;
   if (typeof result.exitCode === "number" && result.exitCode !== 0) return null;
-  if (result.exitCode === undefined && !result.stdout && !result.stderr) return null;
-  const stdout = result.stdout;
-  const stderr = result.stderr;
-  if (stdout !== undefined) return typeof stdout === "string" ? stdout : String(stdout);
-  if (stderr !== undefined) return typeof stderr === "string" ? stderr : String(stderr);
-  return null;
+  const text = remoteResultText(result);
+  if (text === undefined) return null;
+  return stripRemoteShellWarnings(text);
+}
+
+function remoteResultText(result) {
+  const value = result?.stdout ?? result?.output ?? result?.result ?? result?.data ?? result?.artifacts?.stdout ?? result?.stderr;
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "string" ? value : String(value);
+}
+
+function stripRemoteShellWarnings(text) {
+  return String(text).split(/\r?\n/).filter((line) => !/warning: setlocale:|cannot change locale/i.test(line)).join("\n");
 }
 
 function parseRemoteInteger(resultText) {

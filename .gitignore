@@ -5,6 +5,7 @@
 .opencode-job-*.log
 .opencode-companion/
 .tmp-state/
+.tmp/
 node_modules/
 .opencode-state/
 

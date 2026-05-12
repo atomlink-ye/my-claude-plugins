@@ -32,7 +32,7 @@ node "$SCRIPT" push --directory "$WORK_DIR" --path "$WORK_DIR" --remote-path "wo
 # 3. Execute tests remotely
 node "$SCRIPT" exec --directory "$WORK_DIR" --cwd "workspace/$TASK_ID" -- pnpm test
 
-# 4. Pull stdout/stderr/exit-code artifacts back
+# 4. Optional: pull stdout/stderr/exit-code artifacts for later inspection
 node "$SCRIPT" pull --directory "$WORK_DIR" --output "$WORK_DIR/artifacts/daytona/$TASK_ID"
 
 # 5. Tear down when done
