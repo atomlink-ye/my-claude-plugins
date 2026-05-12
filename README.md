@@ -4,7 +4,7 @@ Personal Claude Code plugin marketplace.
 
 ## Skills
 
-All skills are bundled under a single plugin (`my-skills`).
+The main bundled skills are shipped under a single plugin (`my-skills`).
 
 | Skill | Description |
 |-------|-------------|
@@ -16,6 +16,14 @@ All skills are bundled under a single plugin (`my-skills`).
 | [debug-workflow](skills/debug-workflow/) | Real-world issue reproduction (browser/UI/Web3) with Playwright/CDP/agent-wallet |
 | [google-workspace](skills/google-workspace/) | Google Docs/Drive/Sheets via the `gws` CLI |
 | [mcp-skill](skills/mcp-skill/) | On-demand MCP server invocation via MCPorter |
+
+### Optional standalone plugins
+
+Some skills are also available as separate opt-in plugins and are not included in the `my-skills` bundle.
+
+| Plugin | Skill | Description |
+|--------|-------|-------------|
+| `skill-creator` | [skill-creator](skills/skill-creator/) | Vendored fork for creating, evaluating, packaging, and improving Claude Code skills with configurable CLI runners |
 
 Companion skills expose direct script entrypoints:
 
@@ -62,6 +70,16 @@ Then enable the bundled plugin:
 {
   "enabledPlugins": {
     "my-skills@my-claude-plugins": true
+  }
+}
+```
+
+To enable the standalone optional skill creator plugin instead of (or in addition to) the bundled plugin:
+
+```json
+{
+  "enabledPlugins": {
+    "skill-creator@my-claude-plugins": true
   }
 }
 ```
