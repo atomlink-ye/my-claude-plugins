@@ -199,13 +199,12 @@ describe("session usage rendering", () => {
     expect(view).toContain("## Recent execution trace");
     expect(view).toContain("Check recent logs");
     expect(view).toContain("Compare child activity");
-    expect(view).toContain("git status --short");
-    expect(view).toContain("pnpm test eval/opencode/tests/unit/render.test.mjs");
-    expect(view).toContain("inspect repo structure");
+    expect(view).toContain("- bash [completed]: git status --short pnpm test eval/opencode/tests/unit/render.test.mjs");
+    expect(view).toContain("- task [completed]: explorer — inspect repo structure — sessions: ses_child_demo");
     expect(view).toContain("ses_child_demo");
   });
 
-  it("truncates oversized trace details so session status stays readable", () => {
+  it("hides tool output in session status traces while keeping commands readable", () => {
     const longOutput = `stdout:${"x".repeat(1400)}`;
     const messagesBySessionId = new Map([
       [
@@ -243,7 +242,8 @@ describe("session usage rendering", () => {
       messagesBySessionId
     );
 
-    expect(view).toContain("output: [truncated, showing last");
+    expect(view).toContain("- bash [completed]: pnpm test");
+    expect(view).not.toContain("output:");
     expect(view).not.toContain(longOutput);
   });
 
@@ -312,7 +312,7 @@ describe("session usage rendering", () => {
     expect(view).not.toContain("Child activity 1");
   });
 
-  it("applies per-kind truncation so tool output keeps the tail and clearly marks truncation", () => {
+  it("keeps reasoning and command truncation while hiding tool output details", () => {
     const longReasoning = `Thinking start\n${"r".repeat(1600)}`;
     const longCommand = `pnpm exec vitest run ${"x".repeat(900)}`;
     const longOutput = Array.from({ length: 80 }, (_, index) => `line ${index + 1}`).join("\n");
@@ -358,9 +358,10 @@ describe("session usage rendering", () => {
     );
 
     expect(view).toContain("[truncated, showing first");
-    expect(view).toContain("[truncated, showing last");
-    expect(view).toContain("line 80");
-    expect(view).toContain("line 79");
+    expect(view).toContain("- bash [completed]: pnpm exec vitest run");
+    expect(view).not.toContain("output:");
+    expect(view).not.toContain("line 80");
+    expect(view).not.toContain("line 79");
     expect(view).not.toContain("line 4\n");
     expect(view).not.toContain(longReasoning);
     expect(view).not.toContain(longCommand);

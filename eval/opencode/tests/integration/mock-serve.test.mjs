@@ -2396,11 +2396,12 @@ describe("mock serve integration tests", () => {
       });
 
       expect(foreground.exitCode).toBe(0);
-      expect(foreground.stdout).toContain("Plan:");
-      expect(foreground.stdout).toContain("- inspect logs");
-      expect(foreground.stdout).toContain("bash");
-      expect(foreground.stdout).toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
-      expect(foreground.stdout).toContain("1 file passed");
+      expect(foreground.stdout).toContain("thinking: Plan: · - inspect logs · - run tests");
+      expect(foreground.stdout).toContain("bash [completed]: pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(foreground.stdout).not.toContain("1 file passed");
+      expect(foreground.stdout).not.toContain("output:");
+      expect(foreground.stdout).not.toContain("description:");
+      expect(foreground.stdout).not.toContain("input:");
       expect(foreground.stdout).not.toContain("[tool: bash]");
 
       const sessionId = foreground.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
@@ -2424,10 +2425,12 @@ describe("mock serve integration tests", () => {
 
       expect(sessionStatus.exitCode).toBe(0);
       expect(sessionStatus.stdout).toContain("## Recent execution trace");
-      expect(sessionStatus.stdout).toContain("Plan:");
-      expect(sessionStatus.stdout).toContain("bash [completed]");
-      expect(sessionStatus.stdout).toContain("command: pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
-      expect(sessionStatus.stdout).toContain("output: 1 file passed");
+      expect(sessionStatus.stdout).toContain("- thinking: Plan: · - inspect logs · - run tests");
+      expect(sessionStatus.stdout).toContain("- bash [completed]: pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(sessionStatus.stdout).not.toContain("1 file passed");
+      expect(sessionStatus.stdout).not.toContain("output:");
+      expect(sessionStatus.stdout).not.toContain("description:");
+      expect(sessionStatus.stdout).not.toContain("input:");
 
       const backgroundStart = await spawnCompanion([
         "session",
@@ -2468,14 +2471,15 @@ describe("mock serve integration tests", () => {
           },
           timeoutMs: 10000
         });
-        return status.stdout.includes("1 file passed") ? status : null;
+        return status.stdout.includes("pnpm vitest run eval/opencode/tests/unit/render.test.mjs") ? status : null;
       }, { description: "background rich logging output to appear in job status", timeoutMs: 15000, intervalMs: 50 });
 
       expect(jobStatus.exitCode).toBe(0);
       expect(jobStatus.stdout).toContain("## Recent execution trace");
-      expect(jobStatus.stdout).toContain("Plan:");
-      expect(jobStatus.stdout).toContain("pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
-      expect(jobStatus.stdout).toContain("1 file passed");
+      expect(jobStatus.stdout).toContain("- thinking: Plan: · - inspect logs · - run tests");
+      expect(jobStatus.stdout).toContain("- bash [completed]: pnpm vitest run eval/opencode/tests/unit/render.test.mjs");
+      expect(jobStatus.stdout).not.toContain("1 file passed");
+      expect(jobStatus.stdout).not.toContain("output:");
     } finally {
       restorePromptRoute();
     }
