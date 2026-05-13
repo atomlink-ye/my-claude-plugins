@@ -160,7 +160,7 @@ describe("session usage rendering", () => {
                 tool: "bash",
                 state: {
                   status: "completed",
-                  input: { command: "git status --short\npnpm test eval/opencode/tests/unit/render.test.mjs" },
+                  input: { command: "git status --short\npnpm test eval/opencode-companion/tests/unit/render.test.mjs" },
                   output: {
                     exitCode: 0,
                     stdout: " M skills/opencode-companion/scripts/opencode-companion.mjs\n"
@@ -199,7 +199,7 @@ describe("session usage rendering", () => {
     expect(view).toContain("## Recent execution trace");
     expect(view).toContain("Check recent logs");
     expect(view).toContain("Compare child activity");
-    expect(view).toContain("- bash [completed]: git status --short pnpm test eval/opencode/tests/unit/render.test.mjs");
+    expect(view).toContain("- bash [completed]: git status --short pnpm test eval/opencode-companion/tests/unit/render.test.mjs");
     expect(view).toContain("- task [completed]: explorer — inspect repo structure — sessions: ses_child_demo");
     expect(view).toContain("ses_child_demo");
   });

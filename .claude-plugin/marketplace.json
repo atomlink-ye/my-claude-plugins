@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of skills in this marketplace: companion runtimes (opencode, daytona, paseo), generic orchestration (agentic-orchestration), and helpers (google-workspace, mcp-skill).",
+      "description": "Bundle of skills in this marketplace: companion runtimes (opencode, daytona, paseo), team-lead orchestration (team-lead-orchestration), and helpers (google-workspace, mcp-skill).",
       "version": "0.4.0",
       "author": {
         "name": "atomlink-ye"
@@ -19,12 +19,12 @@
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/agentic-orchestration",
         "./skills/daytona-companion",
         "./skills/google-workspace",
         "./skills/mcp-skill",
         "./skills/opencode-companion",
-        "./skills/paseo-companion"
+        "./skills/paseo-companion",
+        "./skills/team-lead-orchestration"
       ]
     },
     {

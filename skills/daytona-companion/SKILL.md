@@ -8,7 +8,7 @@ user-invocable: true
 
 Daytona provides remote cloud sandboxes for running code, tests, and services in isolation. This skill manages the full sandbox lifecycle — create, push code, execute, pull results, preview, and tear down.
 
-This skill is a **runtime adapter**. It documents how to drive Daytona sandboxes; it does **not** decide whether a given task should run remotely instead of locally. That decision belongs to the orchestration layer (`agentic-orchestration`) and any local routing profile that captures host constraints such as memory pressure, secrets, or quota.
+This skill is a **runtime adapter**. It documents how to drive Daytona sandboxes; it does **not** decide whether a given task should run remotely instead of locally. That decision belongs to the orchestration layer (`team-lead-orchestration`) and any local routing profile that captures host constraints such as memory pressure, secrets, or quota.
 
 Set the manager script path from this skill path:
 

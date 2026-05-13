@@ -8,7 +8,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 
 | Skill | Description |
 |-------|-------------|
-| [agentic-orchestration](skills/agentic-orchestration/) | Runtime-neutral principles for lead-agent orchestration, bounded execution lanes, and acceptance gates |
+| [team-lead-orchestration](skills/team-lead-orchestration/) | Runtime-neutral principles for the team-lead role: lead/lane split, bounded execution lanes, and acceptance gates |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
@@ -27,8 +27,9 @@ Some skills are also available as separate opt-in plugins and are not included i
 
 The `my-skills` bundle now keeps runtime adapters and generic orchestration only. Legacy public skills that mixed workflow policy with local implementation details were removed from the bundle and source tree:
 
-- `opencode-orchestrator`: generic orchestration guidance moved to [agentic-orchestration](skills/agentic-orchestration/); OpenCode runtime commands remain in [opencode-companion](skills/opencode-companion/).
-- `task-iteration`: plan execution should be handled by the active agent workflow using [agentic-orchestration](skills/agentic-orchestration/) plus the selected runtime adapter.
+- `opencode-orchestrator`: generic orchestration guidance moved to [team-lead-orchestration](skills/team-lead-orchestration/); OpenCode runtime commands remain in [opencode-companion](skills/opencode-companion/).
+- `task-iteration`: plan execution should be handled by the active agent workflow using [team-lead-orchestration](skills/team-lead-orchestration/) plus the selected runtime adapter.
+- `agentic-orchestration`: renamed to [team-lead-orchestration](skills/team-lead-orchestration/) — same skill, clearer trigger surface around the team-lead framing.
 - `debug-workflow`: browser, documentation, repository, and web-search MCP access should go through [mcp-skill](skills/mcp-skill/) when needed; runtime-specific execution stays in the companion skills.
 
 Companion skills expose direct script entrypoints:
@@ -106,9 +107,9 @@ Per-skill triggers, outcomes, smoke and unit tests live under [`eval/<skill>/`](
 eval/_shared/run-trigger-eval.sh opencode-companion
 
 # Smoke tests (offline-safe)
-eval/opencode/tests/smoke.sh
-eval/daytona/tests/smoke.sh
-eval/paseo/tests/smoke.sh
+eval/opencode-companion/tests/smoke.sh
+eval/daytona-companion/tests/smoke.sh
+eval/paseo-companion/tests/smoke.sh
 ```
 
 If you want eval runs to use a different Anthropic-compatible endpoint (e.g. an overflow-quota wrapper), point `EVAL_RUNNER` at your own wrapper executable. See [`eval/_shared/README.md`](eval/_shared/README.md) for the layout, the runner contract, and the coverage plan across skills.

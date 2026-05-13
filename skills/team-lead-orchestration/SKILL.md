@@ -1,12 +1,12 @@
 ---
-name: agentic-orchestration
-description: "Use when coordinating multi-step agentic work, choosing what stays with the lead agent versus delegated execution lanes, defining implementation/review/fix loops, or setting acceptance gates. Use for manager-vs-executor routing, independent reviews, bounded delegation, session/context reuse decisions, and orchestration policy independent of any specific runtime."
+name: team-lead-orchestration
+description: "Use when acting as the team lead of an agent team — deciding what stays with the lead and what goes to execution lanes, defining implementation/review/fix loops, setting acceptance gates. Use for team orchestration, agent-team coordination, manager-vs-executor routing, independent reviews, bounded delegation, session/context reuse decisions, and orchestration policy independent of any specific runtime."
 user-invocable: false
 ---
 
-# Agentic Orchestration
+# Team Lead Orchestration
 
-Use this skill to decide **how to organize agentic work**. It defines the lead/execution split, lane boundaries, review independence, and acceptance discipline. It does not choose a specific runtime, model, vendor, host, or local configuration.
+Use this skill when you are the **team lead of an agent team** and need to decide **how to organize the work**. It defines the lead/execution split, lane boundaries, review independence, and acceptance discipline. It does not choose a specific runtime, model, vendor, host, or local configuration.
 
 > **Migration note:** this skill takes over the role of providing **generic, runtime-neutral orchestration guidance**. The previous `opencode-orchestrator` skill bundled generic principles with OpenCode-specific defaults; generic principles now live here, OpenCode-specific operational details belong in `opencode-companion`, and any machine-specific routing belongs in a local routing profile — not in a public marketplace skill.
 

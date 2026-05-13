@@ -65,9 +65,9 @@ Not all skills get the full eval kit on day one. The deliberate phasing is:
 
 | Skill | trigger-eval | outcome eval | smoke tests |
 |---|---|---|---|
-| `opencode-companion` | ✓ | ✓ | ✓ (`eval/opencode/tests/`) |
+| `opencode-companion` | ✓ | ✓ | ✓ (`eval/opencode-companion/tests/`) |
 | `mcp-skill` | ✓ | ✓ | — |
-| `agentic-orchestration` | ✓ skeleton | — | — |
+| `team-lead-orchestration` | ✓ skeleton | — | — |
 | `paseo-companion` | ✓ skeleton | — | ✓ smoke (`--help`) |
 | `daytona-companion` | ✓ skeleton | — | ✓ unit + smoke |
 | `google-workspace` | — (external CLI wrapper) | — | — |

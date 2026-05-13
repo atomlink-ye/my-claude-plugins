@@ -8,7 +8,7 @@ user-invocable: true
 
 Paseo is a daemon-managed CLI for launching, observing, and steering AI coding agents. Every agent gets a stable ID that serves as the handle for all subsequent operations — follow-ups, logs, waiting, archiving.
 
-This skill is a **runtime adapter**. It documents how to drive the Paseo CLI; it does **not** decide whether a task should run through Paseo at all, on the local daemon or a remote one, or with which model. Those choices belong to the orchestration layer (`agentic-orchestration`) and any local routing profile that applies (e.g. a personalized routing skill).
+This skill is a **runtime adapter**. It documents how to drive the Paseo CLI; it does **not** decide whether a task should run through Paseo at all, on the local daemon or a remote one, or with which model. Those choices belong to the orchestration layer (`team-lead-orchestration`) and any local routing profile that applies (e.g. a personalized routing skill).
 
 ```bash
 paseo <command> [options]
