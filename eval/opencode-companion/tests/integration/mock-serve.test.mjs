@@ -943,7 +943,7 @@ describe("mock serve integration tests", () => {
     }
   });
 
-  test("session new in foreground creates a session, streams output, and exits 0", async () => {
+  test("session new in foreground returns only the final answer when it completes before timeout", async () => {
     const workspace = tempWorkspace("opencode-task-foreground-");
     const binDir = path.join(workspace, "bin");
     await writeFakeOpencodeBinary(binDir);
@@ -954,16 +954,89 @@ describe("mock serve integration tests", () => {
       startedAt: new Date().toISOString()
     });
 
-    const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "write a hello world function"], {
-      cwd: workspace,
-      env: {
-        PATH: `${binDir}:${process.env.PATH || ""}`
-      }
+    const restorePromptRoute = installRichLoggingPromptScenario(server, {
+      finalText: "mock response"
     });
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("mock response");
-    expect(result.stdout).toContain("Session ID:");
+    try {
+      const result = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "write a hello world function"], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        }
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("mock response");
+      expect(result.stdout).toContain("To inspect progress or trace details later:");
+      expect(result.stdout).toContain("session attach");
+      expect(result.stdout).toContain("session status");
+      expect(result.stdout).toContain("Session ID:");
+      expect(result.stdout).not.toContain("thinking:");
+      expect(result.stdout).not.toContain("bash [");
+    } finally {
+      restorePromptRoute();
+    }
+  });
+
+  test("session continue in foreground returns only the final answer when it completes before timeout", async () => {
+    const workspace = tempWorkspace("opencode-task-continue-foreground-");
+    const binDir = path.join(workspace, "bin");
+    await writeFakeOpencodeBinary(binDir);
+    const { port } = await startMockServer();
+    writeJson(path.join(workspace, ".opencode-serve.json"), {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString()
+    });
+
+    const restoreInitialPromptRoute = installRichLoggingPromptScenario(server, {
+      finalText: "initial response"
+    });
+
+    try {
+      const initialResult = await spawnCompanion(["session", "new", "--directory", workspace, "--server-directory", workspace, "--", "create a finished session"], {
+        cwd: workspace,
+        env: {
+          PATH: `${binDir}:${process.env.PATH || ""}`
+        },
+        timeoutMs: 10000
+      });
+      expect(initialResult.exitCode).toBe(0);
+      const sessionId = initialResult.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
+      expect(sessionId).toBeTruthy();
+
+      restoreInitialPromptRoute();
+      const restoreContinuePromptRoute = installRichLoggingPromptScenario(server, {
+        finalText: "continued response"
+      });
+
+      try {
+        const continueResult = await spawnCompanion(["session", "continue", sessionId, "--directory", workspace, "--server-directory", workspace, "--", "follow up"], {
+          cwd: workspace,
+          env: {
+            PATH: `${binDir}:${process.env.PATH || ""}`
+          },
+          timeoutMs: 10000
+        });
+
+        expect(continueResult.exitCode).toBe(0);
+        expect(continueResult.stdout).toContain("continued response");
+        expect(continueResult.stdout).toContain("To inspect progress or trace details later:");
+        expect(continueResult.stdout).toContain(`session attach ${sessionId}`);
+        expect(continueResult.stdout).toContain(`session status ${sessionId}`);
+        expect(continueResult.stdout).not.toContain("thinking:");
+        expect(continueResult.stdout).not.toContain("bash [");
+      } finally {
+        restoreContinuePromptRoute();
+      }
+    } finally {
+      try {
+        restoreInitialPromptRoute();
+      } catch {
+        // no-op
+      }
+    }
   });
 
   test("session new in foreground finishes even if the idle event is missing", async () => {
@@ -1596,10 +1669,12 @@ describe("mock serve integration tests", () => {
       });
 
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Inspect current session logs");
-      expect(result.stdout).toContain("Compare delegated child activity");
-      expect(result.stdout).toContain("git status --short");
-      expect(result.stdout).toContain("inspect repo structure");
+      expect(result.stdout).toContain("Trace collection complete.");
+      expect(result.stdout).toContain("To inspect progress or trace details later:");
+      expect(result.stdout).toContain("session attach");
+      expect(result.stdout).toContain("session status");
+      expect(result.stdout).not.toContain("Inspect current session logs");
+      expect(result.stdout).not.toContain("git status --short");
 
       const sessionId = result.stdout.match(/Session ID: (.+)/)?.[1]?.trim();
       expect(sessionId).toBeTruthy();
@@ -2396,8 +2471,12 @@ describe("mock serve integration tests", () => {
       });
 
       expect(foreground.exitCode).toBe(0);
-      expect(foreground.stdout).toContain("thinking: Plan: · - inspect logs · - run tests");
-      expect(foreground.stdout).toContain("bash [completed]: pnpm vitest run eval/opencode-companion/tests/unit/render.test.mjs");
+      expect(foreground.stdout).toContain("Done with logging review.");
+      expect(foreground.stdout).toContain("To inspect progress or trace details later:");
+      expect(foreground.stdout).toContain("session attach");
+      expect(foreground.stdout).toContain("session status");
+      expect(foreground.stdout).not.toContain("thinking: Plan: · - inspect logs · - run tests");
+      expect(foreground.stdout).not.toContain("bash [completed]: pnpm vitest run eval/opencode-companion/tests/unit/render.test.mjs");
       expect(foreground.stdout).not.toContain("1 file passed");
       expect(foreground.stdout).not.toContain("output:");
       expect(foreground.stdout).not.toContain("description:");

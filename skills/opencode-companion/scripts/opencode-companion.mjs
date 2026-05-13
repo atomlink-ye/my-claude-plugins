@@ -2447,8 +2447,10 @@ function summarizeHierarchyProgress({
   };
 }
 
-function createTextStreamPrinter() {
+function createTextStreamPrinter(options = {}) {
+  const emitLive = options.emitLive !== false;
   let output = "";
+  let emittedOutput = "";
   let lastBlockType = null;
   const seenReasoningParts = new Set();
   const reasoningBuffers = new Map();
@@ -2461,7 +2463,10 @@ function createTextStreamPrinter() {
       return;
     }
 
-    process.stdout.write(normalized);
+    if (emitLive) {
+      process.stdout.write(normalized);
+      emittedOutput += normalized;
+    }
     output += normalized;
   }
 
@@ -2525,13 +2530,27 @@ function createTextStreamPrinter() {
     getOutput() {
       return output;
     },
+    getEmittedOutput() {
+      return emittedOutput;
+    },
     hasTraceOutput() {
       return hasTraceOutput;
+    },
+    isLiveEmitting() {
+      return emitLive;
     },
     ensureLineBreak() {
       ensureLineBreak();
     }
   };
+}
+
+function renderQuietCompletionHint(sessionId) {
+  return [
+    "To inspect progress or trace details later:",
+    `- session attach ${sessionId}`,
+    `- session status ${sessionId}`
+  ].join("\n");
 }
 
 async function createSession(baseUrl, directory) {
@@ -3645,15 +3664,21 @@ async function monitorSession({
 
   const recentTraceEntries = buildTraceEntriesFromMessages(messages, { sessionId, includeText: false, hierarchyContext: null });
   const recentTraceText = renderTraceEntriesAsText(recentTraceEntries);
-  const streamedLength = printer.getOutput().trim().length;
-  const resultLength = (result.combined_text || "").length;
+  const streamedLength = printer.getEmittedOutput().trim().length;
+  const displayText = !jobId && !printer.isLiveEmitting() && isSuccessfulResultStatus(result.status)
+    ? (result.final_text || result.combined_text)
+    : result.combined_text;
+  const resultLength = (displayText || "").length;
   if (recentTraceText && !printer.hasTraceOutput()) {
     process.stdout.write(`\n${recentTraceText}\n`);
   }
   // Print combined_text if streaming missed significant content (>50% longer from API)
   // or if nothing was streamed at all
-  if (result.combined_text && (!streamedLength || resultLength > streamedLength * 1.5)) {
-    process.stdout.write(`\n${result.combined_text}\n`);
+  if (displayText && (!streamedLength || resultLength > streamedLength * 1.5)) {
+    process.stdout.write(`\n${displayText}\n`);
+  }
+  if (!jobId && !printer.isLiveEmitting() && isSuccessfulResultStatus(result.status)) {
+    process.stdout.write(`\n${renderQuietCompletionHint(sessionId)}\n`);
   }
   process.stdout.write(renderTaskSummary(result));
   const resultIsSuccessful = isSuccessfulResultStatus(result.status);
@@ -3938,7 +3963,7 @@ async function handleTask(argv) {
       return;
     }
 
-    const printer = createTextStreamPrinter();
+    const printer = createTextStreamPrinter({ emitLive: Boolean(jobId) });
     const monitorPromise = monitorSession({
       baseUrl,
       directory,
