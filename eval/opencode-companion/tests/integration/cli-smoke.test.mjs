@@ -29,6 +29,30 @@ describe("companion CLI smoke tests", () => {
     expect(result.stdout).toContain("serve start");
   });
 
+  test("session new --help prints subcommand usage and exits 0", async () => {
+    const result = await spawnCompanion(["session", "new", "--help"], { cwd: tempWorkspace() });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage:");
+    expect(result.stdout).toContain("session new");
+    expect(result.stdout).toContain("--prompt-file PATH | -- \"PROMPT\"");
+  });
+
+  test("session continue <id> --help prints subcommand usage and exits 0", async () => {
+    const result = await spawnCompanion(["session", "continue", "session-123", "--help"], { cwd: tempWorkspace() });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage:");
+    expect(result.stdout).toContain("session continue <session-id>");
+    expect(result.stdout).toContain("--agent NAME");
+  });
+
+  test("review --scope branch --help prints review usage and exits 0", async () => {
+    const result = await spawnCompanion(["review", "--scope", "branch", "--help"], { cwd: tempWorkspace() });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage:");
+    expect(result.stdout).toContain("review [--scope SCOPE]");
+    expect(result.stdout).toContain("--adversarial");
+  });
+
   test("job list with no state file prints No jobs recorded and exits 0", async () => {
     const cwd = tempWorkspace();
     const result = await spawnCompanion(["job", "list", "--directory", cwd], { cwd });

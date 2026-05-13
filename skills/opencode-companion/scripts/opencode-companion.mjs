@@ -76,32 +76,77 @@ import {
 } from "./opencode-companion/review.mjs";
 import { parseSseBlock, streamSseResponse } from "./opencode-companion/sse.mjs";
 
-function printUsage() {
-  process.stdout.write(
-    [
-      "Usage:",
-      "  node scripts/opencode-companion.mjs serve start [--port N] [--server-directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs serve status [--server-directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs serve stop [--server-directory SERVER_DIR]",
-      "",
-      "  node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
-      "  node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
-      "  node scripts/opencode-companion.mjs session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
-      "  node scripts/opencode-companion.mjs session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
-      "  node scripts/opencode-companion.mjs session list [--directory WORK_DIR] [--server-directory SERVER_DIR]",
-      "  node scripts/opencode-companion.mjs session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
-      "",
-      "  node scripts/opencode-companion.mjs job list [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--all] [--verbose]",
-      "  node scripts/opencode-companion.mjs job status <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
-      "  node scripts/opencode-companion.mjs job wait <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--timeout MINS] [--verbose]",
-      "  node scripts/opencode-companion.mjs job result <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
-      "  node scripts/opencode-companion.mjs job cancel <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH]",
-      "",
-      `  Default session timeout: ${DEFAULT_SESSION_TIMEOUT_MINS} minutes`,
-      "  SERVER_DIR: where .opencode-serve.json lives (default: ~)",
-      "  WORK_DIR:   project working directory sent to OpenCode sessions (default: $CLAUDE_PROJECT_DIR or cwd)"
-    ].join("\n") + "\n"
+const USAGE_LINES = {
+  "serve start": "node scripts/opencode-companion.mjs serve start [--port N] [--server-directory SERVER_DIR]",
+  "serve status": "node scripts/opencode-companion.mjs serve status [--server-directory SERVER_DIR]",
+  "serve stop": "node scripts/opencode-companion.mjs serve stop [--server-directory SERVER_DIR]",
+  "session new": "node scripts/opencode-companion.mjs session new [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
+  "session continue": "node scripts/opencode-companion.mjs session continue <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--model MODEL] [--agent NAME] [--async] [--background] [--timeout MINS] [--prompt-file PATH | -- \"PROMPT\"]",
+  "session attach": "node scripts/opencode-companion.mjs session attach <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
+  "session wait": "node scripts/opencode-companion.mjs session wait <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--timeout MINS]",
+  "session list": "node scripts/opencode-companion.mjs session list [--directory WORK_DIR] [--server-directory SERVER_DIR]",
+  "session status": "node scripts/opencode-companion.mjs session status <session-id> [--directory WORK_DIR] [--server-directory SERVER_DIR]",
+  "job list": "node scripts/opencode-companion.mjs job list [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--all] [--verbose]",
+  "job status": "node scripts/opencode-companion.mjs job status <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
+  "job wait": "node scripts/opencode-companion.mjs job wait <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--timeout MINS] [--verbose]",
+  "job result": "node scripts/opencode-companion.mjs job result <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH] [--verbose]",
+  "job cancel": "node scripts/opencode-companion.mjs job cancel <job-id> [--directory WORK_DIR] [--server-directory SERVER_DIR] [--artifact-root PATH]",
+  "review": "node scripts/opencode-companion.mjs review [--scope SCOPE] [--base REF] [--directory WORK_DIR] [--server-directory SERVER_DIR] [--model MODEL] [--timeout MINS] [--wait] [--background] [--adversarial] [-- \"FOCUS\"]"
+};
+
+const USAGE_GROUPS = {
+  root: [
+    "serve start",
+    "serve status",
+    "serve stop",
+    "session new",
+    "session continue",
+    "session attach",
+    "session wait",
+    "session list",
+    "session status",
+    "job list",
+    "job status",
+    "job wait",
+    "job result",
+    "job cancel",
+    "review"
+  ],
+  serve: ["serve start", "serve status", "serve stop"],
+  session: ["session new", "session continue", "session attach", "session wait", "session list", "session status"],
+  job: ["job list", "job status", "job wait", "job result", "job cancel"],
+  review: ["review"]
+};
+
+function hasHelpFlag(argv) {
+  for (const token of argv) {
+    if (token === "--") {
+      return false;
+    }
+    if (token === "--help" || token === "-h") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function printUsage(topic = "root") {
+  const usageKeys = USAGE_GROUPS[topic] ?? [topic];
+  const lines = ["Usage:"];
+  for (const usageKey of usageKeys) {
+    const usageLine = USAGE_LINES[usageKey];
+    if (usageLine) {
+      lines.push(`  ${usageLine}`);
+    }
+  }
+  lines.push(
+    "",
+    `  Default session timeout: ${DEFAULT_SESSION_TIMEOUT_MINS} minutes`,
+    "  Add --help after any command path for scoped help.",
+    "  SERVER_DIR: where .opencode-serve.json lives (default: ~)",
+    "  WORK_DIR:   project working directory sent to OpenCode sessions (default: $CLAUDE_PROJECT_DIR or cwd)"
   );
+  process.stdout.write(`${lines.join("\n")}\n`);
 }
 
 function escapeTableCell(value) {
@@ -4043,8 +4088,8 @@ async function handleTask(argv) {
 }
 
 async function handleReview(argv) {
-  if (argv[0] === "--help" || argv[0] === "-h") {
-    printUsage();
+  if (hasHelpFlag(argv)) {
+    printUsage("review");
     return;
   }
 
@@ -4367,7 +4412,26 @@ async function handleSessionStatus(argv) {
 async function handleSessionCommand(argv) {
   const [subcommand, ...rest] = argv;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
-    printUsage();
+    printUsage("session");
+    return;
+  }
+
+  const usageTopicBySubcommand = {
+    new: "session new",
+    continue: "session continue",
+    resume: "session continue",
+    attach: "session attach",
+    wait: "session wait",
+    list: "session list",
+    status: "session status"
+  };
+
+  const usageTopic = usageTopicBySubcommand[subcommand];
+  if (!usageTopic) {
+    throw new Error(`Unknown session command: ${subcommand}`);
+  }
+  if (hasHelpFlag(rest)) {
+    printUsage(usageTopic);
     return;
   }
 
@@ -4379,7 +4443,7 @@ async function handleSessionCommand(argv) {
   if (subcommand === "continue" || subcommand === "resume") {
     const { options, positionals } = parseArgs(rest, {
       booleanFlags: ["--async", "--background"],
-      stringFlags: ["--directory", "--server-directory", "--artifact-root", "--model", "--timeout", "--prompt-file"]
+      stringFlags: ["--directory", "--server-directory", "--artifact-root", "--model", "--timeout", "--prompt-file", "--agent"]
     });
     const sessionId = positionals[0];
     if (!sessionId) {
@@ -4391,6 +4455,7 @@ async function handleSessionCommand(argv) {
     if (options["artifact-root"]) taskArgs.push("--artifact-root", String(options["artifact-root"]));
     if (options.model) taskArgs.push("--model", String(options.model));
     if (options.timeout) taskArgs.push("--timeout", String(options.timeout));
+    if (options.agent) taskArgs.push("--agent", String(options.agent));
     if (options.async) taskArgs.push("--async");
     if (options.background) taskArgs.push("--background");
     if (options["prompt-file"]) taskArgs.push("--prompt-file", String(options["prompt-file"]));
@@ -4422,13 +4487,26 @@ async function handleSessionCommand(argv) {
     return;
   }
 
-  throw new Error(`Unknown session command: ${subcommand}`);
 }
 
 async function handleServeCommand(argv) {
   const [subcommand, ...rest] = argv;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
-    printUsage();
+    printUsage("serve");
+    return;
+  }
+
+  const usageTopicBySubcommand = {
+    start: "serve start",
+    status: "serve status",
+    stop: "serve stop"
+  };
+  const usageTopic = usageTopicBySubcommand[subcommand];
+  if (!usageTopic) {
+    throw new Error(`Unknown serve command: ${subcommand}`);
+  }
+  if (hasHelpFlag(rest)) {
+    printUsage(usageTopic);
     return;
   }
   if (subcommand === "start") {
@@ -4443,13 +4521,28 @@ async function handleServeCommand(argv) {
     await handleCleanup(rest);
     return;
   }
-  throw new Error(`Unknown serve command: ${subcommand}`);
 }
 
 async function handleJobCommand(argv) {
   const [subcommand, ...rest] = argv;
   if (!subcommand || subcommand === "--help" || subcommand === "-h") {
-    printUsage();
+    printUsage("job");
+    return;
+  }
+
+  const usageTopicBySubcommand = {
+    list: "job list",
+    status: "job status",
+    wait: "job wait",
+    result: "job result",
+    cancel: "job cancel"
+  };
+  const usageTopic = usageTopicBySubcommand[subcommand];
+  if (!usageTopic) {
+    throw new Error(`Unknown job command: ${subcommand}`);
+  }
+  if (hasHelpFlag(rest)) {
+    printUsage(usageTopic);
     return;
   }
   if (subcommand === "list") {
@@ -4472,7 +4565,6 @@ async function handleJobCommand(argv) {
     await handleCancel(rest);
     return;
   }
-  throw new Error(`Unknown job command: ${subcommand}`);
 }
 
 async function handleJobWait(argv) {
