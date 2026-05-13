@@ -23,6 +23,14 @@ Some skills are also available as separate opt-in plugins and are not included i
 |--------|-------|-------------|
 | `skill-creator` | [skill-creator](skills/skill-creator/) | Vendored fork for creating, evaluating, packaging, and improving Claude Code skills with configurable CLI runners |
 
+### Upgrade notes
+
+The `my-skills` bundle now keeps runtime adapters and generic orchestration only. Legacy public skills that mixed workflow policy with local implementation details were removed from the bundle and source tree:
+
+- `opencode-orchestrator`: generic orchestration guidance moved to [agentic-orchestration](skills/agentic-orchestration/); OpenCode runtime commands remain in [opencode-companion](skills/opencode-companion/).
+- `task-iteration`: plan execution should be handled by the active agent workflow using [agentic-orchestration](skills/agentic-orchestration/) plus the selected runtime adapter.
+- `debug-workflow`: browser, documentation, repository, and web-search MCP access should go through [mcp-skill](skills/mcp-skill/) when needed; runtime-specific execution stays in the companion skills.
+
 Companion skills expose direct script entrypoints:
 
 ```bash
