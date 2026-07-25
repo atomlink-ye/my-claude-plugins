@@ -8,6 +8,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 
 | Skill | Description |
 |-------|-------------|
+| [mve-first-development](skills/mve-first-development/) | Shape/Probe/Prove/Protect/Harden stage router for early product delivery; defaults to a real minimum verifiable E2E slice before contract freezing or production hardening |
 | [team-lead-orchestration](skills/team-lead-orchestration/) | Runtime-neutral principles for the team-lead role: lead/lane split, bounded execution lanes, and acceptance gates |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
