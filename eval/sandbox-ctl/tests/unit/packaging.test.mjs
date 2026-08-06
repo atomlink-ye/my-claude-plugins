@@ -44,6 +44,8 @@ describe("sandbox-ctl packaging", () => {
     expect(smoke).toMatch(/--mode full --include-sensitive/);
     expect(smoke).toMatch(/--mode git/);
     expect(smoke).toMatch(/--json down/);
+    expect(smoke).toMatch(/COMPAT_STATE/);
+    expect(smoke).toMatch(/\[\[ ! -e "\$COMPAT_STATE" \]\]/);
     expect(smoke).not.toMatch(/\/tmp\/sandbox-ctl-real-(up|exit7)/);
   });
 

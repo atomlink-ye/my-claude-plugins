@@ -15,8 +15,12 @@ OUT="$(cd "$OUT" && pwd -P)"
 SNAPSHOT="${SANDBOX_CTL_SNAPSHOT:-agent-exec-standard-medium}"
 TRANSFER_BINDING="transfer"
 GIT_BINDING="git"
+PROJECT_KEY="$(node -e 'const {createHash}=require("crypto"); const {realpathSync}=require("fs"); process.stdout.write(createHash("sha256").update(realpathSync(process.argv[1])).digest("hex").slice(0,16))' "$WORK")"
+COMPAT_STATE="${DAYTONA_STATE_DIR:-${HOME}/.daytona/claude-code}/projects/${PROJECT_KEY}.json"
 # Bash 3.2 treats an empty array expansion as unbound under `set -u`.
 CREATED_BINDINGS=("__none__")
+
+[[ ! -e "$COMPAT_STATE" ]]
 
 json_field() {
   node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const v=x[process.argv[2]]; if(v===undefined||v===null||v==="") process.exit(1); process.stdout.write(String(v))' "$1" "$2"
@@ -104,4 +108,5 @@ CREATED_BINDINGS=("__none__")
 
 node "$CLI" --json list >"$OUT/final-inventory.json"
 node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const ids=new Set((x.sandboxes||[]).map(v=>v.id)); if(ids.has(process.argv[2])||ids.has(process.argv[3])) process.exit(1)' "$OUT/final-inventory.json" "$TRANSFER_ID" "$GIT_ID"
+[[ ! -e "$COMPAT_STATE" ]]
 echo "PASS: sandbox-ctl Daytona canary (${TRANSFER_ID}, ${GIT_ID})"
