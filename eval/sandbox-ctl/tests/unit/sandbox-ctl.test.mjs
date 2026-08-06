@@ -20,6 +20,7 @@ import {
   writeProvisionalSandboxState,
   readProjectStateWithSource,
   handleDown,
+  handleAdopt,
   removeStateSource,
   buildSmokeTestOptions,
   migrateLegacyStateToConfig,
@@ -166,7 +167,9 @@ describe("sandbox-ctl dispatch", () => {
         get: async () => null,
         create: async () => ({ id: "created-s1", state: "stopped", start: async () => { throw new Error("start failed"); } }),
       };
-      await expect(handleUp({ directory: dir, client, name: "recoverable", autoStopInterval: 5, autoArchiveInterval: 10, autoDeleteInterval: 15 })).rejects.toMatchObject({ sandboxId: "created-s1", nextActions: expect.any(Array) });
+      const failure = await handleUp({ directory: dir, client, name: "recoverable", autoStopInterval: 5, autoArchiveInterval: 10, autoDeleteInterval: 15 }).catch((error) => error);
+      expect(failure).toMatchObject({ sandboxId: "created-s1", nextActions: expect.any(Array) });
+      expect(failure.nextActions[0]).toContain("--remote-path 'workspace/up-start-failure-");
       expect(readConfig(dir).sandboxes.recoverable).toMatchObject({ sandboxId: "created-s1", lifecycle: { autoStopInterval: 5, autoDeleteInterval: 15 } });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -190,9 +193,66 @@ describe("sandbox-ctl dispatch", () => {
       writeFileSync(`${dir}/.sandbox-ctl/config.json.lock`, "held");
       const failure = await handleUp({ directory: dir, client: { get: async () => null, create: async () => ({ id: "busy-s1" }) } }).catch((error) => error);
       expect(failure).toMatchObject({ sandboxId: "busy-s1", nextActions: [
-        expect.stringMatching(/adopt .*--sandbox-id 'busy-s1'.*--name 'recovery-busy-s1'/),
+        expect.stringMatching(/adopt .*--sandbox-id 'busy-s1'.*--name 'recovery-busy-s1'.*--remote-path 'workspace\/up-config-busy-.*'/),
         expect.stringMatching(/down .*--sandbox 'recovery-busy-s1'/),
       ] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("fails before contacting the client when adopt has no reliable remote path", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/adopt-no-remote-`);
+    const calls = [];
+    const client = {
+      get: async () => { calls.push("get"); throw new Error("client should not be called"); },
+      list: async () => { calls.push("list"); throw new Error("client should not be called"); },
+    };
+    try {
+      await expect(handleAdopt({ directory: dir, client, "sandbox-id": "remote-s1" })).rejects.toThrow(/--remote-path/);
+      expect(calls).toEqual([]);
+      expect(existsSync(path.join(dir, ".sandbox-ctl", "config.json"))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("adopts with an explicit remote path and persists it unchanged", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/adopt-explicit-`);
+    const remotePath = "workspace/with space/and 'quote'";
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      const result = await handleAdopt({
+        directory: dir,
+        client: { get: async () => ({ id: "remote-s1", name: "remote-name", state: "started" }) },
+        "sandbox-id": "remote-s1",
+        "remote-path": remotePath,
+        name: "adopted",
+      });
+      expect(result.remoteWorkspace).toBe(remotePath);
+      expect(readConfig(dir).sandboxes.adopted.remoteWorkspace).toBe(remotePath);
+    } finally { console.log = originalLog; rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("uses the exact-directory binding remote path when adopting without an explicit path", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/adopt-binding-`);
+    const remotePath = "/workspace/existing-binding";
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      writeConfig(dir, { schemaVersion: 1, adapter: "daytona", active: "existing", sandboxes: { existing: { sandboxId: "remote-s1", remoteWorkspace: remotePath } } });
+      await handleAdopt({ directory: dir, client: { get: async () => ({ id: "remote-s1", name: "remote-name", state: "started" }) }, "sandbox-id": "remote-s1" });
+      expect(readConfig(dir).sandboxes.existing.remoteWorkspace).toBe(remotePath);
+    } finally { console.log = originalLog; rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("quotes the known remote workspace in recovery actions", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/recovery-remote-quote-`);
+    const remotePath = "/workspace/with space/and 'quote'";
+    try {
+      writeConfig(dir, { schemaVersion: 1, adapter: "daytona", active: "existing", sandboxes: { existing: { sandboxId: "remote-s1", remoteWorkspace: remotePath } } });
+      const failure = await handleUp({
+        directory: dir,
+        client: { get: async () => ({ id: "remote-s1", state: "stopped", start: async () => { throw new Error("start failed"); } }) },
+      }).catch((error) => error);
+      expect(failure.nextActions[0]).toBe(`sandbox-ctl adopt --directory '${dir}' --sandbox-id 'remote-s1' --name 'recovery-remote-s1' --remote-path '/workspace/with space/and '"'"'quote'"'"''`);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

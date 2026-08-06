@@ -299,10 +299,10 @@ function shellQuote(value) {
   return `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
-function recoveryActions(directory, sandboxId) {
+function recoveryActions(directory, sandboxId, remoteWorkspacePath) {
   const name = `recovery-${String(sandboxId).replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   return [
-    `sandbox-ctl adopt --directory ${shellQuote(directory)} --sandbox-id ${shellQuote(sandboxId)} --name ${shellQuote(name)}`,
+    `sandbox-ctl adopt --directory ${shellQuote(directory)} --sandbox-id ${shellQuote(sandboxId)} --name ${shellQuote(name)} --remote-path ${shellQuote(remoteWorkspacePath)}`,
     `sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(name)}`,
   ];
 }
@@ -930,7 +930,7 @@ async function handleUp(options) {
     const provisionalId = sandbox?.id ?? sandbox?.sandboxId ?? sandbox?.instanceId;
     if (provisionalId) {
       try { if (options.writeProvisionalState) writeProvisionalSandboxState(paths, sandbox); }
-      catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId); throw error; }
+      catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId, paths.remoteWorkspacePath); throw error; }
       const provisionalName = options.name ?? paths.binding?.name ?? paths.taskId;
       try { upsertBinding(paths.directory, provisionalName, {
         sandboxId: provisionalId,
@@ -945,14 +945,14 @@ async function handleUp(options) {
         name: options.name,
         createdAt: new Date().toISOString(),
       }, { use: !options.noUse }); }
-      catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId); throw error; }
+      catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId, paths.remoteWorkspacePath); throw error; }
     }
   }
   try { sandbox = await ensureSandboxStarted(sandbox); }
   catch (error) {
     const sandboxId = sandbox?.id ?? sandbox?.sandboxId ?? sandbox?.instanceId;
     if (sandboxId && !error.sandboxId) error.sandboxId = sandboxId;
-    if (sandboxId) error.nextActions = recoveryActions(paths.directory, sandboxId);
+    if (sandboxId) error.nextActions = recoveryActions(paths.directory, sandboxId, paths.remoteWorkspacePath);
     throw error;
   }
   const sandboxId = sandbox.id ?? sandbox.sandboxId ?? sandbox.instanceId;
@@ -972,7 +972,7 @@ async function handleUp(options) {
     lifecycle,
     updatedAt: now,
   }, { use: !options.noUse }); }
-  catch (error) { error.sandboxId = sandboxId; error.nextActions = recoveryActions(paths.directory, sandboxId); throw error; }
+  catch (error) { error.sandboxId = sandboxId; error.nextActions = recoveryActions(paths.directory, sandboxId, paths.remoteWorkspacePath); throw error; }
   const deleteMessage = lifecycle.autoDeleteInterval === -1
     ? "automatic deletion is disabled"
     : lifecycle.autoDeleteInterval === 0
@@ -987,16 +987,19 @@ async function handleUp(options) {
 
 async function handleAdopt(options) {
   const paths = resolveProjectPaths({ ...options, allowUnboundSandboxRef: true });
-  applyProjectEnv(options, paths);
+  const existing = readProjectState(paths);
+  const remoteWorkspacePath = options["remote-path"] ?? paths.binding?.remoteWorkspace ?? existing?.remoteWorkspacePath;
+  if (remoteWorkspacePath === undefined || remoteWorkspacePath === null || String(remoteWorkspacePath).length === 0) {
+    throw new Error("adopt requires --remote-path when no existing remote workspace path is available");
+  }
   const sandboxRef = options["sandbox-id"] ?? options["sandbox-name"];
   if (!sandboxRef) throw new Error("adopt requires --sandbox-id ID or --sandbox-name NAME");
-  const client = await createClient();
+  applyProjectEnv(options, paths);
+  const client = options.client ?? await createClient();
   const sandbox = await getSandbox(client, sandboxRef, { allowNotFound: false });
   await ensureSandboxStarted(sandbox);
   const { id, name } = sandboxIdentity(sandbox);
   const now = new Date().toISOString();
-  const existing = readProjectState(paths);
-  const remoteWorkspacePath = options["remote-path"] ?? paths.binding?.remoteWorkspace ?? existing?.remoteWorkspacePath ?? paths.remoteWorkspacePath;
   const remoteArtifactsPath = remoteWorkspacePath.startsWith("/")
     ? path.posix.join(remoteWorkspacePath, "artifacts", "daytona", paths.taskId)
     : (existing?.remoteArtifactsPath ?? paths.remoteArtifactsPath);
