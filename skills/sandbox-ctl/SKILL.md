@@ -15,6 +15,7 @@ commands run from a subdirectory automatically discover that file.
 sandbox-ctl up [--name NAME] [--auto-stop 30 --auto-archive 10080 --auto-delete 60]
 sandbox-ctl use NAME
 sandbox-ctl exec -- COMMAND...                 # stream human output
+sandbox-ctl exec --timeout 30m -- COMMAND...   # default foreground timeout: 5m
 sandbox-ctl exec --json -- COMMAND...          # buffer one JSON object
 sandbox-ctl exec --artifacts ./artifacts -- COMMAND...
 sandbox-ctl push --mode bundle
@@ -26,6 +27,10 @@ sandbox-ctl down --sandbox NAME
 a binding for any operation without changing the active binding. `up --name`
 creates or reuses a named binding; `use NAME` changes only the local active
 selection. `--snapshot SNAPSHOT` selects the Daytona image for `up` or `run`.
+`exec --timeout DURATION` accepts a positive integer with `ms`, `s`, `m`, or
+`h`; a bare integer means seconds. Streaming exec defaults to `5m`. A timeout
+only ends the local wait: the remote command status is unknown and it may still
+be running.
 
 `run -- COMMAND...` is a disposable composite: it creates a unique `run-*`
 binding with `noUse=true`, performs a safe bundle push, executes with streaming

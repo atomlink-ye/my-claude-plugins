@@ -417,15 +417,31 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
     if (command === "run") console.log(JSON.stringify(resultObject, null, 2));
     return jsonResult.result;
   } catch (error) {
-    if (findTopLevelCommand(argv) === "run") {
+    const requestedCommand = findTopLevelCommand(argv);
+    if (requestedCommand === "run") {
       const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error });
       process.exitCode = 125;
       if (requestedJson) console.log(JSON.stringify(payload));
       else console.error(payload.error);
       return payload;
     }
+    if (requestedCommand === "exec") {
+      const payload = {
+        ok: false,
+        command: "exec",
+        adapter: "daytona",
+        exitCode: 125,
+        error: sanitizeError(error),
+        sandboxId: error?.sandboxId ?? null,
+        nextActions: error?.nextActions ?? [],
+      };
+      process.exitCode = 125;
+      if (requestedJson) console.log(JSON.stringify(payload));
+      else console.error(payload.error);
+      return payload;
+    }
     if (!requestedJson) throw error;
-    const payload = { ok: false, command: findTopLevelCommand(argv) ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
     process.exitCode = 1;
     console.log(JSON.stringify(payload));
     return payload;

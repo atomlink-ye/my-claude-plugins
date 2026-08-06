@@ -30,6 +30,13 @@ before pull; new local commits must exist before push. A remote workspace must
 be clean and non-divergent.
 
 `exec` streams output when the SDK supports sessions and buffers otherwise.
+The streaming-session client deadline defaults to five minutes and can be set
+with `--timeout 500ms|30s|5m|1h` (a bare integer means seconds). This is a local
+wait deadline, not a confirmed remote command timeout: after it expires, the
+remote command status is unknown and it may still be running. `sandbox-ctl`
+does not delete the Daytona process session on this timeout. Older SDK
+fallbacks expose only a synchronous buffered call, so the client cannot enforce
+the timeout on that path; the result includes an explicit warning.
 `--json` emits one object; `--artifacts DIR` writes `stdout.txt`, `stderr.txt`,
 `exit-code.txt`, and `manifest.json` locally. `run --output DIR` maps to that
 local artifact directory. Remote exit codes are returned exactly; control

@@ -14,6 +14,14 @@ const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--i
 const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete", "--timeout"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
+const DEFAULT_EXEC_TIMEOUT_MS = 300_000;
+
+function formatDurationMs(value) {
+  if (value % 3_600_000 === 0) return `${value / 3_600_000}h`;
+  if (value % 60_000 === 0) return `${value / 60_000}m`;
+  if (value % 1_000 === 0) return `${value / 1_000}s`;
+  return `${value}ms`;
+}
 const CLASS_RESOURCE_DEFAULTS = {
   small: { cpu: 1, memory: 1, disk: 3, gpu: 0 },
 };
@@ -308,7 +316,7 @@ function buildUsage() {
     "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
     "  push [LOCAL_PATH] [--directory DIR] [--state-directory DIR] [--task-id ID] [--path PATH] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--branch BRANCH]",
-    "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] [--artifacts PATH] -- COMMAND...",
+    "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] [--artifacts PATH] [--timeout DURATION] -- COMMAND...",
     "  pull [REMOTE_PATH] [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--overwrite] [--branch BRANCH]",
     "  preview [--directory DIR] [--state-directory DIR] --port PORT [--expires-in SECONDS]",
     "  smoke-test [--directory DIR] [--state-directory DIR] [--task-id ID] [--class small|medium|large] [--include-git] [--include-preview]",
@@ -1047,7 +1055,7 @@ async function handleExec(options, command) {
   let exitCode;
   let warning;
   if (!processApi) {
-    warning = "Output was buffered because streaming is unavailable";
+    warning = "Output was buffered because streaming is unavailable; client timeout cannot be enforced by this SDK path";
     let result;
     try {
       // Preserve the synchronous SDK contract (command, cwd) for older SDKs.
@@ -1063,6 +1071,7 @@ async function handleExec(options, command) {
   } else {
     const sessionId = newExecSessionId();
     let sessionCreated = false;
+    let localWaitTimedOut = false;
     try {
       await sessionCall(processApi, "createSession", [sessionId], sessionId);
       sessionCreated = true;
@@ -1083,7 +1092,7 @@ async function handleExec(options, command) {
       });
       const pollPromise = (async () => {
         const interval = Math.max(5, Number(options.pollIntervalMs ?? options.execPollInterval ?? 25));
-        const timeout = Math.max(interval, Number(options.timeoutMs ?? options.execTimeout ?? 120000));
+        const timeout = Math.max(interval, Number(options.timeoutMs ?? options.execTimeout ?? DEFAULT_EXEC_TIMEOUT_MS));
         const deadline = Date.now() + timeout;
         while (Date.now() <= deadline) {
           const status = await sessionCall(processApi, "getSessionCommand", [sessionId, commandId], { sessionId, commandId });
@@ -1091,13 +1100,14 @@ async function handleExec(options, command) {
           if (code !== undefined) return code;
           await new Promise((resolve) => setTimeout(resolve, interval));
         }
-        throw new Error("Timed out waiting for Daytona session command");
+        localWaitTimedOut = true;
+        throw new Error(`Local wait timed out after ${formatDurationMs(timeout)}; remote command status is unknown and it may still be running`);
       })();
       [exitCode] = await Promise.all([pollPromise, logsPromise]);
     } catch (error) {
       return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error) };
     } finally {
-      if (sessionCreated) {
+      if (sessionCreated && !localWaitTimedOut) {
         try { await processApi.deleteSession(sessionId); } catch { /* cleanup is best effort */ }
       }
     }

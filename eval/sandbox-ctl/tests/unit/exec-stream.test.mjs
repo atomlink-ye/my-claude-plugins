@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,61 @@ import { spawnSync } from "node:child_process";
 import { handleExec } from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
 
 describe("Daytona session exec streaming", () => {
+  async function pendingSessionExec({ timeoutMs, pollIntervalMs }) {
+    const directory = mkdtempSync(path.join(tmpdir(), "sandbox-exec-timeout-"));
+    mkdirSync(path.join(directory, ".daytona"), { recursive: true });
+    writeFileSync(path.join(directory, ".daytona", "state.json"), JSON.stringify({ sandboxId: "sandbox-timeout-1", taskId: "demo", remoteWorkspacePath: "/workspace/demo" }));
+    const processApi = {
+      executeCommand: async () => ({ stdout: "/home/daytona\n", exitCode: 0 }),
+      createSession: async () => {},
+      executeSessionCommand: async () => ({ cmdId: "cmd-timeout" }),
+      getSessionCommandLogs: async () => {},
+      getSessionCommand: async () => ({ exitCode: undefined }),
+      deleteSession: vi.fn(async () => {}),
+    };
+    const client = { get: async () => ({ id: "sandbox-timeout-1", state: "started", process: processApi }) };
+    const promise = handleExec({ client, directory, json: true, ...(timeoutMs === undefined ? {} : { timeoutMs }), pollIntervalMs }, ["sleep", "infinity"]);
+    return { directory, promise, processApi };
+  }
+
+  it("uses a five-minute default streaming deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { directory, promise, processApi } = await pendingSessionExec({ pollIntervalMs: 60_000 });
+    let settled = false;
+    promise.then(() => { settled = true; });
+    try {
+      await vi.advanceTimersByTimeAsync(180_001);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(180_000);
+      await expect(promise).resolves.toMatchObject({
+        exitCode: 125,
+        error: expect.stringMatching(/local wait timed out after 5m.*remote command status is unknown.*may still be running/i),
+      });
+      expect(processApi.deleteSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit streaming timeout", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { directory, promise, processApi } = await pendingSessionExec({ timeoutMs: 500, pollIntervalMs: 100 });
+    try {
+      await vi.advanceTimersByTimeAsync(601);
+      await expect(promise).resolves.toMatchObject({
+        exitCode: 125,
+        error: expect.stringMatching(/local wait timed out after 500ms.*remote command status is unknown.*may still be running/i),
+      });
+      expect(processApi.deleteSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("streams interleaved stdout/stderr before the remote command completes and preserves exit 7", async () => {
     const directory = mkdtempSync(path.join(tmpdir(), "sandbox-exec-stream-"));
     const stateDirectory = path.join(directory, "state");
@@ -93,7 +148,7 @@ describe("Daytona session exec streaming", () => {
       process.stdout.write = (chunk) => { writes.push(["stdout", String(chunk)]); return true; };
       process.stderr.write = (chunk) => { writes.push(["stderr", String(chunk)]); return true; };
       const result = await handleExec({ client, directory, "state-directory": stateDirectory, "task-id": "demo", json: true, artifacts }, ["false"]);
-      expect(result).toMatchObject({ exitCode: 125, stdout: "buffered out\n", stderr: "buffered err\n", warning: "Output was buffered because streaming is unavailable" });
+      expect(result).toMatchObject({ exitCode: 125, stdout: "buffered out\n", stderr: "buffered err\n", warning: expect.stringMatching(/buffered.*timeout.*cannot be enforced/i) });
       expect(writes).toEqual([]);
       expect(readFileSync(path.join(artifacts, "stdout.txt"), "utf8")).toBe("buffered out\n");
       expect(readFileSync(path.join(artifacts, "stderr.txt"), "utf8")).toBe("buffered err\n");
@@ -155,6 +210,20 @@ describe("Daytona session exec streaming", () => {
     } finally {
       rmSync(fixtureDir, { recursive: true, force: true });
     }
+  });
+
+  it("returns control exit 125 for an invalid exec timeout before remote execution", () => {
+    const cli = path.resolve(process.cwd(), "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+    const child = spawnSync(process.execPath, [cli, "--json", "exec", "--timeout", "nope", "--", "true"], { encoding: "utf8" });
+    expect(child.status).toBe(125);
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "exec", adapter: "daytona", exitCode: 125, error: expect.stringMatching(/invalid timeout/i) });
+  });
+
+  it("returns control exit 125 for an invalid exec timeout in human mode", () => {
+    const cli = path.resolve(process.cwd(), "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+    const child = spawnSync(process.execPath, [cli, "exec", "--timeout", "nope", "--", "true"], { encoding: "utf8" });
+    expect(child.status).toBe(125);
+    expect(child.stderr).toMatch(/invalid timeout/i);
   });
 
   it("reports a redacted actionable control failure once in human CLI mode", () => {
