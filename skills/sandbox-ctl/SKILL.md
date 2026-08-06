@@ -28,8 +28,8 @@ sandbox-ctl down --sandbox NAME
 
 `--directory DIR` selects a project; `--sandbox NAME_OR_ID` selects a binding
 without changing active binding. Bare `adopt` requires `--remote-path PATH`; omit
-it only when the exact config binding or legacy state has
-`remoteWorkspace`. `up --name` creates/reuses a binding; `use NAME` changes
+it only when the exact config binding has `remoteWorkspace` or legacy/project
+state has `remoteWorkspacePath`. `up --name` creates/reuses a binding; `use NAME` changes
 local selection. `--snapshot SNAPSHOT` selects the Daytona image for `up`/`run`.
 `exec --timeout DURATION` accepts positive integers with `ms`, `s`, `m`, or `h`
 (bare integer = seconds); streaming defaults to `5m`. Timeout ends only the
