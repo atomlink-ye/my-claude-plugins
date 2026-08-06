@@ -258,6 +258,59 @@ describe("sandbox-ctl dispatch", () => {
     } finally { console.log = originalLog; rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each(["legacy", "project"])("adopts using the existing %s state remote path", async (source) => {
+    const dir = mkdtempSync(`${tmpdir()}/adopt-state-${source}-`);
+    const stateDirectory = mkdtempSync(`${tmpdir()}/adopt-state-root-${source}-`);
+    const remotePath = `workspace/${source}/existing`;
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      let stateFile;
+      if (source === "legacy") {
+        mkdirSync(path.join(dir, ".daytona"), { recursive: true });
+        stateFile = path.join(dir, ".daytona", "state.json");
+      } else {
+        const paths = resolveProjectPaths({ directory: dir, "state-directory": stateDirectory });
+        mkdirSync(paths.stateDir, { recursive: true });
+        stateFile = paths.stateFile;
+      }
+      writeFileSync(stateFile, JSON.stringify({ sandboxId: "state-s1", taskId: "state-task", remoteWorkspacePath: remotePath }));
+      const result = await handleAdopt({
+        directory: dir,
+        "state-directory": stateDirectory,
+        client: { get: async () => ({ id: "state-s1", name: "state-name", state: "started" }) },
+        "sandbox-id": "state-s1",
+      });
+      expect(result.remoteWorkspace).toBe(remotePath);
+      expect(Object.values(readConfig(dir).sandboxes).map((binding) => binding.remoteWorkspace)).toContain(remotePath);
+    } finally { console.log = originalLog; rmSync(dir, { recursive: true, force: true }); rmSync(stateDirectory, { recursive: true, force: true }); }
+  });
+
+  it("prefers and preserves explicit remote path over binding and state paths", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/adopt-precedence-`);
+    const stateDirectory = mkdtempSync(`${tmpdir()}/adopt-precedence-state-`);
+    const bindingPath = "/workspace/config-binding";
+    const statePath = "/workspace/state-path";
+    const explicitPath = "workspace/explicit path/with 'quote'";
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      writeConfig(dir, { schemaVersion: 1, adapter: "daytona", active: "bound", sandboxes: { bound: { sandboxId: "precedence-s1", remoteWorkspace: bindingPath } } });
+      const paths = resolveProjectPaths({ directory: dir, "state-directory": stateDirectory, "sandbox-id": "precedence-s1", allowUnboundSandboxRef: true });
+      mkdirSync(paths.stateDir, { recursive: true });
+      writeFileSync(paths.stateFile, JSON.stringify({ sandboxId: "precedence-s1", taskId: "precedence-task", remoteWorkspacePath: statePath }));
+      const result = await handleAdopt({
+        directory: dir,
+        "state-directory": stateDirectory,
+        client: { get: async () => ({ id: "precedence-s1", name: "precedence-name", state: "started" }) },
+        "sandbox-id": "precedence-s1",
+        "remote-path": explicitPath,
+      });
+      expect(result.remoteWorkspace).toBe(explicitPath);
+      expect(readConfig(dir).sandboxes.bound.remoteWorkspace).toBe(explicitPath);
+    } finally { console.log = originalLog; rmSync(dir, { recursive: true, force: true }); rmSync(stateDirectory, { recursive: true, force: true }); }
+  });
+
   it("quotes the known remote workspace in recovery actions", async () => {
     const dir = mkdtempSync(`${tmpdir()}/recovery-remote-quote-`);
     const remotePath = "/workspace/with space/and 'quote'";
