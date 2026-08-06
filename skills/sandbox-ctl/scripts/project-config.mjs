@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import path from "node:path";
 
 const CONFIG_DIR = ".sandbox-ctl";
@@ -13,6 +13,10 @@ const LOCK_STALE_MS = 30_000;
 
 function configPath(directory = process.cwd()) {
   return path.join(path.resolve(directory), CONFIG_DIR, CONFIG_FILE);
+}
+
+function isExplicitConfigPath(directory) {
+  return path.basename(path.resolve(directory)) === CONFIG_FILE;
 }
 
 function assertNoSymlink(filePath, stopAt) {
@@ -52,9 +56,7 @@ function acquireLock(lockPath) {
 
 function resolveWriteTarget(directory = process.cwd()) {
   const suppliedPath = path.resolve(directory);
-  return suppliedPath.endsWith(`${CONFIG_DIR}/${CONFIG_FILE}`) || path.basename(suppliedPath) === CONFIG_FILE
-    ? suppliedPath
-    : (discoverConfig(suppliedPath) ?? configPath(suppliedPath));
+  return isExplicitConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
 }
 
 function withConfigLock(directory, fn) {
@@ -72,17 +74,11 @@ function withConfigLock(directory, fn) {
   } finally { closeSync(lockFd); unlinkSync(lockPath); }
 }
 
-/** Return the nearest existing config path while walking from directory upward. */
+/** Return the existing config path for exactly this directory. */
 function discoverConfig(directory = process.cwd()) {
-  let current = path.resolve(directory);
-  try { if (!statSync(current).isDirectory()) current = path.dirname(current); } catch { /* use path as a directory */ }
-  while (true) {
-    const candidate = configPath(current);
-    if (existsSync(candidate)) return candidate;
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
+  const suppliedPath = path.resolve(directory);
+  const candidate = isExplicitConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
+  return existsSync(candidate) ? candidate : null;
 }
 
 function assertSafeFields(value, location = "config") {
@@ -134,7 +130,8 @@ function validateConfig(input) {
 }
 
 function readConfig(directory = process.cwd(), { allowMissing = true } = {}) {
-  const file = discoverConfig(directory) ?? configPath(directory);
+  const suppliedPath = path.resolve(directory);
+  const file = isExplicitConfigPath(suppliedPath) ? suppliedPath : (discoverConfig(suppliedPath) ?? configPath(suppliedPath));
   if (!existsSync(file)) {
     if (allowMissing) return null;
     throw new Error(`Sandbox config not found from ${path.resolve(directory)}`);

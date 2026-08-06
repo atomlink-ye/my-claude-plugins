@@ -13,7 +13,7 @@ import {
 } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 describe("sandbox-ctl project config", () => {
-  it("discovers the nearest parent config and validates the v1 shape", () => {
+  it("uses exact-directory config scope and validates the v1 shape", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
     try {
       const nested = path.join(root, "packages", "app");
@@ -24,10 +24,38 @@ describe("sandbox-ctl project config", () => {
         active: "dev",
         sandboxes: { dev: { sandboxId: "s1", remoteWorkspace: "/workspace/dev" } },
       });
-      expect(discoverConfig(nested)).toBe(path.join(root, ".sandbox-ctl", "config.json"));
-      expect(readConfig(nested)).toMatchObject({ active: "dev", sandboxes: { dev: { sandboxId: "s1" } } });
+      expect(discoverConfig(nested)).toBeNull();
+      expect(readConfig(nested)).toBeNull();
       upsertBinding(nested, "child", { sandboxId: "s2", remoteWorkspace: "/workspace/child" });
-      expect(readConfig(root).sandboxes).toHaveProperty("child");
+      expect(readConfig(nested)).toMatchObject({ active: "child", sandboxes: { child: { sandboxId: "s2" } } });
+      expect(readConfig(root).sandboxes).not.toHaveProperty("child");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps active bindings isolated between parent and child directories", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
+    try {
+      const child = path.join(root, "child");
+      mkdirSync(child);
+      upsertBinding(root, "parent", { sandboxId: "p1", remoteWorkspace: "/workspace/parent" });
+      upsertBinding(child, "child", { sandboxId: "c1", remoteWorkspace: "/workspace/child" });
+      expect(readConfig(root).active).toBe("parent");
+      expect(readConfig(child).active).toBe("child");
+      selectBinding(child, "child");
+      expect(readConfig(root).active).toBe("parent");
+      expect(readConfig(child).active).toBe("child");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("reads and writes an explicitly supplied config.json path", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
+    try {
+      const file = path.join(root, "custom", "config.json");
+      writeConfig(file, { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
+      expect(readConfig(file)).toEqual({ schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
+      upsertBinding(file, "dev", { sandboxId: "s1", remoteWorkspace: "/workspace/dev" });
+      expect(readConfig(file)).toMatchObject({ active: "dev", sandboxes: { dev: { sandboxId: "s1" } } });
+      expect(readConfig(root)).toBeNull();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
