@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -24,6 +25,7 @@ import {
   migrateLegacyStateToConfig,
   handleUp,
 } from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
+import * as daytonaAdapter from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readConfig, writeConfig, upsertBinding } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
@@ -543,6 +545,29 @@ describe("sandbox-ctl run", () => {
     writeProvisionalSandboxState(paths, { id: "sandbox" });
     expect(readProjectState(paths)).toMatchObject({ sandboxId: "sandbox", taskId: "task" });
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not leave hashed state after a successful run", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-no-state-`);
+    const stateRoot = mkdtempSync(`${tmpdir()}/run-no-state-root-`);
+    try {
+      const adapter = {
+        ...daytonaAdapter,
+        handleUp: (options) => daytonaAdapter.handleUp({ ...options, client: { get: async () => null, create: async () => ({ id: "run-s1", state: "started" }) } }),
+        handlePush: async () => ({ ok: true }),
+        handleExec: async () => ({ exitCode: 0 }),
+        handleDown: async () => ({ ok: true }),
+      };
+
+      const result = await runSandboxCtl(["--json", "run", "--directory", dir, "--state-directory", stateRoot, "--", "true"], { adapter });
+
+      expect(result).toMatchObject({ ok: true, sandboxId: "run-s1", exitCode: 0 });
+      expect(existsSync(path.join(stateRoot, "projects"))).toBe(false);
+      expect(readdirSync(stateRoot, { recursive: true })).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
   });
 
   it("deletes only the state file actually used as source", () => {

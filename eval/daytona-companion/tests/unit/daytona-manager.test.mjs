@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -432,10 +432,14 @@ describe("daytona-manager up bindings", () => {
     try {
       upsertBinding(dir, "transfer", { sandboxId: "transfer-id", remoteWorkspace: "workspace/transfer" });
       mkdirSync(path.join(dir, ".daytona"), { recursive: true });
-      writeFileSync(path.join(dir, ".daytona", "state.json"), JSON.stringify({ sandboxId: "legacy-id", taskId: "legacy" }));
+      const legacyStateFile = path.join(dir, ".daytona", "state.json");
+      const legacyState = JSON.stringify({ sandboxId: "legacy-id", taskId: "legacy" });
+      writeFileSync(legacyStateFile, legacyState);
       const primaryPaths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot });
       mkdirSync(path.dirname(primaryPaths.stateFile), { recursive: true });
-      writeFileSync(primaryPaths.stateFile, JSON.stringify({ sandboxId: "primary-id", taskId: "primary" }));
+      const primaryState = JSON.stringify({ sandboxId: "primary-id", taskId: "primary" });
+      writeFileSync(primaryPaths.stateFile, primaryState);
+      const stateFilesBefore = readdirSync(stateRoot, { recursive: true }).sort();
       const lookedUp = [];
       let created = 0;
       const client = {
@@ -459,6 +463,9 @@ describe("daytona-manager up bindings", () => {
       expect(config.active).toBe("transfer");
       expect(config.sandboxes.transfer.sandboxId).toBe("transfer-id");
       expect(config.sandboxes.git.sandboxId).toBe("git-id");
+      expect(readFileSync(primaryPaths.stateFile, "utf8")).toBe(primaryState);
+      expect(readFileSync(legacyStateFile, "utf8")).toBe(legacyState);
+      expect(readdirSync(stateRoot, { recursive: true }).sort()).toEqual(stateFilesBefore);
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });

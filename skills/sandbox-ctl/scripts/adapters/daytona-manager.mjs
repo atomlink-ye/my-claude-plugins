@@ -821,7 +821,7 @@ async function handleUp(options) {
     sandbox = await createSandboxWithFallback(client, params, options);
     const provisionalId = sandbox?.id ?? sandbox?.sandboxId ?? sandbox?.instanceId;
     if (provisionalId) {
-      try { if (effectiveOptions.ignoreLegacyState) writeProvisionalSandboxState(paths, sandbox); }
+      try { if (options.writeProvisionalState) writeProvisionalSandboxState(paths, sandbox); }
       catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId); throw error; }
       const provisionalName = options.name ?? paths.binding?.name ?? paths.taskId;
       try { upsertBinding(paths.directory, provisionalName, {
