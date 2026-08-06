@@ -799,9 +799,18 @@ async function downloadFile(sandbox, remotePath, localPath) {
 }
 
 async function handleUp(options) {
-  const paths = resolveProjectPaths(options);
+  let effectiveOptions = options;
+  let paths = resolveProjectPaths(options);
+  if (options.name) {
+    const namedBinding = paths.config?.sandboxes?.[options.name];
+    if (namedBinding) paths = resolveProjectPaths({ ...options, sandbox: options.name });
+    else {
+      effectiveOptions = { ...options, ignoreActiveBinding: true, ignoreState: true, ignoreLegacyState: true };
+      paths = resolveProjectPaths(effectiveOptions);
+    }
+  }
   applyProjectEnv(options, paths);
-  const existing = options.ignoreState ? null : readProjectState(paths);
+  const existing = effectiveOptions.ignoreState ? null : readProjectState(paths);
   const existingBinding = paths.binding;
   const client = options.client ?? await createClient();
   let sandbox = await getSandbox(client, existingBinding?.sandboxId ?? existing?.sandboxId ?? paths.sandboxId);
@@ -811,7 +820,7 @@ async function handleUp(options) {
     sandbox = await createSandboxWithFallback(client, params, options);
     const provisionalId = sandbox?.id ?? sandbox?.sandboxId ?? sandbox?.instanceId;
     if (provisionalId) {
-      try { if (options.ignoreLegacyState) writeProvisionalSandboxState(paths, sandbox); }
+      try { if (effectiveOptions.ignoreLegacyState) writeProvisionalSandboxState(paths, sandbox); }
       catch (error) { error.sandboxId = provisionalId; error.nextActions = recoveryActions(paths.directory, provisionalId); throw error; }
       const provisionalName = options.name ?? paths.binding?.name ?? paths.taskId;
       try { upsertBinding(paths.directory, provisionalName, {

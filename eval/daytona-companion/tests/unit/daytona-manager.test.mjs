@@ -12,6 +12,7 @@ import {
   buildUsage,
   createBundle,
   downloadFile,
+  handleUp,
   listTarEntries,
   loadEnvFile,
   parseArgs,
@@ -29,6 +30,7 @@ import {
   uploadFile,
   validateTarEntries
 } from "../../../../skills/daytona-companion/scripts/daytona-manager.mjs";
+import { readConfig, upsertBinding } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 describe("daytona-manager args", () => {
   it("parses command options and passthrough command", () => {
@@ -417,6 +419,71 @@ describe("daytona-manager paths", () => {
 
       expect(() => resolveProjectPaths({ directory: dir })).toThrow("Invalid task id");
       expect(() => resolveProjectPaths({ directory: dir, "task-id": "a/b" })).toThrow("Invalid task id");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("daytona-manager up bindings", () => {
+  it("creates a new sandbox for an unbound name without changing the active binding", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "daytona-up-binding-test-"));
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-up-binding-state-"));
+    try {
+      upsertBinding(dir, "transfer", { sandboxId: "transfer-id", remoteWorkspace: "workspace/transfer" });
+      mkdirSync(path.join(dir, ".daytona"), { recursive: true });
+      writeFileSync(path.join(dir, ".daytona", "state.json"), JSON.stringify({ sandboxId: "legacy-id", taskId: "legacy" }));
+      const primaryPaths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot });
+      mkdirSync(path.dirname(primaryPaths.stateFile), { recursive: true });
+      writeFileSync(primaryPaths.stateFile, JSON.stringify({ sandboxId: "primary-id", taskId: "primary" }));
+      const lookedUp = [];
+      let created = 0;
+      const client = {
+        get: async (sandboxRef) => {
+          lookedUp.push(sandboxRef);
+          return { id: sandboxRef, state: "started" };
+        },
+        create: async (params) => {
+          created += 1;
+          expect(params.name).toBe("git");
+          return { id: "git-id", name: "git", state: "started" };
+        },
+      };
+
+      const result = await handleUp({ directory: dir, "state-directory": stateRoot, name: "git", noUse: true, client, json: true });
+
+      expect(created).toBe(1);
+      expect(lookedUp).toEqual([]);
+      expect(result.sandboxId).toBe("git-id");
+      const config = readConfig(dir);
+      expect(config.active).toBe("transfer");
+      expect(config.sandboxes.transfer.sandboxId).toBe("transfer-id");
+      expect(config.sandboxes.git.sandboxId).toBe("git-id");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the binding matching the requested name instead of the active binding", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "daytona-up-existing-binding-test-"));
+    try {
+      upsertBinding(dir, "transfer", { sandboxId: "transfer-id", remoteWorkspace: "workspace/transfer" });
+      upsertBinding(dir, "git", { sandboxId: "git-id", remoteWorkspace: "workspace/git" }, { use: false });
+      const lookedUp = [];
+      const client = {
+        get: async (sandboxRef) => {
+          lookedUp.push(sandboxRef);
+          return { id: sandboxRef, state: "started" };
+        },
+        create: async () => { throw new Error("unexpected sandbox creation"); },
+      };
+
+      const result = await handleUp({ directory: dir, name: "git", noUse: true, client, json: true });
+
+      expect(lookedUp).toEqual(["git-id"]);
+      expect(result.sandboxId).toBe("git-id");
+      expect(readConfig(dir).active).toBe("transfer");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
