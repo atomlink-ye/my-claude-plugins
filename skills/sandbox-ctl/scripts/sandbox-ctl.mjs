@@ -271,13 +271,13 @@ async function invokeRun(parsed, adapter) {
     expectedLifecycle: lifecycle,
   };
   const warnings = [];
-  const nextActions = [];
   let sandboxId;
   let upAttempted = false;
   let failure;
   let exitCode = 0;
   let execResult;
   let retained = false;
+  const nextActions = [];
   try {
     upAttempted = true;
     const upResult = await adapter.handleUp(upOptions);
@@ -295,9 +295,10 @@ async function invokeRun(parsed, adapter) {
   } catch (error) {
     failure = error;
     if (!sandboxId && error?.sandboxId) sandboxId = error.sandboxId;
+    if (Array.isArray(error?.nextActions)) nextActions.push(...error.nextActions);
     if (!exitCode) exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 125;
   } finally {
-    retained = Boolean(failure && parsed.options.keep);
+    retained = Boolean(failure && (parsed.options.keep || nextActions.length));
     if (upAttempted && !retained) {
       try { await adapter.handleDown(boundOptions); }
       catch (error) {
@@ -305,7 +306,7 @@ async function invokeRun(parsed, adapter) {
         warnings.push(sanitizeError(`Cleanup failed for sandbox ${sandboxId ?? "unknown"}: ${error?.message ?? error}`));
       }
     }
-    if (retained) nextActions.push(`sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(bindingName)}`);
+    if (retained && !nextActions.length) nextActions.push(`sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(bindingName)}`);
   }
   const result = {
     ...makeRunResult({ directory, bindingName, sandboxId: sandboxId ?? null, exitCode, artifactPath: execResult?.artifactPath ?? artifactPath, retained, warnings, nextActions }),

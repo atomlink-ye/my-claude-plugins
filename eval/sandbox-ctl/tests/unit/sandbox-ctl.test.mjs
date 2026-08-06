@@ -344,6 +344,26 @@ describe("sandbox-ctl run", () => {
     expect(calls[3][1]).not.toHaveProperty("sandbox-id");
   });
 
+  it("retains adapter recovery actions after a partial up binding failure", async () => {
+    const calls = [];
+    const recovery = [
+      "sandbox-ctl adopt --directory '/work' --sandbox-id 'new-remote-id' --name 'recovery-run'",
+      "sandbox-ctl down --directory '/work' --sandbox 'recovery-run'",
+    ];
+    const adapter = runAdapter(calls);
+    adapter.handleUp = async () => {
+      const error = new Error("config upsert failed");
+      error.sandboxId = "new-remote-id";
+      error.nextActions = recovery;
+      throw error;
+    };
+    adapter.handleDown = async () => { throw new Error("run binding does not exist"); };
+    const result = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter });
+    expect(result).toMatchObject({ ok: false, retained: true, sandboxId: "new-remote-id", exitCode: 125 });
+    expect(result.nextActions).toEqual(recovery);
+    expect(result.nextActions.join(" ")).not.toMatch(/--sandbox 'run-/);
+  });
+
   it("uses the explicit run binding for every post-up phase", async () => {
     const dir = mkdtempSync(`${tmpdir()}/run-bound-phases-`);
     try {
