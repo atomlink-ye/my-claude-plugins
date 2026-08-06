@@ -6,8 +6,11 @@ description: "Use for a Daytona sandbox lifecycle, remote command, artifact tran
 # sandbox-ctl
 
 `sandbox-ctl` is the canonical offline-friendly CLI. Daytona is the only
-adapter. Project bindings live in the nearest `.sandbox-ctl/config.json`;
-commands run from a subdirectory automatically discover that file.
+adapter. Project bindings are read only from the exact current working
+directory's `.sandbox-ctl/config.json`, or from `DIR/.sandbox-ctl/config.json`
+when `--directory DIR` is supplied. Discovery never walks up to parent
+directories. To use a root project's binding from a subdirectory—including
+isolated worktrees or concurrent agents—pass `--directory <root>` explicitly.
 
 ## Short workflow
 
@@ -24,7 +27,10 @@ sandbox-ctl down --sandbox NAME
 ```
 
 `--directory DIR` selects a project explicitly. `--sandbox NAME_OR_ID` selects
-a binding for any operation without changing the active binding. `up --name`
+a binding for any operation without changing the active binding. A bare
+`adopt` for a new binding requires `--remote-path PATH`; it may omit that flag
+only when the exact directory's config binding or legacy state already has a
+`remoteWorkspace`. `up --name`
 creates or reuses a named binding; `use NAME` changes only the local active
 selection. `--snapshot SNAPSHOT` selects the Daytona image for `up` or `run`.
 `exec --timeout DURATION` accepts a positive integer with `ms`, `s`, `m`, or
