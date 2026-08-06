@@ -4,11 +4,9 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { realpathSync } from "node:fs";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 
 import * as daytonaAdapter from "./adapters/daytona-manager.mjs";
-import { getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
+import { configPath, discoverConfig, getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
 
 const ADAPTERS = { daytona: daytonaAdapter };
 const LIFECYCLE_FLAGS = new Map([
@@ -67,6 +65,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
     if (flag === "--keep") { options.keep = true; continue; }
     if (flag === "--ephemeral") { options.ephemeral = true; continue; }
     if (flag === "--no-use") { options.noUse = true; continue; }
+    if (flag === "--include-sensitive") { options.includeSensitive = true; forwarded.push(arg); continue; }
     if (flag === "--adapter") {
       const read = readValue(argv, index, flag, inlineValue);
       adapter = read.value;
@@ -94,6 +93,8 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
       const read = readValue(argv, index, flag, inlineValue);
       if (flag === "--sandbox") options.sandbox = read.value;
       else if (flag === "--directory") options.directory = read.value;
+      else if (flag === "--sandbox-id" || flag === "--sandbox-name") options.sandboxSelector = read.value;
+      else if (flag === "--mode") options.mode = read.value;
       else if (flag === "--name") options.name = read.value;
       forwarded.push(arg);
       if (inlineValue === undefined) { forwarded.push(read.value); index = read.next; }
@@ -183,6 +184,29 @@ function makeRunTaskId(value) {
   return value || `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeRunResult({ directory = process.cwd(), bindingName = makeRunTaskId(), sandboxId = null, exitCode = 125, artifactPath = null, retained = false, warnings = [], nextActions = [], stdout = "", stderr = "", error } = {}) {
+  return {
+    ok: false,
+    command: "run",
+    adapter: "daytona",
+    bindingName,
+    configPath: discoverConfig(directory) ?? configPath(directory),
+    sandboxId,
+    exitCode,
+    artifactPath,
+    retained,
+    warnings,
+    nextActions,
+    stdout,
+    stderr,
+    ...(error ? { error: sanitizeError(error) } : {}),
+  };
+}
+
+function makeControlFailure({ directory = process.cwd(), bindingName, error, ...rest } = {}) {
+  return makeRunResult({ directory, bindingName, error, exitCode: 125, ...rest });
+}
+
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
@@ -199,67 +223,95 @@ async function captureExecStreams(fn) {
 }
 
 async function invokeRun(parsed, adapter) {
-  const adapterParsed = adapter.parseArgs(adapterArgs(parsed, { command: "up" }));
-  const stateDirectory = mkdtempSync(path.join(tmpdir(), "sandbox-ctl-run-state-"));
-  const options = { ...adapterParsed.options, directory: adapterParsed.options.directory ?? process.cwd(), "state-directory": stateDirectory, "task-id": adapterParsed.options["task-id"] ?? makeRunTaskId(), ignoreLegacyState: true, labels: buildLifecycleLabels("sandbox", parsed.options.labels) };
-  const lifecycle = normalizeLifecycleOptions("task", parsed.options);
-  Object.assign(options, lifecycle, { requireManagedPolicy: true, expectedKind: "sandbox", expectedLifecycle: lifecycle });
+  let adapterParsed;
+  try {
+    adapterParsed = adapter.parseArgs(adapterArgs(parsed, { command: "up" }));
+  } catch (error) {
+    return makeControlFailure({ directory: parsed.options.directory ?? process.cwd(), error });
+  }
+  const directory = parsed.options.directory ?? adapterParsed.options.directory ?? process.cwd();
+  const bindingName = makeRunTaskId();
+  const selector = parsed.options.sandbox ?? parsed.options.sandboxSelector ?? adapterParsed.options.sandbox ?? adapterParsed.options["sandbox-id"] ?? adapterParsed.options["sandbox-name"];
+  const transferMode = parsed.options.mode ?? adapterParsed.options.mode;
+  const includeSensitive = Boolean(parsed.options.includeSensitive ?? adapterParsed.options.includeSensitive ?? adapterParsed.options["include-sensitive"]);
+  if (selector) return makeControlFailure({ directory, bindingName, error: "run does not accept --sandbox, --sandbox-id, or --sandbox-name; it always creates a unique run-* binding" });
+  if (transferMode && transferMode !== "bundle") return makeControlFailure({ directory, bindingName, error: "run only supports safe bundle transfer; --mode full/git is not allowed" });
+  if (includeSensitive) return makeControlFailure({ directory, bindingName, error: "run does not accept --include-sensitive; credentials cannot be included" });
+  const commonOptions = {
+    ...adapterParsed.options,
+    directory,
+    json: Boolean(parsed.json),
+  };
+  let lifecycle;
+  try { lifecycle = normalizeLifecycleOptions("task", parsed.options); }
+  catch (error) { return makeControlFailure({ directory, bindingName, error }); }
+  const upOptions = {
+    ...commonOptions,
+    name: bindingName,
+    noUse: true,
+    ignoreActiveBinding: true,
+    ignoreState: true,
+    labels: buildLifecycleLabels("sandbox", parsed.options.labels),
+    ...lifecycle,
+    requireManagedPolicy: true,
+    expectedKind: "sandbox",
+    expectedLifecycle: lifecycle,
+  };
   const command = parsed.passthrough.length ? parsed.passthrough : adapterParsed.passthrough.length ? adapterParsed.passthrough : adapterParsed.positionals;
-  if (!command.length) { rmSync(stateDirectory, { recursive: true, force: true }); throw new Error("run requires a command after --"); }
+  if (!command.length) return makeControlFailure({ directory, bindingName, error: "run requires a command after --" });
+  const artifactPath = parsed.options.artifacts ?? parsed.options.output ?? adapterParsed.options.artifacts ?? adapterParsed.options.output ?? null;
+  if (artifactPath) commonOptions.artifacts = artifactPath;
+  const boundOptions = {
+    ...commonOptions,
+    sandbox: bindingName,
+    ignoreActiveBinding: false,
+    ignoreState: false,
+    requireManagedPolicy: true,
+    expectedKind: "sandbox",
+    expectedLifecycle: lifecycle,
+  };
   const warnings = [];
   const nextActions = [];
   let sandboxId;
   let upAttempted = false;
   let failure;
   let exitCode = 0;
-  let pullResult;
   let execResult;
   let retained = false;
   try {
     upAttempted = true;
-    const upResult = await adapter.handleUp(options);
+    const upResult = await adapter.handleUp(upOptions);
     sandboxId = upResult?.sandboxId ?? upResult?.id;
-    await adapter.handlePush({ ...options, path: adapterParsed.options.path ?? options.directory });
-    const capturedExec = await captureExecStreams(() => adapter.handleExec(options, command));
+    await adapter.handlePush({ ...boundOptions, path: adapterParsed.options.path ?? directory });
+    const capturedExec = await captureExecStreams(() => adapter.handleExec(boundOptions, command));
     execResult = capturedExec.result;
-    execResult = { ...(execResult ?? {}), stdout: capturedExec.stdout, stderr: capturedExec.stderr };
+    execResult = {
+      ...(execResult ?? {}),
+      stdout: capturedExec.stdout || execResult?.stdout || "",
+      stderr: capturedExec.stderr || execResult?.stderr || "",
+    };
     exitCode = typeof execResult?.exitCode === "number" ? execResult.exitCode : 0;
-    pullResult = await adapter.handlePull({ ...options, output: adapterParsed.options.output });
     if (exitCode !== 0) failure = new Error(`Remote command exited with code ${exitCode}`);
   } catch (error) {
     failure = error;
     if (!sandboxId && error?.sandboxId) sandboxId = error.sandboxId;
-    if (!exitCode) exitCode = 1;
+    if (!exitCode) exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 125;
   } finally {
     retained = Boolean(failure && parsed.options.keep);
     if (upAttempted && !retained) {
-      try { await adapter.handleDown({ ...options, requireManagedPolicy: true, expectedKind: "sandbox" }); }
+      try { await adapter.handleDown(boundOptions); }
       catch (error) {
         retained = true;
         warnings.push(sanitizeError(`Cleanup failed for sandbox ${sandboxId ?? "unknown"}: ${error?.message ?? error}`));
       }
     }
-    if (retained && sandboxId) {
-      const cleanupProjects = path.join(stateDirectory, "projects");
-      nextActions.push(`SANDBOX_ID=${shellQuote(sandboxId)} sandbox-ctl finish --directory ${shellQuote(options.directory)} --state-directory ${shellQuote(stateDirectory)} --task-id ${shellQuote(options["task-id"])} && rmdir ${shellQuote(cleanupProjects)} ${shellQuote(stateDirectory)}`);
-    }
-    if (!retained) rmSync(stateDirectory, { recursive: true, force: true });
+    if (retained) nextActions.push(`sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(bindingName)}`);
   }
   const result = {
+    ...makeRunResult({ directory, bindingName, sandboxId: sandboxId ?? null, exitCode, artifactPath: execResult?.artifactPath ?? artifactPath, retained, warnings, nextActions }),
     ok: !failure && !warnings.length && exitCode === 0,
-    command: "run",
-    adapter: "daytona",
-    sandboxId: sandboxId ?? null,
-    stateDirectory,
-    exitCode,
-    artifactPath: pullResult?.output ?? null,
-    retained,
-    warnings,
-    nextActions,
-    stdout: "",
-    stderr: "",
   };
-  if (warnings.length && exitCode === 0) result.exitCode = 1;
+  if (warnings.length && exitCode === 0) result.exitCode = 125;
   if (execResult?.stdout) result.stdout = sanitizeError(execResult.stdout);
   if (execResult?.stderr) result.stderr = sanitizeError(execResult.stderr);
   if (failure && !result.error) result.error = sanitizeError(failure);
@@ -357,8 +409,15 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
     if (command === "run") console.log(JSON.stringify(resultObject, null, 2));
     return jsonResult.result;
   } catch (error) {
+    if (findTopLevelCommand(argv) === "run") {
+      const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error });
+      process.exitCode = 125;
+      if (requestedJson) console.log(JSON.stringify(payload));
+      else console.error(payload.error);
+      return payload;
+    }
     if (!requestedJson) throw error;
-    const payload = { ok: false, command: argv.find((arg) => !arg.startsWith("-")) ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    const payload = { ok: false, command: findTopLevelCommand(argv) ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
     process.exitCode = 1;
     console.log(JSON.stringify(payload));
     return payload;
@@ -370,6 +429,28 @@ function sanitizeError(error) {
   for (const [key, value] of Object.entries(process.env)) if (/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|JWT)/i.test(key) && value && value.length > 3) message = message.split(value).join("[redacted]");
   message = message.replace(/(https?:\/\/)([^\s/@]+):([^\s/@]+)@/gi, "$1[redacted]@[redacted]@");
   return message;
+}
+
+const TOP_LEVEL_VALUE_FLAGS = new Set(["--adapter", "--label", "--auto-stop", "--auto-archive", "--auto-delete", "--sandbox", "--sandbox-id", "--sandbox-name", "--directory", "--name", "--path", "--output", "--artifacts", "--mode", "--snapshot", "--env-file"]);
+
+function findTopLevelCommand(argv = []) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--") break;
+    if (!arg.startsWith("-")) return arg;
+    const flag = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
+    if (TOP_LEVEL_VALUE_FLAGS.has(flag) && !arg.includes("=")) index += 1;
+  }
+  return null;
+}
+
+function findTopLevelDirectory(argv = []) {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--") break;
+    if (argv[index] === "--directory" && argv[index + 1] && !argv[index + 1].startsWith("--")) return argv[index + 1];
+    if (argv[index].startsWith("--directory=")) return argv[index].slice("--directory=".length);
+  }
+  return process.cwd();
 }
 
 function isSameRealPath(a, b) {

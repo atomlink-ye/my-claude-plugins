@@ -26,7 +26,7 @@ import {
 } from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { readConfig, writeConfig } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
+import { readConfig, writeConfig, upsertBinding } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 describe("sandbox-ctl argument parsing", () => {
   it("supports local binding selection and no-use lifecycle controls", () => {
@@ -328,18 +328,160 @@ describe("sandbox-ctl run", () => {
     };
   }
 
-  it("runs up, push, exec, pull, down in order", async () => {
+  it("runs up, safe bundle push, exec, and exact named down in order", async () => {
     const calls = [];
     const result = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter: runAdapter(calls) });
     expect(result).toMatchObject({ ok: true, command: "run", adapter: "daytona", sandboxId: "sandbox-run-1", exitCode: 0, retained: false });
-    expect(calls.map(([name]) => name)).toEqual(["up", "push", "exec", "pull", "down"]);
+    expect(result.bindingName).toMatch(/^run-/);
+    expect(result.configPath).toMatch(/\.sandbox-ctl\/config\.json$/);
+    expect(calls.map(([name]) => name)).toEqual(["up", "push", "exec", "down"]);
+    expect(calls[0][1]).toMatchObject({ name: result.bindingName, noUse: true });
+    expect(calls[1][1].mode ?? "bundle").toBe("bundle");
+    expect(calls[3][1]).toMatchObject({ sandbox: result.bindingName });
+    expect(calls[3][1]).not.toHaveProperty("sandbox-name");
+    expect(calls[3][1]).not.toHaveProperty("sandbox-id");
   });
 
-  it("pulls and deletes after remote exit 7, preserving exact exit code", async () => {
+  it("uses the explicit run binding for every post-up phase", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-bound-phases-`);
+    try {
+      writeConfig(dir, { schemaVersion: 1, adapter: "daytona", active: "dev", sandboxes: { dev: { sandboxId: "active-s1", remoteWorkspace: "/workspace/dev" } } });
+      const calls = [];
+      const adapter = runAdapter(calls);
+      adapter.handleUp = async (options) => {
+        upsertBinding(dir, options.name, { sandboxId: "run-s1", remoteWorkspace: "/workspace/run" }, { use: false });
+        calls.push(["up", options]);
+        return { sandboxId: "run-s1" };
+      };
+      for (const phase of ["handlePush", "handleExec", "handleDown"]) {
+        const original = adapter[phase];
+        adapter[phase] = async (options, ...rest) => {
+          const resolved = resolveProjectPaths({ ...options, directory: dir });
+          expect(resolved.binding?.name).toMatch(/^run-/);
+          expect(options.sandbox).toMatch(/^run-/);
+          expect(options.ignoreActiveBinding).toBe(false);
+          expect(options.ignoreState).toBe(false);
+          expect(options).not.toHaveProperty("sandbox-name");
+          expect(options).not.toHaveProperty("sandbox-id");
+          return original(options, ...rest);
+        };
+      }
+      const result = await runSandboxCtl(["--json", "run", "--directory", dir, "--", "echo", "ok"], { adapter });
+      expect(result).toMatchObject({ ok: true, sandboxId: "run-s1", exitCode: 0 });
+      expect(readConfig(dir).active).toBe("dev");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when run is given an existing sandbox selector", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-selector-`);
+    try {
+      writeConfig(dir, { schemaVersion: 1, adapter: "daytona", active: "dev", sandboxes: { dev: { sandboxId: "active-s1", remoteWorkspace: "/workspace/dev" } } });
+      const calls = [];
+      const result = await runSandboxCtl(["--json", "run", "--directory", dir, "--sandbox", "dev", "--", "echo", "ok"], { adapter: runAdapter(calls) });
+      expect(result).toMatchObject({ ok: false, command: "run", exitCode: 125, bindingName: expect.stringMatching(/^run-/) });
+      expect(calls).toEqual([]);
+      expect(readConfig(dir).active).toBe("dev");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([["--mode", "git"], ["--mode", "full"], ["--include-sensitive"]])("rejects unsafe run transfer option %s", async (...args) => {
+    const calls = [];
+    const result = await runSandboxCtl(["--json", "run", ...args, "--", "echo", "ok"], { adapter: runAdapter(calls) });
+    expect(result).toMatchObject({ ok: false, command: "run", exitCode: 125 });
+    expect(calls).toEqual([]);
+    expect(result.error).toMatch(/bundle|unsupported|safe|credential/i);
+  });
+
+  it("returns the complete control-error schema and exit 125 for a commandless real run", () => {
+    const root = path.resolve(process.cwd());
+    const child = spawnSync(process.execPath, [path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs"), "--json", "run"], { encoding: "utf8" });
+    expect(child.status).toBe(125);
+    expect(child.stdout.trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "run", exitCode: 125, bindingName: expect.stringMatching(/^run-/), configPath: expect.any(String), sandboxId: null, artifactPath: null, retained: false, warnings: expect.any(Array), nextActions: expect.any(Array), stdout: "", stderr: "", error: expect.any(String) });
+  });
+
+  it.each([["--auto-stop", "nope"], ["--label", "invalid"]])("returns stable run schema and 125 for top-level parse error %s", (flag, value) => {
+    const root = path.resolve(process.cwd());
+    const child = spawnSync(process.execPath, [path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs"), "--json", "run", flag, value, "--", "echo", "ok"], { encoding: "utf8" });
+    expect(child.status).toBe(125);
+    expect(child.stdout.trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "run", exitCode: 125, bindingName: expect.stringMatching(/^run-/), configPath: expect.any(String), sandboxId: null, artifactPath: null, retained: false, warnings: expect.any(Array), nextActions: expect.any(Array), stdout: "", stderr: "", error: expect.any(String) });
+  });
+
+  it("uses exit 125 and stderr for a human top-level run parse error", () => {
+    const root = path.resolve(process.cwd());
+    const child = spawnSync(process.execPath, [path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs"), "run", "--auto-stop", "nope", "--", "echo", "ok"], { encoding: "utf8" });
+    expect(child.status).toBe(125);
+    expect(child.stderr).toMatch(/invalid|integer/i);
+    expect(child.stdout).toBe("");
+  });
+
+  it("returns stable schema and 125 for normalize and adapter parse failures", async () => {
+    const normalized = await runSandboxCtl(["--json", "run", "--auto-stop", "-1", "--", "echo", "ok"], { adapter: runAdapter([]) });
+    expect(normalized).toMatchObject({ ok: false, command: "run", exitCode: 125, bindingName: expect.stringMatching(/^run-/), sandboxId: null, artifactPath: null, retained: false, warnings: expect.any(Array), nextActions: expect.any(Array), stdout: "", stderr: "", error: expect.any(String) });
+    const parsed = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter: { parseArgs: () => { throw new Error("adapter parse failed"); } } });
+    expect(parsed).toMatchObject({ ok: false, command: "run", exitCode: 125, bindingName: expect.stringMatching(/^run-/), sandboxId: null, artifactPath: null, retained: false, warnings: expect.any(Array), nextActions: expect.any(Array), stdout: "", stderr: "", error: expect.stringMatching(/parse failed/) });
+  });
+
+  it("creates a run binding without resolving or changing an existing active binding", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-active-binding-`);
+    try {
+      writeConfig(dir, {
+        schemaVersion: 1,
+        adapter: "daytona",
+        active: "dev",
+        sandboxes: { dev: { sandboxId: "active-s1", remoteWorkspace: "/workspace/dev" } },
+      });
+      const calls = [];
+      const adapter = runAdapter(calls);
+      adapter.handleUp = async (options) => {
+        calls.push(["up", options]);
+        expect(options.ignoreActiveBinding).toBe(true);
+        return { sandboxId: "run-s1" };
+      };
+      const result = await runSandboxCtl(["--json", "run", "--directory", dir, "--", "echo", "ok"], { adapter });
+      expect(result.bindingName).toMatch(/^run-/);
+      expect(calls[0][1]).toMatchObject({ name: result.bindingName, noUse: true, ignoreActiveBinding: true });
+      expect(readConfig(dir).active).toBe("dev");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("real up ignores active and legacy state only when run requests isolation", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-isolated-up-`);
+    try {
+      writeConfig(dir, {
+        schemaVersion: 1,
+        adapter: "daytona",
+        active: "dev",
+        sandboxes: { dev: { sandboxId: "active-s1", remoteWorkspace: "/workspace/dev" } },
+      });
+      const result = await handleUp({
+        directory: dir,
+        client: { get: async () => null, create: async () => ({ id: "run-s1" }) },
+        name: "run-test",
+        noUse: true,
+        ignoreActiveBinding: true,
+        ignoreState: true,
+      });
+      expect(result).toMatchObject({ sandboxId: "run-s1", name: "run-test" });
+      expect(readConfig(dir).active).toBe("dev");
+      expect(readConfig(dir).sandboxes["run-test"]).toMatchObject({ sandboxId: "run-s1" });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("completes local artifacts before deleting after remote exit 7", async () => {
     const calls = [];
     const result = await runSandboxCtl(["--json", "run", "--", "false"], { adapter: runAdapter(calls, { execCode: 7 }) });
     expect(result).toMatchObject({ ok: false, exitCode: 7, retained: false, stdout: "stream stdout", stderr: "stream stderr" });
-    expect(calls.map(([name]) => name)).toEqual(["up", "push", "exec", "pull", "down"]);
+    expect(calls.map(([name]) => name)).toEqual(["up", "push", "exec", "down"]);
+  });
+
+  it("maps run output to local exec artifacts", async () => {
+    const calls = [];
+    const output = `${tmpdir()}/run-artifacts`;
+    const result = await runSandboxCtl(["--json", "run", "--output", output, "--", "echo", "ok"], { adapter: runAdapter(calls) });
+    expect(result.artifactPath).toBe(output);
+    expect(calls.find(([name]) => name === "exec")[1].artifacts).toBe(output);
   });
 
   it("cleans up after push/exec/pull errors and keeps state only with --keep", async () => {
@@ -349,20 +491,20 @@ describe("sandbox-ctl run", () => {
     const keptCalls = [];
     const kept = await runSandboxCtl(["--json", "--keep", "run", "--", "false"], { adapter: runAdapter(keptCalls, { failAt: "exec" }) });
     expect(kept).toMatchObject({ ok: false, retained: true });
-    expect(kept.nextActions.join(" ")).toContain("sandbox-run-1");
+    expect(kept.nextActions.join(" ")).toMatch(/sandbox-ctl down .*--sandbox 'run-/);
     expect(keptCalls.map(([name]) => name)).toEqual(["up", "push", "exec"]);
   });
 
   it("reports cleanup failure without replacing a successful run's result", async () => {
     const calls = [];
     const result = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter: runAdapter(calls, { cleanupFails: true }) });
-    expect(result).toMatchObject({ ok: false, exitCode: 1, retained: true });
+    expect(result).toMatchObject({ ok: false, exitCode: 125, retained: true });
     expect(result.warnings.join(" ")).toMatch(/cleanup/i);
-    expect(result.nextActions.join(" ")).toContain("sandbox-run-1");
+    expect(result.nextActions.join(" ")).toMatch(/sandbox-ctl down .*--sandbox 'run-/);
   });
 
   it("keeps a stable run JSON schema on success and failures", async () => {
-    const fields = ["sandboxId", "exitCode", "artifactPath", "retained", "warnings", "nextActions", "stdout", "stderr"];
+    const fields = ["bindingName", "configPath", "sandboxId", "exitCode", "artifactPath", "retained", "warnings", "nextActions", "stdout", "stderr"];
     const success = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter: runAdapter([]) });
     const execFailure = await runSandboxCtl(["--json", "run", "--", "false"], { adapter: runAdapter([], { failAt: "exec" }) });
     const upFailure = await runSandboxCtl(["--json", "run", "--", "false"], { adapter: runAdapter([], { failAt: "up" }) });
@@ -385,9 +527,8 @@ describe("sandbox-ctl run", () => {
     const calls = [];
     const result = await runSandboxCtl(["--json", "--keep", "run", "--directory", `${dir} with space`, "--", "false"], { adapter: runAdapter(calls, { failAt: "exec" }) });
     expect(result.nextActions.join(" ")).toMatch(/--directory '.* with space'/);
-    expect(result.nextActions.join(" ")).toMatch(/--state-directory '/);
-    expect(result.nextActions.join(" ")).toMatch(/--task-id '/);
-    expect(result.nextActions.join(" ")).toMatch(/&& rmdir '/);
+    expect(result.nextActions.join(" ")).toMatch(/--sandbox 'run-/);
+    expect(result).not.toHaveProperty("stateDirectory");
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -440,6 +581,6 @@ describe("sandbox-ctl run", () => {
     adapter.handleUp = async () => { const error = new Error("start failed"); error.sandboxId = "sandbox-start-fail"; throw error; };
     const result = await runSandboxCtl(["--json", "--keep", "run", "--", "false"], { adapter });
     expect(result).toMatchObject({ ok: false, sandboxId: "sandbox-start-fail", retained: true });
-    expect(result.nextActions.join(" ")).toContain("sandbox-start-fail");
+    expect(result.nextActions.join(" ")).toMatch(/--sandbox 'run-/);
   });
 });

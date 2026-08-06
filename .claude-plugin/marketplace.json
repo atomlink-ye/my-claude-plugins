@@ -20,6 +20,7 @@
       "strict": false,
       "skills": [
         "./skills/daytona-companion",
+        "./skills/sandbox-ctl",
         "./skills/google-workspace",
         "./skills/mcp-skill",
         "./skills/opencode-companion",

@@ -192,9 +192,9 @@ function resolveProjectPaths(options = {}) {
   const explicitSandbox = options.sandbox ?? options["sandbox-name"] ?? options["sandbox-id"];
   const binding = explicitSandbox
     ? resolveBinding(config ?? { sandboxes: {} }, explicitSandbox)
-    : getActiveBinding(directory);
+    : options.ignoreActiveBinding ? null : getActiveBinding(directory);
   if (explicitSandbox && !binding && !options.allowUnboundSandboxRef) throw new Error(`Sandbox binding not found: ${explicitSandbox}`);
-  const state = readState(stateFile) ?? (!options.ignoreLegacyState ? readState(legacyStateFile) : null);
+  const state = options.ignoreState ? null : (readState(stateFile) ?? (!options.ignoreLegacyState ? readState(legacyStateFile) : null));
   const rawTaskId = options["task-id"] ?? state?.taskId;
   const defaultTaskId = path.basename(directory).replace(/[^A-Za-z0-9._-]+/g, "-") || "project";
   const taskId = sanitizeTaskId(rawTaskId ?? defaultTaskId, rawTaskId === undefined ? "default task id" : "task id");
@@ -801,7 +801,7 @@ async function downloadFile(sandbox, remotePath, localPath) {
 async function handleUp(options) {
   const paths = resolveProjectPaths(options);
   applyProjectEnv(options, paths);
-  const existing = readProjectState(paths);
+  const existing = options.ignoreState ? null : readProjectState(paths);
   const existingBinding = paths.binding;
   const client = options.client ?? await createClient();
   let sandbox = await getSandbox(client, existingBinding?.sandboxId ?? existing?.sandboxId ?? paths.sandboxId);

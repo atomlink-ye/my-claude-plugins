@@ -15,7 +15,7 @@ describe("sandbox-ctl packaging", () => {
 
   it("has secure sandbox-ctl skill frontmatter and guidance", () => {
     const skill = read("skills/sandbox-ctl/SKILL.md");
-    expect(skill).toMatch(/^---\nname: sandbox-ctl\ndescription: ["']Use when/);
+    expect(skill).toMatch(/^---\nname: sandbox-ctl\ndescription: ["']Use (when|for)/);
     expect(skill.trim().split(/\s+/).length).toBeLessThan(500);
     expect(skill).toMatch(/deprecated.*task|task.*deprecated/i);
     expect(skill).not.toMatch(/metadata-only/i);
@@ -50,7 +50,9 @@ describe("sandbox-ctl packaging", () => {
     const daytona = read("skills/sandbox-ctl/references/daytona.md");
     const maintenance = read("skills/sandbox-ctl/references/maintenance.md");
     const runtime = read("skills/daytona-companion/references/remote-agent-runtime.md");
-    for (const flag of ["--directory", "--task-id", "--output", "--snapshot", "--json", "--keep", "--"]) expect(skill).toContain(flag);
+    for (const flag of ["--directory", "--output", "--snapshot", "--json", "--keep", "--", "--sandbox", "--artifacts"]) expect(skill).toContain(flag);
+    expect(skill).toMatch(/bindingName/);
+    expect(skill).toMatch(/configPath/);
     for (const artifact of ["stdout.txt", "stderr.txt", "exit-code.txt", "manifest.json"]) expect(daytona).toContain(artifact);
     expect(daytona).not.toMatch(/metadata-only|task-v1|project-v1/i);
     expect(daytona).toMatch(/sandbox-v1/);
@@ -62,8 +64,8 @@ describe("sandbox-ctl packaging", () => {
     expect(runtime).not.toMatch(/daemon start|PASEO_DAEMON|agent credentials/i);
     expect(read("skills/daytona-companion/references/troubleshooting.md")).not.toMatch(/paseo daemon (stop|start)|PASEO_DAEMON|paseo run --host|remote agents? are/i);
     expect(daytona).toMatch(/reuse.*lifecycle/i);
-    expect(skill).toMatch(/stateDirectory/);
-    expect(skill).toMatch(/error.*optional|optional.*error/i);
+    expect(skill).not.toMatch(/stateDirectory/);
+    expect(skill).toMatch(/control.*125|125.*control/i);
   });
 
   it("keeps smoke cleanup evidence and uses temporary offline paths", () => {

@@ -1,16 +1,40 @@
 # Daytona adapter details
 
-Daytona API inventory is authoritative. Local project state is a compatibility cache keyed by project directory; `sandbox-ctl run` uses an isolated temporary state directory and ignores legacy `.daytona/state.json`.
+The adapter is deliberately narrow: it creates and deletes only managed
+Daytona sandboxes represented by a local named binding. Bindings are the source
+of truth for normal commands; legacy hashed state is read-only compatibility
+input and is migrated only when explicitly resolved.
 
-## Policies
+## Lifecycle
 
-Sandboxes carry managed labels: `sandbox-ctl.managed=true`, `sandbox-ctl.kind=sandbox`, `sandbox-ctl.adapter=daytona`, and `sandbox-ctl.policy=sandbox-v1`. User labels are preserved. Managed operations verify labels, policy, and identity; legacy managed objects are accepted only for read-only migration/adoption.
+Managed labels are `sandbox-ctl.managed=true`, `sandbox-ctl.kind=sandbox`,
+`sandbox-ctl.adapter=daytona`, and `sandbox-ctl.policy=sandbox-v1`. Every
+`up` path uses independent stop/archive/delete timers of 30/10080/60 minutes:
+idle sandboxes stop at 30, continuously-stopped sandboxes delete at 60, and
+archive runs at 10080 when deletion is disabled. Reuse checks the selected
+binding's identity; reuse lifecycle settings are validated before remote
+operations. `run` always creates a
+unique `run-*` binding with `noUse=true`, and cleanup addresses that exact name.
 
-Unified defaults are `autoStopInterval=30`, `autoArchiveInterval=10080`, and `autoDeleteInterval=60` for every alias. `--auto-delete -1` disables deletion; `--auto-delete 0` deletes immediately after stop. `--ephemeral` normalizes auto-delete to zero.
-Reuse validates the selected binding's lifecycle before remote operations.
+## Transfer and execution
 
-## Transfers and execution
+Bundle mode is the safe default. It excludes env files, credentials, VCS data,
+dependencies, build output, logs, and `.sandbox-ctl`; tar entries are checked
+before extraction and links/special files are rejected. Full mode is opt-in
+with both `--mode full` and `--include-sensitive`.
 
-Bundle push excludes environment files, credentials, VCS metadata, dependencies, build output, and logs. Tar entries are validated before extraction. Git push/pull is limited to committed history and a `daytona/<task>` branch. Remote commands are shell-quoted and write `stdout.txt`, `stderr.txt`, `exit-code.txt`, and `manifest.json`. `exec` and `run` return the remote code exactly; a non-zero exec is pulled before cleanup.
+Git mode transfers committed local history on a dedicated branch, never
+force-pushes, warns when local changes are uncommitted, and rejects dirty
+remote workspaces for push and pull. Remote changes require an explicit commit
+before pull; new local commits must exist before push. A remote workspace must
+be clean and non-divergent.
 
-`list` is inventory-only. `doctor` performs a read-only SDK list call and reports configuration/connection categories without secrets. `down` deletes only the exact managed sandbox represented by the selected binding, checking managed/kind/policy identity. Legacy hashed or `.daytona/state.json` state is read-only and migrated to local bindings on first successful resolution.
+`exec` streams output when the SDK supports sessions and buffers otherwise.
+`--json` emits one object; `--artifacts DIR` writes `stdout.txt`, `stderr.txt`,
+`exit-code.txt`, and `manifest.json` locally. `run --output DIR` maps to that
+local artifact directory. Remote exit codes are returned exactly; control
+errors return 125. Artifact writing completes before a remote non-zero result
+is cleaned up.
+
+`list` and `doctor` are read-only inventory/diagnostic calls. `down` checks
+managed labels and identity, then deletes only the exact selected binding.

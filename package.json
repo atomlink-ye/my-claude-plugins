@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Personal Claude Code plugin marketplace.",
   "type": "module",
+  "bin": {
+    "sandbox-ctl": "./skills/sandbox-ctl/scripts/sandbox-ctl.mjs"
+  },
   "scripts": {
     "test": "pnpm run test:js && pnpm run test:python",
     "test:js": "vitest run",
