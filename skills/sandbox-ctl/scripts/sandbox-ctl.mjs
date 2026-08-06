@@ -1,0 +1,386 @@
+#!/usr/bin/env node
+
+import process from "node:process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import path from "node:path";
+import { realpathSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+
+import * as daytonaAdapter from "./adapters/daytona-manager.mjs";
+import { getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
+
+const ADAPTERS = { daytona: daytonaAdapter };
+const LIFECYCLE_FLAGS = new Map([
+  ["--auto-stop", "autoStopInterval"],
+  ["--auto-archive", "autoArchiveInterval"],
+  ["--auto-delete", "autoDeleteInterval"],
+]);
+const BOOLEAN_ADAPTER_FLAGS = new Set(["--refresh", "--keep-state", "--include-git", "--include-preview"]);
+
+function readValue(argv, index, flag, inline) {
+  const value = inline ?? argv[index + 1];
+  if (value === undefined || value === "" || (inline === undefined && value.startsWith("--"))) {
+    throw new Error(`Missing value for option: ${flag}`);
+  }
+  return { value, next: inline === undefined ? index + 1 : index };
+}
+
+function parseInteger(value, source) {
+  const result = Number(value);
+  if (!Number.isInteger(result)) throw new Error(`Invalid ${source}: expected an integer`);
+  return result;
+}
+
+function parseLabel(value) {
+  const separator = String(value).indexOf("=");
+  if (separator <= 0) throw new Error(`Invalid label: expected key=value`);
+  const key = String(value).slice(0, separator).trim();
+  const labelValue = String(value).slice(separator + 1);
+  if (!key) throw new Error("Invalid label: key must not be empty");
+  return [key, labelValue];
+}
+
+/** Parse sandbox-ctl globals while retaining legacy adapter arguments. */
+function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
+  const forwarded = [];
+  const positionals = [];
+  const options = { labels: {} };
+  let adapter = "daytona";
+  let json = false;
+  let command;
+  let passthrough = [];
+  let afterDashDash = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (afterDashDash) {
+      passthrough.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDashDash = true;
+      continue;
+    }
+    const [flag, inlineValue] = arg.startsWith("--") && arg.includes("=") ? arg.split(/=(.*)/s, 2) : [arg, undefined];
+    if (flag === "--help" || flag === "-h") { options.help = true; continue; }
+    if (flag === "--json") { json = true; continue; }
+    if (flag === "--keep") { options.keep = true; continue; }
+    if (flag === "--ephemeral") { options.ephemeral = true; continue; }
+    if (flag === "--no-use") { options.noUse = true; continue; }
+    if (flag === "--adapter") {
+      const read = readValue(argv, index, flag, inlineValue);
+      adapter = read.value;
+      index = read.next;
+      continue;
+    }
+    if (flag === "--label") {
+      const read = readValue(argv, index, flag, inlineValue);
+      const [key, value] = parseLabel(read.value);
+      options.labels[key] = value;
+      index = read.next;
+      continue;
+    }
+    if (LIFECYCLE_FLAGS.has(flag)) {
+      const read = readValue(argv, index, flag, inlineValue);
+      options[LIFECYCLE_FLAGS.get(flag)] = parseInteger(read.value, flag.slice(2));
+      index = read.next;
+      continue;
+    }
+    if (BOOLEAN_ADAPTER_FLAGS.has(flag)) {
+      forwarded.push(arg);
+      continue;
+    }
+    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in") {
+      const read = readValue(argv, index, flag, inlineValue);
+      if (flag === "--sandbox") options.sandbox = read.value;
+      else if (flag === "--directory") options.directory = read.value;
+      else if (flag === "--name") options.name = read.value;
+      forwarded.push(arg);
+      if (inlineValue === undefined) { forwarded.push(read.value); index = read.next; }
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      // Leave unknown adapter options intact; Daytona will provide the precise error.
+      forwarded.push(arg);
+      if (inlineValue === undefined && argv[index + 1] !== undefined && !argv[index + 1].startsWith("--")) forwarded.push(argv[++index]);
+      continue;
+    }
+    if (!command) command = arg;
+    else positionals.push(arg);
+  }
+  if (adapter !== "daytona") throw new Error(`Unknown adapter: ${adapter}. Supported adapters: daytona`);
+  return { adapter, json, command, positionals, passthrough, options, forwarded };
+}
+
+function resolveCommandAlias(command, subcommand) {
+  if (command === "create") return { command: "up", kind: "sandbox" };
+  if (command === "delete" || command === "finish") return { command: "down", kind: "task" };
+  if (command === "import") return { command: "adopt", kind: "sandbox" };
+  if (command === "task" || command === "project") {
+    if (subcommand !== "up") throw new Error("project delete/down is deferred; explicit confirmation is required");
+    return { command: subcommand, kind: "sandbox" };
+  }
+  return { command, kind: "sandbox" };
+}
+
+function normalizeLifecycleOptions(kind = "task", options = {}) {
+  const defaults = { autoStopInterval: 30, autoArchiveInterval: 10080, autoDeleteInterval: 60 };
+  const normalized = { ...defaults };
+  for (const key of ["autoStopInterval", "autoArchiveInterval", "autoDeleteInterval"]) {
+    if (options[key] !== undefined) normalized[key] = parseInteger(options[key], key);
+  }
+  if (normalized.autoStopInterval < 0 || normalized.autoArchiveInterval < 0 || normalized.autoDeleteInterval < -1) {
+    throw new Error("Lifecycle intervals must be non-negative (auto-delete may be -1)");
+  }
+  normalized.ephemeral = Boolean(options.ephemeral);
+  if (normalized.ephemeral) normalized.autoDeleteInterval = 0;
+  return normalized;
+}
+
+function buildLifecycleLabels(kind = "task", labels = {}) {
+  return {
+    ...labels,
+    "sandbox-ctl.managed": "true",
+    "sandbox-ctl.kind": "sandbox",
+    "sandbox-ctl.adapter": "daytona",
+    "sandbox-ctl.policy": "sandbox-v1",
+  };
+}
+
+function usage() {
+  return [
+    "Usage: sandbox-ctl [--adapter daytona] [--json] <command> [options]",
+    "Commands: up, adopt, status, push, exec, run, pull, preview, smoke-test, down, list, doctor",
+    "Deprecated aliases: create, task up, project up (all use the unified up policy)",
+    "Binding: use NAME_OR_ID (select active binding)",
+    "Lifecycle: --label key=value (repeatable), --auto-stop N, --auto-archive N, --auto-delete N, --ephemeral",
+  ].join("\n");
+}
+
+async function capture(fn) {
+  const logs = [];
+  const errors = [];
+  const writes = [];
+  const oldLog = console.log;
+  const oldError = console.error;
+  const oldOut = process.stdout.write;
+  const oldErr = process.stderr.write;
+  console.log = (...args) => logs.push(args.map(String).join(" "));
+  console.error = (...args) => errors.push(args.map(String).join(" "));
+  process.stdout.write = (chunk, ...args) => { writes.push(String(chunk)); return true; };
+  process.stderr.write = (chunk, ...args) => { errors.push(String(chunk)); return true; };
+  try { return { result: await fn(), logs, errors, writes }; }
+  finally { console.log = oldLog; console.error = oldError; process.stdout.write = oldOut; process.stderr.write = oldErr; }
+}
+
+function adapterArgs(parsed, alias) {
+  const args = [...parsed.forwarded];
+  args.unshift(alias.command);
+  return args;
+}
+
+function makeRunTaskId(value) {
+  return value || `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+async function captureExecStreams(fn) {
+  const stdout = [];
+  const stderr = [];
+  const oldOut = process.stdout.write;
+  const oldErr = process.stderr.write;
+  process.stdout.write = (chunk) => { stdout.push(String(chunk)); return true; };
+  process.stderr.write = (chunk) => { stderr.push(String(chunk)); return true; };
+  try { return { result: await fn(), stdout: stdout.join(""), stderr: stderr.join("") }; }
+  finally { process.stdout.write = oldOut; process.stderr.write = oldErr; }
+}
+
+async function invokeRun(parsed, adapter) {
+  const adapterParsed = adapter.parseArgs(adapterArgs(parsed, { command: "up" }));
+  const stateDirectory = mkdtempSync(path.join(tmpdir(), "sandbox-ctl-run-state-"));
+  const options = { ...adapterParsed.options, directory: adapterParsed.options.directory ?? process.cwd(), "state-directory": stateDirectory, "task-id": adapterParsed.options["task-id"] ?? makeRunTaskId(), ignoreLegacyState: true, labels: buildLifecycleLabels("sandbox", parsed.options.labels) };
+  const lifecycle = normalizeLifecycleOptions("task", parsed.options);
+  Object.assign(options, lifecycle, { requireManagedPolicy: true, expectedKind: "sandbox", expectedLifecycle: lifecycle });
+  const command = parsed.passthrough.length ? parsed.passthrough : adapterParsed.passthrough.length ? adapterParsed.passthrough : adapterParsed.positionals;
+  if (!command.length) { rmSync(stateDirectory, { recursive: true, force: true }); throw new Error("run requires a command after --"); }
+  const warnings = [];
+  const nextActions = [];
+  let sandboxId;
+  let upAttempted = false;
+  let failure;
+  let exitCode = 0;
+  let pullResult;
+  let execResult;
+  let retained = false;
+  try {
+    upAttempted = true;
+    const upResult = await adapter.handleUp(options);
+    sandboxId = upResult?.sandboxId ?? upResult?.id;
+    await adapter.handlePush({ ...options, path: adapterParsed.options.path ?? options.directory });
+    const capturedExec = await captureExecStreams(() => adapter.handleExec(options, command));
+    execResult = capturedExec.result;
+    execResult = { ...(execResult ?? {}), stdout: capturedExec.stdout, stderr: capturedExec.stderr };
+    exitCode = typeof execResult?.exitCode === "number" ? execResult.exitCode : 0;
+    pullResult = await adapter.handlePull({ ...options, output: adapterParsed.options.output });
+    if (exitCode !== 0) failure = new Error(`Remote command exited with code ${exitCode}`);
+  } catch (error) {
+    failure = error;
+    if (!sandboxId && error?.sandboxId) sandboxId = error.sandboxId;
+    if (!exitCode) exitCode = 1;
+  } finally {
+    retained = Boolean(failure && parsed.options.keep);
+    if (upAttempted && !retained) {
+      try { await adapter.handleDown({ ...options, requireManagedPolicy: true, expectedKind: "sandbox" }); }
+      catch (error) {
+        retained = true;
+        warnings.push(sanitizeError(`Cleanup failed for sandbox ${sandboxId ?? "unknown"}: ${error?.message ?? error}`));
+      }
+    }
+    if (retained && sandboxId) {
+      const cleanupProjects = path.join(stateDirectory, "projects");
+      nextActions.push(`SANDBOX_ID=${shellQuote(sandboxId)} sandbox-ctl finish --directory ${shellQuote(options.directory)} --state-directory ${shellQuote(stateDirectory)} --task-id ${shellQuote(options["task-id"])} && rmdir ${shellQuote(cleanupProjects)} ${shellQuote(stateDirectory)}`);
+    }
+    if (!retained) rmSync(stateDirectory, { recursive: true, force: true });
+  }
+  const result = {
+    ok: !failure && !warnings.length && exitCode === 0,
+    command: "run",
+    adapter: "daytona",
+    sandboxId: sandboxId ?? null,
+    stateDirectory,
+    exitCode,
+    artifactPath: pullResult?.output ?? null,
+    retained,
+    warnings,
+    nextActions,
+    stdout: "",
+    stderr: "",
+  };
+  if (warnings.length && exitCode === 0) result.exitCode = 1;
+  if (execResult?.stdout) result.stdout = sanitizeError(execResult.stdout);
+  if (execResult?.stderr) result.stderr = sanitizeError(execResult.stderr);
+  if (failure && !result.error) result.error = sanitizeError(failure);
+  return result;
+}
+
+async function invoke(parsed, adapter, alias) {
+  const adapterParsed = adapter.parseArgs(adapterArgs(parsed, alias));
+  const options = { ...adapterParsed.options };
+  options.directory = parsed.options.directory ?? options.directory ?? process.cwd();
+  if (parsed.options.name !== undefined) options.name = parsed.options.name;
+  if (parsed.options.noUse) options.noUse = true;
+  if (alias.command !== "up" && alias.command !== "adopt" && alias.command !== "list" && alias.command !== "doctor") {
+    const config = readConfig(options.directory);
+    const selected = parsed.options.sandbox
+      ? resolveBinding(config ?? { sandboxes: {} }, parsed.options.sandbox)
+      : getActiveBinding(options.directory);
+    if (parsed.options.sandbox && !selected) throw new Error(`Sandbox binding not found: ${parsed.options.sandbox}`);
+    if (selected) {
+      options["sandbox-id"] = selected.sandboxId;
+      options["remote-path"] = selected.remoteWorkspace;
+      options.sandboxId = selected.sandboxId;
+      options.remoteWorkspace = selected.remoteWorkspace;
+    }
+  }
+  if (alias.command === "up") {
+    const lifecycle = normalizeLifecycleOptions(alias.kind, parsed.options);
+    Object.assign(options, lifecycle, {
+      labels: buildLifecycleLabels(alias.kind, parsed.options.labels),
+      requireManagedPolicy: true,
+      expectedKind: "sandbox",
+      expectedLifecycle: lifecycle,
+    });
+  }
+  if (alias.command === "down") {
+    Object.assign(options, { requireManagedPolicy: true, expectedKind: "sandbox" });
+  }
+  if (alias.command === "use") return selectBinding(options.directory, parsed.positionals[0] ?? parsed.options.sandbox);
+  const handler = {
+    up: adapter.handleUp,
+    down: adapter.handleDown,
+    adopt: adapter.handleAdopt,
+    status: adapter.handleStatus,
+    push: adapter.handlePush,
+    exec: (opts) => adapter.handleExec(opts, parsed.passthrough.length ? parsed.passthrough : (adapterParsed.passthrough.length ? adapterParsed.passthrough : adapterParsed.positionals)),
+    pull: adapter.handlePull,
+    preview: adapter.handlePreview,
+    "smoke-test": adapter.handleSmokeTest,
+    list: adapter.handleList,
+    doctor: adapter.handleDoctor,
+  }[alias.command];
+  if (!handler) throw new Error(`Unknown command: ${parsed.command}`);
+  return handler(options);
+}
+
+/** Run the command. The optional dependency injection keeps unit tests offline. */
+async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAdapter } = {}) {
+  const requestedJson = argv.some((arg) => arg === "--json" || arg.startsWith("--json="));
+  try {
+    const parsed = parseSandboxCtlArgs(argv);
+    if (parsed.options.help || !parsed.command) {
+      if (parsed.json) console.log(JSON.stringify({ ok: true, command: "help", adapter: parsed.adapter, usage: usage() }));
+      else console.log(usage());
+      return { ok: true, command: "help", adapter: parsed.adapter };
+    }
+    const deprecatedAlias = parsed.command === "create" || parsed.command === "task" || parsed.command === "project";
+    const alias = parsed.command === "use" ? { command: "use", kind: "sandbox" } : resolveCommandAlias(parsed.command, parsed.positionals[0]);
+    const command = alias.command;
+    const runner = command === "run" ? () => invokeRun(parsed, adapter) : () => invoke(parsed, adapter, alias);
+    const jsonResult = (parsed.json || command === "run") ? await capture(runner) : { result: await runner(), logs: [], errors: [], writes: [] };
+    const resultObject = jsonResult.result && typeof jsonResult.result === "object" ? jsonResult.result : {};
+    const exitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : (resultObject.ok === false ? 1 : 0);
+    if ((command === "exec" || command === "run") && typeof resultObject.exitCode === "number") process.exitCode = exitCode;
+    if (resultObject.ok === false) process.exitCode = 1;
+    if (deprecatedAlias && !parsed.json) console.log(`Deprecated alias: ${parsed.command}${parsed.command === "create" ? "" : " up"}; use sandbox-ctl up instead.`);
+    if (parsed.json) {
+      const payload = { ok: exitCode === 0, command, adapter: parsed.adapter, ...resultObject, ...(command === "exec" ? { exitCode } : {}) };
+      if (deprecatedAlias) payload.warnings = [...(Array.isArray(resultObject.warnings) ? resultObject.warnings : []), `Deprecated alias: ${parsed.command}; use sandbox-ctl up instead.`];
+      if (command === "exec" || command === "run") {
+        const stdout = resultObject.stdout ?? [...jsonResult.writes, ...jsonResult.logs].join("");
+        const stderr = resultObject.stderr ?? jsonResult.errors.join("");
+        if (stdout) payload.stdout = sanitizeError(stdout);
+        if (stderr) payload.stderr = sanitizeError(stderr);
+      }
+      console.log(JSON.stringify(payload));
+      return payload;
+    }
+    if (command === "run") console.log(JSON.stringify(resultObject, null, 2));
+    return jsonResult.result;
+  } catch (error) {
+    if (!requestedJson) throw error;
+    const payload = { ok: false, command: argv.find((arg) => !arg.startsWith("-")) ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    process.exitCode = 1;
+    console.log(JSON.stringify(payload));
+    return payload;
+  }
+}
+
+function sanitizeError(error) {
+  let message = String(error?.message ?? error);
+  for (const [key, value] of Object.entries(process.env)) if (/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|JWT)/i.test(key) && value && value.length > 3) message = message.split(value).join("[redacted]");
+  message = message.replace(/(https?:\/\/)([^\s/@]+):([^\s/@]+)@/gi, "$1[redacted]@[redacted]@");
+  return message;
+}
+
+function isSameRealPath(a, b) {
+  try { return realpathSync(a) === realpathSync(b); } catch { return a === b; }
+}
+
+async function loadDirectAdapter() {
+  const modulePath = process.env.SANDBOX_CTL_ADAPTER_MODULE;
+  if (!modulePath) return daytonaAdapter;
+  return import(pathToFileURL(path.resolve(modulePath)).href);
+}
+
+const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
+if (isDirectExecution) loadDirectAdapter().then((adapter) => runSandboxCtl(process.argv.slice(2), { adapter })).catch((error) => {
+  const wantsJson = process.argv.includes("--json");
+  if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: "daytona", error: sanitizeError(error) }));
+  else console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});
+
+export { buildLifecycleLabels, normalizeLifecycleOptions, parseSandboxCtlArgs, resolveCommandAlias, runSandboxCtl, usage };

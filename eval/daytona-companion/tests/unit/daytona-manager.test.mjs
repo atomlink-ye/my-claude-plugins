@@ -99,12 +99,12 @@ describe("daytona-manager env loading", () => {
       writeFileSync(projectEnvFile, "DAYTONA_API_KEY=project-key\nSHARED=project\n");
 
       const paths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot });
-      expect(resolveEnvFiles({}, paths)).toEqual([globalEnvFile, projectEnvFile]);
+      expect(resolveEnvFiles({}, paths, { globalStateRoot: stateRoot })).toEqual([globalEnvFile, projectEnvFile]);
 
       delete process.env.DAYTONA_API_KEY;
       delete process.env.VISIBLE;
       delete process.env.SHARED;
-      applyProjectEnv({}, paths);
+      applyProjectEnv({}, paths, { globalStateRoot: stateRoot });
 
       expect(process.env.DAYTONA_API_KEY).toBe("project-key");
       expect(process.env.VISIBLE).toBe("global");
@@ -117,6 +117,43 @@ describe("daytona-manager env loading", () => {
       if (oldShared === undefined) delete process.env.SHARED;
       else process.env.SHARED = oldShared;
       rmSync(dir, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the default global env source when state is isolated in a custom root", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "daytona-env-isolated-project-test-"));
+    const globalRoot = mkdtempSync(path.join(tmpdir(), "daytona-env-isolated-global-test-"));
+    const stateRoot = mkdtempSync(path.join(tmpdir(), "daytona-env-isolated-state-test-"));
+    const oldGlobal = process.env.DAYTONA_API_KEY;
+    const oldCustom = process.env.CUSTOM_ONLY;
+    const oldProject = process.env.PROJECT_ONLY;
+    try {
+      writeFileSync(path.join(globalRoot, ".env.local"), "DAYTONA_API_KEY=global-key\nCUSTOM_ONLY=global\n");
+      writeFileSync(path.join(stateRoot, ".env.local"), "CUSTOM_ONLY=custom\n");
+      writeFileSync(path.join(dir, ".env.local"), "PROJECT_ONLY=project\n");
+      const paths = resolveProjectPaths({ directory: dir, "state-directory": stateRoot });
+      expect(resolveEnvFiles({}, paths, { globalStateRoot: globalRoot })).toEqual([
+        path.join(globalRoot, ".env.local"),
+        path.join(stateRoot, ".env.local"),
+        path.join(dir, ".env.local"),
+      ]);
+      delete process.env.DAYTONA_API_KEY;
+      delete process.env.CUSTOM_ONLY;
+      delete process.env.PROJECT_ONLY;
+      applyProjectEnv({}, paths, { globalStateRoot: globalRoot });
+      expect(process.env.DAYTONA_API_KEY).toBe("global-key");
+      expect(process.env.CUSTOM_ONLY).toBe("custom");
+      expect(process.env.PROJECT_ONLY).toBe("project");
+    } finally {
+      if (oldGlobal === undefined) delete process.env.DAYTONA_API_KEY;
+      else process.env.DAYTONA_API_KEY = oldGlobal;
+      if (oldCustom === undefined) delete process.env.CUSTOM_ONLY;
+      else process.env.CUSTOM_ONLY = oldCustom;
+      if (oldProject === undefined) delete process.env.PROJECT_ONLY;
+      else process.env.PROJECT_ONLY = oldProject;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(globalRoot, { recursive: true, force: true });
       rmSync(stateRoot, { recursive: true, force: true });
     }
   });
