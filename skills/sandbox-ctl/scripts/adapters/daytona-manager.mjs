@@ -170,7 +170,7 @@ async function resolveRemoteHome(sandbox) {
 
 function validateGitBranch(branch) {
   const value = String(branch ?? "").trim();
-  if (!value.startsWith("daytona/")) throw new Error("Git sync branch must be under daytona/");
+  if (!value || value.startsWith("-") || value.includes("..") || value.includes("\\") || value.includes("@{")) throw new Error(`Invalid git branch: ${value}`);
   const result = spawnSync("git", ["check-ref-format", "--branch", value], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(`Invalid git branch: ${value}`);
   return value;
@@ -623,20 +623,60 @@ function createGitBundle(repoPath, taskId) {
   const abs = path.resolve(repoPath);
   if (!existsSync(abs) || !statSync(abs).isDirectory()) throw new Error(`Git mode requires an existing local repository directory: ${abs}`);
   runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
-  runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check");
+  const head = runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check").stdout.trim();
+  const dirty = Boolean(spawnSync("git", ["status", "--porcelain"], { cwd: abs, encoding: "utf8" }).stdout?.trim());
   const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-input-"));
   const bundlePath = path.join(tempDir, `daytona-git-input-${taskId}.bundle`);
-  runLocal("git", ["bundle", "create", bundlePath, "HEAD"], abs, "git bundle create");
-  return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
+  const cleanup = () => rmSync(tempDir, { recursive: true, force: true });
+  try {
+    runLocal("git", ["bundle", "create", bundlePath, "HEAD"], abs, "git bundle create");
+    listGitBundle(bundlePath);
+    return { bundlePath, head, dirty, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
+function listGitBundle(bundlePath, repoPath = process.cwd()) {
+  const sourceRepo = path.resolve(repoPath);
+  const result = spawnSync("git", ["-C", sourceRepo, "bundle", "verify", bundlePath], { cwd: sourceRepo, env: { ...process.env, GIT_DIR: path.join(sourceRepo, ".git") }, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`git bundle validation failed: ${result.stderr || result.stdout}`.trim());
+  return result.stdout;
+}
+
+function gitTempRef(prefix = "sync") { return `refs/sandbox-ctl-sync/${prefix}-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`; }
+
+function localBranchCheckedOut(repoPath, branch) {
+  const result = runLocal("git", ["worktree", "list", "--porcelain"], repoPath, "git worktree inspection");
+  return result.stdout.split(/\r?\n/).some((line) => line.startsWith("branch refs/heads/") && line.slice(18).trim() === branch);
 }
 
 function fetchGitBundleIntoBranch(bundlePath, repoPath, branch) {
   const abs = path.resolve(repoPath);
   const safeBranch = validateGitBranch(branch);
   runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
-  const current = spawnSync("git", ["branch", "--show-current"], { cwd: abs, encoding: "utf8" });
-  if (current.status === 0 && current.stdout.trim() === safeBranch) throw new Error(`Refusing to overwrite currently checked-out branch: ${safeBranch}`);
-  runLocal("git", ["fetch", bundlePath, `HEAD:${safeBranch}`, "--force"], abs, "git fetch bundle");
+  const tempRef = gitTempRef("remote");
+  try {
+    runLocal("git", ["fetch", bundlePath, `HEAD:${tempRef}`], abs, "git fetch bundle");
+    const remoteHead = runLocal("git", ["rev-parse", tempRef], abs, "git remote HEAD").stdout.trim();
+    const target = `refs/heads/${safeBranch}`;
+    const current = spawnSync("git", ["rev-parse", "--verify", target], { cwd: abs, encoding: "utf8" });
+    if (current.status !== 0) { runLocal("git", ["update-ref", target, remoteHead, ""], abs, "git branch create"); return { branch: safeBranch, remoteHead, created: true }; }
+    if (localBranchCheckedOut(abs, safeBranch)) throw new Error(`Refusing to update checked-out branch: ${safeBranch}`);
+    const oldHead = current.stdout.trim();
+    const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", oldHead, remoteHead], { cwd: abs, encoding: "utf8" });
+    if (ancestor.status === 0) { runLocal("git", ["update-ref", target, remoteHead, oldHead], abs, "git fast-forward branch"); return { branch: safeBranch, remoteHead, fastForward: true }; }
+    const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+    let actual = `${safeBranch}-${timestamp}`;
+    let suffix = 0;
+    while (spawnSync("git", ["show-ref", "--verify", `refs/heads/${actual}`], { cwd: abs, encoding: "utf8" }).status === 0) actual = `${safeBranch}-${timestamp}-${++suffix}`;
+    runLocal("git", ["update-ref", `refs/heads/${actual}`, remoteHead, ""], abs, "git divergence branch create");
+    return { branch: actual, remoteHead, diverged: true };
+  } finally {
+    const cleanup = spawnSync("git", ["update-ref", "-d", tempRef], { cwd: abs, encoding: "utf8" });
+    if (cleanup.status !== 0) throw new Error(`Failed to clean temporary git ref ${tempRef}: ${cleanup.stderr || cleanup.stdout}`.trim());
+  }
 }
 
 async function sandboxExec(sandbox, command, cwd) {
@@ -930,17 +970,24 @@ async function handlePush(options) {
   const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
   if (mode === "git") {
-    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
+    const defaultBranch = `sandbox-ctl/${paths.binding?.name ?? paths.taskId}`;
+    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? paths.binding?.sync?.branch ?? defaultBranch);
     const safeRemoteWorkspace = assertSafeDestructiveRemoteWorkspace(remoteWorkspace, remoteHome);
-    const { bundlePath, cleanup } = createGitBundle(options.path, paths.taskId);
+    const { bundlePath, head, dirty, cleanup } = createGitBundle(options.path, paths.taskId);
     try {
       const remoteBundle = `/tmp/daytona-git-input-${paths.taskId}.bundle`;
       await uploadFile(sandbox, bundlePath, remoteBundle);
-      const result = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && rm -rf ${shellQuote(safeRemoteWorkspace)} && mkdir -p ${shellQuote(path.posix.dirname(safeRemoteWorkspace))} && git clone ${shellQuote(remoteBundle)} ${shellQuote(safeRemoteWorkspace)} && cd ${shellQuote(safeRemoteWorkspace)} && git checkout -B ${shellQuote(branch)} && git config user.name ${shellQuote("Daytona Companion")} && git config user.email ${shellQuote("daytona-companion@example.invalid")}`);
+      const target = shellQuote(safeRemoteWorkspace);
+      const remoteRef = shellQuote(`refs/heads/${branch}`);
+      const tempRef = shellQuote(`refs/sandbox-ctl-sync/push-${paths.taskId}-${Date.now().toString(36)}`);
+      const result = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && set -eu && target=${shellQuote(safeRemoteWorkspace)} && temp_ref=${shellQuote(`refs/sandbox-ctl-sync/push-${paths.taskId}-${Date.now().toString(36)}`)} && remote_bundle=${shellQuote(remoteBundle)}; cleanup() { git -C "$target" update-ref -d "$temp_ref" >/dev/null 2>&1 || echo 'Warning: failed to clean remote temporary ref' >&2; rm -f "$remote_bundle" || echo 'Warning: failed to clean remote bundle' >&2; }; trap cleanup EXIT; if [ -e "$target" ]; then if [ ! -d "$target" ] || ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then if [ ! -d "$target" ] || [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then echo 'remote workspace is non-git and non-empty; refusing to replace it' >&2; exit 73; fi; git init "$target" >/dev/null; fi; else mkdir -p ${shellQuote(path.posix.dirname(safeRemoteWorkspace))} && git init "$target" >/dev/null; fi && if [ -n "$(git -C "$target" status --porcelain --untracked-files=all)" ]; then echo 'remote git workspace is dirty; commit or clean it before push' >&2; exit 74; fi && remote_head=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null || true) && current_branch=$(git -C "$target" symbolic-ref --short HEAD 2>/dev/null || true) && if [ -n "$remote_head" ] && [ "$current_branch" != ${shellQuote(branch)} ]; then echo 'remote git workspace must have the dedicated branch checked out' >&2; exit 76; fi && git -C "$target" fetch "$remote_bundle" HEAD:"$temp_ref" >/dev/null && temp_head=$(git -C "$target" rev-parse "$temp_ref") && if [ -z "$remote_head" ]; then git -C "$target" checkout -b ${shellQuote(branch)} "$temp_ref" >/dev/null; elif [ "$remote_head" = "$temp_head" ]; then true; elif git -C "$target" merge-base --is-ancestor "$temp_head" "$remote_head"; then echo 'remote git workspace is ahead of local HEAD; pull first' >&2; exit 75; elif ! git -C "$target" merge-base --is-ancestor "$remote_head" "$temp_head"; then echo 'remote git workspace diverged from local HEAD; pull first' >&2; exit 75; else git -C "$target" merge --ff-only "$temp_ref" >/dev/null; fi`);
       assertRemoteCommandSuccess(result, "git push sync");
-      if (!paths.binding) writeState(paths, { ...state, remoteWorkspacePath: options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
-      console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch}`);
-      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch };
+      const warnings = dirty ? ["Local repository has uncommitted changes; git sync includes committed history only."] : [];
+      if (result?.stderr && /Warning: failed to clean/i.test(String(result.stderr))) warnings.push(String(result.stderr).trim());
+      if (paths.binding) upsertBinding(paths.directory, paths.binding.name, { sync: { mode: "git", branch }, updatedAt: new Date().toISOString() }, { use: false });
+      else writeState(paths, { ...state, remoteWorkspacePath: options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
+      console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch}${warnings.length ? `\nWarning: ${warnings[0]}` : ""}`);
+      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch, warnings };
     } finally { cleanup(); }
     return;
   }
@@ -1139,21 +1186,30 @@ async function handlePull(options) {
   if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
   if (mode === "full" && !includeSensitive) throw new Error("--mode full may download credentials; pass --include-sensitive to confirm");
   if (mode === "git") {
-    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
+    const defaultBranch = `sandbox-ctl/${paths.binding?.name ?? paths.taskId}`;
+    const branch = validateGitBranch(options.branch ?? state.gitBranch ?? paths.binding?.sync?.branch ?? defaultBranch);
     const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
     const remoteBundle = `/tmp/daytona-git-output-${paths.taskId}.bundle`;
-    const commitMessage = `sync from Daytona companion ${new Date().toISOString()}`;
-    const gitResult = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && cd ${shellQuote(remoteWorkspace)} && git config user.name ${shellQuote("Daytona Companion")} && git config user.email ${shellQuote("daytona-companion@example.invalid")} && git add -A && (git diff --cached --quiet || git commit -m ${shellQuote(commitMessage)}) && git bundle create ${shellQuote(remoteBundle)} HEAD`);
+    const gitResult = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && if [ ! -d ${shellQuote(remoteWorkspace)} ] || ! git -C ${shellQuote(remoteWorkspace)} rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo 'remote workspace is not a git repository' >&2; exit 73; fi && if [ -n "$(git -C ${shellQuote(remoteWorkspace)} status --porcelain --untracked-files=all)" ]; then echo 'remote git workspace is dirty; commit changes before pull (run sandbox-ctl exec -- git status, then commit explicitly)' >&2; exit 74; fi && git -C ${shellQuote(remoteWorkspace)} bundle create ${shellQuote(remoteBundle)} HEAD`);
     assertRemoteCommandSuccess(gitResult, "git pull sync bundling");
     const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-output-"));
     const localBundle = path.join(tempDir, `daytona-git-output-${paths.taskId}.bundle`);
+    const warnings = [];
     try {
       await downloadFile(sandbox, remoteBundle, localBundle);
-      fetchGitBundleIntoBranch(localBundle, paths.directory, branch);
-      if (!paths.binding) writeState(paths, { ...state, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
-      console.log(`Fetched remote git changes into local branch ${branch}`);
-      return { ok: true, mode: "git", branch };
-    } finally { rmSync(tempDir, { recursive: true, force: true }); }
+      const received = fetchGitBundleIntoBranch(localBundle, paths.directory, branch);
+      const actualBranch = received.branch;
+      if (paths.binding) upsertBinding(paths.directory, paths.binding.name, { sync: { mode: "git", branch }, updatedAt: new Date().toISOString() }, { use: false });
+      else writeState(paths, { ...state, syncMode: "git", gitBranch: actualBranch, updatedAt: new Date().toISOString() });
+      console.log(`Fetched remote git changes into local branch ${actualBranch}`);
+      return { ok: true, mode: "git", branch: actualBranch, requestedBranch: branch, diverged: Boolean(received.diverged), warnings };
+    } finally {
+      try {
+        const cleanupResult = await sandboxExec(sandbox, `rm -f ${shellQuote(remoteBundle)}`);
+        if (typeof cleanupResult?.exitCode === "number" && cleanupResult.exitCode !== 0) warnings.push(`Failed to clean remote git bundle ${remoteBundle}`);
+      } catch (error) { warnings.push(`Failed to clean remote git bundle ${remoteBundle}: ${error?.message ?? error}`); }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
     return;
   }
   const requestedRemotePath = options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath;
@@ -1415,4 +1471,4 @@ if (isDirectExecution) main().then((result) => { if (typeof result?.exitCode ===
 
 const runDaytonaManager = main;
 
-export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, assertSafeRemoteTransferPath, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listTarEntries, loadEnvFile, main, mergeTransferTree, migrateLegacyStateToConfig, parseArgs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, resolveRemoteTransferPath, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };
+export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, assertSafeRemoteTransferPath, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listGitBundle, listTarEntries, loadEnvFile, main, mergeTransferTree, migrateLegacyStateToConfig, parseArgs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, resolveRemoteTransferPath, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };
