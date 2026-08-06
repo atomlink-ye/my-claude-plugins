@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use"];
-const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete"];
+const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
 const CLASS_RESOURCE_DEFAULTS = {
@@ -298,7 +298,7 @@ function buildUsage() {
     "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
     "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
-    "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] -- COMMAND...",
+    "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] [--artifacts PATH] -- COMMAND...",
     "  pull [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
     "  preview [--directory DIR] [--state-directory DIR] --port PORT [--expires-in SECONDS]",
     "  smoke-test [--directory DIR] [--state-directory DIR] [--task-id ID] [--class small|medium|large] [--include-git] [--include-preview]",
@@ -617,6 +617,63 @@ async function sandboxExec(sandbox, command, cwd) {
   throw new Error("Sandbox command execution is not supported by this @daytona/sdk version.");
 }
 
+function sessionProcessApi(sandbox) {
+  const processApi = sandbox?.process;
+  if (!processApi) return null;
+  const names = ["createSession", "executeSessionCommand", "getSessionCommandLogs", "getSessionCommand", "deleteSession"];
+  return names.every((name) => typeof processApi[name] === "function") ? processApi : null;
+}
+
+function newExecSessionId() {
+  return `sandbox-ctl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function sessionCall(processApi, name, canonicalArgs, objectArg) {
+  const method = processApi[name];
+  // The SDK uses (sessionId, request, ...), while small test doubles and older
+  // wrappers sometimes expose a single request object. Support both shapes.
+  if (method.length === 1 && objectArg !== undefined) return method.call(processApi, objectArg);
+  return method.call(processApi, ...canonicalArgs);
+}
+
+function remoteExitCode(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const code = Number(value);
+  return Number.isInteger(code) && code >= 0 && code <= 255 ? code : undefined;
+}
+
+function redactExecFailure(error) {
+  let message = String(error?.message ?? error);
+  for (const [key, value] of Object.entries(process.env)) {
+    if (SECRET_KEY_RE.test(key) && value && value.length > 3) message = message.split(value).join("[redacted]");
+  }
+  return message.replace(/(https?:\/\/)([^\s/@]+):([^\s/@]+)@/gi, "$1[redacted]@[redacted]@");
+}
+
+function writeExecArtifacts(artifactsPath, { stdout, stderr, exitCode, command, cwd }) {
+  const target = path.resolve(String(artifactsPath));
+  mkdirSync(target, { recursive: true });
+  const files = {
+    "stdout.txt": String(stdout ?? ""),
+    "stderr.txt": String(stderr ?? ""),
+    "exit-code.txt": `${exitCode}\n`,
+    "manifest.json": JSON.stringify({ command, cwd, exitCode, generatedAt: new Date().toISOString() }) + "\n",
+  };
+  const temporary = [];
+  try {
+    for (const [name, content] of Object.entries(files)) {
+      const temporaryPath = path.join(target, `.${name}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+      writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+      temporary.push(temporaryPath);
+      renameSync(temporaryPath, path.join(target, name));
+      temporary.pop();
+    }
+  } finally {
+    for (const temporaryPath of temporary) rmSync(temporaryPath, { force: true });
+  }
+  return target;
+}
+
 async function readRemoteText(sandbox, remotePath) {
   const result = await sandboxExec(sandbox, `[ -f ${shellQuote(remotePath)} ] && cat ${shellQuote(remotePath)}`);
   if (!result) return null;
@@ -867,24 +924,91 @@ async function handlePush(options) {
 
 async function handleExec(options, command) {
   if (!command.length) throw new Error("exec requires a command after --");
-  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
-  const artifacts = toRemoteAbsolute(state.remoteArtifactsPath ?? paths.remoteArtifactsPath, remoteHome);
+  let sandboxInfo;
+  try {
+    sandboxInfo = await requireSandbox(options, { includeRemoteHome: true });
+  } catch (error) {
+    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error) };
+  }
+  const { paths, state, sandbox, remoteHome } = sandboxInfo;
   const cwd = toRemoteAbsolute(options.cwd ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
   const cmd = command.map(shellQuote).join(" ");
-  const remoteStdoutPath = `${artifacts}/stdout.txt`;
-  const remoteStderrPath = `${artifacts}/stderr.txt`;
-  const exitCodePath = `${artifacts}/exit-code.txt`;
-  const wrapped = `mkdir -p ${shellQuote(artifacts)}; ( cd ${shellQuote(cwd)} && ${cmd}; ) > ${shellQuote(remoteStdoutPath)} 2> ${shellQuote(remoteStderrPath)}; code=$?; printf '%s\\n' "$code" > ${shellQuote(exitCodePath)}; printf '{"command":%s,"exitCode":%s,"finishedAt":%s}\\n' ${shellQuote(JSON.stringify(cmd))} "$code" ${shellQuote(JSON.stringify(new Date().toISOString()))} > ${shellQuote(`${artifacts}/manifest.json`)}; exit $code`;
-  const result = await sandboxExec(sandbox, wrapped);
-  if (result?.stdout) process.stdout.write(String(result.stdout));
-  if (result?.stderr) process.stderr.write(String(result.stderr));
-  const remoteStdout = await readRemoteText(sandbox, remoteStdoutPath);
-  if (remoteStdout) process.stdout.write(remoteStdout);
-  const remoteStderr = await readRemoteText(sandbox, remoteStderrPath);
-  if (remoteStderr) process.stderr.write(remoteStderr);
-  const remoteExitCode = parseRemoteInteger(await readRemoteText(sandbox, exitCodePath));
-  const exitCode = typeof result?.exitCode === "number" ? result.exitCode : remoteExitCode;
-  return { exitCode };
+  const wrapped = `cd ${shellQuote(cwd)} && ${cmd}`;
+  const stdout = [];
+  const stderr = [];
+  const shouldStream = !options.json && !options.bufferOutput;
+  const emit = (kind, chunk) => {
+    const text = String(chunk ?? "");
+    if (!text) return;
+    (kind === "stderr" ? stderr : stdout).push(text);
+    if (shouldStream) (kind === "stderr" ? process.stderr : process.stdout).write(text);
+  };
+  const processApi = sessionProcessApi(sandbox);
+  let exitCode;
+  let warning;
+  if (!processApi) {
+    warning = "Output was buffered because streaming is unavailable";
+    let result;
+    try {
+      // Preserve the synchronous SDK contract (command, cwd) for older SDKs.
+      result = await sandboxExec(sandbox, cmd, cwd);
+    } catch (error) {
+      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error), warning };
+    }
+    const fallbackStdout = result?.stdout ?? result?.output ?? result?.result ?? result?.data ?? result?.artifacts?.stdout ?? "";
+    const fallbackStderr = result?.stderr ?? result?.artifacts?.stderr ?? "";
+    emit("stdout", fallbackStdout);
+    emit("stderr", fallbackStderr);
+    exitCode = remoteExitCode(result?.exitCode) ?? 0;
+  } else {
+    const sessionId = newExecSessionId();
+    let sessionCreated = false;
+    try {
+      await sessionCall(processApi, "createSession", [sessionId], sessionId);
+      sessionCreated = true;
+      const commandResult = await sessionCall(processApi, "executeSessionCommand", [sessionId, { command: wrapped, runAsync: true }], { sessionId, command: wrapped, runAsync: true });
+      const commandId = commandResult?.cmdId ?? commandResult?.commandId ?? commandResult?.id ?? commandResult;
+      if (!commandId) throw new Error("Daytona session command did not return a command id");
+      const logsPromise = sessionCall(
+        processApi,
+        "getSessionCommandLogs",
+        [sessionId, commandId, (chunk) => emit("stdout", chunk), (chunk) => emit("stderr", chunk)],
+        { sessionId, commandId, onStdout: (chunk) => emit("stdout", chunk), onStderr: (chunk) => emit("stderr", chunk) },
+      ).then((logs) => {
+        // Some wrappers return a buffered response even when callbacks are accepted.
+        if (logs && typeof logs === "object") {
+          emit("stdout", logs.stdout ?? "");
+          emit("stderr", logs.stderr ?? "");
+        }
+      });
+      const pollPromise = (async () => {
+        const interval = Math.max(5, Number(options.pollIntervalMs ?? options.execPollInterval ?? 25));
+        const timeout = Math.max(interval, Number(options.timeoutMs ?? options.execTimeout ?? 120000));
+        const deadline = Date.now() + timeout;
+        while (Date.now() <= deadline) {
+          const status = await sessionCall(processApi, "getSessionCommand", [sessionId, commandId], { sessionId, commandId });
+          const code = remoteExitCode(status?.exitCode ?? status?.code);
+          if (code !== undefined) return code;
+          await new Promise((resolve) => setTimeout(resolve, interval));
+        }
+        throw new Error("Timed out waiting for Daytona session command");
+      })();
+      [exitCode] = await Promise.all([pollPromise, logsPromise]);
+    } catch (error) {
+      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error) };
+    } finally {
+      if (sessionCreated) {
+        try { await processApi.deleteSession(sessionId); } catch { /* cleanup is best effort */ }
+      }
+    }
+  }
+  const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), ...(warning ? { warning } : {}) };
+  if (options.artifacts) {
+    try { result.artifactPath = writeExecArtifacts(options.artifacts, { ...result, command, cwd }); }
+    catch (error) { return { ...result, exitCode: 125, error: redactExecFailure(error) }; }
+  }
+  if (warning && !options.json && !options.bufferOutput) process.stderr.write(`${warning}\n`);
+  return result;
 }
 
 async function handlePull(options) {

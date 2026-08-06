@@ -90,7 +90,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
       forwarded.push(arg);
       continue;
     }
-    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in") {
+    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--artifacts" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in") {
       const read = readValue(argv, index, flag, inlineValue);
       if (flag === "--sandbox") options.sandbox = read.value;
       else if (flag === "--directory") options.directory = read.value;
@@ -269,6 +269,7 @@ async function invokeRun(parsed, adapter) {
 async function invoke(parsed, adapter, alias) {
   const adapterParsed = adapter.parseArgs(adapterArgs(parsed, alias));
   const options = { ...adapterParsed.options };
+  options.json = Boolean(parsed.json);
   options.directory = parsed.options.directory ?? options.directory ?? process.cwd();
   if (parsed.options.name !== undefined) options.name = parsed.options.name;
   if (parsed.options.noUse) options.noUse = true;
@@ -333,7 +334,11 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
     const resultObject = jsonResult.result && typeof jsonResult.result === "object" ? jsonResult.result : {};
     const exitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : (resultObject.ok === false ? 1 : 0);
     if ((command === "exec" || command === "run") && typeof resultObject.exitCode === "number") process.exitCode = exitCode;
-    if (resultObject.ok === false) process.exitCode = 1;
+    if (resultObject.ok === false && !((command === "exec" || command === "run") && typeof resultObject.exitCode === "number")) process.exitCode = 1;
+    if (!parsed.json && command === "exec" && resultObject.error) {
+      if (resultObject.warning) console.error(sanitizeError(resultObject.warning));
+      console.error(sanitizeError(resultObject.error));
+    }
     if (deprecatedAlias && !parsed.json) console.log(`Deprecated alias: ${parsed.command}${parsed.command === "create" ? "" : " up"}; use sandbox-ctl up instead.`);
     if (parsed.json) {
       const payload = { ok: exitCode === 0, command, adapter: parsed.adapter, ...resultObject, ...(command === "exec" ? { exitCode } : {}) };
