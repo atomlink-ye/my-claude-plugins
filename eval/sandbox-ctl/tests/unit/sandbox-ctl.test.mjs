@@ -725,6 +725,43 @@ describe("sandbox-ctl run", () => {
     rmSync(stateRoot, { recursive: true, force: true });
   });
 
+  it("does not delete a parent binding when down runs from an unbound child", async () => {
+    const root = mkdtempSync(`${tmpdir()}/down-exact-scope-`);
+    const parent = path.join(root, "parent");
+    const child = path.join(parent, "child");
+    const isolatedStateRoot = path.join(root, "isolated-state");
+    mkdirSync(child, { recursive: true });
+    try {
+      writeConfig(parent, {
+        schemaVersion: 1,
+        adapter: "daytona",
+        active: "parent",
+        sandboxes: { parent: { sandboxId: "parent-s1", remoteWorkspace: "/workspace/parent" } },
+      });
+      const parentPaths = resolveProjectPaths({ directory: parent, "state-directory": isolatedStateRoot, "task-id": "parent" });
+      mkdirSync(parentPaths.stateDir, { recursive: true });
+      writeFileSync(parentPaths.stateFile, JSON.stringify({ sandboxId: "parent-state-s1", taskId: "parent" }));
+      mkdirSync(parentPaths.legacyStateDir, { recursive: true });
+      writeFileSync(parentPaths.legacyStateFile, JSON.stringify({ sandboxId: "parent-legacy-s1", taskId: "parent" }));
+
+      const calls = [];
+      const client = {
+        get: async (...args) => { calls.push(["get", args]); return { id: "parent-s1", delete: async () => { calls.push(["sandbox.delete"]); } }; },
+        delete: async (...args) => { calls.push(["delete", args]); },
+        list: async (...args) => { calls.push(["list", args]); return []; },
+      };
+      await handleDown({ directory: child, "state-directory": isolatedStateRoot, client });
+
+      expect(calls).toEqual([]);
+      expect(readConfig(parent)).toMatchObject({ active: "parent", sandboxes: { parent: { sandboxId: "parent-s1" } } });
+      expect(readConfig(child)).toBeNull();
+      expect(existsSync(path.join(child, ".sandbox-ctl", "config.json"))).toBe(false);
+      expect(readProjectStateWithSource(parentPaths).state).toMatchObject({ sandboxId: "parent-state-s1" });
+      expect(readProjectStateWithSource(parentPaths).source).toBe(parentPaths.stateFile);
+      expect(existsSync(parentPaths.legacyStateFile)).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("retains the provisional sandbox id when startup fails and --keep is set", async () => {
     const calls = [];
     const adapter = runAdapter(calls);
