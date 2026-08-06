@@ -41,6 +41,22 @@ describe("daytona-manager args", () => {
     expect(parsed.passthrough).toEqual(["pnpm", "test"]);
   });
 
+  it.each([
+    ["500ms", 500],
+    ["30s", 30_000],
+    ["5m", 300_000],
+    ["1h", 3_600_000],
+    ["45", 45_000],
+  ])("normalizes exec timeout %s to milliseconds", (input, expected) => {
+    const parsed = parseArgs(["exec", "--timeout", input, "--", "true"]);
+    expect(parsed.options.timeoutMs).toBe(expected);
+    expect(parsed.passthrough).toEqual(["true"]);
+  });
+
+  it.each(["0", "-1", "1.5", "1.5s", "abc", "5d", "Infinity"])("rejects invalid exec timeout %s", (input) => {
+    expect(() => parseArgs(["exec", "--timeout", input, "--", "true"])).toThrow(/timeout.*positive|invalid.*timeout/i);
+  });
+
   it("throws on unknown options", () => {
     expect(() => parseArgs(["up", "--bad"])).toThrow("Unknown option: --bad");
   });

@@ -31,6 +31,12 @@ import { tmpdir } from "node:os";
 import { readConfig, writeConfig, upsertBinding } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 describe("sandbox-ctl argument parsing", () => {
+  it("forwards exec timeout to the adapter", () => {
+    const parsed = parseSandboxCtlArgs(["exec", "--timeout", "30m", "--", "make", "setup"]);
+    expect(parsed.forwarded).toEqual(["--timeout", "30m"]);
+    expect(parsed.passthrough).toEqual(["make", "setup"]);
+  });
+
   it("supports local binding selection and no-use lifecycle controls", () => {
     const parsed = parseSandboxCtlArgs(["up", "--sandbox", "dev", "--name", "named", "--no-use"]);
     expect(parsed.options).toMatchObject({ sandbox: "dev", name: "named", noUse: true });

@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use", "--include-sensitive", "--overwrite"];
-const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete"];
+const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete", "--timeout"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
 const CLASS_RESOURCE_DEFAULTS = {
@@ -20,6 +20,15 @@ const CLASS_RESOURCE_DEFAULTS = {
 
 function flagName(flag) {
   return flag.replace(/^--/, "");
+}
+
+function parseDurationMs(value, source = "timeout") {
+  const match = /^([1-9]\d*)(ms|s|m|h)?$/.exec(String(value ?? "").trim());
+  if (!match) throw new Error(`Invalid ${source}: expected a positive integer followed by ms, s, m, or h`);
+  const multipliers = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+  const milliseconds = Number(match[1]) * multipliers[match[2] ?? "s"];
+  if (!Number.isSafeInteger(milliseconds)) throw new Error(`Invalid ${source}: duration is too large`);
+  return milliseconds;
 }
 
 function parseArgs(argv = process.argv.slice(2), config = { booleanFlags: BOOL_FLAGS, stringFlags: STRING_FLAGS }) {
@@ -46,7 +55,8 @@ function parseArgs(argv = process.argv.slice(2), config = { booleanFlags: BOOL_F
       if (config.stringFlags.includes(rawFlag)) {
         const value = inlineValue ?? argv[++i];
         if (!value || value.startsWith("--")) throw new Error(`Missing value for option: ${rawFlag}`);
-        options[flagName(rawFlag)] = value;
+        if (rawFlag === "--timeout") options.timeoutMs = parseDurationMs(value);
+        else options[flagName(rawFlag)] = value;
         continue;
       }
       throw new Error(`Unknown option: ${rawFlag}`);
@@ -1481,4 +1491,4 @@ if (isDirectExecution) main().then((result) => { if (typeof result?.exitCode ===
 
 const runDaytonaManager = main;
 
-export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, assertSafeRemoteTransferPath, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listGitBundle, listTarEntries, loadEnvFile, main, mergeTransferTree, migrateLegacyStateToConfig, parseArgs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, resolveRemoteTransferPath, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };
+export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, assertSafeRemoteTransferPath, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listGitBundle, listTarEntries, loadEnvFile, main, mergeTransferTree, migrateLegacyStateToConfig, parseArgs, parseDurationMs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, resolveRemoteTransferPath, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };

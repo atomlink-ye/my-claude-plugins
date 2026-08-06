@@ -89,7 +89,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
       forwarded.push(arg);
       continue;
     }
-    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--artifacts" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in") {
+    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--artifacts" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in" || flag === "--timeout") {
       const read = readValue(argv, index, flag, inlineValue);
       if (flag === "--sandbox") options.sandbox = read.value;
       else if (flag === "--directory") options.directory = read.value;
