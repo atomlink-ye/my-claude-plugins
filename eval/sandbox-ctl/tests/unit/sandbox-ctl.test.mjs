@@ -213,6 +213,21 @@ describe("sandbox-ctl dispatch", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it("rejects malformed legacy remote paths before contacting the client", async () => {
+    for (const remoteWorkspacePath of [null, 42, { path: "/workspace/object" }]) {
+      const dir = mkdtempSync(`${tmpdir()}/adopt-malformed-remote-`);
+      const calls = [];
+      try {
+        mkdirSync(path.join(dir, ".daytona"), { recursive: true });
+        writeFileSync(path.join(dir, ".daytona", "state.json"), JSON.stringify({ sandboxId: "remote-s1", taskId: "legacy-task", remoteWorkspacePath }));
+        const client = { get: async () => { calls.push("get"); return { id: "remote-s1", state: "started" }; } };
+        await expect(handleAdopt({ directory: dir, client, "sandbox-id": "remote-s1" })).rejects.toThrow(/valid --remote-path/);
+        expect(calls).toEqual([]);
+        expect(existsSync(path.join(dir, ".sandbox-ctl", "config.json"))).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
   it("adopts with an explicit remote path and persists it unchanged", async () => {
     const dir = mkdtempSync(`${tmpdir()}/adopt-explicit-`);
     const remotePath = "workspace/with space/and 'quote'";

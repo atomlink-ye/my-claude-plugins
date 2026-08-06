@@ -989,8 +989,8 @@ async function handleAdopt(options) {
   const paths = resolveProjectPaths({ ...options, allowUnboundSandboxRef: true });
   const existing = readProjectState(paths);
   const remoteWorkspacePath = options["remote-path"] ?? paths.binding?.remoteWorkspace ?? existing?.remoteWorkspacePath;
-  if (remoteWorkspacePath === undefined || remoteWorkspacePath === null || String(remoteWorkspacePath).length === 0) {
-    throw new Error("adopt requires --remote-path when no existing remote workspace path is available");
+  if (typeof remoteWorkspacePath !== "string" || !remoteWorkspacePath.trim()) {
+    throw new Error("adopt requires a valid --remote-path when no existing remote workspace path is available");
   }
   const sandboxRef = options["sandbox-id"] ?? options["sandbox-name"];
   if (!sandboxRef) throw new Error("adopt requires --sandbox-id ID or --sandbox-name NAME");
