@@ -51,10 +51,11 @@ after permanent deletion. `--auto-delete 0` deletes immediately after stop;
 Bundle transfer excludes credentials, env files, VCS metadata, dependencies,
 build output, and logs. Full transfer requires the two flags `--mode full
 --include-sensitive`; archive links and special entries are always rejected.
-Git sync uses a dedicated non-force branch, includes only committed local
-history (warning when local work is dirty), refuses dirty remote workspaces on
-push or pull, and requires explicit commits for remote changes and new local
-commits before pushing.
+Git sync uses a dedicated non-force branch. Git push snapshots tracked and
+untracked WIP by default; `--committed-only` sends HEAD only, while
+`--require-clean` rejects WIP (mutually exclusive, git push only). New
+sensitive paths are rejected, local state is preserved, and unrelated/dirty
+remote workspaces are refused. Pull still requires a clean remote.
 
 Agents stay local. This workflow uses no MCP server, daemon, Paseo runtime,
 remote agent bootstrap, provider credential injection, host cleanup, or

@@ -4,7 +4,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
-import { createGitBundle, fetchGitBundleIntoBranch, handlePull, handlePush, listGitBundle, validateGitBranch } from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
+import { createGitBundle, fetchGitBundleIntoBranch, handlePull, handlePush, listGitBundle, main, parseArgs, validateGitBranch } from "../../../../skills/sandbox-ctl/scripts/adapters/daytona-manager.mjs";
 import { writeConfig, readConfig } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 function git(cwd, ...args) {
@@ -32,7 +32,9 @@ function sandboxFixture(root, responses = {}) {
     process: { executeCommand: async (command) => {
       commands.push(command);
       if (command.includes("printf '%s") || command.includes("getent passwd") || command.includes("/etc/passwd")) return { exitCode: 0, stdout: "/home/test\n" };
-      return responses.pull ?? responses.push ?? { exitCode: 0, stdout: "" };
+      const response = responses.pull ?? responses.push ?? { exitCode: 0, stdout: "" };
+      if (command.includes("SANDBOX_SNAPSHOT_HEAD") && response.exitCode === 0) return { ...response, stdout: "SANDBOX_SNAPSHOT_HEAD=0000000000000000000000000000000000000000\n" };
+      return response;
     } },
     fs: { uploadFiles: async () => {}, downloadFile: async () => Buffer.from("") },
   };
@@ -56,6 +58,152 @@ function realSandboxFixture(root, remoteWorkspace = "workspace/dev") {
 }
 
 describe("non-destructive git sync", () => {
+  it("captures the exact WIP tree and normalizes subdirectory invocation", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-tree-"));
+    try {
+      const local = repo(root, "local"); mkdirSync(path.join(local, "nested"));
+      writeFileSync(path.join(local, "delete-me.txt"), "delete\n"); git(local, "add", "."); git(local, "commit", "-qm", "second");
+      spawnSync("git", ["rm", "-q", "delete-me.txt"], { cwd: local });
+      writeFileSync(path.join(local, "nested", "new.txt"), "new\n");
+      const snapshot = createGitBundle(path.join(local, "nested"), "tree", { branch: "sandbox-ctl/dev", binding: "dev" });
+      try {
+        expect(snapshot.includedWip).toBe(true);
+        expect(git(local, "show", `${snapshot.snapshotHead}:nested/new.txt`)).toContain("new");
+        expect(() => git(local, "show", `${snapshot.snapshotHead}:delete-me.txt`)).toThrow();
+      } finally { snapshot.cleanup(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects staged nested sensitive paths and preserves HEAD, branch, refs, index, stash, and status", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-state-"));
+    try {
+      const local = repo(root, "local"); const head = git(local, "rev-parse", "HEAD"); const branch = git(local, "branch", "--show-current");
+      git(local, "stash", "push", "-qm", "empty"); const stash = git(local, "stash", "list");
+      mkdirSync(path.join(local, "nested", ".claude"), { recursive: true }); writeFileSync(path.join(local, "nested", ".claude", "token.key"), "secret\n"); git(local, "add", ".");
+      const index = git(local, "diff", "--cached", "--binary"); const status = git(local, "status", "--porcelain");
+      expect(() => createGitBundle(local, "state")).toThrow(/nested\/\.claude|sensitive/i);
+      expect(git(local, "rev-parse", "HEAD")).toBe(head); expect(git(local, "branch", "--show-current")).toBe(branch);
+      expect(git(local, "diff", "--cached", "--binary")).toBe(index); expect(git(local, "status", "--porcelain")).toBe(status); expect(git(local, "stash", "list")).toBe(stash);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects unrelated nonempty remote takeover and flags outside git push", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-guard-"));
+    try {
+      const local = repo(root, "local"); const fixture = realSandboxFixture(root); const remote = path.join(fixture.remoteHome, "workspace", "dev");
+      mkdirSync(remote, { recursive: true }); git(remote, "init", "-q"); git(remote, "config", "user.name", "human"); git(remote, "config", "user.email", "human@example.invalid"); writeFileSync(path.join(remote, "human.txt"), "human\n"); git(remote, "add", "."); git(remote, "commit", "-qm", "human"); git(remote, "branch", "human"); git(remote, "checkout", "-q", "human");
+      await expect(handlePush({ directory: local, path: local, mode: "git", client: fixture.client })).rejects.toThrow(/non-git|non-empty|foreign|dedicated branch/i);
+      await expect(handlePush({ directory: local, path: local, mode: "bundle", committedOnly: true, client: fixture.client })).rejects.toThrow(/only valid|mode git/i);
+      expect(parseArgs(["push", "--mode", "git", "--committed-only"]).options["committed-only"]).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects sparse WIP but preserves committed-only compatibility and matches sensitive case", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-sparse-"));
+    try {
+      const local = repo(root, "local");
+      git(local, "sparse-checkout", "init", "--cone"); git(local, "sparse-checkout", "set", "missing");
+      expect(() => createGitBundle(local, "sparse")).toThrow(/sparse/i);
+      const committed = createGitBundle(local, "sparse-clean", { committedOnly: true }); committed.cleanup();
+      git(local, "sparse-checkout", "disable");
+      writeFileSync(path.join(local, "CERT.PEM"), "secret\n");
+      expect(() => createGitBundle(local, "upper-sensitive")).toThrow(/CERT\.PEM/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects WIP flags on unrelated top-level commands", async () => {
+    await expect(main(["status", "--committed-only"])).rejects.toThrow(/only valid with push/i);
+    await expect(main(["down", "--require-clean"])).rejects.toThrow(/only valid with push/i);
+  });
+
+  it("rejects dirty tracked and untracked submodule WIP while committed-only sends HEAD", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-submodule-"));
+    try {
+      const child = repo(root, "child"); const local = repo(root, "local");
+      spawnSync("git", ["-c", "protocol.file.allow=always", "submodule", "add", "-q", child, "child"], { cwd: local });
+      git(local, "commit", "-qm", "add submodule");
+      expect(git(local, "ls-files", "--stage")).toMatch(/160000/);
+      writeFileSync(path.join(local, "child", "tracked.txt"), "tracked\n"); writeFileSync(path.join(local, "child", "untracked.txt"), "untracked\n");
+      expect(() => createGitBundle(local, "dirty-submodule")).toThrow(/dirty submodule/i);
+      const committed = createGitBundle(local, "dirty-submodule-head", { committedOnly: true });
+      try { expect(committed.includedWip).toBe(false); expect(committed.snapshotHead).toBe(committed.sourceHead); } finally { committed.cleanup(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it("snapshots tracked, staged, deleted, renamed, and untracked WIP without changing the real index", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-"));
+    try {
+      const local = repo(root, "local");
+      writeFileSync(path.join(local, "rename.txt"), "rename\n"); git(local, "add", "rename.txt"); git(local, "commit", "-qm", "rename source");
+      writeFileSync(path.join(local, "staged.txt"), "staged\n"); git(local, "add", "staged.txt");
+      writeFileSync(path.join(local, "history.txt"), "one\nunstaged\n");
+      git(local, "mv", "rename.txt", "renamed.txt");
+      writeFileSync(path.join(local, "untracked.txt"), "untracked\n");
+      git(local, "rm", "--cached", "staged.txt");
+      const indexBefore = git(local, "diff", "--cached", "--binary");
+      const bundle = createGitBundle(local, "wip");
+      try {
+        expect(bundle.includedWip).toBe(true);
+        expect(bundle.snapshotHead).not.toBe(bundle.sourceHead);
+        expect(bundle.wipSummary.untracked).toBe(2);
+        expect(bundle.wipSummary.renames).toBeGreaterThan(0);
+        expect(git(local, "diff", "--cached", "--binary")).toBe(indexBefore);
+        expect(git(local, "status", "--porcelain")).toMatch(/staged|renamed|untracked/);
+        expect(readFileSync(path.join(local, "history.txt"), "utf8")).toBe("one\nunstaged\n");
+      } finally { bundle.cleanup(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("supports committed-only and require-clean flags and rejects their combination", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-flags-"));
+    try {
+      const local = repo(root, "local"); writeFileSync(path.join(local, "wip.txt"), "wip\n");
+      const committed = createGitBundle(local, "committed", { committedOnly: true });
+      try { expect(committed.includedWip).toBe(false); expect(committed.snapshotHead).toBe(committed.sourceHead); } finally { committed.cleanup(); }
+      expect(() => createGitBundle(local, "clean", { requireClean: true })).toThrow(/require-clean|uncommitted/i);
+      expect(() => createGitBundle(local, "both", { committedOnly: true, requireClean: true })).toThrow(/mutually exclusive/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not claim WIP was included for dirty committed-only pushes", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-committed-warning-"));
+    try {
+      const local = repo(root, "local"); writeFileSync(path.join(local, "draft.txt"), "draft\n"); const fixture = realSandboxFixture(root);
+      const result = await handlePush({ directory: local, path: local, mode: "git", committedOnly: true, client: fixture.client });
+      expect(result.includedWip).toBe(false); expect(result.warnings.join(" ")).not.toMatch(/WIP snapshot included/i); expect(result.warnings.join(" ")).toMatch(/excluded|HEAD only|committed/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("repeats WIP pushes safely and can transition back to committed-only", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-repeat-"));
+    try {
+      const local = repo(root, "local"); const fixture = realSandboxFixture(root);
+      await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
+      writeFileSync(path.join(local, "history.txt"), "one\nwip\n"); writeFileSync(path.join(local, "draft.txt"), "draft one\n");
+      const first = await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
+      expect(first.includedWip).toBe(true);
+      const remote = path.join(fixture.remoteHome, "workspace", "dev");
+      expect(readFileSync(path.join(remote, "draft.txt"), "utf8")).toBe("draft one\n");
+      writeFileSync(path.join(local, "draft.txt"), "draft two\n");
+      await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
+      expect(readFileSync(path.join(remote, "draft.txt"), "utf8")).toBe("draft two\n");
+      const committed = await handlePush({ directory: local, path: local, mode: "git", committedOnly: true, client: fixture.client });
+      expect(committed.includedWip).toBe(false);
+      expect(existsSync(path.join(remote, "draft.txt"))).toBe(false);
+      expect(git(remote, "status", "--porcelain")).toBe("");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects sensitive nonignored untracked WIP while excluding ignored files", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-sensitive-"));
+    try {
+      const local = repo(root, "local"); writeFileSync(path.join(local, ".gitignore"), "ignored.txt\n"); git(local, "add", ".gitignore"); git(local, "commit", "-qm", "ignore");
+      writeFileSync(path.join(local, "ignored.txt"), "ignored\n"); writeFileSync(path.join(local, ".env.secret"), "secret\n");
+      expect(() => createGitBundle(local, "sensitive")).toThrow(/\.env\.secret/);
+      const committed = createGitBundle(local, "ignored", { committedOnly: true });
+      committed.cleanup();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("accepts the sandbox-ctl branch namespace and rejects option injection", () => {
     expect(validateGitBranch("sandbox-ctl/dev")).toBe("sandbox-ctl/dev");
     expect(() => validateGitBranch("--force")).toThrow(/invalid/i);

@@ -23,11 +23,14 @@ dependencies, build output, logs, and `.sandbox-ctl`; tar entries are checked
 before extraction and links/special files are rejected. Full mode is opt-in
 with both `--mode full` and `--include-sensitive`.
 
-Git mode transfers committed local history on a dedicated branch, never
-force-pushes, warns when local changes are uncommitted, and rejects dirty
-remote workspaces for push and pull. Remote changes require an explicit commit
-before pull; new local commits must exist before push. A remote workspace must
-be clean and non-divergent.
+Git mode uses a dedicated non-force branch and preserves the local repository.
+By default `push --mode git` snapshots committed HEAD plus tracked/staged/
+unstaged changes, deletions, renames, and nonignored untracked files. Use
+`--committed-only` for HEAD-only snapshots or `--require-clean` to reject WIP;
+these flags are mutually exclusive and push-only. Newly added sensitive paths
+are rejected. Remote workspaces must be clean and either empty, related to the
+source history, or carry valid sandbox-ctl snapshot metadata; unrelated human
+repositories are never replaced. Pull behavior remains clean-remote only.
 
 `exec` streams output when the SDK supports sessions and buffers otherwise.
 The streaming-session client deadline defaults to five minutes and can be set

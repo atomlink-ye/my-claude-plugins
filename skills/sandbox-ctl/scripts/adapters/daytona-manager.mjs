@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 
-const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use", "--include-sensitive", "--overwrite"];
+const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean"];
 const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete", "--timeout"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
@@ -315,7 +315,7 @@ function buildUsage() {
     "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--class small|medium|large] [--cpu N --memory GB --disk GB --gpu N] [--env-file FILE]",
     "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
-    "  push [LOCAL_PATH] [--directory DIR] [--state-directory DIR] [--task-id ID] [--path PATH] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--branch BRANCH]",
+    "  push [LOCAL_PATH] [--directory DIR] [--state-directory DIR] [--task-id ID] [--path PATH] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--branch BRANCH] [--committed-only|--require-clean]",
     "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] [--artifacts PATH] [--timeout DURATION] -- COMMAND...",
     "  pull [REMOTE_PATH] [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--overwrite] [--branch BRANCH]",
     "  preview [--directory DIR] [--state-directory DIR] --port PORT [--expires-in SECONDS]",
@@ -632,25 +632,113 @@ function createBundle(inputPath, taskId, options = {}) {
   }
 }
 
-function runLocal(command, args, cwd, action) {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8" });
+function runLocal(command, args, cwd, action, env) {
+  const result = spawnSync(command, args, { cwd, env: env ? { ...process.env, ...env } : process.env, encoding: "utf8" });
   if (result.status !== 0) throw new Error(`${action} failed: ${result.stderr || result.stdout}`.trim());
   return result;
 }
 
-function createGitBundle(repoPath, taskId) {
-  const abs = path.resolve(repoPath);
-  if (!existsSync(abs) || !statSync(abs).isDirectory()) throw new Error(`Git mode requires an existing local repository directory: ${abs}`);
-  runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
-  const head = runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check").stdout.trim();
-  const dirty = Boolean(spawnSync("git", ["status", "--porcelain"], { cwd: abs, encoding: "utf8" }).stdout?.trim());
+function gitOutput(args, cwd, env) {
+  return runLocal("git", args, cwd, `git ${args.join(" ")}`, env).stdout.trim();
+}
+
+function sensitiveGitPath(relativePath) {
+  const normalized = String(relativePath).replaceAll("\\", "/");
+  const segments = normalized.split("/").filter(Boolean);
+  const basename = segments.at(-1) ?? "";
+  return segments.some((segment) => segment.startsWith(".env") || segment.startsWith(".sandbox-ctl") || segment.startsWith(".claude") || segment.startsWith(".opencode-state") || segment.startsWith(".daytona")) || /(?:\.pem|\.key|\.p12|\.pfx|\.jks)$/i.test(basename) || /^(?:id_rsa|id_ed25519|\.npmrc|\.netrc|\.pypirc|credentials\.json)$/i.test(basename);
+}
+
+function gitStatusSummary(abs) {
+  const result = spawnSync("git", ["status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=none"], { cwd: abs, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`git status failed: ${result.stderr || result.stdout}`.trim());
+  const summary = { staged: 0, unstaged: 0, untracked: 0, deleted: 0, renames: 0, submoduleDirty: 0, sparse: false };
+  const paths = [];
+  for (const line of String(result.stdout).split(/\r?\n/).filter(Boolean)) {
+    if (line.startsWith("# ")) continue;
+    const kind = line[0];
+    if (kind === "?") { summary.untracked += 1; paths.push(line.slice(2)); continue; }
+    if (kind === "2") { summary.renames += 1; const fields = line.split(" "); paths.push(fields.slice(9).join(" ")); continue; }
+    if (kind === "1" || kind === "u") {
+      const fields = line.split(" ");
+      const xy = fields[1] ?? "  ";
+      if (xy[0] !== "." && xy[0] !== " ") summary.staged += 1;
+      if (xy[1] !== "." && xy[1] !== " ") summary.unstaged += 1;
+      if (xy.includes("D")) summary.deleted += 1;
+      paths.push(fields.slice(kind === "u" ? 10 : 8).join(" "));
+    }
+  }
+  const sparse = spawnSync("git", ["config", "--bool", "core.sparseCheckout"], { cwd: abs, encoding: "utf8" });
+  summary.sparse = sparse.status === 0 && sparse.stdout.trim() === "true";
+  return { summary, paths };
+}
+
+function isGitSubmodule(abs, relativePath) {
+  const mode = spawnSync("git", ["ls-files", "--stage", "--", relativePath], { cwd: abs, encoding: "utf8" });
+  return mode.status === 0 && mode.stdout.split(/\r?\n/).some((line) => line.startsWith("160000 "));
+}
+
+function submoduleIsDirty(abs, relativePath) {
+  if (!isGitSubmodule(abs, relativePath)) return false;
+  const nested = path.join(abs, relativePath);
+  if (!existsSync(nested) || !statSync(nested).isDirectory()) return false;
+  const result = spawnSync("git", ["-C", nested, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" });
+  return result.status === 0 && Boolean(result.stdout.trim());
+}
+
+function createGitBundle(repoPath, taskId, options = {}) {
+  const requested = path.resolve(repoPath);
+  if (!existsSync(requested) || !statSync(requested).isDirectory()) throw new Error(`Git mode requires an existing local repository directory: ${requested}`);
+  const abs = runLocal("git", ["rev-parse", "--show-toplevel"], requested, "git repository check").stdout.trim();
+  const sourceHead = runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check").stdout.trim();
+  const committedOnly = Boolean(options.committedOnly ?? options["committed-only"]);
+  const requireClean = Boolean(options.requireClean ?? options["require-clean"]);
+  if (committedOnly && requireClean) throw new Error("--committed-only and --require-clean are mutually exclusive");
+  const { summary, paths: statusPaths } = gitStatusSummary(abs);
+  const submodulePaths = String(spawnSync("git", ["ls-files", "--stage", "-z"], { cwd: abs, encoding: "utf8" }).stdout ?? "").split("\0").filter(Boolean).filter((entry) => entry.startsWith("160000 ")).map((entry) => entry.slice(entry.indexOf("\t") + 1));
+  const dirtySubmodulePaths = [...statusPaths, ...submodulePaths].filter((entry) => submoduleIsDirty(abs, entry));
+  for (const relativePath of statusPaths.filter((entry) => isGitSubmodule(abs, entry))) {
+    const unstaged = spawnSync("git", ["diff", "--quiet", "--", relativePath], { cwd: abs });
+    const staged = spawnSync("git", ["diff", "--cached", "--quiet", "--", relativePath], { cwd: abs });
+    if (unstaged.status !== 0 || staged.status !== 0) dirtySubmodulePaths.push(relativePath);
+  }
+  summary.submoduleDirty = new Set(dirtySubmodulePaths).size;
+  const dirty = summary.staged + summary.unstaged + summary.untracked + summary.deleted + summary.renames + summary.submoduleDirty > 0;
+  if (requireClean && dirty) throw new Error("--require-clean rejected an uncommitted or dirty worktree");
+  if (!committedOnly && summary.sparse) throw new Error("Git WIP push rejects sparse worktrees; use --committed-only");
+  if (!committedOnly && summary.submoduleDirty) throw new Error("Git WIP push rejects dirty submodules; use --committed-only or clean the submodule");
   const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-input-"));
   const bundlePath = path.join(tempDir, `daytona-git-input-${taskId}.bundle`);
+  const indexPath = path.join(tempDir, "index");
   const cleanup = () => rmSync(tempDir, { recursive: true, force: true });
+  const env = { ...process.env, GIT_INDEX_FILE: indexPath };
   try {
-    runLocal("git", ["bundle", "create", bundlePath, "HEAD"], abs, "git bundle create");
-    listGitBundle(bundlePath);
-    return { bundlePath, head, dirty, cleanup };
+    runLocal("git", ["read-tree", sourceHead], abs, "temporary git index initialization", env);
+    if (!committedOnly) runLocal("git", ["add", "--all", "--", "."], abs, "temporary git worktree snapshot", env);
+    const finalPaths = String(spawnSync("git", ["ls-files", "-z"], { cwd: abs, env, encoding: "utf8" }).stdout ?? "").split("\0").filter(Boolean);
+    if (!committedOnly) {
+      for (const relativePath of finalPaths) {
+        if (!sensitiveGitPath(relativePath)) continue;
+        const existing = spawnSync("git", ["cat-file", "-e", `${sourceHead}:${relativePath}`], { cwd: abs, encoding: "utf8" });
+        if (existing.status !== 0) throw new Error(`Sensitive newly-added path rejected: ${relativePath}`);
+      }
+    }
+    const sourceTree = gitOutput(["rev-parse", `${sourceHead}^{tree}`], abs);
+    const tree = committedOnly ? sourceTree : gitOutput(["write-tree"], abs, env);
+    const includedWip = !committedOnly && tree !== sourceTree;
+    let snapshotHead = sourceHead;
+    if (includedWip) {
+      const marker = `sandbox-ctl snapshot\nbranch=${options.branch ?? ""}\nbinding=${options.binding ?? ""}\nsource=${sourceHead}\n`;
+      const commit = spawnSync("git", ["commit-tree", tree, "-p", sourceHead, "-F", "-"], { cwd: abs, env: { ...env, GIT_AUTHOR_NAME: "sandbox-ctl", GIT_AUTHOR_EMAIL: "sandbox-ctl@localhost", GIT_COMMITTER_NAME: "sandbox-ctl", GIT_COMMITTER_EMAIL: "sandbox-ctl@localhost" }, input: marker, encoding: "utf8" });
+      if (commit.status !== 0) throw new Error(`git snapshot commit failed: ${commit.stderr || commit.stdout}`.trim());
+      snapshotHead = commit.stdout.trim();
+    }
+    const snapshotRef = gitTempRef("input");
+    runLocal("git", ["update-ref", snapshotRef, snapshotHead], abs, "temporary git snapshot ref", env);
+    try { runLocal("git", ["bundle", "create", bundlePath, snapshotRef], abs, "git bundle create"); }
+    finally { const removed = spawnSync("git", ["update-ref", "-d", snapshotRef], { cwd: abs, env: process.env, encoding: "utf8" }); if (removed.status !== 0) throw new Error(`Failed to clean temporary git snapshot ref ${snapshotRef}: ${removed.stderr || removed.stdout}`.trim()); }
+    listGitBundle(bundlePath, abs);
+    return { bundlePath, head: sourceHead, sourceHead, snapshotHead, includedWip, dirty, wipSummary: summary, cleanup };
   } catch (error) {
     cleanup();
     throw error;
@@ -677,7 +765,9 @@ function fetchGitBundleIntoBranch(bundlePath, repoPath, branch) {
   runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
   const tempRef = gitTempRef("remote");
   try {
-    runLocal("git", ["fetch", bundlePath, `HEAD:${tempRef}`], abs, "git fetch bundle");
+    const bundleHead = spawnSync("git", ["bundle", "list-heads", bundlePath], { cwd: abs, encoding: "utf8" }).stdout.trim().split(/\s+/)[1];
+    if (!bundleHead) throw new Error("git bundle has no advertised head");
+    runLocal("git", ["fetch", bundlePath, `${bundleHead}:${tempRef}`], abs, "git fetch bundle");
     const remoteHead = runLocal("git", ["rev-parse", tempRef], abs, "git remote HEAD").stdout.trim();
     const target = `refs/heads/${safeBranch}`;
     const current = spawnSync("git", ["rev-parse", "--verify", target], { cwd: abs, encoding: "utf8" });
@@ -992,6 +1082,7 @@ async function handlePush(options) {
   options.path = options.path ?? options.directory ?? process.cwd();
   const mode = options.mode ?? "bundle";
   if (!["bundle", "full", "git"].includes(mode)) throw new Error("push --mode must be bundle, full, or git");
+  if (mode !== "git" && (options.committedOnly || options["committed-only"] || options.requireClean || options["require-clean"])) throw new Error("--committed-only/--require-clean are only valid with push --mode git");
   const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
   if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
   if (mode === "full" && !includeSensitive) throw new Error("--mode full may upload credentials; pass --include-sensitive to confirm");
@@ -1001,21 +1092,77 @@ async function handlePush(options) {
     const defaultBranch = `sandbox-ctl/${paths.binding?.name ?? paths.taskId}`;
     const branch = validateGitBranch(options.branch ?? state.gitBranch ?? paths.binding?.sync?.branch ?? defaultBranch);
     const safeRemoteWorkspace = assertSafeDestructiveRemoteWorkspace(remoteWorkspace, remoteHome);
-    const { bundlePath, head, dirty, cleanup } = createGitBundle(options.path, paths.taskId);
+    const bindingName = paths.binding?.name ?? paths.taskId;
+    const { bundlePath, head, sourceHead, snapshotHead, includedWip, dirty, wipSummary, cleanup } = createGitBundle(options.path, paths.taskId, { ...options, branch, binding: bindingName });
     try {
-      const remoteBundle = `/tmp/daytona-git-input-${paths.taskId}.bundle`;
+      const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      const remoteBundle = `/tmp/daytona-git-input-${paths.taskId}-${nonce}.bundle`;
       await uploadFile(sandbox, bundlePath, remoteBundle);
-      const target = shellQuote(safeRemoteWorkspace);
-      const remoteRef = shellQuote(`refs/heads/${branch}`);
-      const tempRef = shellQuote(`refs/sandbox-ctl-sync/push-${paths.taskId}-${Date.now().toString(36)}`);
-      const result = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && set -eu && target=${shellQuote(safeRemoteWorkspace)} && temp_ref=${shellQuote(`refs/sandbox-ctl-sync/push-${paths.taskId}-${Date.now().toString(36)}`)} && remote_bundle=${shellQuote(remoteBundle)}; cleanup() { git -C "$target" update-ref -d "$temp_ref" >/dev/null 2>&1 || echo 'Warning: failed to clean remote temporary ref' >&2; rm -f "$remote_bundle" || echo 'Warning: failed to clean remote bundle' >&2; }; trap cleanup EXIT; if [ -e "$target" ]; then if [ ! -d "$target" ] || ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then if [ ! -d "$target" ] || [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then echo 'remote workspace is non-git and non-empty; refusing to replace it' >&2; exit 73; fi; git init "$target" >/dev/null; fi; else mkdir -p ${shellQuote(path.posix.dirname(safeRemoteWorkspace))} && git init "$target" >/dev/null; fi && if [ -n "$(git -C "$target" status --porcelain --untracked-files=all)" ]; then echo 'remote git workspace is dirty; commit or clean it before push' >&2; exit 74; fi && remote_head=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null || true) && current_branch=$(git -C "$target" symbolic-ref --short HEAD 2>/dev/null || true) && if [ -n "$remote_head" ] && [ "$current_branch" != ${shellQuote(branch)} ]; then echo 'remote git workspace must have the dedicated branch checked out' >&2; exit 76; fi && git -C "$target" fetch "$remote_bundle" HEAD:"$temp_ref" >/dev/null && temp_head=$(git -C "$target" rev-parse "$temp_ref") && if [ -z "$remote_head" ]; then git -C "$target" checkout -b ${shellQuote(branch)} "$temp_ref" >/dev/null; elif [ "$remote_head" = "$temp_head" ]; then true; elif git -C "$target" merge-base --is-ancestor "$temp_head" "$remote_head"; then echo 'remote git workspace is ahead of local HEAD; pull first' >&2; exit 75; elif ! git -C "$target" merge-base --is-ancestor "$remote_head" "$temp_head"; then echo 'remote git workspace diverged from local HEAD; pull first' >&2; exit 75; else git -C "$target" merge --ff-only "$temp_ref" >/dev/null; fi`);
+      const tempRefName = `refs/sandbox-ctl-sync/push-${paths.taskId}-${nonce}`;
+      const markerSource = shellQuote(sourceHead);
+      const markerBranch = shellQuote(branch);
+      const markerBinding = shellQuote(bindingName);
+      const markerBranchLine = shellQuote(`branch=${branch}`);
+      const markerBindingLine = shellQuote(`binding=${bindingName}`);
+      const markerSourceLine = shellQuote(`source=${sourceHead}`);
+      const result = await sandboxExec(sandbox, `${remoteEnsureGitCommand()} && set -eu
+target=${shellQuote(safeRemoteWorkspace)}; temp_ref=${shellQuote(tempRefName)}; remote_bundle=${shellQuote(remoteBundle)}
+lock_dir=""; lock_held=0
+cleanup() {
+  if [ "$lock_held" -eq 1 ]; then if ! rmdir "$lock_dir" >/dev/null 2>&1; then echo "Warning: failed to clean remote lock $lock_dir" >&2; fi; fi
+  if ! git -C "$target" update-ref -d "$temp_ref" >/dev/null 2>&1; then echo "Warning: failed to clean temporary git ref $temp_ref" >&2; fi
+  if ! rm -f "$remote_bundle" >/dev/null 2>&1; then echo "Warning: failed to clean remote bundle $remote_bundle" >&2; fi
+}
+trap cleanup EXIT
+if [ -e "$target" ]; then
+  if [ ! -d "$target" ] || ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ ! -d "$target" ] || [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then echo 'remote workspace is non-git and non-empty; refusing to replace it' >&2; exit 73; fi
+    git init "$target" >/dev/null
+  fi
+else mkdir -p ${shellQuote(path.posix.dirname(safeRemoteWorkspace))} && git init "$target" >/dev/null; fi
+git_dir=$(git -C "$target" rev-parse --absolute-git-dir)
+lock_dir="$git_dir/sandbox-ctl-sync.lock"
+if ! mkdir "$lock_dir" >/dev/null 2>&1; then echo "remote git workspace is busy; retry after lock release ($lock_dir)" >&2; exit 77; fi
+lock_held=1
+if [ -n "$(git -C "$target" status --porcelain=v2 --untracked-files=all)" ]; then echo 'remote git workspace is dirty; commit or clean it before push' >&2; exit 74; fi
+remote_head=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null || true)
+current_branch=$(git -C "$target" symbolic-ref --short HEAD 2>/dev/null || true)
+if [ -n "$remote_head" ] && [ "$current_branch" != ${markerBranch} ]; then echo 'remote git workspace must have the dedicated branch checked out' >&2; exit 76; fi
+bundle_ref=$(git bundle list-heads "$remote_bundle" | awk 'NR==1 {print $2}')
+git -C "$target" fetch "$remote_bundle" "\${bundle_ref}:\${temp_ref}" >/dev/null
+incoming=$(git -C "$target" rev-parse "$temp_ref")
+if [ -n "$remote_head" ]; then
+  acceptable=0
+  if git -C "$target" merge-base --is-ancestor "$remote_head" ${markerSource}; then acceptable=1; fi
+  message=$(git -C "$target" show -s --format=%B "$remote_head")
+  if [ "$acceptable" -eq 0 ] && echo "$message" | grep -Fxq 'sandbox-ctl snapshot' && echo "$message" | grep -Fxq ${markerBranchLine} && echo "$message" | grep -Fxq ${markerBindingLine}; then
+    marker_source=$(echo "$message" | sed -n 's/^source=//p' | head -n 1)
+    if [ -n "$marker_source" ] && git -C "$target" merge-base --is-ancestor "$marker_source" ${markerSource} && git -C "$target" merge-base --is-ancestor "$marker_source" "$remote_head"; then acceptable=1; fi
+  fi
+  if [ "$acceptable" -eq 0 ]; then echo 'remote git workspace contains a foreign or unrelated commit; refusing push' >&2; exit 75; fi
+fi
+if [ -z "$remote_head" ]; then git -C "$target" checkout -b ${markerBranch} "$incoming" >/dev/null
+else
+  tree=$(git -C "$target" rev-parse "$incoming^{tree}")
+  old_marker=$(git -C "$target" show -s --format=%B "$remote_head" | grep -Fx 'sandbox-ctl snapshot' || true)
+  if [ "$incoming" = ${markerSource} ] && [ -z "$old_marker" ]; then materialized="$incoming"; else
+    if [ "$remote_head" != ${markerSource} ]; then materialized=$( { echo 'sandbox-ctl snapshot'; echo ${markerBranchLine}; echo ${markerBindingLine}; echo ${markerSourceLine}; } | GIT_AUTHOR_NAME=sandbox-ctl GIT_AUTHOR_EMAIL=sandbox-ctl@localhost GIT_COMMITTER_NAME=sandbox-ctl GIT_COMMITTER_EMAIL=sandbox-ctl@localhost git -C "$target" commit-tree "$tree" -p "$remote_head" -p ${markerSource}); else materialized=$( { echo 'sandbox-ctl snapshot'; echo ${markerBranchLine}; echo ${markerBindingLine}; echo ${markerSourceLine}; } | GIT_AUTHOR_NAME=sandbox-ctl GIT_AUTHOR_EMAIL=sandbox-ctl@localhost GIT_COMMITTER_NAME=sandbox-ctl GIT_COMMITTER_EMAIL=sandbox-ctl@localhost git -C "$target" commit-tree "$tree" -p "$remote_head"); fi
+  fi
+  if [ -n "$(git -C "$target" status --porcelain=v2 --untracked-files=all)" ]; then echo 'remote git workspace became dirty before merge' >&2; exit 74; fi
+  git -C "$target" merge --ff-only "$materialized" >/dev/null
+fi
+echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
       assertRemoteCommandSuccess(result, "git push sync");
-      const warnings = dirty ? ["Local repository has uncommitted changes; git sync includes committed history only."] : [];
-      if (result?.stderr && /Warning: failed to clean/i.test(String(result.stderr))) warnings.push(String(result.stderr).trim());
+      const remoteSnapshotMatch = String(remoteResultText(result) ?? "").match(/SANDBOX_SNAPSHOT_HEAD=([0-9a-f]{40})/);
+      if (!remoteSnapshotMatch) throw new Error("git push sync failed: remote did not return a valid snapshot marker");
+      const remoteSnapshotHead = remoteSnapshotMatch[1];
+      const warnings = dirty ? [includedWip ? "Local repository has uncommitted changes; WIP snapshot included." : "Local repository has uncommitted changes; WIP was excluded (committed HEAD only)."] : [];
+      const remoteWarnings = [remoteResultText(result), result?.stderr].filter(Boolean).flatMap((text) => String(text).split(/\r?\n/)).map((line) => line.trim()).filter((line) => /^Warning: failed to clean/i.test(line));
+      for (const warning of remoteWarnings) if (!warnings.includes(warning)) warnings.push(warning);
       if (paths.binding) upsertBinding(paths.directory, paths.binding.name, { sync: { mode: "git", branch }, updatedAt: new Date().toISOString() }, { use: false });
       else writeState(paths, { ...state, remoteWorkspacePath: options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, syncMode: "git", gitBranch: branch, updatedAt: new Date().toISOString() });
       console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch}${warnings.length ? `\nWarning: ${warnings[0]}` : ""}`);
-      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch, warnings };
+      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch, sourceHead, snapshotHead: remoteSnapshotHead, includedWip, wipSummary, warnings };
     } finally { cleanup(); }
     return;
   }
@@ -1209,9 +1356,10 @@ function assertNoControlArchiveEntries(entries) {
 }
 
 async function handlePull(options) {
-  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const mode = options.mode ?? "bundle";
   if (!["bundle", "full", "git"].includes(mode)) throw new Error("pull --mode must be bundle, full, or git");
+  if (options.committedOnly || options["committed-only"] || options.requireClean || options["require-clean"]) throw new Error("--committed-only/--require-clean are only valid with push --mode git");
+  const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
   if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
   if (mode === "full" && !includeSensitive) throw new Error("--mode full may download credentials; pass --include-sensitive to confirm");
@@ -1476,6 +1624,9 @@ async function handleDoctor(options = {}) {
 async function main(argv = process.argv.slice(2)) {
   const parsed = parseArgs(argv);
   if (!parsed.command || parsed.options.help) { console.log(buildUsage()); return; }
+  if (!["push", "pull"].includes(parsed.command) && (parsed.options.committedOnly || parsed.options["committed-only"] || parsed.options.requireClean || parsed.options["require-clean"])) {
+    throw new Error("--committed-only/--require-clean are only valid with push --mode git");
+  }
   if (parsed.command === "create") return handleUp(parsed.options);
   if (parsed.command === "up") return handleUp(parsed.options);
   if (parsed.command === "adopt" || parsed.command === "import") return handleAdopt(parsed.options);

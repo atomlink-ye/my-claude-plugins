@@ -14,7 +14,7 @@ const LIFECYCLE_FLAGS = new Map([
   ["--auto-archive", "autoArchiveInterval"],
   ["--auto-delete", "autoDeleteInterval"],
 ]);
-const BOOLEAN_ADAPTER_FLAGS = new Set(["--refresh", "--keep-state", "--include-git", "--include-preview", "--include-sensitive", "--overwrite"]);
+const BOOLEAN_ADAPTER_FLAGS = new Set(["--refresh", "--keep-state", "--include-git", "--include-preview", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean"]);
 
 function readValue(argv, index, flag, inline) {
   const value = inline ?? argv[index + 1];
