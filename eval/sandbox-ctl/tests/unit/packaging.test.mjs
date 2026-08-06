@@ -34,14 +34,16 @@ describe("sandbox-ctl packaging", () => {
 
   it("makes real smoke opt-in, isolated, and cleanup-safe", () => {
     const smoke = read("eval/sandbox-ctl/tests/real-smoke.sh");
-    expect(smoke).toMatch(/SANDBOX_CTL_SNAPSHOT:-personal-dev-env-control-20260806/);
+    expect(smoke).toMatch(/SANDBOX_CTL_SNAPSHOT:-agent-exec-standard-medium/);
     expect(smoke).toMatch(/--snapshot[\s\S]+\$SNAPSHOT/);
-    expect(smoke).toMatch(/UP_ATTEMPTED=1/);
-    expect(smoke).toMatch(/if \[\[? "\$UP_ATTEMPTED"/);
-    expect(smoke).toMatch(/OUT\/success/);
-    expect(smoke).toMatch(/OUT\/exit7/);
+    expect(smoke).toMatch(/CREATED_BINDINGS/);
+    expect(smoke).toMatch(/--sandbox "\$binding"/);
+    expect(smoke).toMatch(/stream\.out/);
+    expect(smoke).toMatch(/ARTIFACT_STATUS/);
     expect(smoke).toMatch(/exit-code\.txt/);
-    expect(smoke).toMatch(/finish/);
+    expect(smoke).toMatch(/--mode full --include-sensitive/);
+    expect(smoke).toMatch(/--mode git/);
+    expect(smoke).toMatch(/--json down/);
     expect(smoke).not.toMatch(/\/tmp\/sandbox-ctl-real-(up|exit7)/);
   });
 
@@ -74,9 +76,9 @@ describe("sandbox-ctl packaging", () => {
     const offline = read("eval/sandbox-ctl/tests/smoke.sh");
     expect(adapter).toMatch(/Smoke cleanup failed/);
     expect(adapter).toMatch(/sandbox-ctl finish --directory/);
-    expect(real).toMatch(/retained state|WARNING: cleanup failed/i);
+    expect(real).toMatch(/retained evidence|WARNING:.*cleanup failed/i);
     expect(real).toMatch(/rm -rf .*\$WORK.*\$OUT/);
-    expect(real).toMatch(/node "\$CLI" --json finish --directory "\$WORK" --state-directory "\$STATE" --task-id "\$TASK"/);
+    expect(real).toMatch(/node "\$CLI" --json down --directory "\$WORK" --sandbox "\$binding"/);
     expect(offline).toMatch(/mktemp/);
     expect(offline).not.toMatch(/>\/tmp\//);
   });
