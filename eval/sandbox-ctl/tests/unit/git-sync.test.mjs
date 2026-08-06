@@ -42,7 +42,7 @@ function sandboxFixture(root, responses = {}) {
   return { sandbox, commands, client: { get: async () => sandbox } };
 }
 
-function realSandboxFixture(root, remoteWorkspace = "workspace/dev") {
+function realSandboxFixture(root, remoteWorkspace = "workspace/dev", configDirectory = root) {
   const remoteHome = path.join(root, "remote-home");
   mkdirSync(path.join(remoteHome, "workspace"), { recursive: true });
   const commands = [];
@@ -53,7 +53,7 @@ function realSandboxFixture(root, remoteWorkspace = "workspace/dev") {
     return { exitCode: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
   };
   const sandbox = { state: "started", process: { executeCommand: async (command) => runRemote(command) }, fs: { uploadFiles: async ([item]) => copyFileSync(item.source, item.destination), downloadFile: async (remote, destination) => copyFileSync(remote, destination) } };
-  writeConfig(root, { schemaVersion: 1, adapter: "daytona", active: "dev", sandboxes: { dev: { sandboxId: "s1", remoteWorkspace } } });
+  writeConfig(configDirectory, { schemaVersion: 1, adapter: "daytona", active: "dev", sandboxes: { dev: { sandboxId: "s1", remoteWorkspace } } });
   return { sandbox, commands, client: { get: async () => sandbox }, remoteHome };
 }
 
@@ -90,7 +90,7 @@ describe("non-destructive git sync", () => {
   it("rejects unrelated nonempty remote takeover and flags outside git push", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-guard-"));
     try {
-      const local = repo(root, "local"); const fixture = realSandboxFixture(root); const remote = path.join(fixture.remoteHome, "workspace", "dev");
+      const local = repo(root, "local"); const fixture = realSandboxFixture(root, "workspace/dev", local); const remote = path.join(fixture.remoteHome, "workspace", "dev");
       mkdirSync(remote, { recursive: true }); git(remote, "init", "-q"); git(remote, "config", "user.name", "human"); git(remote, "config", "user.email", "human@example.invalid"); writeFileSync(path.join(remote, "human.txt"), "human\n"); git(remote, "add", "."); git(remote, "commit", "-qm", "human"); git(remote, "branch", "human"); git(remote, "checkout", "-q", "human");
       await expect(handlePush({ directory: local, path: local, mode: "git", client: fixture.client })).rejects.toThrow(/non-git|non-empty|foreign|dedicated branch/i);
       await expect(handlePush({ directory: local, path: local, mode: "bundle", committedOnly: true, client: fixture.client })).rejects.toThrow(/only valid|mode git/i);
@@ -167,7 +167,7 @@ describe("non-destructive git sync", () => {
   it("does not claim WIP was included for dirty committed-only pushes", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-committed-warning-"));
     try {
-      const local = repo(root, "local"); writeFileSync(path.join(local, "draft.txt"), "draft\n"); const fixture = realSandboxFixture(root);
+      const local = repo(root, "local"); writeFileSync(path.join(local, "draft.txt"), "draft\n"); const fixture = realSandboxFixture(root, "workspace/dev", local);
       const result = await handlePush({ directory: local, path: local, mode: "git", committedOnly: true, client: fixture.client });
       expect(result.includedWip).toBe(false); expect(result.warnings.join(" ")).not.toMatch(/WIP snapshot included/i); expect(result.warnings.join(" ")).toMatch(/excluded|HEAD only|committed/i);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -176,7 +176,7 @@ describe("non-destructive git sync", () => {
   it("repeats WIP pushes safely and can transition back to committed-only", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-wip-repeat-"));
     try {
-      const local = repo(root, "local"); const fixture = realSandboxFixture(root);
+      const local = repo(root, "local"); const fixture = realSandboxFixture(root, "workspace/dev", local);
       await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
       writeFileSync(path.join(local, "history.txt"), "one\nwip\n"); writeFileSync(path.join(local, "draft.txt"), "draft one\n");
       const first = await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
@@ -358,7 +358,7 @@ describe("non-destructive git sync", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-real-"));
     try {
       const local = repo(root, "local");
-      const fixture = realSandboxFixture(root);
+      const fixture = realSandboxFixture(root, "workspace/dev", local);
       await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
       const remote = path.join(fixture.remoteHome, "workspace", "dev");
       expect(readFileSync(path.join(remote, "history.txt"), "utf8")).toBe("one\n");
@@ -378,7 +378,7 @@ describe("non-destructive git sync", () => {
     const malicious = `workspace/space $(touch ${sentinel}) \`touch ${sentinel}.backtick\``;
     try {
       const local = repo(root, "local");
-      const fixture = realSandboxFixture(root, malicious);
+      const fixture = realSandboxFixture(root, malicious, local);
       await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
       expect(existsSync(sentinel)).toBe(false);
       expect(existsSync(`${sentinel}.backtick`)).toBe(false);
@@ -389,7 +389,7 @@ describe("non-destructive git sync", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-git-pull-diverge-"));
     try {
       const local = repo(root, "local");
-      const fixture = realSandboxFixture(root);
+      const fixture = realSandboxFixture(root, "workspace/dev", local);
       await handlePush({ directory: local, path: local, mode: "git", client: fixture.client });
       await handlePull({ directory: local, mode: "git", client: fixture.client });
       git(local, "checkout", "-q", "sandbox-ctl/dev");
@@ -400,7 +400,7 @@ describe("non-destructive git sync", () => {
       const result = await handlePull({ directory: local, mode: "git", client: fixture.client });
       expect(result.diverged).toBe(true);
       expect(result.branch).not.toBe("sandbox-ctl/dev");
-      expect(readConfig(root).sandboxes.dev.sync.branch).toBe("sandbox-ctl/dev");
+      expect(readConfig(local).sandboxes.dev.sync.branch).toBe("sandbox-ctl/dev");
       expect(fixture.commands.some((command) => command.includes("rm -f '/tmp/daytona-git-output-local.bundle'"))).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
