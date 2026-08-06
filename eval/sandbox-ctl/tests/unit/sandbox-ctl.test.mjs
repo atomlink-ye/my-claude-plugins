@@ -364,6 +364,30 @@ describe("sandbox-ctl run", () => {
     expect(result.nextActions.join(" ")).not.toMatch(/--sandbox 'run-/);
   });
 
+  it("cleans a recorded run binding even when up finalize reports recovery actions", async () => {
+    const dir = mkdtempSync(`${tmpdir()}/run-recorded-recovery-`);
+    try {
+      const calls = [];
+      const adapter = runAdapter(calls);
+      adapter.handleUp = async (options) => {
+        calls.push(["up", options]);
+        upsertBinding(dir, options.name, { sandboxId: "new-remote-id", remoteWorkspace: "/workspace/run" }, { use: false });
+        const error = new Error("startup finalize failed");
+        error.sandboxId = "new-remote-id";
+        error.nextActions = ["sandbox-ctl adopt --sandbox-id 'new-remote-id' --name 'recovery-run'"];
+        throw error;
+      };
+      adapter.handleDown = async (options) => {
+        calls.push(["down", options]);
+        expect(options.sandbox).toMatch(/^run-/);
+        return { ok: true };
+      };
+      const result = await runSandboxCtl(["--json", "run", "--directory", dir, "--", "echo", "ok"], { adapter });
+      expect(result).toMatchObject({ ok: false, retained: false, sandboxId: "new-remote-id", exitCode: 125, nextActions: [] });
+      expect(calls.map(([name]) => name)).toEqual(["up", "down"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it("uses the explicit run binding for every post-up phase", async () => {
     const dir = mkdtempSync(`${tmpdir()}/run-bound-phases-`);
     try {

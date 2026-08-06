@@ -298,14 +298,21 @@ async function invokeRun(parsed, adapter) {
     if (Array.isArray(error?.nextActions)) nextActions.push(...error.nextActions);
     if (!exitCode) exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 125;
   } finally {
-    retained = Boolean(failure && (parsed.options.keep || nextActions.length));
-    if (upAttempted && !retained) {
+    const hasRecoveryActions = nextActions.length > 0;
+    let bindingRecorded = false;
+    try { bindingRecorded = Boolean(resolveBinding(readConfig(directory) ?? { sandboxes: {} }, bindingName)); } catch { /* recovery path remains conservative */ }
+    retained = Boolean(failure && parsed.options.keep);
+    let cleanupSucceeded = false;
+    if (upAttempted && !retained && (!hasRecoveryActions || bindingRecorded)) {
       try { await adapter.handleDown(boundOptions); }
       catch (error) {
         retained = true;
         warnings.push(sanitizeError(`Cleanup failed for sandbox ${sandboxId ?? "unknown"}: ${error?.message ?? error}`));
       }
+      if (!retained) cleanupSucceeded = true;
     }
+    if (hasRecoveryActions && cleanupSucceeded) nextActions.length = 0;
+    if (hasRecoveryActions && !cleanupSucceeded) retained = true;
     if (retained && !nextActions.length) nextActions.push(`sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(bindingName)}`);
   }
   const result = {
