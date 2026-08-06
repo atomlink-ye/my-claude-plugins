@@ -15,8 +15,9 @@ function configPath(directory = process.cwd()) {
   return path.join(path.resolve(directory), CONFIG_DIR, CONFIG_FILE);
 }
 
-function isExplicitConfigPath(directory) {
-  return path.basename(path.resolve(directory)) === CONFIG_FILE;
+function isCanonicalConfigPath(filePath) {
+  const resolved = path.resolve(filePath);
+  return path.basename(resolved) === CONFIG_FILE && path.basename(path.dirname(resolved)) === CONFIG_DIR;
 }
 
 function assertNoSymlink(filePath, stopAt) {
@@ -56,7 +57,7 @@ function acquireLock(lockPath) {
 
 function resolveWriteTarget(directory = process.cwd()) {
   const suppliedPath = path.resolve(directory);
-  return isExplicitConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
+  return isCanonicalConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
 }
 
 function withConfigLock(directory, fn) {
@@ -77,8 +78,30 @@ function withConfigLock(directory, fn) {
 /** Return the existing config path for exactly this directory. */
 function discoverConfig(directory = process.cwd()) {
   const suppliedPath = path.resolve(directory);
-  const candidate = isExplicitConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
-  return existsSync(candidate) ? candidate : null;
+  const candidate = isCanonicalConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
+  return inspectConfigPath(candidate);
+}
+
+function inspectConfigPath(filePath) {
+  const directory = path.dirname(filePath);
+  let directoryInfo;
+  try { directoryInfo = lstatSync(directory); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (directoryInfo.isSymbolicLink()) throw new Error(`Refusing symlinked sandbox config directory: ${directory}`);
+  if (!directoryInfo.isDirectory()) throw new Error(`Sandbox config path is not a directory: ${directory}`);
+
+  let fileInfo;
+  try { fileInfo = lstatSync(filePath); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (fileInfo.isSymbolicLink()) throw new Error(`Refusing symlinked sandbox config file: ${filePath}`);
+  if (!fileInfo.isFile()) throw new Error(`Sandbox config path is not a regular file: ${filePath}`);
+  return filePath;
 }
 
 function assertSafeFields(value, location = "config") {
@@ -131,8 +154,9 @@ function validateConfig(input) {
 
 function readConfig(directory = process.cwd(), { allowMissing = true } = {}) {
   const suppliedPath = path.resolve(directory);
-  const file = isExplicitConfigPath(suppliedPath) ? suppliedPath : (discoverConfig(suppliedPath) ?? configPath(suppliedPath));
-  if (!existsSync(file)) {
+  const candidate = isCanonicalConfigPath(suppliedPath) ? suppliedPath : configPath(suppliedPath);
+  const file = inspectConfigPath(candidate);
+  if (!file) {
     if (allowMissing) return null;
     throw new Error(`Sandbox config not found from ${path.resolve(directory)}`);
   }
@@ -145,9 +169,11 @@ function readConfig(directory = process.cwd(), { allowMissing = true } = {}) {
 function writeConfigUnlocked(target, config) {
   const normalized = validateConfig(config);
   const dir = path.dirname(target);
-  const gitignore = path.join(dir, ".gitignore");
-  assertNoSymlink(gitignore, dir);
-  if (!existsSync(gitignore) || readFileSync(gitignore, "utf8") !== GITIGNORE) writeFileSync(gitignore, GITIGNORE, { mode: 0o600 });
+  if (isCanonicalConfigPath(target)) {
+    const gitignore = path.join(dir, ".gitignore");
+    assertNoSymlink(gitignore, dir);
+    if (!existsSync(gitignore) || readFileSync(gitignore, "utf8") !== GITIGNORE) writeFileSync(gitignore, GITIGNORE, { mode: 0o600 });
+  }
   assertNoSymlink(target, dir);
   if (existsSync(target) && lstatSync(target).isSymbolicLink()) throw new Error(`Refusing symlinked sandbox config path: ${target}`);
   const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;

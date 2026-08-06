@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, statSync, rmSync, mkdirSync, writeFileSync, symlinkSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, rmSync, mkdirSync, writeFileSync, symlinkSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -47,15 +47,27 @@ describe("sandbox-ctl project config", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("reads and writes an explicitly supplied config.json path", () => {
+  it("reads and writes an explicitly supplied canonical config target", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
     try {
-      const file = path.join(root, "custom", "config.json");
+      const file = path.join(root, ".sandbox-ctl", "config.json");
       writeConfig(file, { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
       expect(readConfig(file)).toEqual({ schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
       upsertBinding(file, "dev", { sandboxId: "s1", remoteWorkspace: "/workspace/dev" });
       expect(readConfig(file)).toMatchObject({ active: "dev", sandboxes: { dev: { sandboxId: "s1" } } });
-      expect(readConfig(root)).toBeNull();
+      expect(readConfig(root)).toMatchObject({ active: "dev" });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("treats a real project directory named config.json as a directory", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
+    try {
+      const directory = path.join(root, "config.json");
+      mkdirSync(directory);
+      writeConfig(directory, { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
+      expect(readConfig(directory)).toEqual({ schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
+      expect(existsSync(path.join(root, ".gitignore"))).toBe(false);
+      expect(existsSync(path.join(root, "config.json", ".sandbox-ctl", ".gitignore"))).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -118,6 +130,28 @@ describe("sandbox-ctl project config", () => {
       symlinkSync(path.join(outside, "config.json"), path.join(root, ".sandbox-ctl", "config.json"));
       expect(() => writeConfig(root, { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} })).toThrow(/symlink|symbolic/i);
       expect(readFileSync(path.join(outside, "sentinel"), "utf8")).toBe("safe");
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
+  });
+
+  it("rejects symlinked or non-regular config files while reading", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
+    const outside = mkdtempSync(path.join(tmpdir(), "sandbox-outside-"));
+    try {
+      writeConfig(outside, { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} });
+      writeFileSync(path.join(outside, "sentinel"), "must not be read");
+
+      symlinkSync(path.join(outside, ".sandbox-ctl"), path.join(root, ".sandbox-ctl"));
+      expect(() => readConfig(root)).toThrow(/symlink|symbolic/i);
+      rmSync(path.join(root, ".sandbox-ctl"));
+
+      mkdirSync(path.join(root, ".sandbox-ctl"));
+      symlinkSync(path.join(outside, ".sandbox-ctl", "config.json"), path.join(root, ".sandbox-ctl", "config.json"));
+      expect(() => readConfig(root)).toThrow(/symlink|symbolic/i);
+      rmSync(path.join(root, ".sandbox-ctl", "config.json"));
+
+      mkdirSync(path.join(root, ".sandbox-ctl", "config.json"));
+      expect(() => readConfig(root)).toThrow(/regular|file|directory/i);
+      expect(readFileSync(path.join(outside, "sentinel"), "utf8")).toBe("must not be read");
     } finally { rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
   });
 
