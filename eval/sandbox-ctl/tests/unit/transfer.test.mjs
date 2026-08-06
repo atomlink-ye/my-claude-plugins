@@ -61,11 +61,13 @@ describe("explicit full directory transfer", () => {
 
   it("rejects a real tar symlink escape before extraction", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-transfer-link-"));
+    const taskId = `link-leak-${process.pid}`;
+    const ownedPrefix = `daytona-input-${taskId}-`;
     try {
       symlinkSync("../../outside", path.join(root, "escape"));
-      const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith("daytona-input-"));
-      expect(() => createBundle(root, "fixture", { mode: "bundle" })).toThrow(/special|symlink|unsafe/i);
-      expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith("daytona-input-"))).toEqual(before);
+      const before = readdirSync(tmpdir()).filter((entry) => entry.startsWith(ownedPrefix));
+      expect(() => createBundle(root, taskId, { mode: "bundle" })).toThrow(/special|symlink|unsafe/i);
+      expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith(ownedPrefix))).toEqual(before);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

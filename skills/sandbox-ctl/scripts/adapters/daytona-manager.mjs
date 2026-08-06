@@ -593,8 +593,9 @@ function createBundle(inputPath, taskId, options = {}) {
   if (mode === "bundle" && /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|logs|.+\.log)$/.test(path.basename(abs))) {
     throw new Error(`Refusing sensitive path in bundle mode: ${abs}; use --mode full --include-sensitive`);
   }
-  const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-input-"));
-  const bundlePath = path.join(tempDir, `daytona-input-${taskId}.tar.gz`);
+  const tempTag = String(taskId ?? "bundle").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 64) || "bundle";
+  const tempDir = mkdtempSync(path.join(tmpdir(), `daytona-input-${tempTag}-`));
+  const bundlePath = path.join(tempDir, `daytona-input-${tempTag}.tar.gz`);
   try {
     const exclusions = mode === "full" ? [".sandbox-ctl"] : [".env*", ".git", ".sandbox-ctl", "node_modules", ".claude", ".opencode-state", ".daytona", "dist", "build", "*.log", "logs"];
     const tarArgs = ["-czf", bundlePath];
