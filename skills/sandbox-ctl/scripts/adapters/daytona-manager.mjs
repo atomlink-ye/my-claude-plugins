@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 
-const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use"];
+const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use", "--include-sensitive", "--overwrite"];
 const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const DEFAULT_STATE_ROOT = path.join(homedir(), ".daytona", "claude-code");
@@ -297,9 +297,9 @@ function buildUsage() {
     "  up [--directory DIR] [--state-directory DIR] [--task-id ID] [--snapshot SNAPSHOT] [--name NAME] [--class small|medium|large] [--cpu N --memory GB --disk GB --gpu N] [--env-file FILE]",
     "  adopt [--directory DIR] [--state-directory DIR] [--task-id ID] (--sandbox-id ID | --sandbox-name NAME) [--remote-path PATH] [--env-file FILE]",
     "  status [--directory DIR] [--state-directory DIR] [--refresh] [--env-file FILE]",
-    "  push [--directory DIR] [--state-directory DIR] [--task-id ID] --path PATH [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
+    "  push [LOCAL_PATH] [--directory DIR] [--state-directory DIR] [--task-id ID] [--path PATH] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--branch BRANCH]",
     "  exec [--directory DIR] [--state-directory DIR] [--cwd PATH] [--artifacts PATH] -- COMMAND...",
-    "  pull [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|git] [--branch BRANCH]",
+    "  pull [REMOTE_PATH] [--directory DIR] [--state-directory DIR] [--output DIR] [--remote-path PATH] [--mode bundle|full|git] [--include-sensitive] [--overwrite] [--branch BRANCH]",
     "  preview [--directory DIR] [--state-directory DIR] --port PORT [--expires-in SECONDS]",
     "  smoke-test [--directory DIR] [--state-directory DIR] [--task-id ID] [--class small|medium|large] [--include-git] [--include-preview]",
     "  down [--directory DIR] [--state-directory DIR] [--keep-state] [--env-file FILE]",
@@ -553,35 +553,64 @@ function runTar(args, cwd) {
 
 function listTarEntries(bundlePath) {
   const result = runTar(["-tzf", bundlePath], process.cwd());
-  return result.stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  const entries = result.stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  const verbose = runTar(["-tvzf", bundlePath], process.cwd()).stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+  for (const line of verbose) {
+    const type = line[0];
+    if (!["-", "d"].includes(type)) throw new Error(`Unsafe tar special entry rejected: ${line}`);
+  }
+  return validateTarEntries(entries);
 }
 
 function validateTarEntries(entries) {
   for (const entry of entries) {
-    const normalized = entry.replaceAll("\\", "/");
+    const rawName = typeof entry === "string" ? entry : entry?.name;
+    if (!rawName) throw new Error(`Unsafe tar entry rejected: ${JSON.stringify(entry)}`);
+    const normalized = String(rawName).replaceAll("\\", "/");
     const segments = normalized.split("/").filter((segment) => segment && segment !== ".");
     if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) || segments.includes("..")) {
-      throw new Error(`Unsafe tar entry rejected: ${entry}`);
+      throw new Error(`Unsafe tar entry rejected: ${rawName}`);
+    }
+    if (typeof entry === "object" && entry.type && !["file", "regular", "directory", "dir", "-", "d"].includes(entry.type)) {
+      throw new Error(`Unsafe tar special entry rejected: ${rawName} (${entry.type})`);
     }
   }
   return entries;
 }
 
-function createBundle(inputPath, taskId) {
+function createBundle(inputPath, taskId, options = {}) {
   const abs = path.resolve(inputPath);
   if (!existsSync(abs)) throw new Error(`Path not found: ${abs}`);
+  const mode = options.mode ?? "bundle";
+  const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
+  if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
+  if (!["bundle", "full"].includes(mode)) throw new Error(`Archive mode must be bundle or full (got ${mode})`);
+  if (mode === "full" && !includeSensitive) throw new Error("--mode full may upload credentials; pass --include-sensitive to confirm");
+  const resolvedAbs = (() => { try { return realpathSync(abs); } catch { return abs; } })();
+  if ([abs, resolvedAbs].some((candidate) => candidate.split(path.sep).includes(".sandbox-ctl"))) {
+    throw new Error(`Refusing to upload .sandbox-ctl control directory: ${abs}`);
+  }
+  if (mode === "bundle" && /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|logs|.+\.log)$/.test(path.basename(abs))) {
+    throw new Error(`Refusing sensitive path in bundle mode: ${abs}; use --mode full --include-sensitive`);
+  }
   const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-input-"));
   const bundlePath = path.join(tempDir, `daytona-input-${taskId}.tar.gz`);
-  const exclusions = [".env*", ".git", "node_modules", ".claude", ".opencode-state", ".daytona", "dist", "build", "*.log"];
-  const tarArgs = ["-czf", bundlePath];
-  if (statSync(abs).isDirectory()) {
-    for (const item of exclusions) tarArgs.push("--exclude", item);
-    tarArgs.push("-C", abs, ".");
-  } else {
-    tarArgs.push("-C", path.dirname(abs), path.basename(abs));
+  try {
+    const exclusions = mode === "full" ? [".sandbox-ctl"] : [".env*", ".git", ".sandbox-ctl", "node_modules", ".claude", ".opencode-state", ".daytona", "dist", "build", "*.log", "logs"];
+    const tarArgs = ["-czf", bundlePath];
+    if (statSync(abs).isDirectory()) {
+      for (const item of exclusions) tarArgs.push("--exclude", item);
+      tarArgs.push("-C", abs, ".");
+    } else {
+      tarArgs.push("-C", path.dirname(abs), path.basename(abs));
+    }
+    runTar(tarArgs, process.cwd());
+    listTarEntries(bundlePath);
+    return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(tempDir, { recursive: true, force: true });
+    throw error;
   }
-  runTar(tarArgs, process.cwd());
-  return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
 }
 
 function runLocal(command, args, cwd, action) {
@@ -711,6 +740,7 @@ function assertRemoteCommandSuccess(result, action = "remote command") {
 }
 
 async function uploadFile(sandbox, localPath, remotePath) {
+  if (sandbox.fs?.uploadFiles) return sandbox.fs.uploadFiles([{ source: localPath, destination: remotePath }]);
   const bytes = Buffer.from(readFileSync(localPath));
   if (sandbox.fs?.uploadFile) return sandbox.fs.uploadFile(bytes, remotePath);
   if (sandbox.fs?.upload) return sandbox.fs.upload(bytes, remotePath);
@@ -891,9 +921,12 @@ async function requireSandbox(options, { includeRemoteHome = false } = {}) {
 }
 
 async function handlePush(options) {
-  if (!options.path) throw new Error("push requires --path PATH");
+  options.path = options.path ?? options.directory ?? process.cwd();
   const mode = options.mode ?? "bundle";
-  if (!["bundle", "git"].includes(mode)) throw new Error("push --mode must be bundle or git");
+  if (!["bundle", "full", "git"].includes(mode)) throw new Error("push --mode must be bundle, full, or git");
+  const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
+  if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
+  if (mode === "full" && !includeSensitive) throw new Error("--mode full may upload credentials; pass --include-sensitive to confirm");
   const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
   if (mode === "git") {
@@ -911,14 +944,14 @@ async function handlePush(options) {
     } finally { cleanup(); }
     return;
   }
-  const { bundlePath, cleanup } = createBundle(options.path, paths.taskId);
+  const { bundlePath, cleanup } = createBundle(options.path, paths.taskId, { mode, includeSensitive });
   try {
     const remoteBundle = `/tmp/daytona-input-${paths.taskId}.tar.gz`;
     await uploadFile(sandbox, bundlePath, remoteBundle);
     const result = await sandboxExec(sandbox, `mkdir -p ${shellQuote(remoteWorkspace)} && tar -xzf ${shellQuote(remoteBundle)} -C ${shellQuote(remoteWorkspace)}`);
     assertRemoteCommandSuccess(result, "push extraction");
-    console.log(`Uploaded bundle to ${remoteWorkspace}`);
-    return { ok: true, mode: "bundle", remoteWorkspace };
+    console.log(`Uploaded ${mode} archive to ${remoteWorkspace}`);
+    return { ok: true, mode, remoteWorkspace };
   } finally { cleanup(); }
 }
 
@@ -1011,10 +1044,100 @@ async function handleExec(options, command) {
   return result;
 }
 
+function assertNoSymlinkAncestors(target, stopAt) {
+  let current = path.resolve(target);
+  const boundary = path.resolve(stopAt);
+  while (true) {
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error(`Refusing symlinked transfer path: ${current}`);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (current === boundary || current === path.dirname(current)) break;
+    current = path.dirname(current);
+  }
+}
+
+function prepareTransferOutput(outputPath, controlRoot, overwrite) {
+  const output = path.resolve(outputPath);
+  const relativeControl = path.relative(path.resolve(controlRoot), output);
+  if (relativeControl === "" || (!relativeControl.startsWith("..") && !path.isAbsolute(relativeControl))) {
+    throw new Error(`Refusing to extract into .sandbox-ctl control directory: ${output}`);
+  }
+  assertNoSymlinkAncestors(path.dirname(output), path.parse(output).root);
+  if (existsSync(output)) {
+    const info = lstatSync(output);
+    if (info.isSymbolicLink()) throw new Error(`Refusing symlinked transfer output: ${output}`);
+    if (!info.isDirectory()) throw new Error(`Transfer output must be a directory: ${output}`);
+    if (readdirSync(output).length && !overwrite) throw new Error(`Transfer output is not empty; pass --overwrite: ${output}`);
+  } else {
+    mkdirSync(output, { recursive: true });
+  }
+  return output;
+}
+
+function assertSafeRemoteTransferPath(remotePath) {
+  const normalized = String(remotePath ?? "").replaceAll("\\", "/");
+  if (!normalized) throw new Error("Remote path must not be empty");
+  if (normalized.split("/").filter(Boolean).includes(".sandbox-ctl")) {
+    throw new Error(`Refusing remote .sandbox-ctl control directory: ${remotePath}`);
+  }
+  return remotePath;
+}
+
+async function resolveRemoteTransferPath(sandbox, remotePath) {
+  assertSafeRemoteTransferPath(remotePath);
+  const quoted = shellQuote(remotePath);
+  const command = `if command -v realpath >/dev/null 2>&1; then realpath -- ${quoted}; elif command -v readlink >/dev/null 2>&1; then readlink -f -- ${quoted}; else echo 'remote realpath/readlink unavailable' >&2; exit 127; fi`;
+  const result = await sandboxExec(sandbox, command);
+  assertRemoteCommandSuccess(result, "remote path resolution");
+  const output = stripRemoteShellWarnings(remoteResultText(result) ?? "");
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length !== 1 || !lines[0].startsWith("/")) throw new Error(`Remote path resolution returned no absolute path: ${remotePath}`);
+  assertSafeRemoteTransferPath(lines[0]);
+  if (lines[0].split("/").includes("..")) throw new Error(`Unsafe resolved remote path rejected: ${lines[0]}`);
+  return lines[0];
+}
+
+function mergeTransferTree(source, destination, overwrite, relative = "") {
+  for (const name of readdirSync(source)) {
+    const sourcePath = path.join(source, name);
+    const targetPath = path.join(destination, name);
+    const rel = relative ? path.join(relative, name) : name;
+    assertNoSymlinkAncestors(path.dirname(targetPath), destination);
+    const sourceInfo = lstatSync(sourcePath);
+    let targetInfo = null;
+    try { targetInfo = lstatSync(targetPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (sourceInfo.isDirectory()) {
+      if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isDirectory())) throw new Error(`Refusing archive path type conflict: ${rel}`);
+      if (!targetInfo) mkdirSync(targetPath);
+      mergeTransferTree(sourcePath, targetPath, overwrite, rel);
+    } else if (sourceInfo.isSymbolicLink()) {
+      throw new Error(`Refusing special archive entry during merge: ${rel} (symlink)`);
+    } else if (sourceInfo.isFile()) {
+      if (targetInfo) {
+        if (targetInfo.isDirectory() || targetInfo.isSymbolicLink() || !overwrite) throw new Error(`Refusing archive overwrite: ${rel}`);
+      }
+      copyFileSync(sourcePath, targetPath);
+    } else throw new Error(`Refusing special archive entry during merge: ${rel}`);
+  }
+}
+
+function assertNoControlArchiveEntries(entries) {
+  for (const entry of entries) {
+    const name = typeof entry === "string" ? entry : entry?.name;
+    const segments = String(name ?? "").replaceAll("\\", "/").split("/").filter(Boolean);
+    if (segments.includes(".sandbox-ctl")) throw new Error(`Refusing archive entry in .sandbox-ctl control directory: ${name}`);
+  }
+}
+
 async function handlePull(options) {
   const { paths, state, sandbox, remoteHome } = await requireSandbox(options, { includeRemoteHome: true });
   const mode = options.mode ?? "bundle";
-  if (!["bundle", "git"].includes(mode)) throw new Error("pull --mode must be bundle or git");
+  if (!["bundle", "full", "git"].includes(mode)) throw new Error("pull --mode must be bundle, full, or git");
+  const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
+  if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
+  if (mode === "full" && !includeSensitive) throw new Error("--mode full may download credentials; pass --include-sensitive to confirm");
   if (mode === "git") {
     const branch = validateGitBranch(options.branch ?? state.gitBranch ?? `daytona/${paths.taskId}`);
     const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath, remoteHome);
@@ -1033,18 +1156,32 @@ async function handlePull(options) {
     } finally { rmSync(tempDir, { recursive: true, force: true }); }
     return;
   }
-  const remotePath = toRemoteAbsolute(options["remote-path"] ?? state.remoteArtifactsPath ?? paths.remoteArtifactsPath, remoteHome);
+  const requestedRemotePath = options["remote-path"] ?? state.remoteWorkspacePath ?? paths.remoteWorkspacePath;
+  assertSafeRemoteTransferPath(requestedRemotePath);
+  const remotePath = toRemoteAbsolute(requestedRemotePath, remoteHome);
+  const resolvedRemotePath = await resolveRemoteTransferPath(sandbox, remotePath);
   const output = path.resolve(options.output ?? paths.localArtifactsPath);
-  mkdirSync(output, { recursive: true });
+  const overwrite = Boolean(options.overwrite);
+  prepareTransferOutput(output, path.join(paths.directory, ".sandbox-ctl"), overwrite);
   const remoteBundle = `/tmp/daytona-artifacts-${paths.taskId}.tar.gz`;
-  const tarResult = await sandboxExec(sandbox, `tar -czf ${shellQuote(remoteBundle)} -C ${shellQuote(remotePath)} .`);
+  const exclusions = mode === "full" ? [".sandbox-ctl"] : ["--exclude=.env*", "--exclude=.git", "--exclude=.sandbox-ctl", "--exclude=node_modules", "--exclude=.claude", "--exclude=.opencode-state", "--exclude=.daytona", "--exclude=dist", "--exclude=build", "--exclude=*.log", "--exclude=logs"];
+  const tarFlags = mode === "full" ? "--exclude=.sandbox-ctl" : exclusions.join(" ");
+  const tarResult = await sandboxExec(sandbox, `tar -czf ${shellQuote(remoteBundle)} ${tarFlags} -C ${shellQuote(resolvedRemotePath)} .`);
   assertRemoteCommandSuccess(tarResult, "pull artifact bundling");
-  const localBundle = path.join(output, "artifacts.tar.gz");
-  await downloadFile(sandbox, remoteBundle, localBundle);
-  validateTarEntries(listTarEntries(localBundle));
-  runTar(["-xzf", localBundle, "-C", output], process.cwd());
+  const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-output-"));
+  const localBundle = path.join(tempDir, `daytona-output-${paths.taskId}.tar.gz`);
+  const staging = path.join(tempDir, "staging");
+  mkdirSync(staging);
+  try {
+    await downloadFile(sandbox, remoteBundle, localBundle);
+    const archiveEntries = listTarEntries(localBundle);
+    validateTarEntries(archiveEntries);
+    assertNoControlArchiveEntries(archiveEntries);
+    runTar(["-xzf", localBundle, "-C", staging], process.cwd());
+    mergeTransferTree(staging, output, overwrite);
+  } finally { rmSync(tempDir, { recursive: true, force: true }); }
   console.log(`Downloaded artifacts to ${output}`);
-  return { ok: true, mode: "bundle", output };
+  return { ok: true, mode, output };
 }
 
 async function handlePreview(options) {
@@ -1278,4 +1415,4 @@ if (isDirectExecution) main().then((result) => { if (typeof result?.exitCode ===
 
 const runDaytonaManager = main;
 
-export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listTarEntries, loadEnvFile, main, migrateLegacyStateToConfig, parseArgs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };
+export { applyDaytonaEnv, applyProjectEnv, assertManagedSandbox, assertRemoteCommandSuccess, assertSafeDestructiveRemoteWorkspace, assertSafeRemoteTransferPath, buildSandboxCreateParams, buildSmokeTestOptions, buildUsage, collectResources, createBundle, createClient, createGitBundle, createSandboxWithFallback, downloadFile, fetchGitBundleIntoBranch, getSandbox, handleAdopt, handleDown, handleExec, handleList, handleDoctor, handlePreview, handlePull, handlePush, handleSmokeTest, handleStatus, handleUp, hasExplicitResourceFlags, listTarEntries, loadEnvFile, main, mergeTransferTree, migrateLegacyStateToConfig, parseArgs, parsePort, parseRemoteInteger, readProjectState, readProjectStateWithSource, readRemoteText, redactStateForDisplay, remoteEnsureGitCommand, removeStateSource, resolveEnvFile, resolveEnvFiles, resolveProjectPaths, resolveRemoteHome, resolveRemoteTransferPath, runDaytonaManager, runDoctorCheck, sandboxExec, sanitizeTaskId, shellQuote, toRemoteAbsolute, uploadFile, validateGitBranch, validateSandboxClass, validateTarEntries, writeProvisionalSandboxState };

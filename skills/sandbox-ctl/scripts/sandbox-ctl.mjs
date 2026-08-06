@@ -16,7 +16,7 @@ const LIFECYCLE_FLAGS = new Map([
   ["--auto-archive", "autoArchiveInterval"],
   ["--auto-delete", "autoDeleteInterval"],
 ]);
-const BOOLEAN_ADAPTER_FLAGS = new Set(["--refresh", "--keep-state", "--include-git", "--include-preview"]);
+const BOOLEAN_ADAPTER_FLAGS = new Set(["--refresh", "--keep-state", "--include-git", "--include-preview", "--include-sensitive", "--overwrite"]);
 
 function readValue(argv, index, flag, inline) {
   const value = inline ?? argv[index + 1];
@@ -298,6 +298,8 @@ async function invoke(parsed, adapter, alias) {
   if (alias.command === "down") {
     Object.assign(options, { requireManagedPolicy: true, expectedKind: "sandbox" });
   }
+  if (alias.command === "push" && parsed.positionals[0] && options.path === undefined) options.path = parsed.positionals[0];
+  if (alias.command === "pull" && parsed.positionals[0]) options["remote-path"] = parsed.positionals[0];
   if (alias.command === "use") return selectBinding(options.directory, parsed.positionals[0] ?? parsed.options.sandbox);
   const handler = {
     up: adapter.handleUp,
