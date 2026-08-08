@@ -1,14 +1,29 @@
 #!/usr/bin/env node
 
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
+import { parseArgs as parseArgsGeneric, parseDurationMs, redactStateForDisplay, sanitizeTaskId, shellQuote } from "../lib/cli-shared.mjs";
+import {
+  assertNoControlArchiveEntries,
+  assertRemoteCommandSuccess,
+  assertSafeRemoteTransferPath,
+  createBundle,
+  listTarEntries,
+  mergeTransferTree,
+  prepareTransferOutput,
+  remoteResultText,
+  resolveRemoteTransferPath as resolveRemoteTransferPathViaExec,
+  runTar,
+  stripRemoteShellWarnings,
+  validateTarEntries,
+} from "../lib/transfer.mjs";
+import { createGitBundle, fetchGitBundleIntoBranch, listGitBundle, remoteEnsureGitCommand, runLocal, validateGitBranch } from "../lib/git-sync.mjs";
 
 const BOOL_FLAGS = ["--help", "--refresh", "--keep-state", "--include-git", "--include-preview", "--ephemeral", "--no-use", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean"];
 const STRING_FLAGS = ["--directory", "--state-directory", "--task-id", "--snapshot", "--name", "--env-file", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--class", "--cpu", "--memory", "--disk", "--gpu", "--branch", "--port", "--expires-in", "--auto-stop", "--auto-archive", "--auto-delete", "--timeout"];
@@ -26,62 +41,9 @@ const CLASS_RESOURCE_DEFAULTS = {
   small: { cpu: 1, memory: 1, disk: 3, gpu: 0 },
 };
 
-function flagName(flag) {
-  return flag.replace(/^--/, "");
-}
-
-function parseDurationMs(value, source = "timeout") {
-  const match = /^([1-9]\d*)(ms|s|m|h)?$/.exec(String(value ?? "").trim());
-  if (!match) throw new Error(`Invalid ${source}: expected a positive integer followed by ms, s, m, or h`);
-  const multipliers = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
-  const milliseconds = Number(match[1]) * multipliers[match[2] ?? "s"];
-  if (!Number.isSafeInteger(milliseconds)) throw new Error(`Invalid ${source}: duration is too large`);
-  return milliseconds;
-}
-
+/** Daytona's flag surface is fixed (BOOL_FLAGS/STRING_FLAGS); the parsing engine itself lives in lib/cli-shared.mjs so other adapters can reuse it with their own flag lists. */
 function parseArgs(argv = process.argv.slice(2), config = { booleanFlags: BOOL_FLAGS, stringFlags: STRING_FLAGS }) {
-  const options = {};
-  const positionals = [];
-  const passthrough = [];
-  let afterDashDash = false;
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (afterDashDash) {
-      passthrough.push(arg);
-      continue;
-    }
-    if (arg === "--") {
-      afterDashDash = true;
-      continue;
-    }
-    if (arg.startsWith("--")) {
-      const [rawFlag, inlineValue] = arg.includes("=") ? arg.split(/=(.*)/s, 2) : [arg, undefined];
-      if (config.booleanFlags.includes(rawFlag)) {
-        options[flagName(rawFlag)] = true;
-        continue;
-      }
-      if (config.stringFlags.includes(rawFlag)) {
-        const value = inlineValue ?? argv[++i];
-        if (!value || value.startsWith("--")) throw new Error(`Missing value for option: ${rawFlag}`);
-        if (rawFlag === "--timeout") options.timeoutMs = parseDurationMs(value);
-        else options[flagName(rawFlag)] = value;
-        continue;
-      }
-      throw new Error(`Unknown option: ${rawFlag}`);
-    }
-    positionals.push(arg);
-  }
-  return { command: positionals[0], options, positionals: positionals.slice(1), passthrough };
-}
-
-function sanitizeTaskId(value, source = "task id") {
-  const taskId = String(value ?? "").trim();
-  if (!taskId) throw new Error(`Invalid ${source}: must not be empty`);
-  if (taskId === "." || taskId === "..") throw new Error(`Invalid ${source}: must not be . or ..`);
-  if (!/^[A-Za-z0-9._-]+$/.test(taskId)) {
-    throw new Error(`Invalid ${source}: use only letters, numbers, dots, underscores, and hyphens`);
-  }
-  return taskId;
+  return parseArgsGeneric(argv, config);
 }
 
 function parseResourceNumber(value, source) {
@@ -186,18 +148,6 @@ async function resolveRemoteHome(sandbox) {
   throw new Error("Could not determine sandbox remote home from environment or passwd database");
 }
 
-function validateGitBranch(branch) {
-  const value = String(branch ?? "").trim();
-  if (!value || value.startsWith("-") || value.includes("..") || value.includes("\\") || value.includes("@{")) throw new Error(`Invalid git branch: ${value}`);
-  const result = spawnSync("git", ["check-ref-format", "--branch", value], { encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`Invalid git branch: ${value}`);
-  return value;
-}
-
-function remoteEnsureGitCommand() {
-  return "if ! command -v git >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then SUDO=''; if [ \"$(id -u)\" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi; $SUDO apt-get update && $SUDO apt-get install -y git; elif command -v apk >/dev/null 2>&1; then apk add --no-cache git; else echo 'git not found and no supported package manager available' >&2; exit 127; fi; fi";
-}
-
 function resolveProjectPaths(options = {}) {
   const directory = path.resolve(options.directory ?? process.cwd());
   const stateRoot = path.resolve(options["state-directory"] ?? process.env.DAYTONA_STATE_DIR ?? DEFAULT_STATE_ROOT);
@@ -285,18 +235,6 @@ function applyProjectEnv(options = {}, paths = resolveProjectPaths(options), env
   const env = {};
   for (const envFile of resolveEnvFiles(options, paths, envConfig)) Object.assign(env, loadEnvFile(envFile));
   applyDaytonaEnv(env);
-}
-
-function redactStateForDisplay(state = {}) {
-  const redacted = {};
-  for (const [key, value] of Object.entries(state ?? {})) redacted[key] = SECRET_KEY_RE.test(key) ? "[redacted]" : value;
-  return redacted;
-}
-
-function shellQuote(value) {
-  const text = String(value);
-  if (text.length === 0) return "''";
-  return `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
 function recoveryActions(directory, sandboxId, remoteWorkspacePath) {
@@ -563,231 +501,6 @@ async function ensureSandboxStarted(sandbox) {
   return sandbox;
 }
 
-function runTar(args, cwd) {
-  const result = spawnSync("tar", args, { cwd, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`tar failed: ${result.stderr || result.stdout}`.trim());
-  return result;
-}
-
-function listTarEntries(bundlePath) {
-  const result = runTar(["-tzf", bundlePath], process.cwd());
-  const entries = result.stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
-  const verbose = runTar(["-tvzf", bundlePath], process.cwd()).stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
-  for (const line of verbose) {
-    const type = line[0];
-    if (!["-", "d"].includes(type)) throw new Error(`Unsafe tar special entry rejected: ${line}`);
-  }
-  return validateTarEntries(entries);
-}
-
-function validateTarEntries(entries) {
-  for (const entry of entries) {
-    const rawName = typeof entry === "string" ? entry : entry?.name;
-    if (!rawName) throw new Error(`Unsafe tar entry rejected: ${JSON.stringify(entry)}`);
-    const normalized = String(rawName).replaceAll("\\", "/");
-    const segments = normalized.split("/").filter((segment) => segment && segment !== ".");
-    if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized) || segments.includes("..")) {
-      throw new Error(`Unsafe tar entry rejected: ${rawName}`);
-    }
-    if (typeof entry === "object" && entry.type && !["file", "regular", "directory", "dir", "-", "d"].includes(entry.type)) {
-      throw new Error(`Unsafe tar special entry rejected: ${rawName} (${entry.type})`);
-    }
-  }
-  return entries;
-}
-
-function createBundle(inputPath, taskId, options = {}) {
-  const abs = path.resolve(inputPath);
-  if (!existsSync(abs)) throw new Error(`Path not found: ${abs}`);
-  const mode = options.mode ?? "bundle";
-  const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
-  if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
-  if (!["bundle", "full"].includes(mode)) throw new Error(`Archive mode must be bundle or full (got ${mode})`);
-  if (mode === "full" && !includeSensitive) throw new Error("--mode full may upload credentials; pass --include-sensitive to confirm");
-  const resolvedAbs = (() => { try { return realpathSync(abs); } catch { return abs; } })();
-  if ([abs, resolvedAbs].some((candidate) => candidate.split(path.sep).includes(".sandbox-ctl"))) {
-    throw new Error(`Refusing to upload .sandbox-ctl control directory: ${abs}`);
-  }
-  if (mode === "bundle" && /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|logs|.+\.log)$/.test(path.basename(abs))) {
-    throw new Error(`Refusing sensitive path in bundle mode: ${abs}; use --mode full --include-sensitive`);
-  }
-  const tempTag = String(taskId ?? "bundle").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 64) || "bundle";
-  const tempDir = mkdtempSync(path.join(tmpdir(), `daytona-input-${tempTag}-`));
-  const bundlePath = path.join(tempDir, `daytona-input-${tempTag}.tar.gz`);
-  try {
-    const exclusions = mode === "full" ? [".sandbox-ctl"] : [".env*", ".git", ".sandbox-ctl", "node_modules", ".claude", ".opencode-state", ".daytona", "dist", "build", "*.log", "logs"];
-    const tarArgs = ["-czf", bundlePath];
-    if (statSync(abs).isDirectory()) {
-      for (const item of exclusions) tarArgs.push("--exclude", item);
-      tarArgs.push("-C", abs, ".");
-    } else {
-      tarArgs.push("-C", path.dirname(abs), path.basename(abs));
-    }
-    runTar(tarArgs, process.cwd());
-    listTarEntries(bundlePath);
-    return { bundlePath, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) };
-  } catch (error) {
-    rmSync(tempDir, { recursive: true, force: true });
-    throw error;
-  }
-}
-
-function runLocal(command, args, cwd, action, env) {
-  const result = spawnSync(command, args, { cwd, env: env ? { ...process.env, ...env } : process.env, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`${action} failed: ${result.stderr || result.stdout}`.trim());
-  return result;
-}
-
-function gitOutput(args, cwd, env) {
-  return runLocal("git", args, cwd, `git ${args.join(" ")}`, env).stdout.trim();
-}
-
-function sensitiveGitPath(relativePath) {
-  const normalized = String(relativePath).replaceAll("\\", "/");
-  const segments = normalized.split("/").filter(Boolean);
-  const basename = segments.at(-1) ?? "";
-  return segments.some((segment) => segment.startsWith(".env") || segment.startsWith(".sandbox-ctl") || segment.startsWith(".claude") || segment.startsWith(".opencode-state") || segment.startsWith(".daytona")) || /(?:\.pem|\.key|\.p12|\.pfx|\.jks)$/i.test(basename) || /^(?:id_rsa|id_ed25519|\.npmrc|\.netrc|\.pypirc|credentials\.json)$/i.test(basename);
-}
-
-function gitStatusSummary(abs) {
-  const result = spawnSync("git", ["status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=none"], { cwd: abs, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`git status failed: ${result.stderr || result.stdout}`.trim());
-  const summary = { staged: 0, unstaged: 0, untracked: 0, deleted: 0, renames: 0, submoduleDirty: 0, sparse: false };
-  const paths = [];
-  for (const line of String(result.stdout).split(/\r?\n/).filter(Boolean)) {
-    if (line.startsWith("# ")) continue;
-    const kind = line[0];
-    if (kind === "?") { summary.untracked += 1; paths.push(line.slice(2)); continue; }
-    if (kind === "2") { summary.renames += 1; const fields = line.split(" "); paths.push(fields.slice(9).join(" ")); continue; }
-    if (kind === "1" || kind === "u") {
-      const fields = line.split(" ");
-      const xy = fields[1] ?? "  ";
-      if (xy[0] !== "." && xy[0] !== " ") summary.staged += 1;
-      if (xy[1] !== "." && xy[1] !== " ") summary.unstaged += 1;
-      if (xy.includes("D")) summary.deleted += 1;
-      paths.push(fields.slice(kind === "u" ? 10 : 8).join(" "));
-    }
-  }
-  const sparse = spawnSync("git", ["config", "--bool", "core.sparseCheckout"], { cwd: abs, encoding: "utf8" });
-  summary.sparse = sparse.status === 0 && sparse.stdout.trim() === "true";
-  return { summary, paths };
-}
-
-function isGitSubmodule(abs, relativePath) {
-  const mode = spawnSync("git", ["ls-files", "--stage", "--", relativePath], { cwd: abs, encoding: "utf8" });
-  return mode.status === 0 && mode.stdout.split(/\r?\n/).some((line) => line.startsWith("160000 "));
-}
-
-function submoduleIsDirty(abs, relativePath) {
-  if (!isGitSubmodule(abs, relativePath)) return false;
-  const nested = path.join(abs, relativePath);
-  if (!existsSync(nested) || !statSync(nested).isDirectory()) return false;
-  const result = spawnSync("git", ["-C", nested, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" });
-  return result.status === 0 && Boolean(result.stdout.trim());
-}
-
-function createGitBundle(repoPath, taskId, options = {}) {
-  const requested = path.resolve(repoPath);
-  if (!existsSync(requested) || !statSync(requested).isDirectory()) throw new Error(`Git mode requires an existing local repository directory: ${requested}`);
-  const abs = runLocal("git", ["rev-parse", "--show-toplevel"], requested, "git repository check").stdout.trim();
-  const sourceHead = runLocal("git", ["rev-parse", "--verify", "HEAD"], abs, "git HEAD check").stdout.trim();
-  const committedOnly = Boolean(options.committedOnly ?? options["committed-only"]);
-  const requireClean = Boolean(options.requireClean ?? options["require-clean"]);
-  if (committedOnly && requireClean) throw new Error("--committed-only and --require-clean are mutually exclusive");
-  const { summary, paths: statusPaths } = gitStatusSummary(abs);
-  const submodulePaths = String(spawnSync("git", ["ls-files", "--stage", "-z"], { cwd: abs, encoding: "utf8" }).stdout ?? "").split("\0").filter(Boolean).filter((entry) => entry.startsWith("160000 ")).map((entry) => entry.slice(entry.indexOf("\t") + 1));
-  const dirtySubmodulePaths = [...statusPaths, ...submodulePaths].filter((entry) => submoduleIsDirty(abs, entry));
-  for (const relativePath of statusPaths.filter((entry) => isGitSubmodule(abs, entry))) {
-    const unstaged = spawnSync("git", ["diff", "--quiet", "--", relativePath], { cwd: abs });
-    const staged = spawnSync("git", ["diff", "--cached", "--quiet", "--", relativePath], { cwd: abs });
-    if (unstaged.status !== 0 || staged.status !== 0) dirtySubmodulePaths.push(relativePath);
-  }
-  summary.submoduleDirty = new Set(dirtySubmodulePaths).size;
-  const dirty = summary.staged + summary.unstaged + summary.untracked + summary.deleted + summary.renames + summary.submoduleDirty > 0;
-  if (requireClean && dirty) throw new Error("--require-clean rejected an uncommitted or dirty worktree");
-  if (!committedOnly && summary.sparse) throw new Error("Git WIP push rejects sparse worktrees; use --committed-only");
-  if (!committedOnly && summary.submoduleDirty) throw new Error("Git WIP push rejects dirty submodules; use --committed-only or clean the submodule");
-  const tempDir = mkdtempSync(path.join(tmpdir(), "daytona-git-input-"));
-  const bundlePath = path.join(tempDir, `daytona-git-input-${taskId}.bundle`);
-  const indexPath = path.join(tempDir, "index");
-  const cleanup = () => rmSync(tempDir, { recursive: true, force: true });
-  const env = { ...process.env, GIT_INDEX_FILE: indexPath };
-  try {
-    runLocal("git", ["read-tree", sourceHead], abs, "temporary git index initialization", env);
-    if (!committedOnly) runLocal("git", ["add", "--all", "--", "."], abs, "temporary git worktree snapshot", env);
-    const finalPaths = String(spawnSync("git", ["ls-files", "-z"], { cwd: abs, env, encoding: "utf8" }).stdout ?? "").split("\0").filter(Boolean);
-    if (!committedOnly) {
-      for (const relativePath of finalPaths) {
-        if (!sensitiveGitPath(relativePath)) continue;
-        const existing = spawnSync("git", ["cat-file", "-e", `${sourceHead}:${relativePath}`], { cwd: abs, encoding: "utf8" });
-        if (existing.status !== 0) throw new Error(`Sensitive newly-added path rejected: ${relativePath}`);
-      }
-    }
-    const sourceTree = gitOutput(["rev-parse", `${sourceHead}^{tree}`], abs);
-    const tree = committedOnly ? sourceTree : gitOutput(["write-tree"], abs, env);
-    const includedWip = !committedOnly && tree !== sourceTree;
-    let snapshotHead = sourceHead;
-    if (includedWip) {
-      const marker = `sandbox-ctl snapshot\nbranch=${options.branch ?? ""}\nbinding=${options.binding ?? ""}\nsource=${sourceHead}\n`;
-      const commit = spawnSync("git", ["commit-tree", tree, "-p", sourceHead, "-F", "-"], { cwd: abs, env: { ...env, GIT_AUTHOR_NAME: "sandbox-ctl", GIT_AUTHOR_EMAIL: "sandbox-ctl@localhost", GIT_COMMITTER_NAME: "sandbox-ctl", GIT_COMMITTER_EMAIL: "sandbox-ctl@localhost" }, input: marker, encoding: "utf8" });
-      if (commit.status !== 0) throw new Error(`git snapshot commit failed: ${commit.stderr || commit.stdout}`.trim());
-      snapshotHead = commit.stdout.trim();
-    }
-    const snapshotRef = gitTempRef("input");
-    runLocal("git", ["update-ref", snapshotRef, snapshotHead], abs, "temporary git snapshot ref", env);
-    try { runLocal("git", ["bundle", "create", bundlePath, snapshotRef], abs, "git bundle create"); }
-    finally { const removed = spawnSync("git", ["update-ref", "-d", snapshotRef], { cwd: abs, env: process.env, encoding: "utf8" }); if (removed.status !== 0) throw new Error(`Failed to clean temporary git snapshot ref ${snapshotRef}: ${removed.stderr || removed.stdout}`.trim()); }
-    listGitBundle(bundlePath, abs);
-    return { bundlePath, head: sourceHead, sourceHead, snapshotHead, includedWip, dirty, wipSummary: summary, cleanup };
-  } catch (error) {
-    cleanup();
-    throw error;
-  }
-}
-
-function listGitBundle(bundlePath, repoPath = process.cwd()) {
-  const sourceRepo = path.resolve(repoPath);
-  const result = spawnSync("git", ["-C", sourceRepo, "bundle", "verify", bundlePath], { cwd: sourceRepo, env: { ...process.env, GIT_DIR: path.join(sourceRepo, ".git") }, encoding: "utf8" });
-  if (result.status !== 0) throw new Error(`git bundle validation failed: ${result.stderr || result.stdout}`.trim());
-  return result.stdout;
-}
-
-function gitTempRef(prefix = "sync") { return `refs/sandbox-ctl-sync/${prefix}-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`; }
-
-function localBranchCheckedOut(repoPath, branch) {
-  const result = runLocal("git", ["worktree", "list", "--porcelain"], repoPath, "git worktree inspection");
-  return result.stdout.split(/\r?\n/).some((line) => line.startsWith("branch refs/heads/") && line.slice(18).trim() === branch);
-}
-
-function fetchGitBundleIntoBranch(bundlePath, repoPath, branch) {
-  const abs = path.resolve(repoPath);
-  const safeBranch = validateGitBranch(branch);
-  runLocal("git", ["rev-parse", "--show-toplevel"], abs, "git repository check");
-  const tempRef = gitTempRef("remote");
-  try {
-    const bundleHead = spawnSync("git", ["bundle", "list-heads", bundlePath], { cwd: abs, encoding: "utf8" }).stdout.trim().split(/\s+/)[1];
-    if (!bundleHead) throw new Error("git bundle has no advertised head");
-    runLocal("git", ["fetch", bundlePath, `${bundleHead}:${tempRef}`], abs, "git fetch bundle");
-    const remoteHead = runLocal("git", ["rev-parse", tempRef], abs, "git remote HEAD").stdout.trim();
-    const target = `refs/heads/${safeBranch}`;
-    const current = spawnSync("git", ["rev-parse", "--verify", target], { cwd: abs, encoding: "utf8" });
-    if (current.status !== 0) { runLocal("git", ["update-ref", target, remoteHead, ""], abs, "git branch create"); return { branch: safeBranch, remoteHead, created: true }; }
-    if (localBranchCheckedOut(abs, safeBranch)) throw new Error(`Refusing to update checked-out branch: ${safeBranch}`);
-    const oldHead = current.stdout.trim();
-    const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", oldHead, remoteHead], { cwd: abs, encoding: "utf8" });
-    if (ancestor.status === 0) { runLocal("git", ["update-ref", target, remoteHead, oldHead], abs, "git fast-forward branch"); return { branch: safeBranch, remoteHead, fastForward: true }; }
-    const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-    let actual = `${safeBranch}-${timestamp}`;
-    let suffix = 0;
-    while (spawnSync("git", ["show-ref", "--verify", `refs/heads/${actual}`], { cwd: abs, encoding: "utf8" }).status === 0) actual = `${safeBranch}-${timestamp}-${++suffix}`;
-    runLocal("git", ["update-ref", `refs/heads/${actual}`, remoteHead, ""], abs, "git divergence branch create");
-    return { branch: actual, remoteHead, diverged: true };
-  } finally {
-    const cleanup = spawnSync("git", ["update-ref", "-d", tempRef], { cwd: abs, encoding: "utf8" });
-    if (cleanup.status !== 0) throw new Error(`Failed to clean temporary git ref ${tempRef}: ${cleanup.stderr || cleanup.stdout}`.trim());
-  }
-}
-
 async function sandboxExec(sandbox, command, cwd) {
   if (sandbox.process?.executeCommand) return sandbox.process.executeCommand(command, cwd);
   if (sandbox.process?.exec) return sandbox.process.exec(command, cwd ? { cwd } : undefined);
@@ -861,31 +574,12 @@ async function readRemoteText(sandbox, remotePath) {
   return stripRemoteShellWarnings(text);
 }
 
-function remoteResultText(result) {
-  const value = result?.stdout ?? result?.output ?? result?.result ?? result?.data ?? result?.artifacts?.stdout ?? result?.stderr;
-  if (value === undefined || value === null) return undefined;
-  return typeof value === "string" ? value : String(value);
-}
-
-function stripRemoteShellWarnings(text) {
-  return String(text).split(/\r?\n/).filter((line) => !/warning: setlocale:|cannot change locale/i.test(line)).join("\n");
-}
-
 function parseRemoteInteger(resultText) {
   if (resultText === null) return undefined;
   const normalized = String(resultText).trim();
   if (!normalized) return undefined;
   const value = Number.parseInt(normalized, 10);
   return Number.isInteger(value) ? value : undefined;
-}
-
-function assertRemoteCommandSuccess(result, action = "remote command") {
-  if (typeof result?.exitCode !== "number" || result.exitCode === 0) return result;
-  const details = [];
-  if (result.stderr) details.push(`stderr: ${String(result.stderr).trim()}`);
-  if (result.stdout) details.push(`stdout: ${String(result.stdout).trim()}`);
-  if (!details.length) details.push(`result: ${JSON.stringify(result)}`);
-  throw new Error(`${action} failed with exit code ${result.exitCode}. ${details.join(" ")}`);
 }
 
 async function uploadFile(sandbox, localPath, remotePath) {
@@ -1271,91 +965,9 @@ async function handleExec(options, command) {
   return result;
 }
 
-function assertNoSymlinkAncestors(target, stopAt) {
-  let current = path.resolve(target);
-  const boundary = path.resolve(stopAt);
-  while (true) {
-    try {
-      if (lstatSync(current).isSymbolicLink()) throw new Error(`Refusing symlinked transfer path: ${current}`);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-    if (current === boundary || current === path.dirname(current)) break;
-    current = path.dirname(current);
-  }
-}
-
-function prepareTransferOutput(outputPath, controlRoot, overwrite) {
-  const output = path.resolve(outputPath);
-  const relativeControl = path.relative(path.resolve(controlRoot), output);
-  if (relativeControl === "" || (!relativeControl.startsWith("..") && !path.isAbsolute(relativeControl))) {
-    throw new Error(`Refusing to extract into .sandbox-ctl control directory: ${output}`);
-  }
-  assertNoSymlinkAncestors(path.dirname(output), path.parse(output).root);
-  if (existsSync(output)) {
-    const info = lstatSync(output);
-    if (info.isSymbolicLink()) throw new Error(`Refusing symlinked transfer output: ${output}`);
-    if (!info.isDirectory()) throw new Error(`Transfer output must be a directory: ${output}`);
-    if (readdirSync(output).length && !overwrite) throw new Error(`Transfer output is not empty; pass --overwrite: ${output}`);
-  } else {
-    mkdirSync(output, { recursive: true });
-  }
-  return output;
-}
-
-function assertSafeRemoteTransferPath(remotePath) {
-  const normalized = String(remotePath ?? "").replaceAll("\\", "/");
-  if (!normalized) throw new Error("Remote path must not be empty");
-  if (normalized.split("/").filter(Boolean).includes(".sandbox-ctl")) {
-    throw new Error(`Refusing remote .sandbox-ctl control directory: ${remotePath}`);
-  }
-  return remotePath;
-}
-
+/** Preserves the historical (sandbox, remotePath) call signature; the reusable engine in lib/transfer.mjs takes an injected remoteExec so other adapters can bind their own transport. */
 async function resolveRemoteTransferPath(sandbox, remotePath) {
-  assertSafeRemoteTransferPath(remotePath);
-  const quoted = shellQuote(remotePath);
-  const command = `if command -v realpath >/dev/null 2>&1; then realpath -- ${quoted}; elif command -v readlink >/dev/null 2>&1; then readlink -f -- ${quoted}; else echo 'remote realpath/readlink unavailable' >&2; exit 127; fi`;
-  const result = await sandboxExec(sandbox, command);
-  assertRemoteCommandSuccess(result, "remote path resolution");
-  const output = stripRemoteShellWarnings(remoteResultText(result) ?? "");
-  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length !== 1 || !lines[0].startsWith("/")) throw new Error(`Remote path resolution returned no absolute path: ${remotePath}`);
-  assertSafeRemoteTransferPath(lines[0]);
-  if (lines[0].split("/").includes("..")) throw new Error(`Unsafe resolved remote path rejected: ${lines[0]}`);
-  return lines[0];
-}
-
-function mergeTransferTree(source, destination, overwrite, relative = "") {
-  for (const name of readdirSync(source)) {
-    const sourcePath = path.join(source, name);
-    const targetPath = path.join(destination, name);
-    const rel = relative ? path.join(relative, name) : name;
-    assertNoSymlinkAncestors(path.dirname(targetPath), destination);
-    const sourceInfo = lstatSync(sourcePath);
-    let targetInfo = null;
-    try { targetInfo = lstatSync(targetPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
-    if (sourceInfo.isDirectory()) {
-      if (targetInfo && (targetInfo.isSymbolicLink() || !targetInfo.isDirectory())) throw new Error(`Refusing archive path type conflict: ${rel}`);
-      if (!targetInfo) mkdirSync(targetPath);
-      mergeTransferTree(sourcePath, targetPath, overwrite, rel);
-    } else if (sourceInfo.isSymbolicLink()) {
-      throw new Error(`Refusing special archive entry during merge: ${rel} (symlink)`);
-    } else if (sourceInfo.isFile()) {
-      if (targetInfo) {
-        if (targetInfo.isDirectory() || targetInfo.isSymbolicLink() || !overwrite) throw new Error(`Refusing archive overwrite: ${rel}`);
-      }
-      copyFileSync(sourcePath, targetPath);
-    } else throw new Error(`Refusing special archive entry during merge: ${rel}`);
-  }
-}
-
-function assertNoControlArchiveEntries(entries) {
-  for (const entry of entries) {
-    const name = typeof entry === "string" ? entry : entry?.name;
-    const segments = String(name ?? "").replaceAll("\\", "/").split("/").filter(Boolean);
-    if (segments.includes(".sandbox-ctl")) throw new Error(`Refusing archive entry in .sandbox-ctl control directory: ${name}`);
-  }
+  return resolveRemoteTransferPathViaExec((command) => sandboxExec(sandbox, command), remotePath);
 }
 
 async function handlePull(options) {

@@ -5,7 +5,8 @@ const CONFIG_DIR = ".sandbox-ctl";
 const CONFIG_FILE = "config.json";
 const GITIGNORE = "*";
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|cookie|header|\bauth\b|api[_-]?key|private[_-]?key|jwt|^env$|env[_-]?value|^value$)/i;
-const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "remoteWorkspace", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
+const ADAPTERS = new Set(["daytona", "cube"]);
+const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "template", "remoteWorkspace", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
 const LIFECYCLE_FIELDS = new Set(["autoStopInterval", "autoArchiveInterval", "autoDeleteInterval", "ephemeral"]);
 const SYNC_FIELDS = new Set(["mode", "branch"]);
 const LEGACY_IDENTITY_FIELDS = new Set(["taskId", "projectIdentity"]);
@@ -119,7 +120,7 @@ function assertSafeFields(value, location = "config") {
 function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Malformed sandbox config: expected an object");
   if (input.schemaVersion !== 1) throw new Error("Malformed sandbox config: schemaVersion must be 1");
-  if (input.adapter !== "daytona") throw new Error("Malformed sandbox config: adapter must be daytona");
+  if (!ADAPTERS.has(input.adapter)) throw new Error("Malformed sandbox config: adapter must be one of daytona, cube");
   if (input.active !== null && input.active !== undefined && typeof input.active !== "string") throw new Error("Malformed sandbox config: active must be a binding name or null");
   if (!input.sandboxes || typeof input.sandboxes !== "object" || Array.isArray(input.sandboxes)) throw new Error("Malformed sandbox config: sandboxes must be an object");
   assertSafeFields(input);
@@ -149,7 +150,7 @@ function validateConfig(input) {
   }
   const active = input.active ?? null;
   if (active !== null && !Object.hasOwn(sandboxes, active)) throw new Error(`Malformed sandbox config: active binding does not exist: ${active}`);
-  return { schemaVersion: 1, adapter: "daytona", active, sandboxes };
+  return { schemaVersion: 1, adapter: input.adapter, active, sandboxes };
 }
 
 function readConfig(directory = process.cwd(), { allowMissing = true } = {}) {
@@ -199,10 +200,12 @@ function resolveBinding(config, nameOrId) {
   return null;
 }
 
-function upsertBinding(directory, name, binding, { use = true } = {}) {
+function upsertBinding(directory, name, binding, { use = true, adapter = "daytona" } = {}) {
   if (typeof name !== "string" || !name.trim()) throw new Error("Binding name must not be empty");
+  if (!ADAPTERS.has(adapter)) throw new Error(`Unsupported adapter: ${adapter}`);
   return withConfigLock(directory, ({ target }) => {
-    const config = readConfig(target) ?? { schemaVersion: 1, adapter: "daytona", active: null, sandboxes: {} };
+    const config = readConfig(target) ?? { schemaVersion: 1, adapter, active: null, sandboxes: {} };
+    if (config.adapter !== adapter) throw new Error(`This directory is already bound to the ${config.adapter} adapter; cannot add a ${adapter} binding here`);
     config.sandboxes[name] = { ...(config.sandboxes[name] ?? {}), ...binding };
     config.active = use ? name : (config.active && config.sandboxes[config.active] ? config.active : null);
     writeConfigUnlocked(target, config);
