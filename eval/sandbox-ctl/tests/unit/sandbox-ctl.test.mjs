@@ -79,6 +79,11 @@ describe("sandbox-ctl argument parsing", () => {
     expect(resolveCommandAlias("project", "up")).toEqual({ command: "up", kind: "sandbox" });
     expect(() => parseSandboxCtlArgs(["--adapter", "other", "list"])).toThrow(/Unknown adapter/);
   });
+
+  it("accepts cube as a supported adapter and rejects an unsupported one listing both adapters", () => {
+    expect(parseSandboxCtlArgs(["--adapter", "cube", "list"]).adapter).toBe("cube");
+    expect(() => parseSandboxCtlArgs(["--adapter", "bogus", "list"])).toThrow(/Unknown adapter: bogus\. Supported adapters: daytona, cube/);
+  });
 });
 
 describe("sandbox-ctl lifecycle policy", () => {
@@ -444,6 +449,32 @@ describe("sandbox-ctl hardening", () => {
     expect(child.status).toBe(7);
     expect(child.stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "exec", exitCode: 7, stdout: "fixture stdout", stderr: "fixture stderr" });
+  });
+
+  it("routes --adapter cube through the real CLI entry to the cube adapter's own handlers, not Daytona's", () => {
+    const root = path.resolve(process.cwd());
+    const cli = path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+    const env = { ...process.env };
+    for (const key of ["SANDBOX_CTL_ADAPTER_MODULE", "CUBE_API_KEY", "E2B_API_KEY", "CUBE_API_URL", "E2B_API_URL"]) delete env[key];
+    const child = spawnSync(process.execPath, [cli, "--adapter", "cube", "--json", "doctor"], { encoding: "utf8", env });
+    expect(child.stdout.trim().split("\n")).toHaveLength(1);
+    const payload = JSON.parse(child.stdout);
+    // cube-manager's handleDoctor fails closed with its own configuration_error/CUBE_API_KEY
+    // message (no network call); Daytona's doctor would report a different apiKeyConfigured
+    // shape and error text, so this proves the cube adapter's handler actually ran.
+    expect(payload).toMatchObject({ command: "doctor", adapter: "cube", ok: false, connected: false });
+    expect(payload.error).toMatch(/CUBE_API_KEY|E2B_API_KEY/);
+  });
+
+  it("still runs Daytona by default through the real CLI entry when --adapter is omitted", () => {
+    const root = path.resolve(process.cwd());
+    const cli = path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+    const env = { ...process.env };
+    delete env.SANDBOX_CTL_ADAPTER_MODULE;
+    const child = spawnSync(process.execPath, [cli, "--json", "--help"], { encoding: "utf8", env });
+    expect(child.status).toBe(0);
+    expect(child.stdout.trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: true, command: "help", adapter: "daytona" });
   });
 });
 

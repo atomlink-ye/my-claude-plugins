@@ -6,9 +6,10 @@ import path from "node:path";
 import { realpathSync } from "node:fs";
 
 import * as daytonaAdapter from "./adapters/daytona-manager.mjs";
+import * as cubeAdapter from "./adapters/cube-manager.mjs";
 import { configPath, discoverConfig, getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
 
-const ADAPTERS = { daytona: daytonaAdapter };
+const ADAPTERS = { daytona: daytonaAdapter, cube: cubeAdapter };
 const LIFECYCLE_FLAGS = new Map([
   ["--auto-stop", "autoStopInterval"],
   ["--auto-archive", "autoArchiveInterval"],
@@ -109,7 +110,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
     if (!command) command = arg;
     else positionals.push(arg);
   }
-  if (adapter !== "daytona") throw new Error(`Unknown adapter: ${adapter}. Supported adapters: daytona`);
+  if (!ADAPTERS[adapter]) throw new Error(`Unknown adapter: ${adapter}. Supported adapters: ${Object.keys(ADAPTERS).join(", ")}`);
   return { adapter, json, command, positionals, passthrough, options, forwarded };
 }
 
@@ -184,11 +185,11 @@ function makeRunTaskId(value) {
   return value || `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function makeRunResult({ directory = process.cwd(), bindingName = makeRunTaskId(), sandboxId = null, exitCode = 125, artifactPath = null, retained = false, warnings = [], nextActions = [], stdout = "", stderr = "", error } = {}) {
+function makeRunResult({ directory = process.cwd(), bindingName = makeRunTaskId(), sandboxId = null, exitCode = 125, artifactPath = null, retained = false, warnings = [], nextActions = [], stdout = "", stderr = "", error, adapter = "daytona" } = {}) {
   return {
     ok: false,
     command: "run",
-    adapter: "daytona",
+    adapter,
     bindingName,
     configPath: discoverConfig(directory) ?? configPath(directory),
     sandboxId,
@@ -227,16 +228,16 @@ async function invokeRun(parsed, adapter) {
   try {
     adapterParsed = adapter.parseArgs(adapterArgs(parsed, { command: "up" }));
   } catch (error) {
-    return makeControlFailure({ directory: parsed.options.directory ?? process.cwd(), error });
+    return makeControlFailure({ directory: parsed.options.directory ?? process.cwd(), error, adapter: parsed.adapter });
   }
   const directory = parsed.options.directory ?? adapterParsed.options.directory ?? process.cwd();
   const bindingName = makeRunTaskId();
   const selector = parsed.options.sandbox ?? parsed.options.sandboxSelector ?? adapterParsed.options.sandbox ?? adapterParsed.options["sandbox-id"] ?? adapterParsed.options["sandbox-name"];
   const transferMode = parsed.options.mode ?? adapterParsed.options.mode;
   const includeSensitive = Boolean(parsed.options.includeSensitive ?? adapterParsed.options.includeSensitive ?? adapterParsed.options["include-sensitive"]);
-  if (selector) return makeControlFailure({ directory, bindingName, error: "run does not accept --sandbox, --sandbox-id, or --sandbox-name; it always creates a unique run-* binding" });
-  if (transferMode && transferMode !== "bundle") return makeControlFailure({ directory, bindingName, error: "run only supports safe bundle transfer; --mode full/git is not allowed" });
-  if (includeSensitive) return makeControlFailure({ directory, bindingName, error: "run does not accept --include-sensitive; credentials cannot be included" });
+  if (selector) return makeControlFailure({ directory, bindingName, error: "run does not accept --sandbox, --sandbox-id, or --sandbox-name; it always creates a unique run-* binding", adapter: parsed.adapter });
+  if (transferMode && transferMode !== "bundle") return makeControlFailure({ directory, bindingName, error: "run only supports safe bundle transfer; --mode full/git is not allowed", adapter: parsed.adapter });
+  if (includeSensitive) return makeControlFailure({ directory, bindingName, error: "run does not accept --include-sensitive; credentials cannot be included", adapter: parsed.adapter });
   const commonOptions = {
     ...adapterParsed.options,
     directory,
@@ -244,7 +245,7 @@ async function invokeRun(parsed, adapter) {
   };
   let lifecycle;
   try { lifecycle = normalizeLifecycleOptions("task", parsed.options); }
-  catch (error) { return makeControlFailure({ directory, bindingName, error }); }
+  catch (error) { return makeControlFailure({ directory, bindingName, error, adapter: parsed.adapter }); }
   const upOptions = {
     ...commonOptions,
     name: bindingName,
@@ -258,7 +259,7 @@ async function invokeRun(parsed, adapter) {
     expectedLifecycle: lifecycle,
   };
   const command = parsed.passthrough.length ? parsed.passthrough : adapterParsed.passthrough.length ? adapterParsed.passthrough : adapterParsed.positionals;
-  if (!command.length) return makeControlFailure({ directory, bindingName, error: "run requires a command after --" });
+  if (!command.length) return makeControlFailure({ directory, bindingName, error: "run requires a command after --", adapter: parsed.adapter });
   const artifactPath = parsed.options.artifacts ?? parsed.options.output ?? adapterParsed.options.artifacts ?? adapterParsed.options.output ?? null;
   if (artifactPath) commonOptions.artifacts = artifactPath;
   const boundOptions = {
@@ -316,7 +317,7 @@ async function invokeRun(parsed, adapter) {
     if (retained && !nextActions.length) nextActions.push(`sandbox-ctl down --directory ${shellQuote(directory)} --sandbox ${shellQuote(bindingName)}`);
   }
   const result = {
-    ...makeRunResult({ directory, bindingName, sandboxId: sandboxId ?? null, exitCode, artifactPath: execResult?.artifactPath ?? artifactPath, retained, warnings, nextActions }),
+    ...makeRunResult({ directory, bindingName, sandboxId: sandboxId ?? null, exitCode, artifactPath: execResult?.artifactPath ?? artifactPath, retained, warnings, nextActions, adapter: parsed.adapter }),
     ok: !failure && !warnings.length && exitCode === 0,
   };
   if (warnings.length && exitCode === 0) result.exitCode = 125;
@@ -418,8 +419,9 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
     return jsonResult.result;
   } catch (error) {
     const requestedCommand = findTopLevelCommand(argv);
+    const requestedAdapter = findTopLevelAdapter(argv);
     if (requestedCommand === "run") {
-      const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error });
+      const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error, adapter: requestedAdapter });
       process.exitCode = 125;
       if (requestedJson) console.log(JSON.stringify(payload));
       else console.error(payload.error);
@@ -429,7 +431,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
       const payload = {
         ok: false,
         command: "exec",
-        adapter: "daytona",
+        adapter: requestedAdapter,
         exitCode: 125,
         error: sanitizeError(error),
         sandboxId: error?.sandboxId ?? null,
@@ -441,7 +443,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
       return payload;
     }
     if (!requestedJson) throw error;
-    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: "daytona", error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: requestedAdapter, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
     process.exitCode = 1;
     console.log(JSON.stringify(payload));
     return payload;
@@ -477,22 +479,49 @@ function findTopLevelDirectory(argv = []) {
   return process.cwd();
 }
 
+/** Lightweight, non-throwing scan for --adapter, used only for reporting the requested
+ * adapter name when the canonical parseSandboxCtlArgs call itself failed (for any reason,
+ * including but not limited to an unrelated flag). Never throws. */
+function findTopLevelAdapter(argv = []) {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--") break;
+    if (argv[index] === "--adapter" && argv[index + 1] !== undefined && !argv[index + 1].startsWith("--")) return argv[index + 1];
+    if (argv[index].startsWith("--adapter=")) return argv[index].slice("--adapter=".length);
+  }
+  return "daytona";
+}
+
 function isSameRealPath(a, b) {
   try { return realpathSync(a) === realpathSync(b); } catch { return a === b; }
 }
 
-async function loadDirectAdapter() {
+/** Resolve the adapter module for a real CLI invocation. SANDBOX_CTL_ADAPTER_MODULE (used by
+ * tests/dev tooling to inject a fake adapter module by path) always wins over --adapter, exactly
+ * as before. Otherwise resolve --adapter (defaulting to daytona) through ADAPTERS. If the
+ * canonical parseSandboxCtlArgs parse fails for any reason (an unsupported --adapter, or an
+ * unrelated flag error), fall back to daytonaAdapter here — runSandboxCtl re-parses argv itself
+ * and will surface the real error (including "Unknown adapter") through its own, already-tested
+ * error handling before any adapter handler is ever invoked. */
+async function loadDirectAdapter(argv = process.argv.slice(2)) {
   const modulePath = process.env.SANDBOX_CTL_ADAPTER_MODULE;
-  if (!modulePath) return daytonaAdapter;
-  return import(pathToFileURL(path.resolve(modulePath)).href);
+  if (modulePath) return import(pathToFileURL(path.resolve(modulePath)).href);
+  try {
+    const { adapter } = parseSandboxCtlArgs(argv);
+    return ADAPTERS[adapter];
+  } catch {
+    return daytonaAdapter;
+  }
 }
 
 const isDirectExecution = isSameRealPath(process.argv[1] ?? "", fileURLToPath(import.meta.url));
-if (isDirectExecution) loadDirectAdapter().then((adapter) => runSandboxCtl(process.argv.slice(2), { adapter })).catch((error) => {
-  const wantsJson = process.argv.includes("--json");
-  if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: "daytona", error: sanitizeError(error) }));
-  else console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (isDirectExecution) {
+  const directArgv = process.argv.slice(2);
+  loadDirectAdapter(directArgv).then((adapter) => runSandboxCtl(directArgv, { adapter })).catch((error) => {
+    const wantsJson = process.argv.includes("--json");
+    if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: findTopLevelAdapter(directArgv), error: sanitizeError(error) }));
+    else console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
 
 export { buildLifecycleLabels, normalizeLifecycleOptions, parseSandboxCtlArgs, resolveCommandAlias, runSandboxCtl, usage };
