@@ -80,6 +80,12 @@ def _json_from_gws_output(stdout: str) -> dict[str, Any]:
     raise RuntimeError(f"gws did not return JSON output; stdout preview={preview!r}")
 
 
+def _get_params(doc_id: str) -> dict[str, Any]:
+    params: dict[str, Any] = {"documentId": doc_id}
+    if _TAB_ID:
+        params["includeTabsContent"] = True
+    return params
+
 def _run_gws(*args: str, json_body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
     cmd = ["gws", *args, "--format", "json"]
     if params is not None:
@@ -105,12 +111,35 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+_TAB_ID: str | None = None
+
+def _location(doc: dict[str, Any]) -> dict[str, Any]:
+    body = _tab_body(doc)
+    index = body["content"][-1]["endIndex"] - 1
+    return _make_location(index)
+
+def _make_location(index: int) -> dict[str, Any]:
+    return {"index": index, "tabId": _TAB_ID} if _TAB_ID else {"index": index}
+
+def _tab_body(doc: dict[str, Any]) -> dict[str, Any]:
+    if _TAB_ID:
+        for t in doc.get("tabs", []):
+            if t.get("tabProperties", {}).get("tabId") == _TAB_ID:
+                dt = t.get("documentTab", {})
+                if "body" not in dt:
+                    # Ensure body exists for empty tabs
+                    dt["body"] = {"content": [{"endIndex": 1, "paragraph": {"elements": [{"endIndex": 2, "startIndex": 1, "textRun": {"content": "\n", "textStyle": {}}}], "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"}}, "startIndex": 1}]}
+                return dt["body"]
+        raise RuntimeError(f"Tab {_TAB_ID} not found in document")
+    return doc.get("body", {"content": [{"endIndex": 1}]})
+
 def _append_index(doc: dict[str, Any]) -> int:
-    return doc["body"]["content"][-1]["endIndex"] - 1
+    return _tab_body(doc)["content"][-1]["endIndex"] - 1
 
 
 def _last_body_paragraph_text(doc: dict[str, Any]) -> str:
-    for item in reversed(doc.get("body", {}).get("content", [])):
+    body = _tab_body(doc)
+    for item in reversed(body.get("content", [])):
         paragraph = item.get("paragraph")
         if paragraph is None:
             continue
@@ -712,11 +741,11 @@ def _insert_footnotes(doc_id: str, footnotes: list[dict[str, Any]]) -> None:
 
 
 def _insert_text_block(doc_id: str, text: str, runs: list[dict[str, Any]], named_style: str = "NORMAL_TEXT", footnotes: list[dict[str, Any]] | None = None) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     payload = text + "\n"
     end = index + _utf16_len(payload)
-    requests: list[dict[str, Any]] = [{"insertText": {"location": {"index": index}, "text": payload}}]
+    requests: list[dict[str, Any]] = [{"insertText": {"location": _make_location(index), "text": payload}}]
     if named_style != "NORMAL_TEXT":
         requests.append(
             {
@@ -735,7 +764,7 @@ def _insert_text_block(doc_id: str, text: str, runs: list[dict[str, Any]], named
 
 
 def _insert_list(doc_id: str, items: list[dict[str, Any]], ordered: bool) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     payload_parts: list[str] = []
     runs: list[dict[str, Any]] = []
@@ -755,7 +784,7 @@ def _insert_list(doc_id: str, items: list[dict[str, Any]], ordered: bool) -> Non
         offset = end
     payload = "".join(payload_parts)
     end = index + _utf16_len(payload)
-    requests: list[dict[str, Any]] = [{"insertText": {"location": {"index": index}, "text": payload}}]
+    requests: list[dict[str, Any]] = [{"insertText": {"location": _make_location(index), "text": payload}}]
     current_preset: str | None = None
     current_start: int | None = None
     current_end: int | None = None
@@ -790,33 +819,33 @@ def _insert_code_block(doc_id: str, code: str, info: str = "") -> None:
 
 
 def _insert_image(doc_id: str, uri: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     _run_gws(
         "docs",
         "documents",
         "batchUpdate",
         params={"documentId": doc_id},
-        json_body={"requests": [{"insertInlineImage": {"location": {"index": _append_index(doc)}, "uri": uri}}]},
+        json_body={"requests": [{"insertInlineImage": {"location": _location(doc), "uri": uri}}]},
     )
     _insert_paragraph_break(doc_id)
 
 
 def _insert_paragraph_break(doc_id: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     _run_gws(
         "docs",
         "documents",
         "batchUpdate",
         params={"documentId": doc_id},
-        json_body={"requests": [{"insertText": {"location": {"index": _append_index(doc)}, "text": "\n"}}]},
+        json_body={"requests": [{"insertText": {"location": _location(doc), "text": "\n"}}]},
     )
 
 
 def _insert_caption(doc_id: str, text: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     requests = [
-        {"insertText": {"location": {"index": index}, "text": text + "\n"}},
+        {"insertText": {"location": _make_location(index), "text": text + "\n"}},
         {
             "updateTextStyle": {
                 "range": {"startIndex": index, "endIndex": index + _utf16_len(text)},
@@ -833,11 +862,11 @@ def _insert_caption(doc_id: str, text: str) -> None:
 
 
 def _insert_horizontal_rule(doc_id: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     text = "────────────────────────"
     requests = [
-        {"insertText": {"location": {"index": index}, "text": text + "\n"}},
+        {"insertText": {"location": _make_location(index), "text": text + "\n"}},
         {
             "updateTextStyle": {
                 "range": {"startIndex": index, "endIndex": index + _utf16_len(text)},
@@ -857,12 +886,12 @@ def _insert_horizontal_rule(doc_id: str) -> None:
 
 
 def _insert_blockquote(doc_id: str, text: str, runs: list[dict[str, Any]], footnotes: list[dict[str, Any]] | None = None) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     payload = text + "\n"
     end = index + _utf16_len(payload)
     requests: list[dict[str, Any]] = [
-        {"insertText": {"location": {"index": index}, "text": payload}},
+        {"insertText": {"location": _make_location(index), "text": payload}},
         {
             "updateParagraphStyle": {
                 "range": {"startIndex": index, "endIndex": end},
@@ -890,14 +919,14 @@ def _insert_blockquote(doc_id: str, text: str, runs: list[dict[str, Any]], footn
 
 
 def _insert_callout(doc_id: str, variant: str, text: str, runs: list[dict[str, Any]], footnotes: list[dict[str, Any]] | None = None) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     index = _append_index(doc)
     prefix = f"{variant}: "
     payload = prefix + text + "\n"
     end = index + _utf16_len(payload)
     prefix_len = _utf16_len(prefix)
     requests: list[dict[str, Any]] = [
-        {"insertText": {"location": {"index": index}, "text": payload}},
+        {"insertText": {"location": _make_location(index), "text": payload}},
         {
             "updateParagraphStyle": {
                 "range": {"startIndex": index, "endIndex": end},
@@ -928,21 +957,24 @@ def _insert_callout(doc_id: str, variant: str, text: str, runs: list[dict[str, A
 
 
 def _clear_body(doc_id: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     end = _append_index(doc)
     if end <= 1:
         return
+    _delete_range = {"startIndex": 1, "endIndex": end}
+    if _TAB_ID:
+        _delete_range["tabId"] = _TAB_ID
     _run_gws(
         "docs",
         "documents",
         "batchUpdate",
         params={"documentId": doc_id},
-        json_body={"requests": [{"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end}}}]},
+        json_body={"requests": [{"deleteContentRange": {"range": _delete_range}}]},
     )
 
 
 def _ensure_append_boundary(doc_id: str) -> None:
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     last_text = _last_body_paragraph_text(doc)
     if last_text in {"", "\n"}:
         return
@@ -951,7 +983,7 @@ def _ensure_append_boundary(doc_id: str) -> None:
         "documents",
         "batchUpdate",
         params={"documentId": doc_id},
-        json_body={"requests": [{"insertText": {"location": {"index": _append_index(doc)}, "text": "\n"}}]},
+        json_body={"requests": [{"insertText": {"location": _location(doc), "text": "\n"}}]},
     )
 
 
@@ -977,15 +1009,15 @@ def _latest_table(doc: dict[str, Any]) -> dict[str, Any]:
 def _insert_table(doc_id: str, rows: list[list[dict[str, Any]]]) -> None:
     if not rows:
         return
-    doc = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+    doc = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
     _run_gws(
         "docs",
         "documents",
         "batchUpdate",
         params={"documentId": doc_id},
-        json_body={"requests": [{"insertTable": {"rows": len(rows), "columns": len(rows[0]), "location": {"index": _append_index(doc)}}}]},
+        json_body={"requests": [{"insertTable": {"rows": len(rows), "columns": len(rows[0]), "location": _location(doc)}}]},
     )
-    table = _latest_table(_run_gws("docs", "documents", "get", params={"documentId": doc_id}))
+    table = _latest_table(_run_gws("docs", "documents", "get", params=_get_params(doc_id)))
     fills: list[tuple[int, dict[str, Any], bool]] = []
     for row_index, row in enumerate(table["tableRows"]):
         for column_index, cell in enumerate(row["tableCells"]):
@@ -995,7 +1027,7 @@ def _insert_table(doc_id: str, rows: list[list[dict[str, Any]]]) -> None:
     requests: list[dict[str, Any]] = []
     for start, cell_ir, is_header in sorted(fills, reverse=True):
         text = cell_ir["text"]
-        requests.append({"insertText": {"location": {"index": start}, "text": text}})
+        requests.append({"insertText": {"location": _make_location(start), "text": text}})
         if is_header:
             requests.append(
                 {
@@ -1026,13 +1058,15 @@ def _insert_table(doc_id: str, rows: list[list[dict[str, Any]]]) -> None:
             _apply_requests_with_footnotes(doc_id, [], cell_ir["text"], start, cell_ir["footnotes"])
 
 
-def render_ir_to_doc_metadata(ir: IR, title: str | None = None, *, into: str | None = None, into_mode: str = "replace", source_hash: str | None = None) -> dict[str, str]:
+def render_ir_to_doc_metadata(ir: IR, title: str | None = None, *, into: str | None = None, into_mode: str = "replace", source_hash: str | None = None, tab_id: str | None = None) -> dict[str, str]:
+    global _TAB_ID
+    _TAB_ID = tab_id
     doc_title = (title or _title_from_ir(ir, "Untitled")).strip() or "Untitled"
     if into_mode not in {"replace", "append"}:
         raise ValueError("into_mode must be 'replace' or 'append'")
     if into:
         doc_id = into
-        existing = _run_gws("docs", "documents", "get", params={"documentId": doc_id})
+        existing = _run_gws("docs", "documents", "get", params=_get_params(doc_id))
         doc_title = existing.get("title") or doc_title
         if into_mode == "replace":
             _clear_body(doc_id)
@@ -1098,13 +1132,13 @@ def convert(path: str | Path, title: str | None = None, *, into: str | None = No
     return render_ir_to_doc(ir, doc_title, into=resolved_into, into_mode=resolved_mode)
 
 
-def convert_metadata(path: str | Path, title: str | None = None, *, into: str | None = None, into_mode: str | None = None) -> dict[str, str]:
+def convert_metadata(path: str | Path, title: str | None = None, *, into: str | None = None, into_mode: str | None = None, tab_id: str | None = None) -> dict[str, str]:
     source_path = Path(path)
     markdown_text = source_path.read_text(encoding="utf-8")
     body, frontmatter, fallback_title, resolved_into, resolved_mode = _conversion_inputs(markdown_text, source_path.stem, title, into, into_mode)
     ir = parse_to_ir(body)
     doc_title = fallback_title if (title or frontmatter.get("title")) else _title_from_ir(ir, fallback_title)
-    return render_ir_to_doc_metadata(ir, doc_title, into=resolved_into, into_mode=resolved_mode, source_hash=_source_hash(markdown_text))
+    return render_ir_to_doc_metadata(ir, doc_title, into=resolved_into, into_mode=resolved_mode, source_hash=_source_hash(markdown_text), tab_id=tab_id)
 
 
 def convert_text(markdown_str: str, title: str | None = None, *, into: str | None = None, into_mode: str | None = None) -> str:
@@ -1114,11 +1148,11 @@ def convert_text(markdown_str: str, title: str | None = None, *, into: str | Non
     return render_ir_to_doc(ir, doc_title, into=resolved_into, into_mode=resolved_mode)
 
 
-def convert_text_metadata(markdown_str: str, title: str | None = None, *, into: str | None = None, into_mode: str | None = None) -> dict[str, str]:
+def convert_text_metadata(markdown_str: str, title: str | None = None, *, into: str | None = None, into_mode: str | None = None, tab_id: str | None = None) -> dict[str, str]:
     body, frontmatter, fallback_title, resolved_into, resolved_mode = _conversion_inputs(markdown_str, "Untitled", title, into, into_mode)
     ir = parse_to_ir(body)
     doc_title = fallback_title if (title or frontmatter.get("title")) else _title_from_ir(ir, fallback_title)
-    return render_ir_to_doc_metadata(ir, doc_title, into=resolved_into, into_mode=resolved_mode, source_hash=_source_hash(markdown_str))
+    return render_ir_to_doc_metadata(ir, doc_title, into=resolved_into, into_mode=resolved_mode, source_hash=_source_hash(markdown_str), tab_id=tab_id)
 
 
 def _extract_doc_id(value: str) -> str:
@@ -1609,6 +1643,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--into-mode", choices=["replace", "append"], help="Existing-doc write mode when --into/frontmatter gdoc_id is used (default: replace)")
     parser.add_argument("--doc-to-markdown", help="Export an existing Google Doc ID or URL back to Markdown")
     parser.add_argument("--json-output", action="store_true", help="Print JSON metadata instead of the plain URL")
+    parser.add_argument("--tab-id", help="Target a specific document tab for content insertion")
     args = parser.parse_args(argv)
 
     try:
@@ -1622,12 +1657,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.dump_ir:
                 print(json.dumps(parse_to_ir(_strip_frontmatter(payload)[0]), ensure_ascii=False))
                 return 0
-            metadata = convert_text_metadata(payload, title=args.title, into=args.into, into_mode=args.into_mode)
+            metadata = convert_text_metadata(payload, title=args.title, into=args.into, into_mode=args.into_mode, tab_id=args.tab_id)
         else:
             if args.dump_ir:
                 print(json.dumps(parse_to_ir(_strip_frontmatter(Path(args.markdown_file).read_text(encoding="utf-8"))[0]), ensure_ascii=False))
                 return 0
-            metadata = convert_metadata(Path(args.markdown_file), title=args.title, into=args.into, into_mode=args.into_mode)
+            metadata = convert_metadata(Path(args.markdown_file), title=args.title, into=args.into, into_mode=args.into_mode, tab_id=args.tab_id)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

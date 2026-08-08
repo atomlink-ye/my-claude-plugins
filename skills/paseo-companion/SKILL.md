@@ -63,6 +63,25 @@ paseo logs --host "$REMOTE_PASEO_HOST" <id> --tail 20
 
 Use the host:port form, not a full `http://...` preview URL.
 
+### Recommended workflow: manager loop over a long-running agent
+
+For a bounded task you dispatch and then check on periodically — rather than babysit synchronously — drive it as a loop, not a single blocking call:
+
+1. **Dispatch one bounded task** with an explicit scope boundary in the prompt (what's in, what's out, what "done" means). Detach it:
+   ```bash
+   id=$(paseo run -d --json --title <lane-name> --workspace <workspace> --cwd <path> "<scoped prompt>" | jq -r .id)
+   ```
+   Always pass `--workspace` explicitly (see `references/worktree-and-cwd.md`) if the run should show up grouped correctly.
+2. **Arm exactly one wait**, sized to how long the task should reasonably take:
+   ```bash
+   paseo wait "$id" --timeout <n>
+   ```
+3. **On wake, verify before deciding** — read `paseo logs "$id" --tail N` or `paseo inspect "$id" --json`, and if the agent claims it delegated to a sub-agent or finished a check, cross-check that claim (see "Don't trust an agent's self-report" in `references/agent-management.md`) rather than accepting the narrative.
+4. **Steer in place, don't relaunch.** If it drifted (scope creep, wrong approach, skipped the actual ask), send a correction into the *same* agent with `paseo send --no-wait "$id" "<correction>"` and re-arm one wait. Do not spin up a second agent for a course correction on work already in flight.
+5. **On completion, exercise the result yourself** before accepting it — run the feature, read the diff, run the test — rather than taking the agent's own completion report at face value.
+
+The two failure modes this avoids: using a blocking `paseo send` as your check-in mechanism (it silently becomes your polling interval — see Non-negotiables), and re-arming a new `paseo wait` after every interim peek (a single armed wait already returns on completion *or* timeout, so stacking waits just produces duplicate wake-ups). Audit stray waits with `ps -eo pid,command | grep "[p]aseo wait"`.
+
 ### Isolate work in a git worktree
 
 ```bash
@@ -141,10 +160,45 @@ paseo delete <id>             # hard-delete
 | Script/automate Paseo output, JSON/YAML formats, schema validation | `references/output-formats.md` |
 | Orchestrating multiple child agents and need to stop losing track of them (unattended waits, expired reminders, unexplained parks) | `references/manager-safety-net.md` |
 
+## Daemon health triage
+
+When `paseo status` shows `Local Daemon: unresponsive` / `Connected Daemon: unreachable` but still reports a PID, do not assume the daemon is healthy just because the supervisor process exists.
+
+Check in this order:
+
+```bash
+paseo status
+ps -p <pid> -o pid=,ppid=,stat=,start=,etime=,command=
+lsof -nP -iTCP:6767 -sTCP:LISTEN
+```
+
+Then inspect the daemon log near the end:
+
+```bash
+tail -n 120 ~/.paseo/daemon.log
+```
+
+A real local failure seen on this machine after upgrading Paseo CLI was a worker crash loop caused by a Homebrew dylib mismatch:
+
+```text
+dyld: Library not loaded: /opt/homebrew/opt/llhttp/lib/libllhttp.9.3.dylib
+Referenced from: /opt/homebrew/Cellar/node/25.8.2/bin/node
+```
+
+In that state:
+- the supervisor PID stays alive,
+- the websocket port is not actually healthy,
+- `Daemon Version` may show `-`,
+- and the log repeats `Worker crashed (SIGABRT). Restarting worker...`.
+
+Treat this as a local runtime/dependency problem (Node/Homebrew dylib mismatch), not a normal restart delay.
+
 ## Non-negotiables
 
-- **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one.
+- **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one. Reuse when it's the same task and the same context (a direct continuation, not a topic change) and that context hasn't gone stale or noisy; otherwise start fresh rather than let a long-lived session keep absorbing unrelated work.
 - **Wait, don't poll.** Never loop on `paseo ls` / `paseo inspect`. Use `paseo wait <id>` (blocks efficiently) or `paseo logs <id> -f` (streams).
+- **One armed wait per agent.** A single `paseo wait <id>` already returns on either completion or timeout — that covers both "it finished" and "check on it again." Don't re-arm a new wait after every interim `paseo logs`/`paseo inspect` peek; the peek is free and doesn't consume the pending wait. Stacking waits produces duplicate wake-ups on the same event.
+- **Detach follow-ups too.** Plain `paseo send <id> "..."` blocks until that turn finishes, just like `run` without `-d`. If you're driving your own check-in cadence with `paseo wait`, use `paseo send --no-wait <id> "..."` — otherwise the blocking send quietly becomes your polling interval.
 - **Timeout doesn't stop.** If `wait` times out, the agent is still running. Use `paseo stop <id>` to actually interrupt.
 - **Carry `--host` through.** A remote agent ID is only useful when later `wait`, `logs`, `send`, and `inspect` target the same daemon host.
 - **Quote prompts.** For multi-line or escape-heavy prompts, use `--prompt-file`.

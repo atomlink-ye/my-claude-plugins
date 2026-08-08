@@ -41,6 +41,16 @@ paseo worktree archive feature-x
 
 Removes both the worktree directory and the associated branch. Use after the agent's work has been merged or discarded.
 
+## `--workspace <id-or-path>` — attach a run to a named workspace
+
+```bash
+paseo run --workspace <workspace-id-or-path> --cwd <path> "..."
+```
+
+Pass `--workspace` explicitly whenever the run should show up correctly grouped in the Paseo UI, matching an existing entry from `paseo workspace ls`. `--cwd` alone does not attach the run to a named workspace — the daemon echoes `Using workspace <path>` when it worked, so check for that line.
+
+`--cwd` inside a workspace can get normalized back to the workspace root rather than the requested subdirectory. If the task depends on an exact working directory, tell the agent the absolute path in the prompt and have it `cd` itself rather than relying on `--cwd` alone.
+
 ## Notes
 
 - `paseo worktree` only manages worktrees paseo created. Plain `git worktree` directories are unaffected.

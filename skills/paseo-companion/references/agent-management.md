@@ -70,6 +70,18 @@ paseo run --image one.png --image two.png "..."
 paseo send <id> --image screenshot.png "..."
 ```
 
+## Self-identification
+
+`paseo inspect <id> --json` doubles as a way to confirm an ID actually refers to *your own* running session — check Provider/Model/Status/Cwd against what you know about yourself before targeting an ID for self-directed operations (e.g. self-messaging, self-compact — see `references/chat-and-permit.md`).
+
+## Don't trust an agent's self-report of delegation
+
+An agent's own narrative ("confirmed: I used a sub-agent for X") is not proof on its own. Cross-check against records Paseo actually tracks:
+
+- `paseo inspect <id> --json` returns `ParentAgentId` — Paseo tracks manager→runtime parentage, so a claimed dispatch should show up as a real parent/child relationship between agent IDs.
+- The Paseo GUI renders structured sub-steps (e.g. a `Sub Agent` step nested inside a tool-call card) that are daemon-recorded events, not model-written text — their presence is trustworthy signal even if the flattened CLI view doesn't preserve the same structure.
+- `paseo logs <id>` can flatten nested tool-call structure into plain lines that look like unstructured narrative. A missing structural marker in `paseo logs` output is not proof a delegation didn't happen — check `inspect --json` or the GUI before concluding that.
+
 ## Reading prompts from files
 
 `paseo send` accepts `--prompt-file <path>` for prompts too long, multi-line, or escape-heavy to pass as a CLI argument. The file is read as UTF-8.

@@ -1,77 +1,67 @@
-import Database from 'better-sqlite3';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import type { ActivityEvent, ActivityLogEntry } from '../types/index.js';
 
-interface ActivityLogRow {
-  id: number | bigint;
-  event: ActivityEvent;
-  request_id: string | null;
-  data: string | null;
-  timestamp: number;
-}
-
+/**
+ * Pure-JS activity logger — no native dependencies, so it runs on any modern
+ * Node version (no ABI coupling, no node-gyp build step).
+ *
+ * Entries are held in memory. When `dbPath` points at a real file path
+ * (anything other than ':memory:' or empty), each entry is additionally
+ * appended as a JSON line for durability. Persistence is best-effort: a write
+ * failure never throws and the in-memory log keeps working.
+ */
 export class Logger {
-  private readonly db: Database.Database;
+  private readonly entries: ActivityLogEntry[] = [];
+  private nextId = 1;
+  private readonly filePath: string | undefined;
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY,
-        event TEXT NOT NULL,
-        request_id TEXT,
-        data TEXT,
-        timestamp INTEGER NOT NULL
-      )
-    `);
+  constructor(dbPath?: string) {
+    this.filePath = dbPath && dbPath !== ':memory:' ? dbPath : undefined;
+
+    if (this.filePath) {
+      try {
+        mkdirSync(dirname(this.filePath), { recursive: true });
+      } catch {
+        // best-effort directory creation; fall back to in-memory only
+      }
+    }
   }
 
   log(event: ActivityEvent, requestId?: string, data?: string): ActivityLogEntry {
-    const timestamp = Date.now();
-    const result = this.db
-      .prepare(
-        'INSERT INTO activity_log (event, request_id, data, timestamp) VALUES (?, ?, ?, ?)',
-      )
-      .run(event, requestId ?? null, data ?? null, timestamp);
-
-    return {
-      id: Number(result.lastInsertRowid),
+    const entry: ActivityLogEntry = {
+      id: this.nextId++,
       event,
       requestId,
       data,
-      timestamp,
+      timestamp: Date.now(),
     };
+
+    this.entries.push(entry);
+
+    if (this.filePath) {
+      try {
+        appendFileSync(this.filePath, `${JSON.stringify(entry)}\n`);
+      } catch {
+        // best-effort persistence; ignore write failures
+      }
+    }
+
+    return { ...entry };
   }
 
   getAll(): ActivityLogEntry[] {
-    const rows = this.db
-      .prepare('SELECT id, event, request_id, data, timestamp FROM activity_log ORDER BY id ASC')
-      .all() as ActivityLogRow[];
-
-    return rows.map((row) => this.mapRow(row));
+    return this.entries.map((entry) => ({ ...entry }));
   }
 
   getByRequestId(requestId: string): ActivityLogEntry[] {
-    const rows = this.db
-      .prepare(
-        'SELECT id, event, request_id, data, timestamp FROM activity_log WHERE request_id = ? ORDER BY id ASC',
-      )
-      .all(requestId) as ActivityLogRow[];
-
-    return rows.map((row) => this.mapRow(row));
+    return this.entries
+      .filter((entry) => entry.requestId === requestId)
+      .map((entry) => ({ ...entry }));
   }
 
   close(): void {
-    this.db.close();
-  }
-
-  private mapRow(row: ActivityLogRow): ActivityLogEntry {
-    return {
-      id: Number(row.id),
-      event: row.event,
-      requestId: row.request_id ?? undefined,
-      data: row.data ?? undefined,
-      timestamp: row.timestamp,
-    };
+    // No external resources to release in the in-memory implementation.
   }
 }

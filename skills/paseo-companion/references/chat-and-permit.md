@@ -40,6 +40,21 @@ paseo chat wait <room> --timeout <duration>
 
 `wait` blocks until a new message arrives or the timeout fires.
 
+## Self-messaging — triggering your own compaction
+
+This relies on the agent's own provider/CLI supporting a `/compact`-style slash command in the first place — Paseo just relays the message, it doesn't implement compaction itself. Most providers currently in use (e.g. Claude Code, Codex) do support it, but confirm the target agent's provider has an equivalent command before relying on this for a given agent; if it doesn't, the message will just be treated as a normal prompt instead of triggering compaction.
+
+A Claude Code session running *as* a Paseo agent can self-trigger `/compact`, optionally with custom preservation instructions, by sending itself a message:
+
+```bash
+paseo send <own-agent-id> "/compact [optional custom instructions]" --no-wait
+```
+
+- Confirm `<own-agent-id>` first via `paseo inspect <id> --json` (see "Self-identification" in `references/agent-management.md`) — check Provider/Model/Status/Cwd match the current session.
+- This interrupts the current turn: the `paseo send` tool call itself will appear rejected/interrupted with no visible return value. That is expected, not a failure — the interruption is what injects the real internal compaction prompt.
+- Text after `/compact` is merged into the compaction prompt as additional instructions, so you can steer what a self-triggered compaction preserves (e.g. `/compact keep the API contract decisions and the open TODOs`).
+- Useful for a long-running Paseo-hosted session that needs to compact itself autonomously — e.g. right before going idle at the end of a long task — without waiting for the user to run `/compact` manually.
+
 ## Permit — pending permission requests
 
 Some provider modes require explicit approval before the agent can run a tool. `paseo permit` manages those queued requests.

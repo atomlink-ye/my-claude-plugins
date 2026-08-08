@@ -74,4 +74,9 @@ env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY paseo daemon start
 
   Also verify the local CLI separately with the same env cleanup if you need to distinguish a shell-env problem from a daemon-env problem: `env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY claude -p "Reply with exactly OK" --max-turns 1`.
 - After updating paseo or its providers → `paseo daemon restart` to reload.
+- `paseo status` / `paseo daemon status` can falsely report `Local Daemon: unresponsive` even when the daemon is actually up. On this machine with paseo `0.1.89`, the websocket can be reachable and the daemon can be listening on `127.0.0.1:6767`, but the status command still downgrades health because its internal archived-agent probe times out. Practical verification steps:
+  1. Check the process tree for `Paseo Supervisor` / `Paseo Daemon`.
+  2. Check that `127.0.0.1:6767` is actually listening.
+  3. Check the daemon log for `Worker ready` and `Server listening on http://127.0.0.1:6767`.
+  4. Run `paseo ls --json`. If that works but `paseo ls -a --json` fails with `Failed to list agents: Timeout waiting for message (10000ms)`, treat the daemon as running and the status output as a large-archive timeout issue rather than a startup failure.
 - Remote agent ID appears missing → repeat the command with the same `--host` used at launch.

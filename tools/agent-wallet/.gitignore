@@ -1,0 +1,25 @@
+# One-off exploration/debug scripts from pentest sessions — not part of the shipped tool.
+capture-order.mjs
+cdp-flow.mjs
+cdp-flow2.mjs
+cdp-recorder.mjs
+click-agent.mjs
+click-privy.cjs
+e2e-check.mjs
+e2e-final.mjs
+e2e-step.mjs
+explore-local.mjs
+final-e2e.mjs
+pf-login.mjs
+pf-login2.mjs
+pf-login3.mjs
+pf-login4.mjs
+pf-login5.mjs
+place-order.mjs
+privy-flow.cjs
+shim-code.js
+step-login.mjs
+step-privy.mjs
+step-screenshot.mjs
+step-wallet.mjs
+test-order.cjs

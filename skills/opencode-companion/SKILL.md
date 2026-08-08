@@ -89,6 +89,25 @@ node "$SCRIPT" session continue "$SID" \
 
 Before continuing a very long-running session, check `session status "$SID"` and watch the usage/context lines. If the context appears near its limit or the topic has changed, start a fresh session instead.
 
+### Important host-timeout nuance for `session continue` / `session attach`
+
+A live Hermes run exposed a sharp edge:
+- when `session continue` or `session attach` is run in the **foreground** under a host-level timeout,
+- the host may send `SIGTERM` when its timeout expires,
+- and that signal can abort the underlying OpenCode session instead of merely timing out the wrapper command.
+
+Observed failure text looked like:
+- `[opencode] Received SIGTERM; aborting OpenCode session ...`
+- `This operation was aborted`
+
+Practical rule:
+1. Treat long `session continue` and long `session attach` the same way as `session new` / `job wait`.
+2. If the follow-up review / analysis / implementation could run longer than a short foreground timeout, launch it via the host agent's **background mode**.
+3. Prefer background `job wait` or background `session attach` with completion notification over a foreground wait when the task is expected to take minutes.
+4. If a foreground `continue` timed out, do **not** assume the OpenCode tree is dead; check `session status` immediately and inspect whether descendants are still active.
+
+This matters especially for orchestrator reviews with subtasks: the root session may still be healthy while child sessions continue settling, and a host timeout can otherwise kill the follow-up at exactly the wrong moment.
+
 ### Check or restart the serve
 
 ```bash
@@ -134,3 +153,4 @@ These are the rules that keep the runtime honest. Each one exists because of a r
 - **Forward output verbatim.** When the user asked for runtime output, don't summarize companion stdout. Session IDs, job IDs, and error messages are load-bearing.
 - **Quote everything.** Paths and prompts must be quoted; prompt text goes after `--` so it isn't parsed as flags.
 - **Verify artifacts directly.** Progress logs and quiescence verdicts are *signals*, not proof. Read the file, run the test, check the diff.
+- **Error text beats the completion banner.** A provider/model failure can still leave the root session in an idle-looking state, and the companion may print a normal completion summary around it. If stdout/stderr includes provider errors like `Requested entity was not found.`, treat the run as failed until a minimal repro or artifact check proves otherwise.
