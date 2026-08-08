@@ -1,0 +1,51 @@
+{
+  "skill_name": "mve-first-development",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我们正在做一个全新的 Lark Agent 接入，接口和数据模型都还没稳定。请给我下一轮开发计划，先不要做生产级完善。",
+      "expected_output": "The response should default to Prove/MVE, set a fixed appetite, define one real Lark-to-agent-to-reply vertical slice, list explicit no-gos and deferred hardening, and avoid a broad test-first or contract-freezing plan.",
+      "expectations": [
+        "The response explicitly identifies the stage as Prove/MVE or explains that MVE is the default",
+        "The response defines one real end-to-end path using a real Lark event and real runtime/result",
+        "The response sets an appetite or timebox and an exit condition",
+        "The response defers rich message types, generalized adapters, broad failure matrices, or production hardening",
+        "The response does not require a comprehensive Red-Green-Refactor or mock-based E2E suite before the real path runs"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Review 这个早期 PR：用户输入到 Task、OpenCode 执行、最终结果已经真实跑通，但还没有完整重试、容量测试、灾备和所有安全边界。你觉得要不要拒绝合并？",
+      "expected_output": "The response should review against the current MVE gate, classify findings, and reject only for BLOCKER-NOW issues that invalidate the real path or safety. Missing production hardening should be recorded rather than automatically blocking.",
+      "expectations": [
+        "The response asks whether the claimed real path and evidence are reproducible",
+        "The response distinguishes BLOCKER-NOW from deferred feature and hardening findings",
+        "The response does not automatically reject solely because retry, capacity, disaster recovery, or the full security matrix is incomplete",
+        "The response states that MVE passing is not the same as production readiness"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "支付授权服务准备对外上线，API 已被三个客户端依赖，涉及数据库迁移、幂等、回滚和审计。请规划实现和验证。",
+      "expected_output": "The response should route the work to Protect/Harden rather than use the default early MVE shortcut. It should preserve stable contracts and require migration, integration, contract, failure, security, rollback, and release evidence appropriate to the risk.",
+      "expectations": [
+        "The response identifies Protect or Harden as the appropriate stage",
+        "The response treats the existing API consumers as a stable contract that needs protection",
+        "The response includes real migration and rollback validation",
+        "The response includes idempotency, failure/recovery, audit, and security checks",
+        "The response does not use early-stage scope deferral to waive release-critical controls"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "这个探索任务我明确要求用 TDD，从失败测试开始，但只验证一个 provider 的最小链路。",
+      "expected_output": "The response should honor the explicit TDD request while keeping the scope narrow, setting an appetite, and still requiring a real provider path. It should not silently override the user with the default no-TDD early-stage policy.",
+      "expectations": [
+        "The response explicitly honors the user's TDD requirement",
+        "The response limits the tests to the one-provider minimal path",
+        "The response still includes a real provider canary rather than relying only on mocks",
+        "The response sets an exit condition and defers generalized provider contracts"
+      ]
+    }
+  ]
+}
