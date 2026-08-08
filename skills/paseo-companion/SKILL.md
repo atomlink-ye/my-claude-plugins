@@ -139,6 +139,7 @@ paseo delete <id>             # hard-delete
 | First-time setup, daemon start/stop/restart, connect to remote daemon | `references/daemon-and-onboarding.md` |
 | Drive agents on a remote daemon through preview/tunnel host routing | `references/remote-host-orchestration.md` |
 | Script/automate Paseo output, JSON/YAML formats, schema validation | `references/output-formats.md` |
+| Orchestrating multiple child agents and need to stop losing track of them (unattended waits, expired reminders, unexplained parks) | `references/manager-safety-net.md` |
 
 ## Non-negotiables
 

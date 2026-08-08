@@ -5,6 +5,10 @@
   {"query": "paseo wait --timeout 30m 那个 agent 怎么操作，超时之后还活着吗", "should_trigger": true},
   {"query": "想用 paseo loop 跑 vitest 直到 pass，verify-check 怎么写", "should_trigger": true},
   {"query": "paseo run 起一个独立 worktree 的 lane 跑 feature-x，base develop", "should_trigger": true},
+  {"query": "两条 paseo lane 跑了一整天，我怕自己漏看某条已经 idle 半天了，有没有办法自动叫醒我", "should_trigger": true},
+  {"query": "这个 agent 我打算不再管了，但想留个记录说明为什么 park 它", "should_trigger": true},
+  {"query": "我打算自我 compact 一下，怎么保证醒过来能接着干活而不是忘了", "should_trigger": true},
+  {"query": "remind_me_in 这种定时提醒 paseo 有原生支持吗，还是要自己搓", "should_trigger": true},
 
   {"query": "OpenCode session 超时怎么 attach 回去", "should_trigger": false},
   {"query": "Daytona sandbox preview 怎么暴露 6767 端口", "should_trigger": false},
