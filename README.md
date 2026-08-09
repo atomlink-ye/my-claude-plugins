@@ -15,6 +15,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
 | [google-workspace](skills/google-workspace/) | Google Docs/Drive/Sheets via the `gws` CLI |
 | [mcp-skill](skills/mcp-skill/) | On-demand MCP server invocation via MCPorter |
+| [figma-console](skills/figma-console/) | Schema-first local Figma Desktop Bridge workflow with verified reads, edits, screenshots, and deterministic HTML/CSS export |
 
 ### Optional standalone plugins
 

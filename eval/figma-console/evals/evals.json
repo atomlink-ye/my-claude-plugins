@@ -1,0 +1,39 @@
+{
+  "skill_name": "figma-console",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "请诊断我本机打开的 Figma，并告诉我 Bridge 是否连接、当前文件和页面是什么。",
+      "expected_output": "The response inspects the installed figma-console-mcp schema, calls figma_diagnose locally with the mcporter config, and reports connection/file/page status without printing credentials.",
+      "expectations": [
+        "Runs or quotes `mcporter list figma-console-mcp --schema --config ~/.mcporter/mcporter.json` before tool use",
+        "Calls `figma_diagnose` through the local Desktop Bridge",
+        "States that Desktop Bridge is local live Figma state",
+        "Does not inspect or print secret/credential files"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "把当前选中的 frame 读取出来，保存截图，再导出成可打开的 html/css；最后说说你如何验收。",
+      "expected_output": "The response diagnoses and reads the frame, captures an image using --save-images, runs export.py on the read-back JSON, and verifies by comparing screenshot, read-back, and generated HTML/CSS.",
+      "expectations": [
+        "Uses schema-first inspection and a focused read before export",
+        "Uses `figma_capture_screenshot` and `--save-images`",
+        "Runs `python3 .../skills/figma-console/scripts/export.py`",
+        "Does not claim the exporter creates PNGs or prototype flows"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "将这个文本节点改成 Inter 16px 并连到下一个 frame，要求用 Smart Animate；完成后确认画面真的更新。",
+      "expected_output": "The response reads the node and destination first, loads the font with figma.loadFontAsync before writing, uses reactions with an actions array, verifies matching names/hierarchy for Smart Animate, then reads back and screenshots.",
+      "expectations": [
+        "Calls and awaits `figma.loadFontAsync` before text mutation",
+        "Uses current reaction `actions` shape rather than legacy singular action",
+        "Checks Smart Animate layer names and hierarchy",
+        "Reads back the edited node and captures a screenshot after writing",
+        "Labels stale text rendering and cross-page behavior as session observations when applicable"
+      ]
+    }
+  ]
+}
