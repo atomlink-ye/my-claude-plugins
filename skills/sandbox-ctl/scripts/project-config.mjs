@@ -5,8 +5,10 @@ const CONFIG_DIR = ".sandbox-ctl";
 const CONFIG_FILE = "config.json";
 const GITIGNORE = "*";
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|cookie|header|\bauth\b|api[_-]?key|private[_-]?key|jwt|^env$|env[_-]?value|^value$)/i;
-const ADAPTERS = new Set(["daytona", "cube"]);
-const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "template", "remoteWorkspace", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
+const ADAPTERS = new Set(["daytona", "cube-sandbox"]);
+const LEGACY_ADAPTERS = new Map([["cube", "cube-sandbox"]]);
+const CONFIG_FIELDS = new Set(["schemaVersion", "adapter", "active", "sandboxes"]);
+const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "template", "remoteWorkspace", "remoteHome", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
 const LIFECYCLE_FIELDS = new Set(["autoStopInterval", "autoArchiveInterval", "autoDeleteInterval", "ephemeral"]);
 const SYNC_FIELDS = new Set(["mode", "branch"]);
 const LEGACY_IDENTITY_FIELDS = new Set(["taskId", "projectIdentity"]);
@@ -117,10 +119,19 @@ function assertSafeFields(value, location = "config") {
   }
 }
 
+function canonicalizeAdapter(adapter) {
+  const value = String(adapter ?? "").trim();
+  return LEGACY_ADAPTERS.get(value) ?? value;
+}
+
 function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Malformed sandbox config: expected an object");
+  for (const key of Object.keys(input)) if (!CONFIG_FIELDS.has(key)) throw new Error(`Malformed sandbox config: unsupported field ${key}; config may only select an adapter`);
   if (input.schemaVersion !== 1) throw new Error("Malformed sandbox config: schemaVersion must be 1");
-  if (!ADAPTERS.has(input.adapter)) throw new Error("Malformed sandbox config: adapter must be one of daytona, cube");
+  // Pre-v1 configs omitted adapter and represented the Daytona state format;
+  // read them as Daytona and canonicalize on the next write.
+  const adapter = canonicalizeAdapter(input.adapter ?? "daytona");
+  if (!ADAPTERS.has(adapter)) throw new Error("Malformed sandbox config: adapter must be one of daytona, cube-sandbox");
   if (input.active !== null && input.active !== undefined && typeof input.active !== "string") throw new Error("Malformed sandbox config: active must be a binding name or null");
   if (!input.sandboxes || typeof input.sandboxes !== "object" || Array.isArray(input.sandboxes)) throw new Error("Malformed sandbox config: sandboxes must be an object");
   assertSafeFields(input);
@@ -144,13 +155,17 @@ function validateConfig(input) {
     const remoteWorkspace = binding.remoteWorkspace ?? binding.remoteWorkspacePath;
     if (typeof sandboxId !== "string" || !sandboxId.trim()) throw new Error(`Malformed sandbox config: binding ${name} requires sandboxId`);
     if (typeof remoteWorkspace !== "string" || !remoteWorkspace.trim()) throw new Error(`Malformed sandbox config: binding ${name} requires remoteWorkspace`);
+    if (binding.remoteHome !== undefined && (typeof binding.remoteHome !== "string" || !binding.remoteHome.startsWith("/") || binding.remoteHome === "/" || binding.remoteHome.split("/").includes(".."))) throw new Error(`Malformed sandbox config: binding ${name} has invalid remoteHome`);
     sandboxes[name] = { ...binding, sandboxId: sandboxId.trim(), remoteWorkspace: remoteWorkspace.trim() };
     delete sandboxes[name].id;
     delete sandboxes[name].remoteWorkspacePath;
   }
   const active = input.active ?? null;
   if (active !== null && !Object.hasOwn(sandboxes, active)) throw new Error(`Malformed sandbox config: active binding does not exist: ${active}`);
-  return { schemaVersion: 1, adapter: input.adapter, active, sandboxes };
+  const normalized = { schemaVersion: 1, adapter, active, sandboxes };
+  if (input.adapter === undefined) Object.defineProperty(normalized, "legacyAdapterMissing", { value: true, enumerable: false });
+  if (input.adapter === "cube") Object.defineProperty(normalized, "legacyAdapterAlias", { value: true, enumerable: false });
+  return normalized;
 }
 
 function readConfig(directory = process.cwd(), { allowMissing = true } = {}) {
@@ -202,6 +217,7 @@ function resolveBinding(config, nameOrId) {
 
 function upsertBinding(directory, name, binding, { use = true, adapter = "daytona" } = {}) {
   if (typeof name !== "string" || !name.trim()) throw new Error("Binding name must not be empty");
+  adapter = canonicalizeAdapter(adapter);
   if (!ADAPTERS.has(adapter)) throw new Error(`Unsupported adapter: ${adapter}`);
   return withConfigLock(directory, ({ target }) => {
     const config = readConfig(target) ?? { schemaVersion: 1, adapter, active: null, sandboxes: {} };
@@ -255,6 +271,7 @@ export {
   getActiveBinding,
   removeBinding,
   resolveBinding,
+  canonicalizeAdapter,
   validateConfig,
   // Descriptive aliases retained for callers that use the public module API.
   discoverConfig as findProjectConfig,

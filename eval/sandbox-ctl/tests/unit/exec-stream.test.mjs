@@ -216,7 +216,7 @@ describe("Daytona session exec streaming", () => {
     const cli = path.resolve(process.cwd(), "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
     const child = spawnSync(process.execPath, [cli, "--json", "exec", "--timeout", "nope", "--", "true"], { encoding: "utf8" });
     expect(child.status).toBe(125);
-    expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "exec", adapter: "daytona", exitCode: 125, error: expect.stringMatching(/invalid timeout/i) });
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "exec", adapter: "cube-sandbox", exitCode: 125, error: expect.stringMatching(/invalid timeout/i) });
   });
 
   it("returns control exit 125 for an invalid exec timeout in human mode", () => {

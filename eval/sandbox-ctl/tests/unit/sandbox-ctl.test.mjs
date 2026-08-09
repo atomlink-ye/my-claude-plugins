@@ -9,6 +9,7 @@ import {
   parseSandboxCtlArgs,
   resolveCommandAlias,
   runSandboxCtl,
+  sanitizeError,
 } from "../../../../skills/sandbox-ctl/scripts/sandbox-ctl.mjs";
 import {
   assertManagedSandbox,
@@ -31,7 +32,17 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readConfig, writeConfig, upsertBinding } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
+function missingUserConfig(prefix) {
+  const directory = mkdtempSync(`${tmpdir()}/${prefix}-`);
+  return { directory, path: path.join(directory, "config.json") };
+}
+
 describe("sandbox-ctl argument parsing", () => {
+  it("removes URL query and fragment from top-level errors", () => {
+    const message = sanitizeError(new Error("request failed https://user:pass@example.test/api?token=secret#fragment"));
+    expect(message).toContain("https://example.test/api");
+    expect(message).not.toMatch(/user|pass|token=secret|fragment/);
+  });
   it("forwards exec timeout to the adapter", () => {
     const parsed = parseSandboxCtlArgs(["exec", "--timeout", "30m", "--", "make", "setup"]);
     expect(parsed.forwarded).toEqual(["--timeout", "30m"]);
@@ -80,9 +91,10 @@ describe("sandbox-ctl argument parsing", () => {
     expect(() => parseSandboxCtlArgs(["--adapter", "other", "list"])).toThrow(/Unknown adapter/);
   });
 
-  it("accepts cube as a supported adapter and rejects an unsupported one listing both adapters", () => {
-    expect(parseSandboxCtlArgs(["--adapter", "cube", "list"]).adapter).toBe("cube");
-    expect(() => parseSandboxCtlArgs(["--adapter", "bogus", "list"])).toThrow(/Unknown adapter: bogus\. Supported adapters: daytona, cube/);
+  it("accepts Cube Sandbox canonical and legacy adapter names", () => {
+    expect(parseSandboxCtlArgs(["--adapter", "cube-sandbox", "list"]).adapter).toBe("cube-sandbox");
+    expect(parseSandboxCtlArgs(["--adapter", "cube", "list"]).adapter).toBe("cube-sandbox");
+    expect(() => parseSandboxCtlArgs(["--adapter", "bogus", "list"])).toThrow(/Unknown adapter: bogus\. Supported adapters: daytona, cube-sandbox/);
   });
 });
 
@@ -129,7 +141,7 @@ describe("sandbox-ctl dispatch", () => {
 
   it("prints help as stable JSON", async () => {
     const result = await runSandboxCtl(["--json", "--help"]);
-    expect(result).toMatchObject({ ok: true, command: "help", adapter: "daytona" });
+    expect(result).toMatchObject({ ok: true, command: "help", adapter: "cube-sandbox" });
   });
 
   it("forwards legacy commands and aliases to adapter handlers", async () => {
@@ -421,7 +433,7 @@ describe("sandbox-ctl hardening", () => {
     try {
       await runSandboxCtl(["--json", "unknown-command"], { adapter: { parseArgs: () => ({ options: {}, positionals: [], passthrough: [] }) } });
       expect(logs).toHaveLength(1);
-      expect(JSON.parse(logs[0])).toMatchObject({ ok: false, command: "unknown-command", adapter: "daytona" });
+      expect(JSON.parse(logs[0])).toMatchObject({ ok: false, command: "unknown-command", adapter: "cube-sandbox" });
     } finally {
       console.log = originalLog;
       process.exitCode = originalExitCode;
@@ -454,19 +466,42 @@ describe("sandbox-ctl hardening", () => {
   it("routes --adapter cube through the real CLI entry to the cube adapter's own handlers, not Daytona's", () => {
     const root = path.resolve(process.cwd());
     const cli = path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+    const userConfig = missingUserConfig("cube-cli-missing");
     const env = { ...process.env };
-    for (const key of ["SANDBOX_CTL_ADAPTER_MODULE", "CUBE_API_KEY", "E2B_API_KEY", "CUBE_API_URL", "E2B_API_URL"]) delete env[key];
-    const child = spawnSync(process.execPath, [cli, "--adapter", "cube", "--json", "doctor"], { encoding: "utf8", env });
-    expect(child.stdout.trim().split("\n")).toHaveLength(1);
-    const payload = JSON.parse(child.stdout);
-    // cube-manager's handleDoctor fails closed with its own configuration_error/CUBE_API_KEY
-    // message (no network call); Daytona's doctor would report a different apiKeyConfigured
-    // shape and error text, so this proves the cube adapter's handler actually ran.
-    expect(payload).toMatchObject({ command: "doctor", adapter: "cube", ok: false, connected: false });
-    expect(payload.error).toMatch(/CUBE_API_KEY|E2B_API_KEY/);
+    try {
+      for (const key of ["SANDBOX_CTL_ADAPTER_MODULE", "CUBE_API_KEY", "E2B_API_KEY", "CUBE_API_URL", "E2B_API_URL"]) delete env[key];
+      env.SANDBOX_CTL_USER_CONFIG = userConfig.path;
+      const child = spawnSync(process.execPath, [cli, "--adapter", "cube", "--json", "doctor"], { encoding: "utf8", env });
+      expect(child.stdout.trim().split("\n")).toHaveLength(1);
+      const payload = JSON.parse(child.stdout);
+      // Cube Sandbox's handleDoctor fails closed with its own configuration_error/CUBE_API_KEY
+      // message (no network call); Daytona's doctor would report a different apiKeyConfigured
+      // shape and error text, so this proves the cube adapter's handler actually ran.
+      expect(payload).toMatchObject({ command: "doctor", adapter: "cube-sandbox", ok: false, connected: false });
+      expect(payload.error).toMatch(/CUBE_API_KEY|E2B_API_KEY/);
+    } finally { rmSync(userConfig.directory, { recursive: true, force: true }); }
   });
 
-  it("still runs Daytona by default through the real CLI entry when --adapter is omitted", () => {
+  it("routes an exact-directory Cube Sandbox config without requiring --adapter", () => {
+    const root = mkdtempSync(`${tmpdir()}/cube-config-route-`);
+    const userConfig = missingUserConfig("cube-config-route-user");
+    try {
+      writeConfig(root, { schemaVersion: 1, adapter: "cube-sandbox", active: null, sandboxes: {} });
+      const cli = path.join(process.cwd(), "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+      const env = { ...process.env };
+      for (const key of ["SANDBOX_CTL_ADAPTER_MODULE", "CUBE_API_KEY", "E2B_API_KEY", "CUBE_API_URL", "E2B_API_URL"]) delete env[key];
+      env.SANDBOX_CTL_USER_CONFIG = userConfig.path;
+      const child = spawnSync(process.execPath, [cli, "--json", "--directory", root, "doctor"], { encoding: "utf8", env });
+      const payload = JSON.parse(child.stdout);
+      expect(payload).toMatchObject({ command: "doctor", adapter: "cube-sandbox", connected: false });
+      expect(payload.error).toMatch(/CUBE_API_KEY|E2B_API_KEY/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(userConfig.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("runs Cube Sandbox by default through the real CLI entry when --adapter is omitted", () => {
     const root = path.resolve(process.cwd());
     const cli = path.join(root, "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
     const env = { ...process.env };
@@ -474,7 +509,7 @@ describe("sandbox-ctl hardening", () => {
     const child = spawnSync(process.execPath, [cli, "--json", "--help"], { encoding: "utf8", env });
     expect(child.status).toBe(0);
     expect(child.stdout.trim().split("\n")).toHaveLength(1);
-    expect(JSON.parse(child.stdout)).toMatchObject({ ok: true, command: "help", adapter: "daytona" });
+    expect(JSON.parse(child.stdout)).toMatchObject({ ok: true, command: "help", adapter: "cube-sandbox" });
   });
 });
 
@@ -498,7 +533,7 @@ describe("sandbox-ctl run", () => {
   it("runs up, safe bundle push, exec, and exact named down in order", async () => {
     const calls = [];
     const result = await runSandboxCtl(["--json", "run", "--", "echo", "ok"], { adapter: runAdapter(calls) });
-    expect(result).toMatchObject({ ok: true, command: "run", adapter: "daytona", sandboxId: "sandbox-run-1", exitCode: 0, retained: false });
+    expect(result).toMatchObject({ ok: true, command: "run", adapter: "cube-sandbox", sandboxId: "sandbox-run-1", exitCode: 0, retained: false });
     expect(result.bindingName).toMatch(/^run-/);
     expect(result.configPath).toMatch(/\.sandbox-ctl\/config\.json$/);
     expect(calls.map(([name]) => name)).toEqual(["up", "push", "exec", "down"]);

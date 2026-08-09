@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import {
   assertManagedSandboxInfo,
   createClient,
+  wrapCubeSandboxClient,
   cubeExec,
   handleDoctor,
   handleDown,
@@ -22,9 +23,10 @@ import {
   projectIdentity,
   requireSandbox,
   resolveProjectPaths,
+  redactExecFailure,
   runDoctorCheck,
   toRemoteAbsolute,
-} from "../../../../skills/sandbox-ctl/scripts/adapters/cube-manager.mjs";
+} from "../../../../skills/sandbox-ctl/scripts/adapters/cube-sandbox-manager.mjs";
 import { readConfig, writeConfig } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
 function git(cwd, ...args) {
@@ -88,10 +90,52 @@ function fakeSandbox({ sandboxId = "sbx-1", commandHandler, files = {}, host } =
 }
 
 function bindConfig(root, overrides = {}) {
-  writeConfig(root, { schemaVersion: 1, adapter: "cube", active: "dev", sandboxes: { dev: { sandboxId: "sbx-1", remoteWorkspace: "workspace/dev", ...overrides } } });
+  writeConfig(root, { schemaVersion: 1, adapter: "cube-sandbox", active: "dev", sandboxes: { dev: { sandboxId: "sbx-1", remoteWorkspace: "workspace/dev", ...overrides } } });
 }
 
-describe("cube-manager argument parsing", () => {
+function missingUserConfig(prefix) {
+  const directory = mkdtempSync(path.join(tmpdir(), `${prefix}-`));
+  return { directory, path: path.join(directory, "config.json") };
+}
+
+describe("cube-sandbox-manager argument parsing", () => {
+  it("removes URL credentials, query, and fragment from diagnostics", () => {
+    const error = redactExecFailure(new Error("request failed https://user:pass@cube.example/api?token=secret#fragment"));
+    expect(error).toContain("https://cube.example/api");
+    expect(error).not.toMatch(/user|pass|token=secret|fragment/);
+  });
+  it("injects the resolved proxy into all Cube lifecycle static calls", async () => {
+    const calls = [];
+    const fake = {};
+    for (const method of ["create", "connect", "getInfo", "kill", "list"]) fake[method] = (...args) => { calls.push([method, args]); return method === "list" ? {} : {}; };
+    const wrapped = wrapCubeSandboxClient(fake, { proxy: "http://127.0.0.1:43123" });
+    await wrapped.create({ template: "base" });
+    await wrapped.connect("sbx");
+    await wrapped.getInfo("sbx");
+    await wrapped.kill("sbx");
+    await wrapped.list();
+    expect(calls.map(([method, args]) => [method, args.at(-1)])).toEqual([
+      ["create", { template: "base", proxy: "http://127.0.0.1:43123" }],
+      ["connect", { proxy: "http://127.0.0.1:43123" }],
+      ["getInfo", { proxy: "http://127.0.0.1:43123" }],
+      ["kill", { proxy: "http://127.0.0.1:43123" }],
+      ["list", { proxy: "http://127.0.0.1:43123" }],
+    ]);
+  });
+
+  it("passes explicit Cube connection settings to every SDK lifecycle call", async () => {
+    const calls = [];
+    const fake = {};
+    for (const method of ["create", "connect", "getInfo", "kill", "list"]) fake[method] = (...args) => { calls.push([method, args]); return method === "list" ? {} : {}; };
+    const wrapped = wrapCubeSandboxClient(fake, { apiKey: "cube-key", apiUrl: "https://cube.example/api", proxy: "http://127.0.0.1:43123" });
+    await wrapped.create({ apiKey: "e2b-key", apiUrl: "https://e2b.example", proxy: "http://e2b-proxy" });
+    await wrapped.connect("sbx", { apiKey: "e2b-key" });
+    await wrapped.getInfo("sbx", { apiUrl: "https://e2b.example" });
+    await wrapped.kill("sbx", { proxy: "http://e2b-proxy" });
+    await wrapped.list({ apiKey: "e2b-key" });
+    for (const [, args] of calls) expect(args.at(-1)).toMatchObject({ apiKey: "cube-key", apiUrl: "https://cube.example/api", proxy: "http://127.0.0.1:43123" });
+  });
+
   it("parses transfer mode flags", () => {
     expect(parseArgs(["push", "--mode", "full", "--include-sensitive"]).options).toMatchObject({ mode: "full", "include-sensitive": true });
     expect(parseArgs(["pull", "--mode", "git", "--branch", "sandbox-ctl/dev"]).options).toMatchObject({ mode: "git", branch: "sandbox-ctl/dev" });
@@ -109,7 +153,7 @@ describe("cube-manager argument parsing", () => {
   });
 });
 
-describe("cube-manager remote path helpers", () => {
+describe("cube-sandbox-manager remote path helpers", () => {
   it("requires a remote home for relative remote paths", () => {
     expect(() => toRemoteAbsolute("relative/path")).toThrow(/remote home/i);
     expect(toRemoteAbsolute("/workspace/x")).toBe("/workspace/x");
@@ -138,7 +182,7 @@ describe("cubeExec duck-typed exit handling", () => {
   });
 });
 
-describe("cube-manager sandbox lookups", () => {
+describe("cube-sandbox-manager sandbox lookups", () => {
   it("isNotFoundError recognizes e2b's SandboxNotFoundError/.name shape", () => {
     expect(isNotFoundError({ name: "SandboxNotFoundError", message: "Sandbox x not found" })).toBe(true);
     expect(isNotFoundError({ name: "FileNotFoundError" })).toBe(true);
@@ -154,7 +198,7 @@ describe("cube-manager sandbox lookups", () => {
   });
 });
 
-describe("cube-manager exec", () => {
+describe("cube-sandbox-manager exec", () => {
   it("streams stdout/stderr and preserves a non-zero remote exit code", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-exec-"));
     const oldOut = process.stdout.write;
@@ -201,7 +245,7 @@ describe("cube-manager exec", () => {
   });
 });
 
-describe("cube-manager push/pull mode validation", () => {
+describe("cube-sandbox-manager push/pull mode validation", () => {
   it("rejects unknown modes", async () => {
     await expect(handlePush({ directory: mkdtempSync(path.join(tmpdir(), "cube-push-mode-")), mode: "bogus" })).rejects.toThrow(/mode must be bundle, full, or git/i);
     await expect(handlePull({ directory: mkdtempSync(path.join(tmpdir(), "cube-pull-mode-")), mode: "bogus" })).rejects.toThrow(/mode must be bundle, full, or git/i);
@@ -217,7 +261,7 @@ describe("cube-manager push/pull mode validation", () => {
   });
 });
 
-describe("cube-manager single-file fast path", () => {
+describe("cube-sandbox-manager single-file fast path", () => {
   it("push auto-detects a non-directory local path and uploads via files.write without tar", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-push-file-"));
     try {
@@ -271,7 +315,7 @@ describe("cube-manager single-file fast path", () => {
   });
 });
 
-describe("cube-manager git push shell script construction", () => {
+describe("cube-sandbox-manager git push shell script construction", () => {
   it("builds a fast-forward-only remote script and returns the parsed snapshot head without executing real git remotely", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-git-push-"));
     try {
@@ -313,7 +357,7 @@ describe("cube-manager git push shell script construction", () => {
   });
 });
 
-describe("cube-manager preview", () => {
+describe("cube-sandbox-manager preview", () => {
   it("requires --port and rejects --expires-in", async () => {
     await expect(handlePreview({ directory: mkdtempSync(path.join(tmpdir(), "cube-preview-noport-")) })).rejects.toThrow(/requires --port/i);
     const root = mkdtempSync(path.join(tmpdir(), "cube-preview-expires-"));
@@ -335,7 +379,7 @@ describe("cube-manager preview", () => {
   });
 });
 
-describe("cube-manager down", () => {
+describe("cube-sandbox-manager down", () => {
   it("refuses to kill without a binding", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-down-nobinding-"));
     try {
@@ -382,7 +426,7 @@ describe("cube-manager down", () => {
   });
 });
 
-describe("cube-manager list/doctor", () => {
+describe("cube-sandbox-manager list/doctor", () => {
   it("paginates through Sandbox.list()'s SandboxPaginator shape", async () => {
     const pages = [[{ sandboxId: "a", name: "one", state: "running", templateId: "base" }], [{ sandboxId: "b", name: "two", state: "paused", templateId: "base" }]];
     const client = { list: () => {
@@ -400,9 +444,12 @@ describe("cube-manager list/doctor", () => {
   });
 
   it("runDoctorCheck reports missing configuration without throwing", async () => {
-    const result = await runDoctorCheck({ createClient: async () => { throw new Error("Cube API key is required. Set CUBE_API_KEY or E2B_API_KEY."); }, env: {} });
-    expect(result).toMatchObject({ apiKeyConfigured: false, apiUrlConfigured: false, connected: false, category: "connection_error" });
-    expect(result.error).toMatch(/api key is required/i);
+    const userConfig = missingUserConfig("cube-doctor-missing");
+    try {
+      const result = await runDoctorCheck({ createClient: async () => { throw new Error("Cube Sandbox API key is required. Set CUBE_API_KEY or E2B_API_KEY."); }, env: { SANDBOX_CTL_USER_CONFIG: userConfig.path } });
+      expect(result).toMatchObject({ apiKeyConfigured: false, apiUrlConfigured: false, connected: false, category: "connection_error" });
+      expect(result.error).toMatch(/api key is required/i);
+    } finally { rmSync(userConfig.directory, { recursive: true, force: true }); }
   });
 
   it("runDoctorCheck reports connected:true when the client lists successfully", async () => {
@@ -412,21 +459,31 @@ describe("cube-manager list/doctor", () => {
   });
 
   it("handleDoctor never throws and always prints JSON", async () => {
+    const userConfig = missingUserConfig("cube-doctor-handler");
+    const previousUserConfig = process.env.SANDBOX_CTL_USER_CONFIG;
     const originalLog = console.log;
     const logs = [];
     try {
+      process.env.SANDBOX_CTL_USER_CONFIG = userConfig.path;
       console.log = (...args) => logs.push(args.join(" "));
       const result = await handleDoctor({});
       expect(result.ok).toBe(false);
       expect(logs.join(" ")).toContain('"connected": false');
-    } finally { console.log = originalLog; }
+    } finally {
+      console.log = originalLog;
+      if (previousUserConfig === undefined) delete process.env.SANDBOX_CTL_USER_CONFIG;
+      else process.env.SANDBOX_CTL_USER_CONFIG = previousUserConfig;
+      rmSync(userConfig.directory, { recursive: true, force: true });
+    }
   });
 });
 
-describe("cube-manager createClient env resolution", () => {
+describe("cube-sandbox-manager createClient env resolution", () => {
   it("requires an API key and URL, bridging CUBE_* into E2B_*", async () => {
+    const userConfig = missingUserConfig("cube-client-missing");
     const savedEnv = { ...process.env };
     try {
+      process.env.SANDBOX_CTL_USER_CONFIG = userConfig.path;
       delete process.env.CUBE_API_KEY;
       delete process.env.E2B_API_KEY;
       delete process.env.CUBE_API_URL;
@@ -444,11 +501,21 @@ describe("cube-manager createClient env resolution", () => {
     } finally {
       for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
       Object.assign(process.env, savedEnv);
+      rmSync(userConfig.directory, { recursive: true, force: true });
     }
   });
 });
 
-describe("cube-manager up binding shape", () => {
+describe("cube-sandbox-manager up binding shape", () => {
+  it("requires a template before creating an unbound sandbox", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-up-template-required-"));
+    const create = vi.fn(async () => { throw new Error("client.create should not be called"); });
+    try {
+      await expect(handleUp({ directory: root, client: { create } })).rejects.toThrow(/requires --template/i);
+      expect(create).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("creates the bound remote workspace before returning a new sandbox", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-up-workspace-"));
     try {
@@ -468,14 +535,14 @@ describe("cube-manager up binding shape", () => {
       const result = await handleUp({ directory: root, template: "base", client, json: true });
       expect(result.sandboxId).toBe("sbx-new");
       expect(result.template).toBe("base");
-      expect(result.warning).toMatch(/no cube\/e2b equivalent/i);
+      expect(result.warning).toMatch(/no cube sandbox\/e2b equivalent/i);
       expect(created[0]).toMatchObject({ template: "base" });
-      expect(created[0].metadata).toMatchObject({ "sandbox-ctl.managed": "true", "sandbox-ctl.adapter": "cube" });
+      expect(created[0].metadata).toMatchObject({ "sandbox-ctl.managed": "true", "sandbox-ctl.adapter": "cube-sandbox" });
       const config = readConfig(root);
       const binding = Object.values(config.sandboxes)[0];
       expect(binding.sandboxId).toBe("sbx-new");
       expect(binding.template).toBe("base");
-      expect(config.adapter).toBe("cube");
+      expect(config.adapter).toBe("cube-sandbox");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -493,7 +560,7 @@ describe("cube-manager up binding shape", () => {
   });
 });
 
-describe("cube-manager resolveProjectPaths", () => {
+describe("cube-sandbox-manager resolveProjectPaths", () => {
   it("resolves an explicit sandbox selector and errors when it does not exist", () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-paths-"));
     try {

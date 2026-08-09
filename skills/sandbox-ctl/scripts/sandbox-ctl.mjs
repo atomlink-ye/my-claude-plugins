@@ -6,10 +6,11 @@ import path from "node:path";
 import { realpathSync } from "node:fs";
 
 import * as daytonaAdapter from "./adapters/daytona-manager.mjs";
-import * as cubeAdapter from "./adapters/cube-manager.mjs";
-import { configPath, discoverConfig, getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
+import * as cubeAdapter from "./adapters/cube-sandbox-manager.mjs";
+import { daemonStatus, startDaemon, stopDaemon } from "./lib/cube-sandbox-daemon.mjs";
+import { canonicalizeAdapter, configPath, discoverConfig, getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
 
-const ADAPTERS = { daytona: daytonaAdapter, cube: cubeAdapter };
+const ADAPTERS = { daytona: daytonaAdapter, "cube-sandbox": cubeAdapter };
 const LIFECYCLE_FLAGS = new Map([
   ["--auto-stop", "autoStopInterval"],
   ["--auto-archive", "autoArchiveInterval"],
@@ -46,6 +47,8 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
   const positionals = [];
   const options = { labels: {} };
   let adapter = "daytona";
+  let adapterExplicit = false;
+  const warnings = [];
   let json = false;
   let command;
   let passthrough = [];
@@ -69,7 +72,10 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
     if (flag === "--include-sensitive") { options.includeSensitive = true; forwarded.push(arg); continue; }
     if (flag === "--adapter") {
       const read = readValue(argv, index, flag, inlineValue);
-      adapter = read.value;
+      adapterExplicit = true;
+      const requestedAdapter = read.value;
+      adapter = canonicalizeAdapter(requestedAdapter);
+      if (requestedAdapter === "cube") warnings.push("Deprecated adapter alias: cube; use --adapter cube-sandbox instead.");
       index = read.next;
       continue;
     }
@@ -111,7 +117,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
     else positionals.push(arg);
   }
   if (!ADAPTERS[adapter]) throw new Error(`Unknown adapter: ${adapter}. Supported adapters: ${Object.keys(ADAPTERS).join(", ")}`);
-  return { adapter, json, command, positionals, passthrough, options, forwarded };
+  return { adapter, adapterExplicit, json, command, positionals, passthrough, options, forwarded, warnings };
 }
 
 function resolveCommandAlias(command, subcommand) {
@@ -139,20 +145,20 @@ function normalizeLifecycleOptions(kind = "task", options = {}) {
   return normalized;
 }
 
-function buildLifecycleLabels(kind = "task", labels = {}) {
+function buildLifecycleLabels(kind = "task", labels = {}, adapter = "daytona") {
   return {
     ...labels,
     "sandbox-ctl.managed": "true",
     "sandbox-ctl.kind": "sandbox",
-    "sandbox-ctl.adapter": "daytona",
+    "sandbox-ctl.adapter": canonicalizeAdapter(adapter),
     "sandbox-ctl.policy": "sandbox-v1",
   };
 }
 
 function usage() {
   return [
-    "Usage: sandbox-ctl [--adapter daytona] [--json] <command> [options]",
-    "Commands: up, adopt, status, push, exec, run, pull, preview, smoke-test, down, list, doctor",
+    "Usage: sandbox-ctl [--adapter daytona|cube-sandbox] [--json] <command> [options]",
+    "Commands: up, adopt, status, push, exec, run, pull, preview, smoke-test, down, list, doctor, daemon start|status|stop (Cube Sandbox)",
     "Deprecated aliases: create, task up, project up (all use the unified up policy)",
     "Binding: use NAME_OR_ID (select active binding)",
     "Lifecycle: --label key=value (repeatable), --auto-stop N, --auto-archive N, --auto-delete N, --ephemeral",
@@ -252,7 +258,7 @@ async function invokeRun(parsed, adapter) {
     noUse: true,
     ignoreActiveBinding: true,
     ignoreState: true,
-    labels: buildLifecycleLabels("sandbox", parsed.options.labels),
+    labels: buildLifecycleLabels("sandbox", parsed.options.labels, parsed.adapter),
     ...lifecycle,
     requireManagedPolicy: true,
     expectedKind: "sandbox",
@@ -350,7 +356,7 @@ async function invoke(parsed, adapter, alias) {
   if (alias.command === "up") {
     const lifecycle = normalizeLifecycleOptions(alias.kind, parsed.options);
     Object.assign(options, lifecycle, {
-      labels: buildLifecycleLabels(alias.kind, parsed.options.labels),
+      labels: buildLifecycleLabels(alias.kind, parsed.options.labels, parsed.adapter),
       requireManagedPolicy: true,
       expectedKind: "sandbox",
       expectedLifecycle: lifecycle,
@@ -380,19 +386,59 @@ async function invoke(parsed, adapter, alias) {
 }
 
 /** Run the command. The optional dependency injection keeps unit tests offline. */
-async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAdapter } = {}) {
+function resolveConfiguredAdapter(parsed) {
+  const directory = parsed.options.directory ?? process.cwd();
+  const config = readConfig(directory);
+  if (config?.legacyAdapterMissing) parsed.warnings.push("Legacy sandbox config had no adapter; treating it as Daytona. It will be canonicalized on the next write.");
+  if (config?.legacyAdapterAlias) parsed.warnings.push("Deprecated adapter alias in config: cube; use cube-sandbox. It will be canonicalized on the next write.");
+  const configured = config?.adapter ? canonicalizeAdapter(config.adapter) : null;
+  if (parsed.adapterExplicit && configured && parsed.adapter !== configured) {
+    throw new Error(`Explicit adapter ${parsed.adapter} conflicts with this directory's configured adapter ${configured}`);
+  }
+  // New/unconfigured directories default to Cube Sandbox. A discovered config
+  // remains authoritative (legacy Daytona configs therefore stay Daytona).
+  const name = parsed.adapterExplicit ? parsed.adapter : (configured ?? "cube-sandbox");
+  return { name, adapter: ADAPTERS[name] };
+}
+
+async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
   const requestedJson = argv.some((arg) => arg === "--json" || arg.startsWith("--json="));
   try {
     const parsed = parseSandboxCtlArgs(argv);
+    const configuredSelection = resolveConfiguredAdapter(parsed);
+    parsed.adapter = configuredSelection.name;
+    const selectedAdapter = adapter ?? configuredSelection.adapter;
     if (parsed.options.help || !parsed.command) {
       if (parsed.json) console.log(JSON.stringify({ ok: true, command: "help", adapter: parsed.adapter, usage: usage() }));
       else console.log(usage());
       return { ok: true, command: "help", adapter: parsed.adapter };
     }
+    if (parsed.command === "daemon") {
+      if (parsed.adapter !== "cube-sandbox") throw new Error("sandbox-ctl daemon is only available for the cube-sandbox adapter; pass --adapter cube-sandbox");
+      const daemonCommand = parsed.positionals[0] || "status";
+      if (!["start", "status", "stop"].includes(daemonCommand)) throw new Error("Usage: sandbox-ctl --adapter cube-sandbox daemon start|status|stop");
+      const daemonOptions = { runtimeDir: process.env.SANDBOX_CTL_RUNTIME_DIR };
+      const result = daemonCommand === "start" ? await startDaemon(daemonOptions) : daemonCommand === "stop" ? await stopDaemon(daemonOptions) : await daemonStatus(daemonOptions);
+      const daemonOk = daemonCommand === "stop" ? result.stopped === true : result.running === true;
+      if (daemonCommand === "stop" && !daemonOk) process.exitCode = 1;
+      if (parsed.json) console.log(JSON.stringify({ ok: daemonOk, command: "daemon", adapter: parsed.adapter, daemonCommand, ...result }));
+      else console.log(JSON.stringify(result, null, 2));
+      return result;
+    }
+    if (parsed.command === "config") {
+      if (parsed.adapter !== "cube-sandbox") throw new Error("sandbox-ctl config is only available for the cube-sandbox adapter; pass --adapter cube-sandbox");
+      const configCommand = parsed.positionals[0] || "status";
+      const result = await selectedAdapter.handleConfig({ configCommand, env: process.env });
+      if (parsed.json) console.log(JSON.stringify({ ...result, command: "config", adapter: parsed.adapter, configCommand }));
+      else if (configCommand === "path") console.log(result.path);
+      else if (configCommand === "set") console.log(`Cube Sandbox user config updated at ${result.path}\nConfigured fields: ${result.configuredFields.join(", ")}`);
+      else console.log(JSON.stringify(result, null, 2));
+      return result;
+    }
     const deprecatedAlias = parsed.command === "create" || parsed.command === "task" || parsed.command === "project";
     const alias = parsed.command === "use" ? { command: "use", kind: "sandbox" } : resolveCommandAlias(parsed.command, parsed.positionals[0]);
     const command = alias.command;
-    const runner = command === "run" ? () => invokeRun(parsed, adapter) : () => invoke(parsed, adapter, alias);
+    const runner = command === "run" ? () => invokeRun(parsed, selectedAdapter) : () => invoke(parsed, selectedAdapter, alias);
     const jsonResult = (parsed.json || command === "run") ? await capture(runner) : { result: await runner(), logs: [], errors: [], writes: [] };
     const resultObject = jsonResult.result && typeof jsonResult.result === "object" ? jsonResult.result : {};
     const exitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : (resultObject.ok === false ? 1 : 0);
@@ -403,9 +449,11 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
       console.error(sanitizeError(resultObject.error));
     }
     if (deprecatedAlias && !parsed.json) console.log(`Deprecated alias: ${parsed.command}${parsed.command === "create" ? "" : " up"}; use sandbox-ctl up instead.`);
+    if (parsed.warnings.length && !parsed.json) for (const warning of parsed.warnings) console.log(warning);
     if (parsed.json) {
       const payload = { ok: exitCode === 0, command, adapter: parsed.adapter, ...resultObject, ...(command === "exec" ? { exitCode } : {}) };
       if (deprecatedAlias) payload.warnings = [...(Array.isArray(resultObject.warnings) ? resultObject.warnings : []), `Deprecated alias: ${parsed.command}; use sandbox-ctl up instead.`];
+      if (parsed.warnings.length) payload.warnings = [...(Array.isArray(payload.warnings) ? payload.warnings : []), ...parsed.warnings];
       if (command === "exec" || command === "run") {
         const stdout = resultObject.stdout ?? [...jsonResult.writes, ...jsonResult.logs].join("");
         const stderr = resultObject.stderr ?? jsonResult.errors.join("");
@@ -421,7 +469,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
     const requestedCommand = findTopLevelCommand(argv);
     const requestedAdapter = findTopLevelAdapter(argv);
     if (requestedCommand === "run") {
-      const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error, adapter: requestedAdapter });
+      const payload = makeControlFailure({ directory: findTopLevelDirectory(argv), error, adapter: findEffectiveAdapter(argv) });
       process.exitCode = 125;
       if (requestedJson) console.log(JSON.stringify(payload));
       else console.error(payload.error);
@@ -431,7 +479,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
       const payload = {
         ok: false,
         command: "exec",
-        adapter: requestedAdapter,
+        adapter: findEffectiveAdapter(argv),
         exitCode: 125,
         error: sanitizeError(error),
         sandboxId: error?.sandboxId ?? null,
@@ -443,7 +491,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
       return payload;
     }
     if (!requestedJson) throw error;
-    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: requestedAdapter, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
     process.exitCode = 1;
     console.log(JSON.stringify(payload));
     return payload;
@@ -451,10 +499,30 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter = daytonaAd
 }
 
 function sanitizeError(error) {
-  let message = String(error?.message ?? error);
+  let message = sanitizeErrorUrls(error?.message ?? error);
   for (const [key, value] of Object.entries(process.env)) if (/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|JWT)/i.test(key) && value && value.length > 3) message = message.split(value).join("[redacted]");
-  message = message.replace(/(https?:\/\/)([^\s/@]+):([^\s/@]+)@/gi, "$1[redacted]@[redacted]@");
-  return message;
+  return sanitizeErrorUrls(message);
+}
+
+function sanitizeErrorUrls(value) {
+  return String(value ?? "").replace(/https?:\/\/[^\s<>"']+/gi, (raw) => {
+    let trailing = "";
+    let candidate = raw;
+    while (/[),.;!?]$/.test(candidate)) {
+      trailing = candidate.slice(-1) + trailing;
+      candidate = candidate.slice(0, -1);
+    }
+    try {
+      const url = new URL(candidate);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return `${url.toString()}${trailing}`;
+    } catch {
+      return candidate.replace(/:[^/@\s]+@/g, "@").replace(/[?#].*$/, "") + trailing;
+    }
+  });
 }
 
 const TOP_LEVEL_VALUE_FLAGS = new Set(["--adapter", "--label", "--auto-stop", "--auto-archive", "--auto-delete", "--sandbox", "--sandbox-id", "--sandbox-name", "--directory", "--name", "--path", "--output", "--artifacts", "--mode", "--snapshot", "--env-file"]);
@@ -485,10 +553,17 @@ function findTopLevelDirectory(argv = []) {
 function findTopLevelAdapter(argv = []) {
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--") break;
-    if (argv[index] === "--adapter" && argv[index + 1] !== undefined && !argv[index + 1].startsWith("--")) return argv[index + 1];
-    if (argv[index].startsWith("--adapter=")) return argv[index].slice("--adapter=".length);
+    if (argv[index] === "--adapter" && argv[index + 1] !== undefined && !argv[index + 1].startsWith("--")) return canonicalizeAdapter(argv[index + 1]);
+    if (argv[index].startsWith("--adapter=")) return canonicalizeAdapter(argv[index].slice("--adapter=".length));
   }
-  return "daytona";
+  return "cube-sandbox";
+}
+
+function findEffectiveAdapter(argv = []) {
+  const explicit = argv.some((arg) => arg === "--adapter" || arg.startsWith("--adapter="));
+  if (explicit) return findTopLevelAdapter(argv);
+  try { return canonicalizeAdapter(readConfig(findTopLevelDirectory(argv))?.adapter ?? "cube-sandbox"); }
+  catch { return "cube-sandbox"; }
 }
 
 function isSameRealPath(a, b) {
@@ -506,8 +581,8 @@ async function loadDirectAdapter(argv = process.argv.slice(2)) {
   const modulePath = process.env.SANDBOX_CTL_ADAPTER_MODULE;
   if (modulePath) return import(pathToFileURL(path.resolve(modulePath)).href);
   try {
-    const { adapter } = parseSandboxCtlArgs(argv);
-    return ADAPTERS[adapter];
+    const parsed = parseSandboxCtlArgs(argv);
+    return resolveConfiguredAdapter(parsed).adapter;
   } catch {
     return daytonaAdapter;
   }
@@ -518,10 +593,10 @@ if (isDirectExecution) {
   const directArgv = process.argv.slice(2);
   loadDirectAdapter(directArgv).then((adapter) => runSandboxCtl(directArgv, { adapter })).catch((error) => {
     const wantsJson = process.argv.includes("--json");
-    if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: findTopLevelAdapter(directArgv), error: sanitizeError(error) }));
+    if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: findEffectiveAdapter(directArgv), error: sanitizeError(error) }));
     else console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
 }
 
-export { buildLifecycleLabels, normalizeLifecycleOptions, parseSandboxCtlArgs, resolveCommandAlias, runSandboxCtl, usage };
+export { buildLifecycleLabels, normalizeLifecycleOptions, parseSandboxCtlArgs, resolveCommandAlias, runSandboxCtl, sanitizeError, usage };

@@ -32,6 +32,39 @@ describe("sandbox-ctl project config", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("canonicalizes legacy cube adapter configs on read and write", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-cube-"));
+    try {
+      mkdirSync(path.join(root, ".sandbox-ctl"), { recursive: true });
+      writeFileSync(path.join(root, ".sandbox-ctl", "config.json"), JSON.stringify({
+        schemaVersion: 1,
+        adapter: "cube",
+        active: "dev",
+        sandboxes: { dev: { sandboxId: "s1", remoteWorkspace: "workspace/dev" } },
+      }));
+      expect(readConfig(root).adapter).toBe("cube-sandbox");
+      writeConfig(root, readConfig(root));
+      expect(JSON.parse(readFileSync(path.join(root, ".sandbox-ctl", "config.json"), "utf8")).adapter).toBe("cube-sandbox");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects endpoint, proxy, and secret fields from project config", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-fields-"));
+    try {
+      for (const field of ["endpoint", "proxy", "apiKey"]) {
+        expect(() => writeConfig(root, { schemaVersion: 1, adapter: "cube-sandbox", [field]: "https://example.test", active: null, sandboxes: {} })).toThrow(/unsupported|config|secret|endpoint|proxy/i);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when adding a binding with an adapter different from config", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-mixed-"));
+    try {
+      writeConfig(root, { schemaVersion: 1, adapter: "cube-sandbox", active: null, sandboxes: {} });
+      expect(() => upsertBinding(root, "daytona", { sandboxId: "s1", remoteWorkspace: "/workspace/daytona" }, { adapter: "daytona" })).toThrow(/already bound|cube-sandbox/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("keeps active bindings isolated between parent and child directories", () => {
     const root = mkdtempSync(path.join(tmpdir(), "sandbox-config-"));
     try {

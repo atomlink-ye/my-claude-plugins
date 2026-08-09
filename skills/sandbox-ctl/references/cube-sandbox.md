@@ -1,0 +1,53 @@
+# Cube Sandbox adapter details
+
+Cube Sandbox uses the E2B-compatible JavaScript SDK against a network-reachable
+operator API endpoint. The control plane needs an API endpoint and API key from
+`CUBE_API_URL`/`CUBE_API_KEY` (or the upstream SDK names `E2B_API_URL`/
+`E2B_API_KEY`). Credentials can be imported into the per-user global config with
+`sandbox-ctl --adapter cube-sandbox config set`; project
+`.sandbox-ctl/config.json` remains secret-free. `config status` reports only
+booleans, sanitized URLs, and the config path. `config path` prints the path.
+The default is `~/Library/Application Support/sandbox-ctl/config.json` on macOS,
+`$XDG_CONFIG_HOME/sandbox-ctl/config.json` when set, and `~/.config/sandbox-ctl/config.json`
+otherwise; `SANDBOX_CTL_USER_CONFIG` overrides it.
+
+Each field resolves independently as `CUBE_*` environment value, then global
+config, then the corresponding `E2B_*` value. Stored config files are mode 0600
+inside a mode 0700 directory and are written atomically. A configured `caPath`
+is applied to Node's runtime CA set when supported (and passed through as
+`CUBE_CA_PATH`); otherwise start Node with `NODE_EXTRA_CA_CERTS`.
+
+The data plane is CubeProxy. No SSH session or tunnel is required by
+`sandbox-ctl`; operators must provide a network-reachable endpoint. Preview
+URLs use the SDK's `getHost(port)` result and therefore require the target
+domain's DNS/TLS/proxy wiring. For E2B JS transport in production, use
+wildcard DNS and TLS, or the official development-sidecar fallback.
+
+For a fixed self-hosted node, set `CUBE_API_NODE_IP` and
+`CUBE_PROXY_NODE_IP` (plus `CUBE_PROXY_PORT_HTTPS` when it is not 443).
+`sandbox-ctl` starts a per-user local daemon and a strict loopback proxy that
+direct-dials those IPs while preserving the API/sandbox Host and TLS SNI. It
+does not read SSH config or server credentials. `sandbox-ctl daemon
+start|status|stop` manages this process; `exec` starts it automatically.
+Changing connection settings or rotating the API key requires a daemon
+restart and is detected by a non-secret fingerprint.
+
+New directories default to Cube Sandbox. An existing project config remains
+authoritative; legacy configs without an adapter continue to mean Daytona.
+
+## Templates and timeouts are per-call, not defaults
+
+`up` has no built-in template default that works here: the upstream SDK falls
+back to a template literally named `base`, which does not exist on our operator
+node and fails with CubeMaster `130404`. **Always pass `--template`.** The node
+exposes no template-listing command; query the API's `/templates` endpoint.
+
+Likewise pass `--timeout` per call rather than relying on the 30-minute sandbox
+default or the 5-minute `exec` default. Idle expiry **kills** the sandbox —
+unlike Daytona there is no separate stop/archive/delete ladder and no
+`--auto-delete -1` — so size the timeout to the work and pull artifacts before
+it expires.
+
+`cube` is retained only as a deprecated CLI/config compatibility spelling and
+is normalized to the canonical machine ID `cube-sandbox` and human name
+`Cube Sandbox` on read/write.
