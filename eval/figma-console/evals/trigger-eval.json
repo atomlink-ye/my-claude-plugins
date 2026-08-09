@@ -1,0 +1,21 @@
+[
+  {"query":"诊断本机 Figma Desktop Bridge 是否连上，并列出当前文件和页面","should_trigger":true},
+  {"query":"用 figma-console 读取一个 frame，截屏并导出 html/css","should_trigger":true},
+  {"query":"在 Figma 里修改文本，先加载字体，写完读回并截图","should_trigger":true},
+  {"query":"给两个 frame 设置 Smart Animate prototype reaction","should_trigger":true},
+  {"query":"用 fileKey 锁定 Figma 文件后检查节点几何","should_trigger":true},
+  {"query":"Figma 当前选区的真实 live state 是什么？走 Desktop Bridge 查一下","should_trigger":true},
+  {"query":"figma_execute 的 timeout、font 和 actions shape 怎么用","should_trigger":true},
+  {"query":"把 Figma 画面保存成 frame.json 并运行 export.py","should_trigger":true},
+  {"query":"为什么 figma-console 的请求遇到 429，帮我按 schema 诊断","should_trigger":true},
+
+  {"query":"写一个普通 HTML landing page，不要连接 Figma","should_trigger":false},
+  {"query":"解释 CSS 的 box-shadow 语法","should_trigger":false},
+  {"query":"帮我在 GitHub 上查一个 Figma 插件仓库","should_trigger":false},
+  {"query":"把这张本地 PNG 压缩一下","should_trigger":false},
+  {"query":"用 Google Docs 写一份设计周报","should_trigger":false},
+  {"query":"在 React 项目里修一个 unrelated 的路由 bug","should_trigger":false},
+  {"query":"列出 npm 的 figma 依赖版本","should_trigger":false},
+  {"query":"给我讲讲 REST API 的一般限流策略","should_trigger":false},
+  {"query":"把 Markdown 转成 PDF","should_trigger":false}
+]
