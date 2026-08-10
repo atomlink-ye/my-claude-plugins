@@ -1,9 +1,45 @@
 import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { chmodSync, lstatSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-import { createDaemonServer, createDaemonClient, connectionFingerprint, daemonRequestDeadline, runtimePaths } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon.mjs";
+import { createDaemonServer, createDaemonClient, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, daemonStatus, ensureRuntimeDir, runtimePaths, startDaemon } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon.mjs";
+import { daemonPathsFromEnvironment } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon-process.mjs";
 import { createCubeDirectProxy } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-proxy.mjs";
 import net from "node:net";
 import http from "node:http";
+
+function testRuntimeDir() {
+  return mkdtempSync(path.join(os.tmpdir(), "sandbox-ctl-daemon-test-"));
+}
+
+function testPaths(runtimeDir) {
+  return runtimePaths({
+    runtimeDir,
+    socketPath: path.join(runtimeDir, "cube-sandbox.sock"),
+    statePath: path.join(runtimeDir, "cube-sandbox-state.json"),
+    lockPath: path.join(runtimeDir, "cube-sandbox.lock"),
+  });
+}
+
+async function withDaemon(options, callback) {
+  const runtimeDir = testRuntimeDir();
+  const paths = testPaths(runtimeDir);
+  const server = createDaemonServer({ ...paths, ...options });
+  await server.listen();
+  try { return await callback(server); }
+  finally {
+    await server.close();
+    rmSync(runtimeDir, { recursive: true, force: true });
+  }
+}
+
+function loadRuntimePathsInChild(env) {
+  const moduleUrl = new URL("../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon.mjs", import.meta.url).href;
+  const source = `import { runtimePaths } from ${JSON.stringify(moduleUrl)}; process.stdout.write(JSON.stringify(runtimePaths()));`;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", source], { env, encoding: "utf8" }));
+}
 
 describe("Cube Sandbox daemon protocol", () => {
   it("fingerprints the CUBE connection without exposing the API key or URL query", () => {
@@ -17,15 +53,124 @@ describe("Cube Sandbox daemon protocol", () => {
     expect(runtimePaths({ runtimeDir: "/tmp/cube-runtime" })).toMatchObject({ socketPath: "/tmp/cube-runtime/cube-sandbox.sock", statePath: "/tmp/cube-runtime/cube-sandbox-state.json", lockPath: "/tmp/cube-runtime/cube-sandbox.lock" });
   });
 
+  it("uses one stable default runtime path across independently loaded shells", () => {
+    const makeEnv = (suffix) => {
+      const env = { ...process.env };
+      for (const key of ["SANDBOX_CTL_RUNTIME_DIR", "SANDBOX_CTL_DAEMON_SOCKET", "SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL", "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL", "SANDBOX_CTL_USER_CONFIG"]) delete env[key];
+      env.TMPDIR = `/tmp/tmp-${suffix}`;
+      env.HOME = `/tmp/home-${suffix}`;
+      env.XDG_RUNTIME_DIR = `/tmp/runtime-${suffix}`;
+      return env;
+    };
+    const first = loadRuntimePathsInChild(makeEnv("one"));
+    const second = loadRuntimePathsInChild(makeEnv("two"));
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      runtimeDir: `/tmp/sandbox-ctl-${process.getuid?.() ?? "user"}`,
+      socketPath: `/tmp/sandbox-ctl-${process.getuid?.() ?? "user"}/cube-sandbox.sock`,
+    });
+  });
+
+  it("applies runtime and socket overrides in the documented order", () => {
+    const originalRuntime = process.env.SANDBOX_CTL_RUNTIME_DIR;
+    const originalSocket = process.env.SANDBOX_CTL_DAEMON_SOCKET;
+    try {
+      process.env.SANDBOX_CTL_RUNTIME_DIR = "/tmp/env-runtime";
+      process.env.SANDBOX_CTL_DAEMON_SOCKET = "/tmp/env-daemon.sock";
+      expect(runtimePaths()).toMatchObject({ runtimeDir: "/tmp/env-runtime", socketPath: "/tmp/env-runtime/cube-sandbox.sock" });
+      expect(runtimePaths({ runtimeDir: "/tmp/option-runtime" })).toMatchObject({ runtimeDir: "/tmp/option-runtime", socketPath: "/tmp/option-runtime/cube-sandbox.sock" });
+      expect(runtimePaths({ socketPath: "/tmp/option-daemon.sock" })).toMatchObject({ runtimeDir: "/tmp/env-runtime", socketPath: "/tmp/option-daemon.sock" });
+      expect(runtimePaths({ runtimeDir: "/tmp/option-runtime", socketPath: "/tmp/option-daemon.sock" })).toMatchObject({ runtimeDir: "/tmp/option-runtime", socketPath: "/tmp/option-daemon.sock" });
+    } finally {
+      if (originalRuntime === undefined) delete process.env.SANDBOX_CTL_RUNTIME_DIR; else process.env.SANDBOX_CTL_RUNTIME_DIR = originalRuntime;
+      if (originalSocket === undefined) delete process.env.SANDBOX_CTL_DAEMON_SOCKET; else process.env.SANDBOX_CTL_DAEMON_SOCKET = originalSocket;
+    }
+  });
+
+  it("passes the parent-resolved address to the child without a public socket override", () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const configPath = path.join(runtimeDir, "missing-config.json");
+    const childEnv = daemonChildEnvironment(paths, { PATH: process.env.PATH, SANDBOX_CTL_DAEMON_SOCKET: "/tmp/public-daemon.sock", SANDBOX_CTL_USER_CONFIG: configPath });
+    try {
+      expect(childEnv.SANDBOX_CTL_DAEMON_SOCKET).toBeUndefined();
+      expect(daemonPathsFromEnvironment(childEnv)).toEqual(paths);
+      for (const key of ["SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL", "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL"]) expect(childEnv[key]).toBeUndefined();
+    } finally { rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
+  it("does not pass the removed public socket override to daemonEnvironment", () => {
+    const runtimeDir = testRuntimeDir();
+    try {
+      const env = daemonEnvironment({ PATH: process.env.PATH, SANDBOX_CTL_DAEMON_SOCKET: "/tmp/public-daemon.sock", SANDBOX_CTL_USER_CONFIG: path.join(runtimeDir, "missing-config.json") });
+      expect(env.SANDBOX_CTL_DAEMON_SOCKET).toBeUndefined();
+    } finally { rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
+  it("ignores hostile internal address variables during ordinary default lookup", async () => {
+    const names = ["SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL", "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL", "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL"];
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    const paths = testPaths(testRuntimeDir());
+    try {
+      for (const name of names) process.env[name] = "/tmp/attacker-controlled";
+      expect(runtimePaths()).toMatchObject({ runtimeDir: `/tmp/sandbox-ctl-${process.getuid?.() ?? "user"}`, socketPath: `/tmp/sandbox-ctl-${process.getuid?.() ?? "user"}/cube-sandbox.sock` });
+      await expect(daemonStatus(paths)).resolves.toMatchObject({ running: false, socketPath: paths.socketPath });
+    } finally {
+      for (const [name, value] of Object.entries(original)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+      rmSync(paths.runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("only accepts a private real runtime directory and re-verifies mode", () => {
+    const runtimeDir = testRuntimeDir();
+    const filePath = path.join(runtimeDir, "not-a-directory");
+    const linkPath = path.join(runtimeDir, "symlink");
+    try {
+      chmodSync(runtimeDir, 0o755);
+      ensureRuntimeDir(runtimeDir);
+      expect(lstatSync(runtimeDir).mode & 0o777).toBe(0o700);
+      writeFileSync(filePath, "test");
+      symlinkSync(runtimeDir, linkPath);
+      expect(() => ensureRuntimeDir(filePath)).toThrow("not a directory");
+      expect(() => ensureRuntimeDir(linkPath)).toThrow("symlinked");
+    } finally { rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
+  it("reports the exact socket path when no daemon is listening", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const socketPath = paths.socketPath;
+    try {
+      await expect(createDaemonClient({ socketPath, connectTimeoutMs: 50 }).ping()).rejects.toThrow(socketPath);
+      await expect(daemonStatus(paths)).resolves.toMatchObject({ running: false, socketPath });
+    } finally { rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
   it("best-effort disconnects cached sandbox and client resources on close", async () => {
     const calls = [];
     const sandbox = { commands: { run: async () => ({ exitCode: 0 }) }, disconnect: async () => calls.push("sandbox") };
     const client = { connect: async () => sandbox, close: async () => calls.push("client") };
-    const server = createDaemonServer({ socketPath: "/tmp/sandbox-ctl-daemon-resource-test.sock", client });
-    await server.listen();
-    await server.handleRequest({ version: 1, op: "exec", sandboxId: "sbx" }, () => {});
-    await server.close();
+    await withDaemon({ client }, async (server) => {
+      await server.handleRequest({ version: 1, op: "exec", sandboxId: "sbx" }, () => {});
+    });
     expect(calls.sort()).toEqual(["client", "sandbox"]);
+  });
+
+  it("includes the exact socket path for an indeterminate daemon identity", async () => {
+    const configDir = testRuntimeDir();
+    const configPath = path.join(configDir, "missing-config.json");
+    const originalConfig = process.env.SANDBOX_CTL_USER_CONFIG;
+    process.env.SANDBOX_CTL_USER_CONFIG = configPath;
+    try {
+      await withDaemon({}, async (server) => {
+        const paths = testPaths(server.runtimeDir);
+        await expect(daemonStatus(paths)).resolves.toMatchObject({ daemonDetected: true, identityError: `daemon state identity is unavailable at ${server.socketPath}` });
+        await expect(startDaemon(paths)).rejects.toThrow(server.socketPath);
+      });
+    } finally {
+      if (originalConfig === undefined) delete process.env.SANDBOX_CTL_USER_CONFIG; else process.env.SANDBOX_CTL_USER_CONFIG = originalConfig;
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 
   it("gives exec requests a deadline after the requested remote timeout", () => {
@@ -35,8 +180,7 @@ describe("Cube Sandbox daemon protocol", () => {
 
   it("streams stdout/stderr and returns the exact remote exit code", async () => {
     const calls = { clients: 0, connects: 0, homes: 0, runs: 0 };
-    const server = createDaemonServer({
-      socketPath: "/tmp/sandbox-ctl-daemon-test.sock",
+    await withDaemon({
       createClient: async () => { calls.clients += 1; return {
         connect: async () => { calls.connects += 1; return {
           commands: { run: async (_command, options) => {
@@ -48,9 +192,7 @@ describe("Cube Sandbox daemon protocol", () => {
         }; },
       }; },
       resolveRemoteHome: async () => { calls.homes += 1; return "/home/test"; },
-    });
-    await server.listen();
-    try {
+    }, async (server) => {
       const result = await createDaemonClient({ socketPath: server.socketPath }).exec({
         sandboxId: "sbx-1", command: "printf test", cwd: "/home/test", timeoutMs: 1000,
       });
@@ -59,14 +201,13 @@ describe("Cube Sandbox daemon protocol", () => {
       const second = await createDaemonClient({ socketPath: server.socketPath }).exec({ sandboxId: "sbx-1", command: "true" });
       expect(second.exitCode).toBe(7);
       expect(calls).toEqual({ clients: 1, connects: 1, homes: 1, runs: 2 });
-    } finally { await server.close(); }
+    });
   });
 
   it("exposes the daemon-owned loopback proxy through ping/status", async () => {
-    const server = createDaemonServer({ socketPath: "/tmp/sandbox-ctl-daemon-proxy-test.sock", proxyUrl: "http://127.0.0.1:43123" });
-    await server.listen();
-    try { await expect(createDaemonClient({ socketPath: server.socketPath }).ping()).resolves.toMatchObject({ ok: true, proxyUrl: "http://127.0.0.1:43123" }); }
-    finally { await server.close(); }
+    await withDaemon({ proxyUrl: "http://127.0.0.1:43123" }, async (server) => {
+      await expect(createDaemonClient({ socketPath: server.socketPath }).ping()).resolves.toMatchObject({ ok: true, proxyUrl: "http://127.0.0.1:43123" });
+    });
   });
 
   it("routes CONNECT through the configured Cube node without rewriting the target", async () => {
