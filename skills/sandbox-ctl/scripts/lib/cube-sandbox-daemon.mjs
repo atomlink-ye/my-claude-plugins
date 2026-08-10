@@ -1,7 +1,6 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, connect as connectSocket } from "node:net";
 import { spawn } from "node:child_process";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { createHash, randomUUID } from "node:crypto";
@@ -9,16 +8,29 @@ import { fileURLToPath } from "node:url";
 import { materializeCubeSandboxEnv } from "./cube-sandbox-user-config.mjs";
 
 const PROTOCOL_VERSION = 1;
-const DEFAULT_RUNTIME_DIR = path.join(process.env.XDG_RUNTIME_DIR || tmpdir(), `sandbox-ctl-${process.getuid?.() ?? "user"}`);
+// Keep the daemon address stable across agent shells and login sessions.  In
+// particular, TMPDIR and XDG_RUNTIME_DIR can differ between the human shell
+// and a paseo-launched agent, which must still attach to the same per-user
+// daemon.
+const DEFAULT_RUNTIME_DIR = path.join("/tmp", `sandbox-ctl-${process.getuid?.() ?? "user"}`);
 const DEFAULT_SOCKET_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox.sock");
 const DEFAULT_STATE_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox-state.json");
 const DEFAULT_LOCK_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox.lock");
+// These are intentionally not public configuration knobs. They are set only
+// on the detached daemon child by startDaemon; the daemon entrypoint consumes
+// them once and turns them into explicit runtimePaths options.
+const CHILD_PATH_ENVS = {
+  runtimeDir: "SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL",
+  socketPath: "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL",
+  statePath: "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL",
+  lockPath: "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL",
+};
 
 function runtimePaths(options = {}) {
   const runtimeDir = options.runtimeDir || process.env.SANDBOX_CTL_RUNTIME_DIR || DEFAULT_RUNTIME_DIR;
   return {
     runtimeDir,
-    socketPath: options.socketPath || process.env.SANDBOX_CTL_DAEMON_SOCKET || path.join(runtimeDir, "cube-sandbox.sock"),
+    socketPath: options.socketPath || path.join(runtimeDir, "cube-sandbox.sock"),
     statePath: options.statePath || path.join(runtimeDir, "cube-sandbox-state.json"),
     lockPath: options.lockPath || path.join(runtimeDir, "cube-sandbox.lock"),
   };
@@ -86,12 +98,34 @@ function daemonEnvironment(env = process.env) {
   return Object.fromEntries([...allowed].filter((key) => env[key] !== undefined).map((key) => [key, env[key]]));
 }
 
+function daemonChildEnvironment(paths, env = process.env) {
+  const childEnv = daemonEnvironment(env);
+  childEnv.SANDBOX_CTL_RUNTIME_DIR = paths.runtimeDir;
+  for (const [key, envName] of Object.entries(CHILD_PATH_ENVS)) childEnv[envName] = paths[key];
+  return childEnv;
+}
+
 function ensureRuntimeDir(runtimeDir) {
-  try { if (lstatSync(runtimeDir).isSymbolicLink()) throw protocolError(`Refusing symlinked daemon runtime directory: ${runtimeDir}`); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
-  chmodSync(runtimeDir, 0o700);
-  const info = statSync(runtimeDir);
+  let info;
+  try {
+    info = lstatSync(runtimeDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+    info = lstatSync(runtimeDir);
+  }
+  if (info.isSymbolicLink()) throw protocolError(`Refusing symlinked daemon runtime directory: ${runtimeDir}`);
+  if (!info.isDirectory()) throw protocolError(`Daemon runtime path is not a directory: ${runtimeDir}`);
   if (process.getuid && info.uid !== process.getuid()) throw protocolError(`Daemon runtime directory is not owned by the current user: ${runtimeDir}`);
+  chmodSync(runtimeDir, 0o700);
+
+  // Re-read after chmod so a replacement/race cannot leave us believing that
+  // an untrusted path is the private runtime directory.
+  info = lstatSync(runtimeDir);
+  if (info.isSymbolicLink()) throw protocolError(`Refusing symlinked daemon runtime directory: ${runtimeDir}`);
+  if (!info.isDirectory()) throw protocolError(`Daemon runtime path is not a directory: ${runtimeDir}`);
+  if (process.getuid && info.uid !== process.getuid()) throw protocolError(`Daemon runtime directory is not owned by the current user: ${runtimeDir}`);
+  if ((info.mode & 0o777) !== 0o700) throw protocolError(`Daemon runtime directory must be mode 0700: ${runtimeDir}`);
 }
 
 function readState(statePath) {
@@ -342,7 +376,7 @@ export async function daemonStatus(options = {}) {
     return {
       running: false,
       daemonDetected: true,
-      identityError: !stateIdentity ? "daemon state identity is unavailable" : "daemon connection settings changed",
+      identityError: !stateIdentity ? `daemon state identity is unavailable at ${paths.socketPath}` : `daemon connection settings changed at ${paths.socketPath}`,
       pid: probe.ping.pid,
       uid: probe.ping.uid,
       socketPath: paths.socketPath,
@@ -368,7 +402,7 @@ export async function startDaemon(options = {}) {
   }
   writeFileSync(paths.lockPath, JSON.stringify({ pid: process.pid, timestamp: Date.now() }), { mode: 0o600 });
   try {
-    const child = spawn(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "cube-sandbox-daemon-process.mjs")], { detached: true, stdio: "ignore", env: daemonEnvironment(process.env) });
+    const child = spawn(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "cube-sandbox-daemon-process.mjs")], { detached: true, stdio: "ignore", env: daemonChildEnvironment(paths, process.env) });
     child.unref();
     const deadline = Date.now() + (options.startTimeoutMs ?? 5000);
     while (Date.now() < deadline) {
@@ -378,7 +412,7 @@ export async function startDaemon(options = {}) {
       // polling through that tiny window, but never treat the socket as ready.
       await new Promise((resolve) => setTimeout(resolve, 30));
     }
-    throw protocolError("Cube Sandbox daemon failed to start; check CUBE_API_URL and credentials, then retry");
+    throw protocolError(`Cube Sandbox daemon failed to start at ${paths.socketPath}; check CUBE_API_URL and credentials, then retry`);
   } finally { try { unlinkSync(paths.lockPath); } catch {} }
 }
 
@@ -406,4 +440,4 @@ export async function stopDaemon(options = {}) {
   return { running: false, stopped: true, socketPath: paths.socketPath };
 }
 
-export { PROTOCOL_VERSION, connectionFingerprint, daemonEnvironment, daemonRequestDeadline, runtimePaths, readState, writeState };
+export { PROTOCOL_VERSION, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, ensureRuntimeDir, runtimePaths, readState, writeState };
