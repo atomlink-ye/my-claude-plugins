@@ -10,6 +10,37 @@ Paseo is a daemon-managed CLI for launching, observing, and steering AI coding a
 
 This skill is a **runtime adapter**. It documents how to drive the Paseo CLI; it does **not** decide whether a task should run through Paseo at all, on the local daemon or a remote one, or with which model. Those choices belong to the orchestration layer (`team-lead-orchestration`) and any local routing profile that applies (e.g. a personalized routing skill).
 
+## Manager companion messages
+
+For durable asynchronous worker content, use the local companion's message queue:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8787/messages \
+  -H 'content-type: application/json' \
+  -d '{"to":"worker-id","from":"manager-id","body":"Please review the diff","urgency":"normal"}'
+```
+
+The queue persists each message before calling Paseo, groups pending messages by
+sender, and keeps at most one live one-shot delivery schedule per recipient. An
+urgent message is placed at the queue head and is attempted on the next scheduled
+turn after the recipient becomes available; it is not an interruption guarantee.
+The one-minute schedule cadence and reconciliation interval mean this is not an
+exact-turn or exact-second SLA. A busy failed attempt keeps its messages and is
+re-armed; successful delivery removes only that schedule generation's captured
+batch. Delivery uses `schedule inspect`/`schedule logs` for run truth and never
+injects a message into a running worker.
+
+This supersedes the older “worker intermediate updates are unavailable” guidance:
+use `/messages` for durable updates, and reserve `send` for safe direct steering.
+
+Choose the primitive by intent:
+
+| Need | Use |
+|---|---|
+| Deliberate immediate follow-up and interruption is safe | `paseo send` |
+| Repeating/time-based nudge with explicit acknowledgement | Companion `POST /reminders` |
+| Durable asynchronous worker content, coalesced without interruption | Companion `POST /messages` |
+
 ```bash
 paseo <command> [options]
 ```

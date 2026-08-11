@@ -1,5 +1,6 @@
 export type LedgerType = 'park' | 'known-red' | 'deferred';
 export type ReminderKind = 'generic' | 'compact-wake' | 'child-watch';
+export type MessageUrgency = 'normal' | 'urgent';
 
 export interface ReminderRecord {
   id: string;
@@ -54,4 +55,29 @@ export interface ChildrenResult {
   selfWakeupSources: ReminderRecord[];
   partial: boolean;
   failedCandidates: FailedCandidate[];
+}
+
+/** A durable message waiting to be delivered to a Paseo agent. */
+export interface MessageRecord {
+  id: string;
+  to: string;
+  from: string;
+  body: string;
+  urgency: MessageUrgency;
+  status: 'pending' | 'delivered';
+  createdAt: string;
+  deliveredAt?: string;
+}
+
+/** Local index for one generation of a recipient's one-shot delivery schedule. */
+export interface MessageScheduleRecord {
+  id: string;
+  recipient: string;
+  generation: string;
+  daemonId?: string;
+  batchIds: string[];
+  prompt: string;
+  status: 'pending' | 'active' | 'running' | 'failed' | 'completed' | 'deleted';
+  createdAt: string;
+  lastRunAt?: string;
 }

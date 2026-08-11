@@ -46,6 +46,12 @@ export async function createServer(service = new CompanionService()): Promise<Co
         required(body.agentId, 'agentId'); required(body.message, 'message');
         send(res, 201, await service.createReminder(body)); return;
       }
+      if (method === 'POST' && pathname === '/messages') {
+        const body = await readBody(req);
+        required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
+        if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new HttpError(400, 'urgency must be normal or urgent');
+        send(res, 201, await service.postMessage(body)); return;
+      }
       const reminderMatch = pathname.match(/^\/reminders\/([^/]+)$/);
       if (method === 'DELETE' && reminderMatch) {
         const body = await readBody(req);

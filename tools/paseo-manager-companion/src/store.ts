@@ -1,12 +1,15 @@
-import { mkdir, readFile, appendFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { LedgerRecord, ReminderRecord } from './types.js';
+import type { LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord } from './types.js';
 
 export class Store {
   readonly dir: string;
   private reminders: ReminderRecord[] = [];
   private ledger: LedgerRecord[] = [];
+  private messages: MessageRecord[] = [];
+  private messageSchedules: MessageScheduleRecord[] = [];
+  private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
 
   constructor(dir = process.env.PASEO_COMPANION_DATA || path.join(process.cwd(), '.paseo-manager-companion')) {
@@ -17,6 +20,8 @@ export class Store {
     await mkdir(this.dir, { recursive: true });
     this.reminders = await this.load<ReminderRecord[]>('reminders.json', []);
     this.ledger = await this.load<LedgerRecord[]>('ledger.json', []);
+    this.messages = await this.loadDurable<MessageRecord[]>('messages.json', []);
+    this.messageSchedules = await this.loadDurable<MessageScheduleRecord[]>('message-schedules.json', []);
     const managerList = await this.load<string[]>('managers.json', []);
     this.managers = new Set(managerList);
   }
@@ -25,7 +30,22 @@ export class Store {
     try { return JSON.parse(await readFile(path.join(this.dir, file), 'utf8')) as T; } catch { return fallback; }
   }
   private async save(file: string, value: unknown): Promise<void> {
-    await writeFile(path.join(this.dir, file), JSON.stringify(value, null, 2) + '\n');
+    const previous = this.saveLocks.get(file) ?? Promise.resolve();
+    const write = previous.catch(() => undefined).then(async () => {
+      const temporary = path.join(this.dir, `.${file}.${randomUUID()}.tmp`);
+      await writeFile(temporary, JSON.stringify(value, null, 2) + '\n');
+      await rename(temporary, path.join(this.dir, file));
+    });
+    this.saveLocks.set(file, write);
+    await write;
+  }
+  private async loadDurable<T>(file: string, fallback: T): Promise<T> {
+    try {
+      return JSON.parse(await readFile(path.join(this.dir, file), 'utf8')) as T;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback;
+      throw new Error(`corrupt durable companion state: ${file}`);
+    }
   }
   async addManager(id: string | undefined): Promise<void> {
     if (!id) return;
@@ -44,6 +64,27 @@ export class Store {
     return item;
   }
   findReminder(id: string): ReminderRecord | undefined { return this.reminders.find((r) => r.id === id || r.daemonId === id); }
+
+  getMessages(): MessageRecord[] { return this.messages; }
+  async addMessage(record: MessageRecord): Promise<void> { this.messages.push(record); await this.save('messages.json', this.messages); }
+  async removeMessages(ids: Iterable<string>): Promise<void> {
+    const remove = new Set(ids);
+    this.messages = this.messages.filter((message) => !remove.has(message.id));
+    await this.save('messages.json', this.messages);
+  }
+
+  getMessageSchedules(): MessageScheduleRecord[] { return this.messageSchedules; }
+  async addMessageSchedule(record: MessageScheduleRecord): Promise<void> {
+    this.messageSchedules.push(record);
+    await this.save('message-schedules.json', this.messageSchedules);
+  }
+  async updateMessageSchedule(id: string, patch: Partial<MessageScheduleRecord>): Promise<MessageScheduleRecord | undefined> {
+    const item = this.messageSchedules.find((schedule) => schedule.id === id);
+    if (!item) return undefined;
+    Object.assign(item, patch);
+    await this.save('message-schedules.json', this.messageSchedules);
+    return item;
+  }
 
   getLedger(): LedgerRecord[] { return this.ledger; }
   async addLedger(input: Omit<LedgerRecord, 'id' | 'createdAt'>): Promise<LedgerRecord> {

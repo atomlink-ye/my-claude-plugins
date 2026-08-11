@@ -2,10 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { PaseoCli, asRecord } from './cli.js';
 import { Store } from './store.js';
-import type { AgentInfo, ChildrenResult, FailedCandidate, LedgerType, ReminderKind, ReminderRecord } from './types.js';
+import type { AgentInfo, ChildrenResult, FailedCandidate, LedgerType, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderRecord } from './types.js';
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
+type MessageScheduleInspection = {
+  state: 'live' | 'running' | 'success' | 'failed' | 'missing' | 'unknown';
+  hasRun: boolean;
+};
 
 function json(value: unknown): string { return JSON.stringify(value, null, 2); }
 function lowerStatus(value: any): string { return String(value ?? '').toLowerCase(); }
@@ -23,20 +27,26 @@ export class CompanionService {
   readonly store: Store;
   readonly startedAt = new Date().toISOString();
   private reconcileTimer?: NodeJS.Timeout;
+  private messageReconcileTimer?: NodeJS.Timeout;
   private lastReconcileAt?: string;
   private port = Number(process.env.PORT || 0);
   private observers = new Set<AbortController>();
   private childWatchInFlight = new Map<string, Promise<ReminderRecord | undefined>>();
+  private messageInFlight = new Map<string, Promise<void>>();
 
   constructor(cli = new PaseoCli(), store = new Store()) { this.cli = cli; this.store = store; }
   async init(): Promise<void> {
     await this.store.init();
     await this.reconcileReminders();
+    await this.reconcileMessages();
     this.reconcileTimer = setInterval(() => { void this.reconcileOnce(); }, 180_000);
     this.reconcileTimer.unref();
+    this.messageReconcileTimer = setInterval(() => { void this.reconcileMessages(); }, 15_000);
+    this.messageReconcileTimer.unref();
   }
   close(): void {
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    if (this.messageReconcileTimer) clearInterval(this.messageReconcileTimer);
     for (const controller of this.observers) controller.abort();
     this.observers.clear();
   }
@@ -189,6 +199,211 @@ export class CompanionService {
     return result.value;
   }
 
+  /**
+   * Persist a message before touching Paseo, then make the recipient's queue
+   * have one coalesced, one-shot delivery schedule. The queue remains durable
+   * if the daemon is unavailable or a recipient is busy.
+   */
+  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency }): Promise<MessageRecord & { schedule: MessageScheduleRecord | null }> {
+    if (!body.to?.trim() || !body.from?.trim() || !body.body?.trim()) throw new Error('to, from, and body are required');
+    if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new Error('urgency must be normal or urgent');
+    const message: MessageRecord = {
+      id: randomUUID(),
+      to: body.to.trim(),
+      from: body.from.trim(),
+      body: body.body,
+      urgency: body.urgency ?? 'normal',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+    // This write deliberately precedes every daemon call.
+    await this.store.addMessage(message);
+    await this.ensureMessageDelivery(message.to);
+    const schedule = this.store.getMessageSchedules().find((item) => item.recipient === message.to && item.status === 'active') ?? null;
+    return { ...message, schedule };
+  }
+
+  getMessages(to?: string): MessageRecord[] {
+    return this.store.getMessages().filter((message) => !to || message.to === to);
+  }
+
+  private sortMessages(messages: MessageRecord[]): MessageRecord[] {
+    return [...messages].sort((a, b) => {
+      const urgency = (a.urgency === 'urgent' ? 0 : 1) - (b.urgency === 'urgent' ? 0 : 1);
+      if (urgency) return urgency;
+      const sender = a.from.localeCompare(b.from);
+      if (sender) return sender;
+      const timestamp = a.createdAt.localeCompare(b.createdAt);
+      return timestamp || a.id.localeCompare(b.id);
+    });
+  }
+
+  private messagePrompt(recipient: string, messages: MessageRecord[]): string {
+    const grouped = new Map<string, MessageRecord[]>();
+    for (const message of this.sortMessages(messages)) {
+      const sender = grouped.get(message.from) ?? [];
+      sender.push(message);
+      grouped.set(message.from, sender);
+    }
+    const lines = [
+      `Deliver the queued messages below to ${recipient}. Do not send a response through the companion; process each message exactly once.`,
+    ];
+    for (const [sender, senderMessages] of grouped) {
+      lines.push(`From: ${sender}`);
+      for (const message of senderMessages) lines.push(`- [${message.createdAt}] (${message.urgency}) ${message.body}`);
+    }
+    return lines.join('\n');
+  }
+
+  private async inspectMessageSchedule(schedule: MessageScheduleRecord): Promise<MessageScheduleInspection> {
+    if (!schedule.daemonId) return { state: 'missing', hasRun: false };
+    try {
+      const inspected = asRecord((await this.cli.run(['schedule', 'inspect', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 })).value);
+      if (!Object.keys(inspected).length) return { state: 'unknown', hasRun: false };
+      const logsValue = (await this.cli.run(['schedule', 'logs', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 })).value;
+      const logsRecord = asRecord(logsValue);
+      if (!Array.isArray(logsValue) && !Array.isArray(logsRecord.logs) && !Array.isArray(logsRecord.runs) && !Array.isArray(logsRecord.entries)) return { state: 'unknown', hasRun: false };
+      const logs = Array.isArray(logsValue) ? logsValue : (logsRecord.logs ?? logsRecord.runs ?? logsRecord.entries ?? []);
+      const latest = Array.isArray(logs) && logs.length ? asRecord(logs[logs.length - 1]) : {};
+      const hasRun = Array.isArray(logs) && logs.length > 0;
+      const runStatus = lowerStatus(latest.status ?? latest.state ?? latest.outcome ?? latest.result);
+      const scheduleStatus = lowerStatus(inspected.status ?? inspected.Status ?? inspected.state ?? inspected.State);
+      // A terminal run log is authoritative over the wrapper schedule status:
+      // Paseo may report a max-runs schedule as completed after a busy failure.
+      if (runStatus) {
+        if (/running|in.?progress|started/.test(runStatus)) return { state: 'running', hasRun };
+        if (/fail|error|timeout|busy/.test(runStatus)) return { state: 'failed', hasRun };
+        if (/success|succeed|complete|ok/.test(runStatus)) return { state: 'success', hasRun };
+        return { state: 'unknown', hasRun };
+      }
+      // A completed wrapper without a terminal successful/failed run log is
+      // not delivery evidence. Preserve the queue and wait for a real log.
+      if (/complete|success|succeed|fail|error/.test(scheduleStatus)) return { state: 'unknown', hasRun };
+      if (['deleted', 'expired', 'missing', 'dead'].includes(scheduleStatus)) return { state: 'missing', hasRun };
+      return { state: 'live', hasRun };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { state: /not found|no such schedule|unknown schedule|404/i.test(message) ? 'missing' : 'unknown', hasRun: false };
+    }
+  }
+
+  private async retireMessageSchedule(schedule: MessageScheduleRecord, status: MessageScheduleRecord['status'] = 'deleted'): Promise<boolean> {
+    let removed = true;
+    if (schedule.daemonId) {
+      try { await this.cli.run(['schedule', 'delete', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 }); } catch { removed = false; }
+    }
+    // Terminal schedules are no longer live even if the daemon's delete call
+    // is unavailable. An active duplicate stays active locally until deletion
+    // succeeds, preventing a replacement from creating another live delivery.
+    if (removed || status !== 'deleted') await this.store.updateMessageSchedule(schedule.id, { status });
+    return removed;
+  }
+
+  private async createMessageSchedule(recipient: string, batch: MessageRecord[]): Promise<MessageScheduleRecord | undefined> {
+    const generation = randomUUID();
+    const local: MessageScheduleRecord = {
+      id: randomUUID(),
+      recipient,
+      generation,
+      batchIds: batch.map((message) => message.id),
+      prompt: this.messagePrompt(recipient, batch),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+    await this.store.addMessageSchedule(local);
+    try {
+      const value = asRecord((await this.cli.run([
+        'heartbeat', 'create', local.prompt,
+        '--cron', '* * * * *', '--expires-in', '30m', '--max-runs', '1',
+        '--name', `companion-message-${generation.slice(0, 8)}`,
+        '--timezone', 'UTC', '--json',
+      ], { agentId: recipient })).value);
+      await this.store.updateMessageSchedule(local.id, {
+        daemonId: String(value.id ?? value.scheduleId ?? value.heartbeatId ?? ''),
+        status: 'active',
+        lastRunAt: value.lastRunAt,
+      });
+      return this.store.getMessageSchedules().find((item) => item.id === local.id);
+    } catch {
+      await this.store.updateMessageSchedule(local.id, { status: 'failed' });
+      return undefined;
+    }
+  }
+
+  private async ensureMessageDelivery(recipient: string): Promise<void> {
+    const existing = this.messageInFlight.get(recipient);
+    if (existing) return existing;
+    const operation = this.ensureMessageDeliveryOnce(recipient);
+    this.messageInFlight.set(recipient, operation);
+    try { await operation; } finally { this.messageInFlight.delete(recipient); }
+  }
+
+  private async ensureMessageDeliveryOnce(recipient: string): Promise<void> {
+    // Let concurrent POSTs finish their durable writes before taking the batch
+    // snapshot. This keeps a burst of arrivals to one schedule generation.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const schedules = this.store.getMessageSchedules().filter((schedule) => schedule.recipient === recipient && ['pending', 'active', 'running'].includes(schedule.status));
+    const liveCandidates: Array<{ schedule: MessageScheduleRecord; inspection: MessageScheduleInspection }> = [];
+    let running: MessageScheduleRecord | undefined;
+    let uncertain = false;
+    for (const schedule of schedules) {
+      const state = await this.inspectMessageSchedule(schedule);
+      if (state.state === 'success') {
+        // Only this generation's captured ids are removed. New arrivals stay.
+        await this.store.removeMessages(schedule.batchIds);
+        await this.retireMessageSchedule(schedule, 'completed');
+      } else if (state.state === 'running') {
+        await this.store.updateMessageSchedule(schedule.id, { status: 'running' });
+        running = running ?? schedule;
+      } else if (state.state === 'live') {
+        liveCandidates.push({ schedule, inspection: state });
+      } else if (state.state === 'unknown') {
+        uncertain = true;
+      } else if (state.state === 'missing') {
+        await this.store.updateMessageSchedule(schedule.id, { status: 'deleted' });
+      } else {
+        await this.retireMessageSchedule(schedule);
+      }
+    }
+    const live = liveCandidates.sort((a, b) => a.schedule.createdAt.localeCompare(b.schedule.createdAt)).at(-1);
+    for (const candidate of liveCandidates) {
+      if (candidate === live) continue;
+      const removed = await this.retireMessageSchedule(candidate.schedule);
+      if (!removed) uncertain = true;
+    }
+    const queued = this.store.getMessages().filter((message) => message.to === recipient && message.status === 'pending');
+    if (!queued.length || running || uncertain) return;
+    const sorted = this.sortMessages(queued);
+    // Never replace a live generation merely because new arrivals exist. The
+    // captured batch must get its turn; remainder messages are armed after the
+    // terminal run is observed.
+    if (live) {
+      // Before the first real run, expand the existing schedule in place. This
+      // avoids a second live wakeup while still folding in staggered arrivals.
+      if (!live.inspection.hasRun && (live.schedule.batchIds.length !== sorted.length || live.schedule.batchIds.some((id, index) => id !== sorted[index]?.id))) {
+        const prompt = this.messagePrompt(recipient, sorted);
+        try {
+          await this.cli.run(['schedule', 'update', live.schedule.daemonId!, '--prompt', prompt, '--json'], { agentId: recipient, timeoutMs: 5_000 });
+          await this.store.updateMessageSchedule(live.schedule.id, { prompt, batchIds: sorted.map((message) => message.id) });
+        } catch {
+          // Preserve the old generation and durable arrivals; reconcile later.
+        }
+      }
+      return;
+    }
+    await this.createMessageSchedule(recipient, sorted);
+    // A write can complete while heartbeat create is in flight. Rebuild once
+    // against the newer queue, retaining every message in durable storage.
+  }
+
+  private async reconcileMessages(): Promise<void> {
+    const recipients = new Set(this.store.getMessages().filter((message) => message.status === 'pending').map((message) => message.to));
+    for (const schedule of this.store.getMessageSchedules()) if (['pending', 'active', 'running'].includes(schedule.status)) recipients.add(schedule.recipient);
+    for (const recipient of recipients) {
+      try { await this.ensureMessageDelivery(recipient); } catch { /* retry next reconciliation */ }
+    }
+  }
+
   async compactWake(body: { agentId: string; resumeSteps: string }): Promise<unknown> {
     await this.store.addManager(body.agentId);
     const cron = '*/5 * * * *';
@@ -335,6 +550,7 @@ export class CompanionService {
   async reconcileOnce(): Promise<void> {
     this.lastReconcileAt = new Date().toISOString();
     await this.reconcileReminders();
+    await this.reconcileMessages();
     for (const managerId of this.store.getManagers()) {
       try {
         const { children, selfWakeupSources, partial } = await this.listChildren(managerId);
