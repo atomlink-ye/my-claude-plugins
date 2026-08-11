@@ -1,5 +1,5 @@
 export type LedgerType = 'park' | 'known-red' | 'deferred';
-export type ReminderKind = 'generic' | 'compact-wake' | 'child-watch';
+export type ReminderKind = 'generic' | 'compact-wake' | 'child-watch' | 'idle' | 'watchdog' | 'heartbeat-recovery';
 export type MessageUrgency = 'normal' | 'urgent';
 
 export interface ReminderRecord {
@@ -27,6 +27,31 @@ export interface ReminderRecord {
   missedRunIds?: string[];
   alive?: boolean | 'unknown';
   createdAt: string;
+  /** Optional finite delivery count. `1` makes this a one-shot reminder. */
+  maxRuns?: number;
+  eventType?: string;
+  criterion?: string;
+}
+
+export interface WatchdogSnapshot {
+  managerId: string;
+  childId: string;
+  status: string;
+  updatedAt?: string;
+  notified?: string[];
+}
+
+export interface IdleReminderRecord {
+  id: string;
+  agentId: string;
+  message: string;
+  thresholdSeconds: number;
+  once: boolean;
+  status: 'active' | 'deleted';
+  idleSince?: string;
+  lastObservedUpdatedAt?: string;
+  lastTriggeredAt?: string;
+  createdAt: string;
 }
 
 export interface LedgerRecord {
@@ -52,6 +77,20 @@ export interface AgentInfo {
   hasLiveCompanionWatch: boolean | 'unknown';
   hasLiveWakeupSource: boolean | 'unknown';
   gitDirty: boolean | 'unknown';
+  createdAt?: string;
+  trackedSource?: TrackedChildSource;
+  trackedAddedAt?: string;
+  source?: TrackedChildSource;
+  addedAt?: string;
+}
+
+export type TrackedChildSource = 'explicit' | 'auto' | 'migrated';
+
+export interface TrackedChildRecord {
+  managerId: string;
+  childId: string;
+  source: TrackedChildSource;
+  addedAt: string;
 }
 
 export interface FailedCandidate {

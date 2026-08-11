@@ -35,7 +35,9 @@ describe('HTTP integration through a paseo executable', () => {
   it('exercises every route and enforces ledger/reminder reasons', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-'));
     const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {
+      'pre-start-child': { id: 'pre-start-child', Id: 'pre-start-child', ParentAgentId: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-08T00:00:00.000Z', Cwd: process.cwd() },
+    }, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
     process.env.PASEO_AGENT_ID = 'manager-1';
     await chmod(shim, 0o755);
@@ -50,17 +52,22 @@ describe('HTTP integration through a paseo executable', () => {
     const childId = spawned.body.id;
     const children = await request(base, 'GET', '/children?agentId=manager-1');
     expect(children.status).toBe(200); expect(children.body.children.some((c: any) => c.id === childId)).toBe(true);
+    expect(children.body.children.some((c: any) => c.id === 'pre-start-child')).toBe(false);
+    expect(children.body.children.find((c: any) => c.id === childId)?.trackedSource).toBe('auto');
     expect((await request(base, 'GET', `/children/${childId}/briefing`)).status).toBe(200);
     const reminder = await request(base, 'POST', '/reminders', { agentId: 'manager-1', delaySeconds: 60, message: 'check' });
     expect(reminder.status).toBe(201);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, { reason: 'done' })).status).toBe(200);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, {})).status).toBe(400);
-    process.env.PASEO_SEND_FAIL = '1';
     const message = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'explicit message' });
-    delete process.env.PASEO_SEND_FAIL;
     expect(message.status).toBe(201);
+    const visibleBeforeAck = await request(base, 'GET', '/messages?to=manager-1');
+    expect(visibleBeforeAck.status).toBe(200);
+    expect(visibleBeforeAck.body.some((item: any) => item.id === message.body.id && item.status === 'delivered')).toBe(true);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, {})).status).toBe(400);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'handled' })).status).toBe(200);
+    const absentAfterAck = await request(base, 'GET', '/messages?to=manager-1');
+    expect(absentAfterAck.body.some((item: any) => item.id === message.body.id)).toBe(false);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'retry handled' })).status).toBe(200);
     expect((await request(base, 'DELETE', '/messages/unknown-message-id', { reason: 'not present' })).status).toBe(404);
     expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', resumeSteps: 'read state; continue' })).status).toBe(202);
@@ -199,7 +206,7 @@ describe('HTTP integration through a paseo executable', () => {
     restarted.close();
   });
 
-  it('acknowledging a child-watch reminder leaves opt-out disabled and reconciliation replaces it', async () => {
+  it('acknowledging a child-watch reminder persists opt-out and reconciliation never replaces it', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-ack-'));
     const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
@@ -209,14 +216,18 @@ describe('HTTP integration through a paseo executable', () => {
     const watch = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'watch' });
     await service.store.updateReminder(watch.id, { missedFires: 2, missedRunIds: ['ack-run'] });
     await service.deleteReminder(watch.id, 'acknowledged');
-    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(false);
+    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(true);
     expect(service.store.findReminder(watch.id)?.status).toBe('deleted');
     expect(service.store.findReminder(watch.id)?.missedFires).toBe(0);
     await service.reconcileOnce();
     const active = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
-    expect(active).toHaveLength(1);
-    expect(active[0].id).not.toBe(watch.id);
+    expect(active).toHaveLength(0);
     service.close();
+    const restarted = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await restarted.init(); await restarted.reconcileOnce();
+    expect(restarted.store.isChildWatchOptedOut('manager-1', childId)).toBe(true);
+    expect(restarted.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    restarted.close();
   });
 
   it('serializes unsubscribe with ensure so a concurrent reconcile cannot leave a new watch', async () => {
@@ -291,8 +302,11 @@ describe('HTTP integration through a paseo executable', () => {
       return { service, childId: String((child as any).id), detector };
     };
     const waitOnly = await make(true);
-    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: false, hasLiveWakeupSource: true }));
+    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: false, hasLiveWakeupSource: true, source: 'auto', addedAt: expect.any(String) }));
     expect(waitOnly.service.store.getReminders().filter((r) => r.kind === 'child-watch' && r.status === 'active')).toHaveLength(0);
+    const forced = await waitOnly.service.resubscribeChildWatch('manager-1', waitOnly.childId, 'operator override');
+    expect(forced.watch).not.toBeNull();
+    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: true }));
     waitOnly.service.close();
     const companionOnly = await make(false);
     expect((await companionOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: false, hasLiveCompanionWatch: true, hasLiveWakeupSource: true }));
@@ -366,6 +380,9 @@ describe('HTTP integration through a paseo executable', () => {
         return { value: {}, stdout: '', stderr: '' };
       },
     };
+    await writeFile(path.join(root, 'tracked-children.json'), JSON.stringify({
+      'manager-1\0child-1': { managerId: 'manager-1', childId: 'child-1', source: 'explicit', addedAt: new Date().toISOString() },
+    }));
     const service = new CompanionService(cli as any, new Store(root), undefined, { detect: async () => false });
     await service.init();
     expect((await service.listChildren('manager-1')).children).toHaveLength(1);
@@ -389,7 +406,7 @@ describe('HTTP integration through a paseo executable', () => {
     service.close();
   });
 
-  it('coalesces a burst into one real one-shot run and removes only its successful batch', async () => {
+  it('coalesces a burst into one real one-shot run and retains delivered records until ack', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-'));
     const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
     const state = path.join(root, 'state.json');
@@ -400,19 +417,20 @@ describe('HTTP integration through a paseo executable', () => {
     const posted = await Promise.all(Array.from({ length: 15 }, (_, index) => service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `message-${index}`, urgency: index === 14 ? 'urgent' : 'normal' })));
     const reloaded = new Store(root);
     await reloaded.init();
-    expect(reloaded.getMessages()).toHaveLength(0);
+    expect(reloaded.getMessages()).toHaveLength(15);
     const saved = JSON.parse(await readFile(state, 'utf8'));
     expect(saved.sends).toHaveLength(1);
     const delivery = saved.sends[0];
     expect(delivery.args).toEqual(['send', '--no-wait', '--json', 'manager-1', expect.any(String)]);
     expect(delivery.prompt).toContain(`id=${posted[0].id}`);
-    expect(delivery.prompt).not.toContain('/messages/');
+    expect(delivery.prompt).toContain('/messages/');
     expect(delivery.prompt.indexOf('message-14')).toBeLessThan(delivery.prompt.indexOf('message-0'));
     expect(posted).toHaveLength(15);
     expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'accepted' && message.delivery.transport === 'paseo-send')).toBe(true);
-    expect(service.getMessages()).toHaveLength(0);
+    expect(service.getMessages()).toHaveLength(15);
     expect(service.store.getMessageSchedules().every((item) => item.status !== 'active' && !item.daemonId)).toBe(true);
     expect(await service.deleteMessage(posted[0].id, 'already delivered')).toEqual({ id: posted[0].id, status: 'deleted', retirementPending: false });
+    expect(service.getMessages()).toHaveLength(14);
     await expect(service.deleteMessage('unknown-message-id', 'not present')).rejects.toThrow('message not found');
     service.close();
   });
@@ -434,7 +452,7 @@ describe('HTTP integration through a paseo executable', () => {
     expect(service.getMessages()).toHaveLength(1);
     delete process.env.PASEO_SEND_FAIL;
     await service.reconcileOnce();
-    expect(service.getMessages()).toHaveLength(0);
+    expect(service.getMessages()).toHaveLength(1);
     expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
     service.close();
   });
@@ -471,7 +489,7 @@ describe('HTTP integration through a paseo executable', () => {
     expect(service.getMessages()).toHaveLength(1);
     delete process.env.PASEO_SEND_STATUS;
     await service.reconcileOnce();
-    expect(service.getMessages()).toHaveLength(0);
+    expect(service.getMessages()).toHaveLength(1);
     service.close();
   });
 
@@ -512,7 +530,7 @@ describe('HTTP integration through a paseo executable', () => {
     expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
     await service.reconcileOnce();
     expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
-    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(false);
+    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
     service.close();
   });
 

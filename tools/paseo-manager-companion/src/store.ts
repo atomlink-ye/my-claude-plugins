@@ -1,16 +1,19 @@
 import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord } from './types.js';
+import type { IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WatchdogSnapshot } from './types.js';
 
 export class Store {
   readonly dir: string;
   private reminders: ReminderRecord[] = [];
+  private idleReminders: IdleReminderRecord[] = [];
+  private watchdogSnapshots: Record<string, WatchdogSnapshot> = {};
   private ledger: LedgerRecord[] = [];
   private messages: MessageRecord[] = [];
   private messageSchedules: MessageScheduleRecord[] = [];
   private recoveryReceipts: Record<string, Record<string, { missedFires: number; missedRunIds: string[] }>> = {};
   private childWatchOptOuts: Record<string, { reason: string; updatedAt: string }> = {};
+  private trackedChildren: Record<string, TrackedChildRecord> = {};
   private childWatchOptOutsCorrupt = false;
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
@@ -22,6 +25,8 @@ export class Store {
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
     this.reminders = await this.load<ReminderRecord[]>('reminders.json', []);
+    this.idleReminders = await this.loadDurable<IdleReminderRecord[]>('idle-reminders.json', []);
+    this.watchdogSnapshots = await this.loadDurable<Record<string, WatchdogSnapshot>>('watchdog-snapshots.json', {});
     this.ledger = await this.load<LedgerRecord[]>('ledger.json', []);
     this.messages = await this.loadDurable<MessageRecord[]>('messages.json', []);
     this.messageSchedules = await this.loadDurable<MessageScheduleRecord[]>('message-schedules.json', []);
@@ -41,6 +46,20 @@ export class Store {
       this.childWatchOptOutsCorrupt = true;
       this.childWatchOptOuts = {};
     }
+    const tracked = await this.loadDurable<Record<string, TrackedChildRecord>>('tracked-children.json', {});
+    if (tracked && typeof tracked === 'object' && !Array.isArray(tracked)) this.trackedChildren = tracked;
+    // Preserve upgrade state: any currently live/pending child-watch pair is
+    // considered tracked, but does not clear an explicit opt-out.
+    let migrated = false;
+    for (const reminder of this.reminders) {
+      if (!reminder.subjectChildId || (reminder.kind !== 'child-watch' && reminder.watchKind !== 'child')) continue;
+      if (reminder.status !== 'active' && reminder.status !== 'pending') continue;
+      const key = this.childWatchKey(reminder.agentId, reminder.subjectChildId);
+      if (this.childWatchOptOuts[key] || this.trackedChildren[key]) continue;
+      this.trackedChildren[key] = { managerId: reminder.agentId, childId: reminder.subjectChildId, source: 'migrated', addedAt: new Date().toISOString() };
+      migrated = true;
+    }
+    if (migrated) await this.save('tracked-children.json', this.trackedChildren);
     await this.pruneMessageSchedules();
   }
 
@@ -89,6 +108,31 @@ export class Store {
     await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
   }
 
+  getTrackedChildren(managerId?: string): TrackedChildRecord[] {
+    return Object.values(this.trackedChildren).filter((item) => !managerId || item.managerId === managerId);
+  }
+  isTrackedChild(managerId: string, childId: string): boolean {
+    return Boolean(this.trackedChildren[this.childWatchKey(managerId, childId)]);
+  }
+  async trackChild(managerId: string, childId: string, source: TrackedChildSource): Promise<TrackedChildRecord> {
+    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    delete this.childWatchOptOuts[this.childWatchKey(managerId, childId)];
+    const key = this.childWatchKey(managerId, childId);
+    const prior = this.trackedChildren[key];
+    const record = prior ?? { managerId, childId, source, addedAt: new Date().toISOString() };
+    if (!prior || source === 'explicit') record.source = source;
+    this.trackedChildren[key] = record;
+    await this.save('tracked-children.json', this.trackedChildren);
+    await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
+    return record;
+  }
+  async untrackChild(managerId: string, childId: string, reason: string): Promise<void> {
+    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    delete this.trackedChildren[this.childWatchKey(managerId, childId)];
+    await this.save('tracked-children.json', this.trackedChildren);
+    await this.optOutChildWatch(managerId, childId, reason);
+  }
+
   getReminders(): ReminderRecord[] { return this.reminders; }
   async addReminder(record: ReminderRecord): Promise<void> { this.reminders.push(record); await this.save('reminders.json', this.reminders); }
   async updateReminder(id: string, patch: Partial<ReminderRecord>): Promise<ReminderRecord | undefined> {
@@ -102,6 +146,32 @@ export class Store {
     return this.updateReminder(id, { missedFires: 0, missedRunIds: [] });
   }
   findReminder(id: string): ReminderRecord | undefined { return this.reminders.find((r) => r.id === id || r.daemonId === id); }
+
+  getIdleReminders(): IdleReminderRecord[] { return this.idleReminders; }
+  async addIdleReminder(record: IdleReminderRecord): Promise<void> {
+    this.idleReminders.push(record);
+    await this.save('idle-reminders.json', this.idleReminders);
+  }
+  async updateIdleReminder(id: string, patch: Partial<IdleReminderRecord>): Promise<IdleReminderRecord | undefined> {
+    const item = this.idleReminders.find((record) => record.id === id);
+    if (!item) return undefined;
+    Object.assign(item, patch);
+    await this.save('idle-reminders.json', this.idleReminders);
+    return item;
+  }
+  findIdleReminder(id: string): IdleReminderRecord | undefined { return this.idleReminders.find((record) => record.id === id); }
+
+  getWatchdogSnapshot(managerId: string, childId: string): WatchdogSnapshot | undefined {
+    return this.watchdogSnapshots[`${managerId}\0${childId}`];
+  }
+  async setWatchdogSnapshot(snapshot: WatchdogSnapshot): Promise<void> {
+    this.watchdogSnapshots[`${snapshot.managerId}\0${snapshot.childId}`] = snapshot;
+    await this.save('watchdog-snapshots.json', this.watchdogSnapshots);
+  }
+  async removeWatchdogSnapshot(managerId: string, childId: string): Promise<void> {
+    delete this.watchdogSnapshots[`${managerId}\0${childId}`];
+    await this.save('watchdog-snapshots.json', this.watchdogSnapshots);
+  }
 
   getMessages(): MessageRecord[] { return this.messages; }
   async addMessage(record: MessageRecord): Promise<void> { this.messages.push(record); await this.save('messages.json', this.messages); }

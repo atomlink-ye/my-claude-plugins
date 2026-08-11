@@ -45,6 +45,18 @@ export async function createServer(service = new CompanionService(undefined, und
         const agentId = required(url.searchParams.get('agentId'), 'agentId');
         send(res, 200, await service.listChildren(agentId)); return;
       }
+      const childExactMatch = pathname.match(/^\/children\/([^/]+)$/);
+      if ((method === 'DELETE' || method === 'PUT') && childExactMatch) {
+        const body = await readBody(req);
+        const managerId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
+        const childId = decodeURIComponent(childExactMatch[1]);
+        if (method === 'DELETE') {
+          const reason = required(body.reason, 'reason');
+          const result = await service.unsubscribeChildWatch(managerId, childId, reason);
+          send(res, result.retirementPending ? 202 : 200, result); return;
+        }
+        send(res, 200, await service.resubscribeChildWatch(managerId, childId, typeof body.reason === 'string' ? body.reason : undefined)); return;
+      }
       if (method === 'POST' && pathname === '/spawn') {
         const body = await readBody(req);
         required(body.provider, 'provider'); required(body.title, 'title'); required(body.cwd, 'cwd'); required(body.prompt, 'prompt');
@@ -55,11 +67,28 @@ export async function createServer(service = new CompanionService(undefined, und
         required(body.agentId, 'agentId'); required(body.message, 'message');
         send(res, 201, await service.createReminder(body)); return;
       }
+      if (method === 'POST' && pathname === '/idle-reminders') {
+        const body = await readBody(req);
+        required(body.agentId, 'agentId'); required(body.message, 'message');
+        send(res, 201, await service.createIdleReminder(body)); return;
+      }
+      if (method === 'GET' && pathname === '/idle-reminders') {
+        send(res, 200, await service.listIdleReminders(url.searchParams.get('agentId') || undefined)); return;
+      }
+      const idleReminderMatch = pathname.match(/^\/idle-reminders\/([^/]+)$/);
+      if (method === 'DELETE' && idleReminderMatch) {
+        const body = await readBody(req);
+        const reason = required(body.reason, 'reason');
+        send(res, 200, await service.deleteIdleReminder(decodeURIComponent(idleReminderMatch[1]), reason)); return;
+      }
       if (method === 'POST' && pathname === '/messages') {
         const body = await readBody(req);
         required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
         if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new HttpError(400, 'urgency must be normal or urgent');
         send(res, 201, await service.postMessage(body)); return;
+      }
+      if (method === 'GET' && pathname === '/messages') {
+        send(res, 200, service.getMessages(url.searchParams.get('to') || undefined)); return;
       }
       const messageMatch = pathname.match(/^\/messages\/([^/]+)$/);
       if (method === 'DELETE' && messageMatch) {
@@ -113,7 +142,7 @@ export async function createServer(service = new CompanionService(undefined, und
       send(res, 404, { error: 'not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|message not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
+      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|idle reminder not found|message not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|maxRuns must be a positive integer|thresholdSeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
       send(res, status, { error: message });
     }
   });

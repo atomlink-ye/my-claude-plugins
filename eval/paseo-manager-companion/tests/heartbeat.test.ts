@@ -75,6 +75,11 @@ async function makeService(observer: DirectPayloadObserver, initialReminders: Re
   await writeFile(state, JSON.stringify({ agents, heartbeats: {} }));
   await writeFile(path.join(root, 'reminders.json'), JSON.stringify(initialReminders));
   await writeFile(path.join(root, 'managers.json'), JSON.stringify(initialReminders.length ? ['manager-1'] : []));
+  const tracked = Object.values(agents).filter((agent: any) => agent.ParentAgentId === 'manager-1').map((agent: any) => [
+    `manager-1\0${agent.id ?? agent.Id}`,
+    { managerId: 'manager-1', childId: String(agent.id ?? agent.Id), source: 'explicit', addedAt: new Date().toISOString() },
+  ]);
+  if (tracked.length) await writeFile(path.join(root, 'tracked-children.json'), JSON.stringify(Object.fromEntries(tracked)));
   process.env.PASEO_SHIM_STATE = state;
   await chmod(shim, 0o755);
   const service = new CompanionService(new PaseoCli(shim), new Store(root), observer);
@@ -105,7 +110,9 @@ describe('durable heartbeat reconciliation', () => {
     expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(0);
     expect(service.store.getRecoveryReceipt(firstSchedule.batchIds[0])).toBeDefined();
     expect(firstSchedule.prompt).toContain('missed_fires=3');
-    expect(firstSchedule.prompt).toMatch(/status=working; hasLivePaseoWait=(false|unknown); hasLiveCompanionWatch=(false|unknown); gitDirty=(true|false|unknown)/);
+    expect(firstSchedule.prompt).toContain('Affected sources:');
+    expect(firstSchedule.prompt).toContain('durable and cancellable; no individual message acknowledgement is required');
+    expect(firstSchedule.prompt).not.toContain('/messages/');
 
     observer.logs.set('hb-main', [...observer.logs.get('hb-main')!, run('run-4', '2026-08-11T00:04:00Z', 'failed')]);
     await service.reconcileReminders();
@@ -348,6 +355,9 @@ describe('durable heartbeat reconciliation', () => {
       'manager-1': { id: 'manager-1', Status: 'running' },
       'child-clean': { id: 'child-clean', Id: 'child-clean', ParentAgentId: 'manager-1', Status: 'running', Cwd: repo, Worktree: repo },
     }, heartbeats: {} }));
+    await writeFile(path.join(root, 'tracked-children.json'), JSON.stringify({
+      'manager-1\0child-clean': { managerId: 'manager-1', childId: 'child-clean', source: 'explicit', addedAt: new Date().toISOString() },
+    }));
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
