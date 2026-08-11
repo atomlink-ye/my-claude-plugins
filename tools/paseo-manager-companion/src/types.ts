@@ -74,7 +74,7 @@ export interface MessageRecord {
   from: string;
   body: string;
   urgency: MessageUrgency;
-  status: 'pending' | 'delivered';
+  status: 'pending' | 'delivered' | 'cancelled';
   createdAt: string;
   deliveredAt?: string;
   kind?: 'heartbeat-recovery';

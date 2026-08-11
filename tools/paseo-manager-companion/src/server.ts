@@ -61,6 +61,13 @@ export async function createServer(service = new CompanionService(undefined, und
         if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new HttpError(400, 'urgency must be normal or urgent');
         send(res, 201, await service.postMessage(body)); return;
       }
+      const messageMatch = pathname.match(/^\/messages\/([^/]+)$/);
+      if (method === 'DELETE' && messageMatch) {
+        const body = await readBody(req);
+        const reason = required(body.reason, 'reason');
+        const result = await service.deleteMessage(decodeURIComponent(messageMatch[1]), reason);
+        send(res, result.retirementPending ? 202 : 200, result); return;
+      }
       const reminderMatch = pathname.match(/^\/reminders\/([^/]+)$/);
       if (method === 'DELETE' && reminderMatch) {
         const body = await readBody(req);
@@ -106,7 +113,7 @@ export async function createServer(service = new CompanionService(undefined, und
       send(res, 404, { error: 'not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
+      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|message not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
       send(res, status, { error: message });
     }
   });

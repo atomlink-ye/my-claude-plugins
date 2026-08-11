@@ -38,11 +38,13 @@ if (args[0] === 'ls') {
   if (!hb) process.exit(1);
   out(hb.logs || []);
 } else if (args[0] === 'schedule' && args[1] === 'update') {
+  if (process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT === '1') { process.stderr.write('temporary schedule mutation failure'); process.exit(1); }
   const hb = state.heartbeats[args[2]];
   if (!hb) process.exit(1);
   hb.prompt = args[args.indexOf('--prompt') + 1];
   out(hb);
 } else if (args[0] === 'schedule' && args[1] === 'delete') {
+  if (process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT === '1') { process.stderr.write('temporary schedule mutation failure'); process.exit(1); }
   const hb = state.heartbeats[args[2]];
   if (!hb) process.exit(1);
   hb.status = 'deleted'; out({ id: hb.id, status: 'deleted' });

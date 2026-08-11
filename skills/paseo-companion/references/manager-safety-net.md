@@ -30,12 +30,13 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 |---|---|
 | `GET /children?agentId=<self>` | "What are my child agents doing, and does each one still have a live wakeup source?" Ground-truth enumeration via `ParentAgentId`, not dependent on having spawned through this service. |
 | `POST /spawn` | Fast-path wrapper over `paseo run -d`. Not required for correctness — the reconciliation loop (below) catches children spawned by raw `paseo run` too. |
-| `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — repeats until you `DELETE` it, capped by a TTL (default 30-60min). The daemon delivers it even while you're busy or disconnected. |
+| `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — the current reminder repeats until acknowledged with `DELETE`, capped by a TTL (default 30-60min). Acknowledging an automatic child-watch delivery does not unsubscribe that child; reconciliation arms its next watch. |
 | `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are grouped by sender into one one-shot schedule per recipient (`--max-runs 1`), with urgent messages at the queue head. Delivery is attempted on the next scheduled turn after availability is observed; it never interrupts a running recipient. |
-| `DELETE /reminders/:id` `{reason}` | The explicit "I've decided not to wait anymore" action. `reason` is required — 400 without it. |
+| `DELETE /messages/:id` `{reason}` | Explicitly acknowledge and remove one queued ordinary message. Delivery prompts include the message id and a ready-to-run acknowledgement command. Recovery snapshots retire automatically and do not need this call. |
+| `DELETE /reminders/:id` `{reason}` | Acknowledge this delivered reminder only. It clears that reminder's missed-fire state and has no subscription-policy side effect. `reason` is required — 400 without it. |
 | `DELETE /children/:childId/watch?agentId=` `{reason}` | Persistently stop automatic watch registration for one manager/child pair; all existing copies are retired. |
 | `PUT /children/:childId/watch?agentId=` `{reason?}` | Explicitly restore automatic watch registration for the pair. |
-| `DELETE /heartbeats/:id` `{reason}` | Delete a listed heartbeat id (or an unambiguous 8+ character prefix); child-watch deletion is treated as pair unsubscribe. |
+| `DELETE /heartbeats/:id` `{reason}` | Delete a listed heartbeat id (or an unambiguous 8+ character prefix). Deleting a child-watch heartbeat is an explicit persistent pair unsubscribe; prefer the child-watch route above when the child identity is known. |
 | `POST /compact-wake` `{agentId, resumeSteps}` | Call right before self-compact. Arms a fallback heartbeat immediately, then watches for you to go idle and *stay* idle for a debounce window before delivering `resumeSteps` — not a blind fixed delay. |
 | `GET /children/:id/briefing` | The "what happened while I was waiting" report §2 of PROPOSAL.md asks for: commits, uncommitted changes, diff stat. Reads git directly (not `paseo logs` — see UPSTREAM.md #6). |
 | `POST /ledger` `{type, target, verdict, reason, recovery?}` | park / known-red / deferred, unified. Missing `verdict` or `reason` → 400, always, no exceptions. |
@@ -52,6 +53,14 @@ Decision guide: use `paseo send` for a deliberate follow-up when interruption is
 safe; `/reminders` for a repeated/time-based nudge needing explicit acknowledgement;
 `/messages` for durable asynchronous worker content that should be coalesced without
 interrupting a running worker.
+
+Heartbeat-recovery snapshots are different from ordinary `/messages`: they are
+attempt-once observations, not durable instructions. Once one delivery schedule is
+successfully armed, that snapshot is retired locally instead of being rescheduled
+after it becomes stale. Child summary fields use the same camelCase names as
+`GET /children`: `hasLivePaseoWait`, `hasLiveCompanionWatch`, and `gitDirty`.
+Terminal message-schedule history is bounded to the newest 50 records; every live
+schedule is retained regardless of age.
 
 ## What it does NOT guarantee
 

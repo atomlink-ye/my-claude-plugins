@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PaseoCli } from '../../../tools/paseo-manager-companion/src/cli.js';
 import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
 import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
@@ -21,6 +21,7 @@ afterEach(async () => {
   delete process.env.PASEO_CONCURRENCY_STATE;
   delete process.env.PASEO_CONCURRENCY_FAIL;
   delete process.env.PASEO_DELETE_TRANSIENT;
+  delete process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT;
 });
 
 async function request(base: string, method: string, route: string, body?: unknown) {
@@ -36,7 +37,7 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     process.env.PASEO_AGENT_ID = 'manager-1';
     await chmod(shim, 0o755);
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
     running = await createServer(service);
     await new Promise<void>((resolve) => running!.server.listen(0, '127.0.0.1', resolve));
     const address = running.server.address();
@@ -52,6 +53,10 @@ describe('HTTP integration through a paseo executable', () => {
     expect(reminder.status).toBe(201);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, { reason: 'done' })).status).toBe(200);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, {})).status).toBe(400);
+    const message = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'explicit message' });
+    expect(message.status).toBe(201);
+    expect((await request(base, 'DELETE', `/messages/${message.body.id}`, {})).status).toBe(400);
+    expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'handled' })).status).toBe(200);
     expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', resumeSteps: 'read state; continue' })).status).toBe(202);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: 'parked', reason: 'waiting', recovery: 'resume later' })).status).toBe(201);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: '', reason: '' })).status).toBe(400);
@@ -188,21 +193,23 @@ describe('HTTP integration through a paseo executable', () => {
     restarted.close();
   });
 
-  it('turns deleting one child-watch reminder into a pair opt-out and retires every copy', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-delete-pair-'));
+  it('acknowledging a child-watch reminder leaves opt-out disabled and reconciliation replaces it', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-ack-'));
     const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root)); await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'duplicate watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await service.spawn({ provider: 'shim', title: 'ack watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
     const childId = String((child as any).id);
-    const copyA = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'a', name: 'copy-a' });
-    const copyB = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'b', name: 'copy-b' });
-    await service.deleteReminder(copyA.id, 'stop watching');
-    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(true);
-    expect(service.store.findReminder(copyA.id)?.status).toBe('deleted');
-    expect(service.store.findReminder(copyB.id)?.status).toBe('deleted');
+    const watch = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'watch' });
+    await service.store.updateReminder(watch.id, { missedFires: 2, missedRunIds: ['ack-run'] });
+    await service.deleteReminder(watch.id, 'acknowledged');
+    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(false);
+    expect(service.store.findReminder(watch.id)?.status).toBe('deleted');
+    expect(service.store.findReminder(watch.id)?.missedFires).toBe(0);
     await service.reconcileOnce();
-    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    const active = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
+    expect(active).toHaveLength(1);
+    expect(active[0].id).not.toBe(watch.id);
     service.close();
   });
 
@@ -339,6 +346,28 @@ describe('HTTP integration through a paseo executable', () => {
     service.close();
   });
 
+  it('caches known non-child parents while refreshing known children on the next listing', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-parent-cache-'));
+    const inspectCalls: string[] = [];
+    const cli = {
+      run: async (args: string[]) => {
+        if (args[0] === 'ls') return { value: [{ id: 'other-1' }, { id: 'child-1' }], stdout: '', stderr: '' };
+        if (args[0] === 'inspect') {
+          inspectCalls.push(args[1]);
+          const parent = args[1] === 'child-1' ? 'manager-1' : null;
+          return { value: { Id: args[1], ParentAgentId: parent, Status: 'working' }, stdout: '', stderr: '' };
+        }
+        return { value: {}, stdout: '', stderr: '' };
+      },
+    };
+    const service = new CompanionService(cli as any, new Store(root), undefined, { detect: async () => false });
+    await service.init();
+    expect((await service.listChildren('manager-1')).children).toHaveLength(1);
+    expect((await service.listChildren('manager-1')).children).toHaveLength(1);
+    expect(inspectCalls).toEqual(['other-1', 'child-1', 'child-1']);
+    service.close();
+  });
+
   it('does not conclude all children are done when the child listing is partial', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-partial-'));
     const shim = fileURLToPath(new URL('../fixtures/partial-shim.mjs', import.meta.url));
@@ -371,7 +400,8 @@ describe('HTTP integration through a paseo executable', () => {
     expect(active).toHaveLength(1);
     const schedule = active[0] as any;
     expect(schedule.maxRuns).toBe(1);
-    expect(schedule.prompt).not.toMatch(/ack/i);
+    expect(schedule.prompt).toContain(`id=${posted[0].id}`);
+    expect(schedule.prompt).toContain(`/messages/${posted[0].id}`);
     expect(schedule.prompt.indexOf('message-14')).toBeLessThan(schedule.prompt.indexOf('message-0'));
     expect(posted).toHaveLength(15);
     await new PaseoCli(shim).run(['fire', schedule.id]);
@@ -410,6 +440,87 @@ describe('HTTP integration through a paseo executable', () => {
     await new PaseoCli(shim).run(['fire', active.id]);
     await service.reconcileOnce();
     expect(service.getMessages(childId)).toHaveLength(0);
+    service.close();
+  });
+
+  it('deletes one queued message while preserving the other batch item', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-delete-'));
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await service.init();
+    const first = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'remove me' });
+    const second = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'keep me' });
+    const result = await service.deleteMessage(first.id, 'no longer needed');
+    expect(result).toEqual(expect.objectContaining({ id: first.id, status: 'deleted', retirementPending: false }));
+    expect(service.getMessages().map((message) => message.id)).toEqual([second.id]);
+    const active = service.store.getMessageSchedules().find((schedule) => schedule.status === 'active')!;
+    expect(active.batchIds).toEqual([second.id]);
+    expect(active.prompt).not.toContain(first.id);
+    expect(active.prompt).toContain(second.id);
+    service.close();
+  });
+
+  it('keeps a cancellation tombstone until a failed live-schedule retirement succeeds', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-delete-retry-'));
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await service.init();
+    const message = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'cancel me durably' });
+    process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT = '1';
+    const pending = await service.deleteMessage(message.id, 'processed despite stale daemon status');
+    expect(pending.retirementPending).toBe(true);
+    expect(service.getMessages().find((item) => item.id === message.id)?.status).toBe('cancelled');
+    delete process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT;
+    await service.reconcileOnce();
+    expect(service.getMessages().some((item) => item.id === message.id)).toBe(false);
+    expect(service.store.getMessageSchedules().some((item) => item.batchIds.includes(message.id) && ['pending', 'active', 'running'].includes(item.status))).toBe(false);
+    service.close();
+  });
+
+  it('retains every live message schedule and only the newest 50 terminal records', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-prune-'));
+    const terminal = Array.from({ length: 60 }, (_, index) => ({
+      id: `terminal-${index}`,
+      recipient: 'manager-1',
+      generation: `generation-${index}`,
+      batchIds: [],
+      prompt: 'done',
+      status: index % 2 ? 'completed' : 'deleted',
+      createdAt: new Date(Date.UTC(2026, 7, 11, 0, index)).toISOString(),
+    }));
+    const live = { id: 'live', recipient: 'manager-1', generation: 'live', batchIds: [], prompt: 'live', status: 'active', createdAt: '2026-08-10T00:00:00.000Z' };
+    await writeFile(path.join(root, 'message-schedules.json'), JSON.stringify([...terminal, live]));
+    const store = new Store(root);
+    await store.init();
+    expect(store.getMessageSchedules()).toHaveLength(51);
+    expect(store.getMessageSchedules().some((item) => item.id === 'live')).toBe(true);
+    expect(store.getMessageSchedules().some((item) => item.id === 'terminal-59')).toBe(true);
+    expect(store.getMessageSchedules().some((item) => item.id === 'terminal-0')).toBe(false);
+  });
+
+  it('keeps an armed recovery schedule live when local receipt persistence fails once', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-recovery-receipt-retry-'));
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const store = new Store(root);
+    const applyReceipt = store.applyRecoveryReceipt.bind(store);
+    vi.spyOn(store, 'applyRecoveryReceipt').mockRejectedValueOnce(new Error('disk unavailable')).mockImplementation(applyReceipt);
+    const service = new CompanionService(new PaseoCli(paseoShim), store);
+    await service.init();
+    const recovery = await service.postMessage({
+      to: 'manager-1', from: 'companion', body: 'attempt once', kind: 'heartbeat-recovery',
+      recoveryManagerId: 'manager-1', recoveryCounts: {}, recoveryRunIds: {},
+    });
+    expect(service.store.getMessageSchedules().filter((item) => item.status === 'active')).toHaveLength(1);
+    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
+    await service.reconcileOnce();
+    expect(service.store.getMessageSchedules().filter((item) => item.status === 'active')).toHaveLength(1);
+    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(false);
     service.close();
   });
 

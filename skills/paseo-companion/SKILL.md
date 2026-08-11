@@ -30,6 +30,14 @@ re-armed; successful delivery removes only that schedule generation's captured
 batch. Delivery uses `schedule inspect`/`schedule logs` for run truth and never
 injects a message into a running worker.
 
+Automatic heartbeat-recovery snapshots are attempt-once rather than durable
+instructions: after a one-shot delivery schedule is armed, the snapshot is retired
+locally so an aging full child snapshot is not repeatedly re-delivered. Ordinary
+worker `/messages` retain the durable retry-until-success behavior above.
+Each ordinary delivery includes its message id and a `DELETE /messages/:id`
+acknowledgement command for cases where daemon run status disagrees with visible
+delivery; `reason` is required.
+
 This supersedes the older “worker intermediate updates are unavailable” guidance:
 use `/messages` for durable updates, and reserve `send` for safe direct steering.
 

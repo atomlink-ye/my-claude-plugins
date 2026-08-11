@@ -41,6 +41,7 @@ export class Store {
       this.childWatchOptOutsCorrupt = true;
       this.childWatchOptOuts = {};
     }
+    await this.pruneMessageSchedules();
   }
 
   private async load<T>(file: string, fallback: T): Promise<T> {
@@ -154,6 +155,17 @@ export class Store {
     Object.assign(item, patch);
     await this.save('message-schedules.json', this.messageSchedules);
     return item;
+  }
+  async pruneMessageSchedules(maxTerminal = 50): Promise<void> {
+    const live = new Set<MessageScheduleRecord['status']>(['pending', 'active', 'running']);
+    const terminal = this.messageSchedules
+      .filter((schedule) => !live.has(schedule.status))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const keep = new Set(terminal.slice(0, maxTerminal).map((schedule) => schedule.id));
+    const next = this.messageSchedules.filter((schedule) => live.has(schedule.status) || keep.has(schedule.id));
+    if (next.length === this.messageSchedules.length) return;
+    this.messageSchedules = next;
+    await this.save('message-schedules.json', this.messageSchedules);
   }
 
   getLedger(): LedgerRecord[] { return this.ledger; }

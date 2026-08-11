@@ -100,26 +100,26 @@ describe('durable heartbeat reconciliation', () => {
     saved.agents['manager-1'].Status = 'idle';
     await writeFile(state, JSON.stringify(saved));
     await service.reconcileReminders();
-    const firstMessage = service.store.getMessages()[0];
     const firstSchedule = service.store.getMessageSchedules().find((item) => item.status === 'active')!;
-    expect(service.store.getMessages()).toHaveLength(1);
+    expect(service.store.getMessages()).toHaveLength(0);
     expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
-    expect(firstMessage.body).toContain('missed_fires=3');
-    expect(firstMessage.body).toContain('last_delivered_at=2026-08-11T00:00:00Z');
-    expect(firstMessage.body).toMatch(/status=working; paseo_wait=(false|unknown); companion_watch=(false|unknown); git_dirty=(true|false|unknown)/);
+    expect(service.store.getRecoveryReceipt(firstSchedule.batchIds[0])).toBeDefined();
+    expect(firstSchedule.prompt).toContain('missed_fires=3');
+    expect(firstSchedule.prompt).toMatch(/status=working; hasLivePaseoWait=(false|unknown); hasLiveCompanionWatch=(false|unknown); gitDirty=(true|false|unknown)/);
 
     observer.logs.set('hb-main', [...observer.logs.get('hb-main')!, run('run-4', '2026-08-11T00:04:00Z', 'failed')]);
     await service.reconcileReminders();
-    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(4);
+    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
     observer.schedules.set(firstSchedule.daemonId!, { id: firstSchedule.daemonId, status: 'completed' });
     observer.logs.set(firstSchedule.daemonId!, [run('delivery-1', '2026-08-11T00:05:00Z', 'succeeded')]);
     await service.reconcileOnce();
-    expect(service.store.findReminder('local-heartbeat')!.missedRunIds).toEqual(['run-4']);
+    expect(service.store.findReminder('local-heartbeat')!.missedRunIds).toEqual([]);
     expect(service.store.getMessages()).toHaveLength(0);
+    const secondSchedules = service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status));
+    expect(secondSchedules).toHaveLength(1);
     await service.reconcileOnce();
-    const nextMessage = service.store.getMessages()[0];
-    expect(nextMessage.body).toContain('missed_fires=1');
-    expect(nextMessage.recoveryRunIds?.['local-heartbeat']).toEqual(['run-4']);
+    expect(service.store.getMessages()).toHaveLength(0);
+    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
     service.close();
   });
 
@@ -137,7 +137,7 @@ describe('durable heartbeat reconciliation', () => {
     expect(response.status).toBe(200);
     const [heartbeat] = await response.json() as any[];
     expect(Object.keys(heartbeat).sort()).toEqual(['alive', 'cron', 'id', 'last_delivered_at', 'last_fired_at', 'missed_fires', 'next_run'].sort());
-    expect(heartbeat).toEqual({ id: 'hb-main', cron: '*/5 * * * *', last_fired_at: '2026-08-11T00:01:00Z', last_delivered_at: '2026-08-11T00:00:00Z', missed_fires: 1, next_run: '2026-08-11T01:00:00Z', alive: true });
+    expect(heartbeat).toEqual({ id: 'hb-main', cron: '*/5 * * * *', last_fired_at: '2026-08-11T00:01:00Z', last_delivered_at: '2026-08-11T00:00:00Z', missed_fires: 0, next_run: '2026-08-11T01:00:00Z', alive: true });
     service.close();
     running = undefined;
 
@@ -146,7 +146,7 @@ describe('durable heartbeat reconciliation', () => {
     restartedObserver.logs.set('hb-main', observer.logs.get('hb-main')!);
     const restarted = new CompanionService(new PaseoCli(shim), new Store(root), restartedObserver);
     await restarted.init();
-    expect(restarted.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
+    expect(restarted.store.findReminder('local-heartbeat')!.missedFires).toBe(0);
     expect(restarted.store.findReminder('local-heartbeat')!.observedRunIds).toEqual(['run-success', 'run-failed']);
     restarted.close();
   });
@@ -176,6 +176,26 @@ describe('durable heartbeat reconciliation', () => {
     expect(ambiguous.status).toBe(409);
     const unique = await fetch(`${base}/heartbeats/deadbeef-2`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'done' }) });
     expect(unique.status).toBe(200);
+    service.close();
+  });
+
+  it('deleting a child heartbeat explicitly opts out and prevents re-registration', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.schedules.set('hb-child', { id: 'hb-child', status: 'active' });
+    const childWatch = reminder({ id: 'child-watch-local', daemonId: 'hb-child', kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1' });
+    const { state, service } = await makeService(observer, [childWatch], {
+      'manager-1': { id: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
+      'child-1': { id: 'child-1', Id: 'child-1', ParentAgentId: 'manager-1', Status: 'working', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
+    });
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    saved.heartbeats['hb-child'] = { id: 'hb-child', status: 'active', logs: [] };
+    await writeFile(state, JSON.stringify(saved));
+
+    await service.deleteHeartbeat('hb-child', 'stop watching');
+    expect(service.store.isChildWatchOptedOut('manager-1', 'child-1')).toBe(true);
+    expect(service.store.findReminder('child-watch-local')?.status).toBe('deleted');
+    await service.reconcileOnce();
+    expect(service.store.getReminders().filter((item) => item.subjectChildId === 'child-1' && item.status === 'active')).toHaveLength(0);
     service.close();
   });
 
@@ -378,5 +398,25 @@ describe('durable heartbeat reconciliation', () => {
     const result = await service.deleteReminder('direct-local', 'already gone');
     expect(result).toEqual({ id: 'direct-local', status: 'deleted' });
     expect(service.store.findReminder('direct-local')?.status).toBe('deleted');
+  });
+
+  it('retains active message schedules and only the newest fifty terminal records', async () => {
+    const observer = new DirectPayloadObserver();
+    const { root, service } = await makeService(observer);
+    const schedules = Array.from({ length: 55 }, (_, index) => ({
+      id: `terminal-${index}`, recipient: 'manager-1', generation: `g-${index}`, batchIds: [], prompt: `terminal-${index}`,
+      status: 'completed' as const, createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    }));
+    schedules.push({ id: 'active-live', recipient: 'manager-1', generation: 'g-active', batchIds: [], prompt: 'active', status: 'active' as const, daemonId: 'daemon-live', createdAt: new Date().toISOString() });
+    await writeFile(path.join(root, 'message-schedules.json'), JSON.stringify(schedules));
+    service.close();
+    const restarted = new CompanionService(new PaseoCli(shim), new Store(root), observer);
+    await restarted.init();
+    const retained = restarted.store.getMessageSchedules();
+    expect(retained).toHaveLength(51);
+    expect(retained.some((schedule) => schedule.id === 'terminal-0')).toBe(false);
+    expect(retained.some((schedule) => schedule.id === 'terminal-54')).toBe(true);
+    expect(retained.find((schedule) => schedule.id === 'active-live')).toEqual(expect.objectContaining({ status: 'active', daemonId: 'daemon-live' }));
+    restarted.close();
   });
 });
