@@ -18,7 +18,7 @@ if (args[0] === 'ls') {
   out({ agentId: id, status: 'running', provider: 'shim', cwd: state.agents[id].Cwd });
 } else if (args[0] === 'heartbeat' && args[1] === 'create') {
   const id = `hb-${Object.keys(state.heartbeats).length + 1}`;
-  state.heartbeats[id] = { id, status: 'active', nextRunAt: '2026-08-08T00:05:00.000Z', lastRunAt: null, cron: args[args.indexOf('--cron') + 1], prompt: args[2], maxRuns: args.includes('--max-runs') ? Number(args[args.indexOf('--max-runs') + 1]) : undefined, target: agentId, logs: [] };
+  state.heartbeats[id] = { id, status: 'active', nextRunAt: '2026-08-08T00:05:00.000Z', lastRunAt: null, cron: args[args.indexOf('--cron') + 1], expiresIn: args[args.indexOf('--expires-in') + 1], prompt: args[2], maxRuns: args.includes('--max-runs') ? Number(args[args.indexOf('--max-runs') + 1]) : undefined, target: agentId, logs: [] };
   out(state.heartbeats[id]);
 } else if (args[0] === 'heartbeat' && args[1] === 'update') {
   const hb = state.heartbeats[args[2]];
@@ -27,6 +27,7 @@ if (args[0] === 'ls') {
 } else if (args[0] === 'heartbeat' && args[1] === 'delete') {
   const hb = state.heartbeats[args[2]];
   if (!hb) process.exit(1);
+  if (process.env.PASEO_DELETE_TRANSIENT === '1') { process.stderr.write('temporary network reset'); process.exit(1); }
   hb.status = 'deleted'; out({ id: hb.id, status: 'deleted' });
 } else if (args[0] === 'schedule' && args[1] === 'inspect') {
   const hb = state.heartbeats[args[2]];

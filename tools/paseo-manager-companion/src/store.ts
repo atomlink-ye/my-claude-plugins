@@ -130,6 +130,7 @@ export class Store {
     return record;
   }
   async revokeLedger(record: LedgerRecord, reason: string): Promise<void> {
+    if (record.revokedAt) return;
     record.revokedAt = new Date().toISOString();
     record.revokeReason = reason;
     await this.save('ledger.json', this.ledger);

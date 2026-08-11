@@ -1,4 +1,6 @@
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +10,8 @@ import { createServer } from '../../../tools/paseo-manager-companion/src/server.
 import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
 import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
 import type { ReminderRecord } from '../../../tools/paseo-manager-companion/src/types.js';
+
+const execFile = promisify(execFileCallback);
 
 type Run = {
   id: string;
@@ -61,7 +65,7 @@ function reminder(overrides: Partial<ReminderRecord> = {}): ReminderRecord {
   return {
     id: 'local-heartbeat', daemonId: 'hb-main', agentId: 'manager-1', name: 'manager-heartbeat', prompt: 'check',
     cron: '*/5 * * * *', expiresIn: '30m', status: 'active', alive: true,
-    createdAt: '2026-08-11T00:00:00Z', ...overrides,
+    createdAt: new Date().toISOString(), ...overrides,
   };
 }
 
@@ -123,7 +127,7 @@ describe('durable heartbeat reconciliation', () => {
     const observer = new DirectPayloadObserver();
     observer.schedules.set('hb-main', { id: 'hb-main', status: 'active', nextRun: '2026-08-11T01:00:00Z' });
     observer.logs.set('hb-main', [run('run-success', '2026-08-11T00:00:00Z', 'succeeded'), run('run-failed', '2026-08-11T00:01:00Z', 'failed')]);
-    const initial = reminder();
+    const initial = reminder({ expiresIn: '1d' });
     const { root, service } = await makeService(observer, [initial]);
     running = await createServer(service);
     await new Promise<void>((resolve) => running!.server.listen(0, '127.0.0.1', resolve));
@@ -174,6 +178,18 @@ describe('durable heartbeat reconciliation', () => {
     transient.close();
   });
 
+  it('rebuilds a missing heartbeat with only its remaining TTL', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.modes.set('hb-ttl', 'missing');
+    const createdAt = new Date(Date.now() - 120_000).toISOString();
+    const { state, service } = await makeService(observer, [reminder({ id: 'ttl-local', daemonId: 'hb-ttl', expiresIn: '300s', createdAt })]);
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    const created = Object.values(saved.heartbeats)[0] as any;
+    expect(Number.parseInt(created.expiresIn, 10)).toBeLessThan(300);
+    expect(Number.parseInt(created.expiresIn, 10)).toBeGreaterThan(0);
+    service.close();
+  });
+
   it('replaces a dead all-silent fallback but leaves a live fallback idempotent', async () => {
     const deadObserver = new DirectPayloadObserver();
     const dead = await makeService(deadObserver, [reminder({ id: 'dead-fallback', daemonId: undefined, name: 'dead-fallback', kind: 'generic', status: 'dead', alive: false })], {
@@ -196,5 +212,75 @@ describe('durable heartbeat reconciliation', () => {
     expect(live.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active').map((item) => item.id)).toEqual(firstIds);
     expect(live.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active')).toHaveLength(1);
     live.service.close();
+  });
+
+  it('resolves only git worktree/cwd paths and reports clean, dirty, or unknown', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-git-'));
+    const repo = path.join(root, 'repo');
+    await execFile('mkdir', ['-p', repo]);
+    await execFile('git', ['-C', repo, 'init', '-q']);
+    await execFile('git', ['-C', repo, 'config', 'user.email', 'test@example.com']);
+    await execFile('git', ['-C', repo, 'config', 'user.name', 'test']);
+    await writeFile(path.join(repo, 'tracked.txt'), 'clean\n');
+    await execFile('git', ['-C', repo, 'add', 'tracked.txt']);
+    await execFile('git', ['-C', repo, 'commit', '-qm', 'initial']);
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {
+      'manager-1': { id: 'manager-1', Status: 'running' },
+      'child-clean': { id: 'child-clean', Id: 'child-clean', ParentAgentId: 'manager-1', Status: 'running', Cwd: repo, Worktree: repo },
+    }, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    let children = await service.listChildren('manager-1');
+    expect(children.children[0]).toEqual(expect.objectContaining({ cwd: repo, gitDirty: false }));
+    await writeFile(path.join(repo, 'dirty.txt'), 'dirty\n');
+    children = await service.listChildren('manager-1');
+    expect(children.children[0].gitDirty).toBe(true);
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    // Even a clean git Cwd is untrusted without explicit Worktree metadata.
+    saved.agents['child-clean'].Cwd = repo;
+    delete saved.agents['child-clean'].Worktree;
+    await writeFile(state, JSON.stringify(saved));
+    children = await service.listChildren('manager-1');
+    expect(children.children[0].cwd).toBeUndefined();
+    expect(children.children[0].gitDirty).toBe('unknown');
+    service.close();
+  });
+
+  it('reports expired heartbeats as dead and deletes a missing daemon schedule idempotently', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.modes.set('hb-expired', 'missing');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-expired-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    const deleteShim = fileURLToPath(new URL('../fixtures/not-found-delete-shim.mjs', import.meta.url));
+    await chmod(deleteShim, 0o755);
+    await writeFile(path.join(root, 'reminders.json'), JSON.stringify([reminder({ id: 'expired-local', daemonId: 'hb-expired', expiresIn: '1s', createdAt: '2020-01-01T00:00:00Z' })]));
+    await writeFile(path.join(root, 'managers.json'), JSON.stringify(['manager-1']));
+    const service = new CompanionService(new PaseoCli(deleteShim), new Store(root), observer);
+    await service.init();
+    const heartbeats = await service.listHeartbeats();
+    expect(heartbeats[0].alive).toBe(false);
+    expect(JSON.parse(await readFile(state, 'utf8')).heartbeats).toEqual({});
+    running = await createServer(service);
+    await new Promise<void>((resolve) => running!.server.listen(0, '127.0.0.1', resolve));
+    const address = running.server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    const response = await fetch(`http://127.0.0.1:${port}/reminders/expired-local`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'expired' }) });
+    expect(response.status).toBe(200);
+    expect(service.store.findReminder('expired-local')?.status).toBe('deleted');
+    service.close();
+  });
+
+  it('treats structured daemon-missing evidence as idempotent before local expiry', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.modes.set('hb-direct-missing', 'missing');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-direct-delete-'));
+    await writeFile(path.join(root, 'reminders.json'), JSON.stringify([reminder({ id: 'direct-local', daemonId: 'hb-direct-missing', expiresIn: '1d' })]));
+    const service = new CompanionService(new PaseoCli(shim), new Store(root), observer);
+    await service.store.init();
+    const result = await service.deleteReminder('direct-local', 'already gone');
+    expect(result).toEqual({ id: 'direct-local', status: 'deleted' });
+    expect(service.store.findReminder('direct-local')?.status).toBe('deleted');
   });
 });

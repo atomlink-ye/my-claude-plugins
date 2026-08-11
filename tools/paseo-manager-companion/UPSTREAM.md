@@ -15,6 +15,10 @@ Heartbeat registrations are observed through the Paseo daemon's direct schedule 
 (`DaemonClient.scheduleList/Inspect/Logs`); the CLI remains reserved for mutations
 such as heartbeat create/delete. This supersedes the earlier note that the daemon has
 no `heartbeat ls`/`inspect` and that ids must be probed with `heartbeat update`.
+Agent-scoped heartbeat schedules are not visible through the public CLI's
+`schedule ls`/`schedule inspect` path; the companion therefore uses the direct
+daemon schedule observer for registration and run observations. CLI list output
+must not be treated as proof that an agent-scoped heartbeat is absent.
 The companion persists run ids and cursors because the daemon does not push run events;
 `last_fired_at` is therefore taken only from a run's `startedAt`/`scheduledFor`, never
 from a cron-derived next-run value. A missing schedule is rebuilt only for an explicit
