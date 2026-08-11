@@ -608,7 +608,18 @@ export class CompanionService {
   async deleteMessage(id: string, reason: string): Promise<{ id: string; status: 'deleted'; retirementPending: boolean }> {
     if (!reason?.trim()) throw new Error('reason is required');
     const message = this.store.getMessages().find((item) => item.id === id);
-    if (!message) throw new Error('message not found');
+    if (!message) {
+      // Successful one-shot delivery removes the message receipt locally, but
+      // its terminal schedule remains durable. A prior cancellation likewise
+      // leaves either a deleted schedule or the explicit deletion ledger
+      // record. Treat those records as proof for idempotent DELETE retries;
+      // unknown IDs still return 404.
+      const delivered = this.store.getMessageSchedules().some((schedule) => schedule.batchIds.includes(id) && schedule.status === 'completed');
+      const retired = this.store.getMessageSchedules().some((schedule) => schedule.batchIds.includes(id) && schedule.status === 'deleted')
+        || this.store.getLedger().some((record) => record.type === 'deferred' && record.target === id && record.verdict === 'message-deleted');
+      if (delivered || retired) return { id, status: 'deleted', retirementPending: false };
+      throw new Error('message not found');
+    }
     await this.store.updateMessage(id, { status: 'cancelled' });
     const retirementPending = await this.cleanupCancelledMessage(id);
     if (!retirementPending) await this.store.removeMessages([id]);

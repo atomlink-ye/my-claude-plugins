@@ -44,12 +44,16 @@ describe('paseo manager companion', () => {
     expect(created).toBe(2);
   });
 
-  it('matches full UUID waits launched with a safe prefix without shell self-matches', () => {
-    const id = '01d5fe32-c7f2-4c39-b973-e053c436b8a1';
+  it('matches real paseo wait argv with a seven-character UUID prefix without shell self-matches', () => {
+    const id = '2291059d-c7f2-4c39-b973-e053c436b8a1';
+    expect(commandIsPaseoWait('node --disable-warning=DEP0040 /opt/homebrew/bin/paseo wait 2291059 --timeout 900', id)).toBe(true);
     expect(commandIsPaseoWait(`paseo wait ${id.slice(0, 8)} --timeout 1800`, id)).toBe(true);
     expect(commandIsPaseoWait(`paseo wait ${id} --timeout 1800`, id.slice(0, 8))).toBe(true);
     expect(commandIsPaseoWait(`sh -c "paseo wait ${id}"`, id)).toBe(false);
-    expect(commandIsPaseoWait(`paseo wait ${id.slice(0, 7)}`, id)).toBe(false);
+    expect(commandIsPaseoWait(`paseo wait 2291058 --timeout 900`, id)).toBe(false);
+    expect(commandIsPaseoWait(`node --disable-warning=DEP0040 /opt/homebrew/bin/paseo wait 2291059d-near-prefix --timeout 900`, id)).toBe(false);
+    expect(commandIsPaseoWait(`node --require /opt/homebrew/bin/paseo wait 2291059 --timeout 900`, id)).toBe(false);
+    expect(commandIsPaseoWait(`node --disable-warning=DEP0040 /opt/homebrew/bin/paseo wait 2291059 --timeout 900`, id.replace(/^2291059d/, '2291058d'))).toBe(false);
     expect(commandIsPaseoWait(`paseo wait ${id}-near-prefix`, id)).toBe(false);
   });
 });

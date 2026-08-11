@@ -38,7 +38,11 @@ export function commandIsPaseoWait(command: string, agentId: string): boolean {
   if (path.basename(argv[0] ?? '') === 'paseo') return argv[1] === 'wait' && waitTargetMatches(argv[2], agentId);
   if (path.basename(argv[0] ?? '') !== 'node') return false;
   let index = 1;
-  while (index < argv.length && argv[index].startsWith('-')) index++;
+  const nodeOptionsWithValues = new Set(['-e', '--eval', '-p', '--print', '-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '--inspect-port']);
+  while (index < argv.length && argv[index].startsWith('-')) {
+    const option = argv[index++];
+    if (!option.includes('=') && nodeOptionsWithValues.has(option)) index++;
+  }
   if (path.basename(argv[index] ?? '') !== 'paseo') return false;
   return argv[index + 1] === 'wait' && waitTargetMatches(argv[index + 2], agentId);
 }
@@ -46,11 +50,16 @@ export function commandIsPaseoWait(command: string, agentId: string): boolean {
 function waitTargetMatches(target: string | undefined, agentId: string): boolean {
   if (!target || !agentId) return false;
   if (target === agentId) return true;
-  // Paseo commonly runs waits with an 8-character id prefix. Accept either
-  // side as a prefix only when it is long enough to avoid accidental matches.
-  const fullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(agentId);
-  if (fullUuid) return target.length >= 8 && target.length < agentId.length && agentId.startsWith(target);
-  return (target.length >= 8 && agentId.startsWith(target)) || (agentId.length >= 8 && target.startsWith(agentId));
+  // Paseo may shorten UUID targets to a hexadecimal prefix (including the
+  // seven-character form emitted by the real CLI). Restrict prefix matching
+  // to UUID-shaped values so arbitrary command-line substrings cannot count as
+  // a live wait source.
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const targetIsUuid = uuid.test(target);
+  const agentIsUuid = uuid.test(agentId);
+  if (agentIsUuid) return /^[0-9a-f]{7,}$/i.test(target) && agentId.toLowerCase().startsWith(target.toLowerCase());
+  if (targetIsUuid) return /^[0-9a-f]{7,}$/i.test(agentId) && target.toLowerCase().startsWith(agentId.toLowerCase());
+  return false;
 }
 
 /** macOS-compatible implementation; it intentionally avoids a shell/grep pipeline. */

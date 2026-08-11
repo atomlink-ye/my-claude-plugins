@@ -61,6 +61,8 @@ describe('HTTP integration through a paseo executable', () => {
     expect(message.status).toBe(201);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, {})).status).toBe(400);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'handled' })).status).toBe(200);
+    expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'retry handled' })).status).toBe(200);
+    expect((await request(base, 'DELETE', '/messages/unknown-message-id', { reason: 'not present' })).status).toBe(404);
     expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', resumeSteps: 'read state; continue' })).status).toBe(202);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: 'parked', reason: 'waiting', recovery: 'resume later' })).status).toBe(201);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: '', reason: '' })).status).toBe(400);
@@ -410,6 +412,8 @@ describe('HTTP integration through a paseo executable', () => {
     expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'accepted' && message.delivery.transport === 'paseo-send')).toBe(true);
     expect(service.getMessages()).toHaveLength(0);
     expect(service.store.getMessageSchedules().every((item) => item.status !== 'active' && !item.daemonId)).toBe(true);
+    expect(await service.deleteMessage(posted[0].id, 'already delivered')).toEqual({ id: posted[0].id, status: 'deleted', retirementPending: false });
+    await expect(service.deleteMessage('unknown-message-id', 'not present')).rejects.toThrow('message not found');
     service.close();
   });
 
