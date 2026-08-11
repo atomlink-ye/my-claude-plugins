@@ -31,8 +31,8 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 | `GET /children?agentId=<self>` | "What are my child agents doing, and does each one still have a live wakeup source?" Ground-truth enumeration via `ParentAgentId`, not dependent on having spawned through this service. |
 | `POST /spawn` | Fast-path wrapper over `paseo run -d`. Not required for correctness — the reconciliation loop (below) catches children spawned by raw `paseo run` too. |
 | `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — the current reminder repeats until acknowledged with `DELETE`, capped by a TTL (default 30-60min). Acknowledging an automatic child-watch delivery does not unsubscribe that child; reconciliation arms its next watch. |
-| `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are grouped by sender into one one-shot schedule per recipient (`--max-runs 1`), with urgent messages at the queue head. Delivery is attempted on the next scheduled turn after availability is observed; it never interrupts a running recipient. |
-| `DELETE /messages/:id` `{reason}` | Explicitly acknowledge and remove one queued ordinary message. Delivery prompts include the message id and a ready-to-run acknowledgement command. Recovery snapshots retire automatically and do not need this call. |
+| `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are persisted and grouped by sender, then handed to `paseo send --no-wait`; Paseo delivers the batch at the recipient's next turn boundary without interrupting the current turn. Local messages are removed only after an explicit `sent`/`accepted` response. |
+| `DELETE /messages/:id` `{reason}` | Cancel one message that is still locally pending. Once Paseo has accepted a send, the local record is already gone and daemon turn-boundary delivery owns completion. |
 | `DELETE /reminders/:id` `{reason}` | Acknowledge this delivered reminder only. It clears that reminder's missed-fire state and has no subscription-policy side effect. `reason` is required — 400 without it. |
 | `DELETE /children/:childId/watch?agentId=` `{reason}` | Persistently stop automatic watch registration for one manager/child pair; all existing copies are retired. |
 | `PUT /children/:childId/watch?agentId=` `{reason?}` | Explicitly restore automatic watch registration for the pair. |
@@ -54,13 +54,10 @@ safe; `/reminders` for a repeated/time-based nudge needing explicit acknowledgem
 `/messages` for durable asynchronous worker content that should be coalesced without
 interrupting a running worker.
 
-Heartbeat-recovery snapshots are different from ordinary `/messages`: they are
-attempt-once observations, not durable instructions. Once one delivery schedule is
-successfully armed, that snapshot is retired locally instead of being rescheduled
-after it becomes stale. Child summary fields use the same camelCase names as
+Heartbeat-recovery snapshots use the same turn-boundary send transport and are
+retired locally once Paseo accepts the batch. Child summary fields use the same camelCase names as
 `GET /children`: `hasLivePaseoWait`, `hasLiveCompanionWatch`, and `gitDirty`.
-Terminal message-schedule history is bounded to the newest 50 records; every live
-schedule is retained regardless of age.
+Terminal message-delivery audit history is bounded to the newest 50 records.
 
 ## What it does NOT guarantee
 
@@ -77,12 +74,10 @@ Read `UPSTREAM.md` at the repo root before treating any of these as solved:
   a `heartbeat update <id> --cron <unchanged>` probe at startup, but a total data
   loss produces harmless orphan heartbeats (extra noise), not silent failure.
 
-For messages, schedule existence and run outcome are checked with `schedule inspect`
-and `schedule logs`; the service does not use heartbeat update as a delivery probe.
-If a schedule fires while its recipient is busy, the failed batch remains durable
-and one replacement schedule is armed for the next scheduled attempt. Urgent means
-queue-head priority, not immediate interruption or an exact-turn SLA; the one-minute
-schedule cadence and reconciliation interval bound responsiveness.
+For messages, the authoritative handoff is the `paseo send --no-wait` response.
+Missing, false, or failed status is not accepted as delivery evidence and leaves the
+batch durable for retry. Urgent means queue-head priority inside a coalesced batch,
+not immediate interruption or an exact-turn SLA.
 
 ## Full spec
 

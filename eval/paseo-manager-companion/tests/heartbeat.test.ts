@@ -100,26 +100,24 @@ describe('durable heartbeat reconciliation', () => {
     saved.agents['manager-1'].Status = 'idle';
     await writeFile(state, JSON.stringify(saved));
     await service.reconcileReminders();
-    const firstSchedule = service.store.getMessageSchedules().find((item) => item.status === 'active')!;
+    const firstSchedule = service.store.getMessageSchedules().find((item) => item.status === 'completed')!;
     expect(service.store.getMessages()).toHaveLength(0);
-    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
+    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(0);
     expect(service.store.getRecoveryReceipt(firstSchedule.batchIds[0])).toBeDefined();
     expect(firstSchedule.prompt).toContain('missed_fires=3');
     expect(firstSchedule.prompt).toMatch(/status=working; hasLivePaseoWait=(false|unknown); hasLiveCompanionWatch=(false|unknown); gitDirty=(true|false|unknown)/);
 
     observer.logs.set('hb-main', [...observer.logs.get('hb-main')!, run('run-4', '2026-08-11T00:04:00Z', 'failed')]);
     await service.reconcileReminders();
-    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
-    observer.schedules.set(firstSchedule.daemonId!, { id: firstSchedule.daemonId, status: 'completed' });
-    observer.logs.set(firstSchedule.daemonId!, [run('delivery-1', '2026-08-11T00:05:00Z', 'succeeded')]);
+    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(0);
     await service.reconcileOnce();
     expect(service.store.findReminder('local-heartbeat')!.missedRunIds).toEqual([]);
     expect(service.store.getMessages()).toHaveLength(0);
     const secondSchedules = service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status));
-    expect(secondSchedules).toHaveLength(1);
+    expect(secondSchedules).toHaveLength(0);
     await service.reconcileOnce();
     expect(service.store.getMessages()).toHaveLength(0);
-    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
+    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(0);
     service.close();
   });
 
@@ -248,23 +246,28 @@ describe('durable heartbeat reconciliation', () => {
     service.close();
   });
 
-  it('reports pending recovery retirement when schedule update and delete both fail', async () => {
+  it('blocks new delivery while legacy heartbeat retirement fails, then retries migration', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-recovery-retire-fail-'));
     const store = new Store(root); await store.init();
     let fail = true;
+    const calls: string[][] = [];
     const cli = { run: async (args: string[]) => {
-      if (fail && ((args[0] === 'schedule' && (args[1] === 'update' || args[1] === 'delete')))) throw new Error('temporary daemon failure');
-      return { value: { id: args[2], status: 'active' }, stdout: '', stderr: '' };
+      calls.push(args);
+      if (fail && args[0] === 'heartbeat' && args[1] === 'delete') throw new Error('temporary daemon failure');
+      return { value: args[0] === 'send' ? { status: 'sent' } : { id: args[2], status: 'deleted' }, stdout: '', stderr: '' };
     } };
     const service = new CompanionService(cli as any, store, new DirectPayloadObserver());
-    await store.addReminder(reminder({ id: 'child-watch', daemonId: undefined, kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1' }));
-    await store.addMessage({ id: 'recovery', to: 'manager-1', from: 'companion', body: 'auto child-1', urgency: 'urgent', status: 'pending', createdAt: new Date().toISOString(), kind: 'heartbeat-recovery', recoveryManagerId: 'manager-1', recoveryCounts: { 'child-watch': 1 }, recoveryRunIds: { 'child-watch': ['run-1'] } });
-    await store.addMessage({ id: 'explicit', to: 'child-1', from: 'manager-1', body: 'keep explicit', urgency: 'normal', status: 'pending', createdAt: new Date().toISOString() });
-    await store.addMessageSchedule({ id: 'recovery-schedule', recipient: 'manager-1', generation: 'g1', daemonId: 'recovery-daemon', batchIds: ['recovery', 'explicit'], prompt: 'auto child-1 + keep explicit', status: 'running', createdAt: new Date().toISOString() });
-    const result = await service.unsubscribeChildWatch('manager-1', 'child-1', 'cancel recovery');
-    expect(result.retirementPending).toBe(true);
-    expect(store.getMessages().map((message) => message.id)).toEqual(expect.arrayContaining(['recovery', 'explicit']));
+    await service.init();
+    await store.addMessage({ id: 'recovery', to: 'manager-1', from: 'companion', body: 'auto child-1', urgency: 'urgent', status: 'pending', createdAt: new Date().toISOString() });
+    await store.addMessageSchedule({ id: 'recovery-schedule', recipient: 'manager-1', generation: 'g1', daemonId: 'recovery-daemon', batchIds: ['recovery'], prompt: 'auto child-1', status: 'running', createdAt: new Date().toISOString() });
+    await service.reconcileOnce();
     expect(store.getMessageSchedules().find((schedule) => schedule.id === 'recovery-schedule')?.status).toBe('running');
+    expect(calls.some((args) => args[0] === 'send')).toBe(false);
+    fail = false;
+    await service.reconcileOnce();
+    expect(calls.map((args) => args.slice(0, 2))).toEqual(expect.arrayContaining([['heartbeat', 'delete'], ['send', '--no-wait']]));
+    expect(store.getMessageSchedules().find((schedule) => schedule.id === 'recovery-schedule')?.status).toBe('deleted');
+    service.close();
   });
 
   it('rebuilds an explicitly missing schedule once, while transient observer failures neither rebuild nor duplicate a local watch', async () => {

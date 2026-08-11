@@ -21,22 +21,17 @@ curl -sS -X POST http://127.0.0.1:8787/messages \
 ```
 
 The queue persists each message before calling Paseo, groups pending messages by
-sender, and keeps at most one live one-shot delivery schedule per recipient. An
-urgent message is placed at the queue head and is attempted on the next scheduled
-turn after the recipient becomes available; it is not an interruption guarantee.
-The one-minute schedule cadence and reconciliation interval mean this is not an
-exact-turn or exact-second SLA. A busy failed attempt keeps its messages and is
-re-armed; successful delivery removes only that schedule generation's captured
-batch. Delivery uses `schedule inspect`/`schedule logs` for run truth and never
-injects a message into a running worker.
+sender, and hands one coalesced batch to `paseo send --no-wait`. Paseo queues that
+send at the recipient's next turn boundary; it does not interrupt an in-flight
+turn. The companion removes the durable local batch only after Paseo explicitly
+returns `sent` or `accepted`. A failed or ambiguous response remains pending and
+is retried by reconciliation. Structured `message-delivery-accepted` and
+`message-delivery-failed` log records expose the transport decision.
 
-Automatic heartbeat-recovery snapshots are attempt-once rather than durable
-instructions: after a one-shot delivery schedule is armed, the snapshot is retired
-locally so an aging full child snapshot is not repeatedly re-delivered. Ordinary
-worker `/messages` retain the durable retry-until-success behavior above.
-Each ordinary delivery includes its message id and a `DELETE /messages/:id`
-acknowledgement command for cases where daemon run status disagrees with visible
-delivery; `reason` is required.
+Automatic heartbeat-recovery snapshots and ordinary worker messages use the same
+turn-boundary send transport. `DELETE /messages/:id` remains an escape hatch for a
+message that is still locally pending; after Paseo accepts the send, the daemon owns
+delivery and the local record is already removed.
 
 This supersedes the older “worker intermediate updates are unavailable” guidance:
 use `/messages` for durable updates, and reserve `send` for safe direct steering.

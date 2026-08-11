@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 const stateFile = process.env.PASEO_SHIM_STATE;
-const state = stateFile && fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { heartbeats: {}, agents: {} };
+const state = stateFile && fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : { heartbeats: {}, agents: {}, sends: [] };
+state.sends ||= [];
 const save = () => stateFile && fs.writeFileSync(stateFile, JSON.stringify(state));
 const args = process.argv.slice(2);
 const out = (value) => { process.stdout.write(JSON.stringify(value)); save(); };
@@ -64,7 +65,13 @@ if (args[0] === 'ls') {
 } else if (args[0] === 'wait') {
   out({ id: args[1], status: 'idle' });
 } else if (args[0] === 'send') {
-  out({ status: 'sent', id: args[1] });
+  if (process.env.PASEO_SEND_FAIL === '1') { process.stderr.write('temporary send failure'); process.exit(1); }
+  const noWait = args[1] === '--no-wait';
+  const json = args[2] === '--json';
+  const recipient = noWait && json ? args[3] : args[1];
+  const prompt = noWait && json ? args[4] : args[2];
+  state.sends.push({ recipient, prompt, args });
+  out({ status: process.env.PASEO_SEND_STATUS || 'sent', id: `send-${state.sends.length}` });
 } else if (args[0] === 'agent' && args[1] === 'update') {
   out({ id: args[2], status: 'updated' });
 } else {

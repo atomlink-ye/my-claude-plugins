@@ -22,6 +22,8 @@ afterEach(async () => {
   delete process.env.PASEO_CONCURRENCY_FAIL;
   delete process.env.PASEO_DELETE_TRANSIENT;
   delete process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT;
+  delete process.env.PASEO_SEND_FAIL;
+  delete process.env.PASEO_SEND_STATUS;
 });
 
 async function request(base: string, method: string, route: string, body?: unknown) {
@@ -53,7 +55,9 @@ describe('HTTP integration through a paseo executable', () => {
     expect(reminder.status).toBe(201);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, { reason: 'done' })).status).toBe(200);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, {})).status).toBe(400);
+    process.env.PASEO_SEND_FAIL = '1';
     const message = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'explicit message' });
+    delete process.env.PASEO_SEND_FAIL;
     expect(message.status).toBe(201);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, {})).status).toBe(400);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'handled' })).status).toBe(200);
@@ -394,26 +398,22 @@ describe('HTTP integration through a paseo executable', () => {
     const posted = await Promise.all(Array.from({ length: 15 }, (_, index) => service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `message-${index}`, urgency: index === 14 ? 'urgent' : 'normal' })));
     const reloaded = new Store(root);
     await reloaded.init();
-    expect(reloaded.getMessages()).toHaveLength(15);
+    expect(reloaded.getMessages()).toHaveLength(0);
     const saved = JSON.parse(await readFile(state, 'utf8'));
-    const active = Object.values(saved.heartbeats).filter((heartbeat: any) => heartbeat.status === 'active');
-    expect(active).toHaveLength(1);
-    const schedule = active[0] as any;
-    expect(schedule.maxRuns).toBe(1);
-    expect(schedule.prompt).toContain(`id=${posted[0].id}`);
-    expect(schedule.prompt).toContain(`/messages/${posted[0].id}`);
-    expect(schedule.prompt.indexOf('message-14')).toBeLessThan(schedule.prompt.indexOf('message-0'));
+    expect(saved.sends).toHaveLength(1);
+    const delivery = saved.sends[0];
+    expect(delivery.args).toEqual(['send', '--no-wait', '--json', 'manager-1', expect.any(String)]);
+    expect(delivery.prompt).toContain(`id=${posted[0].id}`);
+    expect(delivery.prompt).not.toContain('/messages/');
+    expect(delivery.prompt.indexOf('message-14')).toBeLessThan(delivery.prompt.indexOf('message-0'));
     expect(posted).toHaveLength(15);
-    await new PaseoCli(shim).run(['fire', schedule.id]);
-    await service.reconcileOnce();
+    expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'accepted' && message.delivery.transport === 'paseo-send')).toBe(true);
     expect(service.getMessages()).toHaveLength(0);
-    const after = JSON.parse(await readFile(state, 'utf8'));
-    expect(after.heartbeats[schedule.id].logs.at(-1).status).toBe('succeeded');
-    expect(service.store.getMessageSchedules().every((item) => item.status !== 'active')).toBe(true);
+    expect(service.store.getMessageSchedules().every((item) => item.status !== 'active' && !item.daemonId)).toBe(true);
     service.close();
   });
 
-  it('retains a busy batch and rearms it until the recipient has an idle turn', async () => {
+  it('retains a failed send and retries it on reconciliation', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-busy-'));
     const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
     const state = path.join(root, 'state.json');
@@ -421,25 +421,17 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'busy child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
-    const childId = String((child as any).id);
-    await service.postMessage({ to: childId, from: 'manager-1', body: 'keep this', urgency: 'normal' });
-    let saved = JSON.parse(await readFile(state, 'utf8'));
-    let active = Object.values(saved.heartbeats).find((heartbeat: any) => heartbeat.status === 'active') as any;
-    await new PaseoCli(shim).run(['fire', active.id]);
-    const failedRun = JSON.parse(await readFile(state, 'utf8')).heartbeats[active.id];
-    expect(failedRun.status).toBe('completed');
-    expect(failedRun.logs.at(-1).status).toBe('failed');
+    process.env.PASEO_SEND_FAIL = '1';
+    const posted = await service.postMessage({ to: 'manager-1', from: 'manager-1', body: 'keep this', urgency: 'normal' });
+    expect(posted.status).toBe('pending');
+    expect(posted.schedule).toBeNull();
+    expect(posted.delivery).toEqual(expect.objectContaining({ transport: 'paseo-send', status: 'pending', acceptedAt: null }));
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('failed');
+    expect(service.getMessages()).toHaveLength(1);
+    delete process.env.PASEO_SEND_FAIL;
     await service.reconcileOnce();
-    expect(service.getMessages(childId)).toHaveLength(1);
-    saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(Object.values(saved.heartbeats).filter((heartbeat: any) => heartbeat.status === 'active' && heartbeat.target === childId)).toHaveLength(1);
-    saved.agents[childId].Status = 'idle';
-    await writeFile(state, JSON.stringify(saved));
-    active = Object.values(saved.heartbeats).find((heartbeat: any) => heartbeat.status === 'active') as any;
-    await new PaseoCli(shim).run(['fire', active.id]);
-    await service.reconcileOnce();
-    expect(service.getMessages(childId)).toHaveLength(0);
+    expect(service.getMessages()).toHaveLength(0);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
     service.close();
   });
 
@@ -450,34 +442,32 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
     await service.init();
+    process.env.PASEO_SEND_FAIL = '1';
     const first = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'remove me' });
     const second = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'keep me' });
+    delete process.env.PASEO_SEND_FAIL;
     const result = await service.deleteMessage(first.id, 'no longer needed');
     expect(result).toEqual(expect.objectContaining({ id: first.id, status: 'deleted', retirementPending: false }));
     expect(service.getMessages().map((message) => message.id)).toEqual([second.id]);
-    const active = service.store.getMessageSchedules().find((schedule) => schedule.status === 'active')!;
-    expect(active.batchIds).toEqual([second.id]);
-    expect(active.prompt).not.toContain(first.id);
-    expect(active.prompt).toContain(second.id);
+    expect(service.getMessages().map((message) => message.id)).toEqual([second.id]);
     service.close();
   });
 
-  it('keeps a cancellation tombstone until a failed live-schedule retirement succeeds', async () => {
+  it('does not claim acceptance when send status is false', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-delete-retry-'));
     const state = path.join(root, 'state.json');
     await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
     await service.init();
-    const message = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'cancel me durably' });
-    process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT = '1';
-    const pending = await service.deleteMessage(message.id, 'processed despite stale daemon status');
-    expect(pending.retirementPending).toBe(true);
-    expect(service.getMessages().find((item) => item.id === message.id)?.status).toBe('cancelled');
-    delete process.env.PASEO_SCHEDULE_MUTATION_TRANSIENT;
+    process.env.PASEO_SEND_STATUS = 'false';
+    const message = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'retain this' });
+    expect(message.status).toBe('pending');
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('failed');
+    expect(service.getMessages()).toHaveLength(1);
+    delete process.env.PASEO_SEND_STATUS;
     await service.reconcileOnce();
-    expect(service.getMessages().some((item) => item.id === message.id)).toBe(false);
-    expect(service.store.getMessageSchedules().some((item) => item.batchIds.includes(message.id) && ['pending', 'active', 'running'].includes(item.status))).toBe(false);
+    expect(service.getMessages()).toHaveLength(0);
     service.close();
   });
 
@@ -502,29 +492,27 @@ describe('HTTP integration through a paseo executable', () => {
     expect(store.getMessageSchedules().some((item) => item.id === 'terminal-0')).toBe(false);
   });
 
-  it('keeps an armed recovery schedule live when local receipt persistence fails once', async () => {
+  it('does not duplicate an accepted send when local cleanup fails once', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-recovery-receipt-retry-'));
     const state = path.join(root, 'state.json');
     await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
     const store = new Store(root);
-    const applyReceipt = store.applyRecoveryReceipt.bind(store);
-    vi.spyOn(store, 'applyRecoveryReceipt').mockRejectedValueOnce(new Error('disk unavailable')).mockImplementation(applyReceipt);
+    const removeMessages = store.removeMessages.bind(store);
+    vi.spyOn(store, 'removeMessages').mockRejectedValueOnce(new Error('disk unavailable')).mockImplementation(removeMessages);
     const service = new CompanionService(new PaseoCli(paseoShim), store);
     await service.init();
-    const recovery = await service.postMessage({
-      to: 'manager-1', from: 'companion', body: 'attempt once', kind: 'heartbeat-recovery',
-      recoveryManagerId: 'manager-1', recoveryCounts: {}, recoveryRunIds: {},
-    });
-    expect(service.store.getMessageSchedules().filter((item) => item.status === 'active')).toHaveLength(1);
+    const recovery = await service.postMessage({ to: 'manager-1', from: 'companion', body: 'attempt once' });
+    expect(recovery.status).toBe('delivered');
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('completed');
     expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
     await service.reconcileOnce();
-    expect(service.store.getMessageSchedules().filter((item) => item.status === 'active')).toHaveLength(1);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
     expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(false);
     service.close();
   });
 
-  it('updates one pre-run schedule in place for staggered arrivals and preserves urgent queue order', async () => {
+  it('coalesces only concurrent arrivals and preserves urgent queue order', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-staggered-'));
     const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
     const state = path.join(root, 'state.json');
@@ -533,15 +521,13 @@ describe('HTTP integration through a paseo executable', () => {
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
     for (let index = 0; index < 15; index++) {
-      await service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `staggered-${index}`, urgency: index === 14 ? 'urgent' : 'normal' });
-      await new Promise((resolve) => setTimeout(resolve, 2));
+      void service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `staggered-${index}`, urgency: index === 14 ? 'urgent' : 'normal' });
     }
+    await new Promise((resolve) => setTimeout(resolve, 100));
     const saved = JSON.parse(await readFile(state, 'utf8'));
-    const active = Object.values(saved.heartbeats).filter((heartbeat: any) => heartbeat.status === 'active');
-    expect(active).toHaveLength(1);
-    expect((active[0] as any).prompt).toContain('staggered-14');
-    expect((active[0] as any).prompt.indexOf('staggered-14')).toBeLessThan((active[0] as any).prompt.indexOf('staggered-0'));
-    expect(Object.keys(saved.heartbeats)).toHaveLength(1);
+    expect(saved.sends).toHaveLength(1);
+    expect(saved.sends[0].prompt).toContain('staggered-14');
+    expect(saved.sends[0].prompt.indexOf('staggered-14')).toBeLessThan(saved.sends[0].prompt.indexOf('staggered-0'));
     service.close();
   });
 
@@ -553,15 +539,50 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
+    process.env.PASEO_SEND_STATUS = 'false';
     await service.postMessage({ to: 'manager-1', from: 'manager-1', body: 'must retain' });
-    const saved = JSON.parse(await readFile(state, 'utf8'));
-    const id = Object.keys(saved.heartbeats)[0];
-    saved.heartbeats[id].status = 'completed';
-    saved.heartbeats[id].logs = [];
-    await writeFile(state, JSON.stringify(saved));
-    await service.reconcileOnce();
-    expect(service.getMessages()).toHaveLength(1);
-    expect(Object.values(JSON.parse(await readFile(state, 'utf8')).heartbeats).filter((heartbeat: any) => heartbeat.status === 'active')).toHaveLength(0);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(1);
     service.close();
+  });
+
+  it('migrates legacy message heartbeats with heartbeat delete and retries drift before send', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-migration-'));
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: { 'legacy-daemon': { id: 'legacy-daemon', status: 'active', logs: [] } } }));
+    process.env.PASEO_SHIM_STATE = state;
+    await writeFile(path.join(root, 'messages.json'), JSON.stringify([{ id: 'legacy-message', to: 'manager-1', from: 'child', body: 'legacy', urgency: 'normal', status: 'pending', createdAt: new Date().toISOString() }]));
+    await writeFile(path.join(root, 'message-schedules.json'), JSON.stringify([{ id: 'legacy-local', recipient: 'manager-1', generation: 'legacy-generation', daemonId: 'legacy-daemon', batchIds: ['legacy-message'], prompt: 'legacy', status: 'active', createdAt: new Date().toISOString() }]));
+    process.env.PASEO_DELETE_TRANSIENT = '1';
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await service.init();
+    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
+    expect(service.store.getMessageSchedules()[0].status).toBe('active');
+    delete process.env.PASEO_DELETE_TRANSIENT;
+    await service.reconcileOnce();
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    expect(saved.sends).toHaveLength(1);
+    expect(saved.heartbeats['legacy-daemon'].status).toBe('deleted');
+    expect(service.store.getMessageSchedules()[0]).toEqual(expect.objectContaining({ status: 'deleted' }));
+    expect(service.store.getMessageSchedules()[0].daemonId).toBeUndefined();
+    service.close();
+  });
+
+  it('emits accepted and failed delivery records with generation and batch probes', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-logs-'));
+    const state = path.join(root, 'state.json');
+    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const accepted = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const failed = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await service.init();
+    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'accepted' });
+    process.env.PASEO_SEND_FAIL = '1';
+    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'failed' });
+    const acceptedRecord = JSON.parse(String(accepted.mock.calls.at(-1)?.[0]));
+    const failedRecord = JSON.parse(String(failed.mock.calls.at(-1)?.[0]));
+    expect(acceptedRecord).toEqual(expect.objectContaining({ type: 'message-delivery-accepted', recipient: 'manager-1', transport: 'paseo-send', generation: expect.any(String), batchIds: expect.any(Array) }));
+    expect(failedRecord).toEqual(expect.objectContaining({ type: 'message-delivery-failed', recipient: 'manager-1', transport: 'paseo-send', generation: expect.any(String), batchIds: expect.any(Array) }));
+    accepted.mockRestore(); failed.mockRestore(); service.close();
   });
 });

@@ -566,12 +566,11 @@ export class CompanionService {
     return result.value;
   }
 
-  /**
-   * Persist a message before touching Paseo, then make the recipient's queue
-   * have one coalesced, one-shot delivery schedule. The queue remains durable
-   * if the daemon is unavailable or a recipient is busy.
-   */
-  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<MessageRecord & { schedule: MessageScheduleRecord | null }> {
+  /** Persist before handing a coalesced batch to Paseo's turn-boundary queue. */
+  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<MessageRecord & {
+    schedule: null;
+    delivery: { id: string; transport: 'paseo-send'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
+  }> {
     if (!body.to?.trim() || !body.from?.trim() || !body.body?.trim()) throw new Error('to, from, and body are required');
     if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new Error('urgency must be normal or urgent');
     const message: MessageRecord = {
@@ -590,8 +589,16 @@ export class CompanionService {
     // This write deliberately precedes every daemon call.
     await this.store.addMessage(message);
     await this.ensureMessageDelivery(message.to);
-    const schedule = this.store.getMessageSchedules().find((item) => item.recipient === message.to && item.status === 'active') ?? null;
-    return { ...message, schedule };
+    const audit = this.store.getMessageSchedules().find((item) => item.batchIds.includes(message.id)) ?? null;
+    const delivery = audit ? {
+      id: audit.id,
+      transport: 'paseo-send' as const,
+      status: audit.status === 'completed' ? 'accepted' as const : 'pending' as const,
+      acceptedAt: audit.status === 'completed' ? audit.lastRunAt ?? null : null,
+      batchIds: audit.batchIds,
+    } : null;
+    if (audit?.status === 'completed') return { ...message, status: 'delivered', deliveredAt: audit.lastRunAt, schedule: null, delivery };
+    return { ...message, schedule: null, delivery };
   }
 
   getMessages(to?: string): MessageRecord[] {
@@ -610,31 +617,16 @@ export class CompanionService {
   }
 
   private async cleanupCancelledMessage(id: string): Promise<boolean> {
-    let retirementPending = false;
-    const schedules = this.store.getMessageSchedules().filter((schedule) =>
-      schedule.batchIds.includes(id) && ['pending', 'active', 'running'].includes(schedule.status));
+    // Message delivery is now a one-shot `paseo send`; there is no live
+    // schedule to mutate or retire.  Keep the explicit DELETE/tombstone path
+    // durable until the cancelled receipt is removed locally.
+    const schedules = this.store.getMessageSchedules().filter((schedule) => schedule.batchIds.includes(id));
     for (const schedule of schedules) {
-      const remaining = this.store.getMessages().filter((item) => item.status === 'pending' && item.id !== id && schedule.batchIds.includes(item.id));
-      const remainingIds = remaining.map((item) => item.id);
-      if (!remaining.length) {
-        if (!await this.retireMessageSchedule(schedule)) retirementPending = true;
-        continue;
-      }
-      const prompt = this.messagePrompt(schedule.recipient, remaining);
-      if (schedule.status === 'running') {
-        if (await this.retireMessageSchedule(schedule)) await this.store.updateMessageSchedule(schedule.id, { batchIds: remainingIds, prompt });
-        else retirementPending = true;
-        continue;
-      }
-      try {
-        if (schedule.daemonId && schedule.status === 'active') await this.cli.run(['schedule', 'update', schedule.daemonId, '--prompt', prompt, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
-        await this.store.updateMessageSchedule(schedule.id, { batchIds: remainingIds, prompt });
-      } catch {
-        if (await this.retireMessageSchedule(schedule)) await this.store.updateMessageSchedule(schedule.id, { batchIds: remainingIds, prompt });
-        else retirementPending = true;
+      if (['pending', 'active', 'running'].includes(schedule.status)) {
+        await this.migrateLegacyMessageSchedule(schedule);
       }
     }
-    return retirementPending;
+    return false;
   }
 
   private sortMessages(messages: MessageRecord[]): MessageRecord[] {
@@ -661,9 +653,7 @@ export class CompanionService {
     for (const [sender, senderMessages] of grouped) {
       lines.push(`From: ${sender}`);
       for (const message of senderMessages) {
-        const ack = `curl -X DELETE http://127.0.0.1:${this.port || '<port>'}/messages/${message.id} -H 'content-type: application/json' -d '{"reason":"acknowledged"}'`;
         lines.push(`- [id=${message.id}] [${message.createdAt}] (${message.urgency}) ${message.body}`);
-        if (message.kind !== 'heartbeat-recovery') lines.push(`  Acknowledge with: ${ack}`);
       }
     }
     return lines.join('\n');
@@ -709,16 +699,41 @@ export class CompanionService {
     }
   }
 
-  private async retireMessageSchedule(schedule: MessageScheduleRecord, status: MessageScheduleRecord['status'] = 'deleted'): Promise<boolean> {
-    let removed = true;
-    if (schedule.daemonId) {
-      try { await this.cli.run(['schedule', 'delete', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 }); } catch { removed = false; }
+  /** Retire schedules written by releases that used heartbeat delivery. */
+  private async migrateLegacyMessageSchedules(): Promise<void> {
+    for (const schedule of this.store.getMessageSchedules()) {
+      if (!['pending', 'active', 'running'].includes(schedule.status)) continue;
+      await this.migrateLegacyMessageSchedule(schedule);
     }
-    // Terminal schedules are no longer live even if the daemon's delete call
-    // is unavailable. An active duplicate stays active locally until deletion
-    // succeeds, preventing a replacement from creating another live delivery.
-    if (removed || status !== 'deleted') await this.store.updateMessageSchedule(schedule.id, { status });
-    return removed;
+  }
+
+  private async migrateLegacyMessageSchedule(schedule: MessageScheduleRecord): Promise<void> {
+    if (schedule.daemonId) {
+      try {
+        // Legacy message generations were heartbeat daemons, so use the
+        // heartbeat endpoint for cleanup.  `schedule delete` is not valid for
+        // these records and can leave the daemon active in Paseo.
+        await this.cli.run(['heartbeat', 'delete', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // A missing daemon is already retired.  Other failures leave the
+        // legacy record live so no replacement send can duplicate its batch.
+        if (!/not found|no such heartbeat|unknown heartbeat|404/i.test(message)) {
+          console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'legacy-heartbeat-delete', error: message }));
+          throw error;
+        }
+      }
+    }
+    await this.store.updateMessageSchedule(schedule.id, { status: 'deleted', daemonId: undefined });
+  }
+
+  /** Finish local cleanup for a generation whose send was already accepted. */
+  private async finalizeAcceptedMessageSchedule(schedule: MessageScheduleRecord): Promise<void> {
+    const messages = this.store.getMessages().filter((message) => schedule.batchIds.includes(message.id));
+    for (const message of messages) {
+      if (message.kind === 'heartbeat-recovery') await this.completeRecovery(message);
+    }
+    if (messages.length) await this.store.removeMessages(messages.map((message) => message.id));
   }
 
   private async createMessageSchedule(recipient: string, batch: MessageRecord[]): Promise<MessageScheduleRecord | undefined> {
@@ -733,25 +748,23 @@ export class CompanionService {
       createdAt: new Date().toISOString(),
     };
     await this.store.addMessageSchedule(local);
+    let acceptedAt: string;
     try {
-      const value = asRecord((await this.cli.run([
-        'heartbeat', 'create', local.prompt,
-        '--cron', '* * * * *', '--expires-in', '30m', '--max-runs', '1',
-        '--name', `companion-message-${generation.slice(0, 8)}`,
-        '--timezone', 'UTC', '--json',
-      ], { agentId: recipient })).value);
-      await this.store.updateMessageSchedule(local.id, {
-        daemonId: String(value.id ?? value.scheduleId ?? value.heartbeatId ?? ''),
-        status: 'active',
-        lastRunAt: value.lastRunAt,
-      });
-    } catch {
+      const value = unwrapPayload((await this.cli.run(['send', '--no-wait', '--json', recipient, local.prompt])).value);
+      const status = lowerStatus(value.status);
+      if (!['sent', 'accepted'].includes(status)) throw new Error(`paseo send did not confirm sent status (status=${String(value.status)})`);
+      acceptedAt = new Date().toISOString();
+      // Mark the local record terminal before receipt cleanup.  If local
+      // cleanup fails after acceptance, reconcile can finish it without ever
+      // issuing a duplicate send.
+      await this.store.updateMessageSchedule(local.id, { status: 'completed', lastRunAt: acceptedAt });
+    } catch (error) {
       await this.store.updateMessageSchedule(local.id, { status: 'failed' });
+      console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', error: error instanceof Error ? error.message : String(error) }));
       return undefined;
     }
-    // The daemon schedule is now armed. Local receipt cleanup may be retried,
-    // but must never downgrade or duplicate that live external attempt.
-    try { await this.consumeRecoveryBatch(batch); } catch { /* retry while adopting the live generation */ }
+    console.log(JSON.stringify({ type: 'message-delivery-accepted', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send' }));
+    try { await this.finalizeAcceptedMessageSchedule(local); } catch { /* retry cleanup without another send */ }
     return this.store.getMessageSchedules().find((item) => item.id === local.id);
   }
 
@@ -767,66 +780,17 @@ export class CompanionService {
     // Let concurrent POSTs finish their durable writes before taking the batch
     // snapshot. This keeps a burst of arrivals to one schedule generation.
     await new Promise<void>((resolve) => setImmediate(resolve));
-    const alreadyConsumed = this.store.getMessages().filter((message) => message.status === 'pending' && message.kind === 'heartbeat-recovery' && this.store.getRecoveryReceipt(message.id));
-    if (alreadyConsumed.length) await this.store.removeMessages(alreadyConsumed.map((message) => message.id));
-    const schedules = this.store.getMessageSchedules().filter((schedule) => schedule.recipient === recipient && ['pending', 'active', 'running'].includes(schedule.status));
-    const liveCandidates: Array<{ schedule: MessageScheduleRecord; inspection: MessageScheduleInspection }> = [];
-    let running: MessageScheduleRecord | undefined;
-    let uncertain = false;
-    for (const schedule of schedules) {
-      const state = await this.inspectMessageSchedule(schedule);
-      if (state.state === 'success') {
-        // Only this generation's captured ids are removed. New arrivals stay.
-        const delivered = this.store.getMessages().filter((message) => schedule.batchIds.includes(message.id));
-        for (const message of delivered) if (message.kind === 'heartbeat-recovery') await this.completeRecovery(message);
-        await this.store.removeMessages(schedule.batchIds);
-        await this.retireMessageSchedule(schedule, 'completed');
-      } else if (state.state === 'running') {
-        await this.store.updateMessageSchedule(schedule.id, { status: 'running' });
-        running = running ?? schedule;
-      } else if (state.state === 'live') {
-        liveCandidates.push({ schedule, inspection: state });
-      } else if (state.state === 'unknown') {
-        uncertain = true;
-      } else if (state.state === 'missing') {
-        await this.store.updateMessageSchedule(schedule.id, { status: 'deleted' });
-      } else {
-        await this.retireMessageSchedule(schedule);
-      }
-    }
-    const live = liveCandidates.sort((a, b) => a.schedule.createdAt.localeCompare(b.schedule.createdAt)).at(-1);
-    for (const candidate of liveCandidates) {
-      if (candidate === live) continue;
-      const removed = await this.retireMessageSchedule(candidate.schedule);
-      if (!removed) uncertain = true;
+    try { await this.migrateLegacyMessageSchedules(); } catch { return; }
+    // Complete accepted generations whose local receipt cleanup was interrupted
+    // after the send was already accepted.
+    for (const schedule of this.store.getMessageSchedules().filter((item) => item.recipient === recipient && item.status === 'completed')) {
+      try { await this.finalizeAcceptedMessageSchedule(schedule); } catch { /* accepted send is terminal; retry local cleanup later */ }
     }
     const queued = this.store.getMessages().filter((message) => message.to === recipient && message.status === 'pending');
-    if (!queued.length || running || uncertain) return;
-    const sorted = this.sortMessages(queued);
-    // Never replace a live generation merely because new arrivals exist. The
-    // captured batch must get its turn; remainder messages are armed after the
-    // terminal run is observed.
-    if (live) {
-      // Recovery snapshots are attempt-once generations. Once armed, keep the
-      // captured prompt immutable while normal arrivals wait for the next turn.
-      await this.consumeRecoveryBatch(this.store.getMessages().filter((message) => live.schedule.batchIds.includes(message.id)));
-      // Before the first real run, expand the existing schedule in place. This
-      // avoids a second live wakeup while still folding in staggered arrivals.
-      const recoveryFrozen = live.schedule.batchIds.some((id) => this.store.getRecoveryReceipt(id));
-      if (!recoveryFrozen && !live.inspection.hasRun && (live.schedule.batchIds.length !== sorted.length || live.schedule.batchIds.some((id, index) => id !== sorted[index]?.id))) {
-        const prompt = this.messagePrompt(recipient, sorted);
-        try {
-          await this.cli.run(['schedule', 'update', live.schedule.daemonId!, '--prompt', prompt, '--json'], { agentId: recipient, timeoutMs: 5_000 });
-          await this.store.updateMessageSchedule(live.schedule.id, { prompt, batchIds: sorted.map((message) => message.id) });
-        } catch {
-          // Preserve the old generation and durable arrivals; reconcile later.
-        }
-      }
-      return;
-    }
-    await this.createMessageSchedule(recipient, sorted);
-    // A write can complete while heartbeat create is in flight. Rebuild once
-    // against the newer queue, retaining every message in durable storage.
+    const accepted = new Set(this.store.getMessageSchedules().filter((item) => item.recipient === recipient && item.status === 'completed').flatMap((item) => item.batchIds));
+    const pending = queued.filter((message) => !accepted.has(message.id));
+    if (!pending.length) return;
+    await this.createMessageSchedule(recipient, this.sortMessages(pending));
   }
 
   private async completeRecovery(message: MessageRecord): Promise<void> {
@@ -835,14 +799,6 @@ export class CompanionService {
     if (this.store.getRecoveryReceipt(message.id)) return;
     const covered = Object.fromEntries(Object.entries(counts).map(([id, missedFires]) => [id, { missedFires: Number(missedFires), missedRunIds: runIds[id] ?? [] }]));
     await this.store.applyRecoveryReceipt(message.id, covered);
-  }
-
-  /** Apply recovery receipts and remove only the automatic snapshots. */
-  private async consumeRecoveryBatch(batch: MessageRecord[]): Promise<void> {
-    const recovery = batch.filter((message) => message.kind === 'heartbeat-recovery' && message.status === 'pending');
-    if (!recovery.length) return;
-    for (const message of recovery) await this.completeRecovery(message);
-    await this.store.removeMessages(recovery.map((message) => message.id));
   }
 
   private async suppressRecoveryForChild(managerId: string, childId: string, reminderIds: string[]): Promise<boolean> {
@@ -864,36 +820,15 @@ export class CompanionService {
       }
     }
     if (!removed.size && !changed.size) return false;
-    let retirementPending = false;
-    for (const schedule of this.store.getMessageSchedules()) {
-      if (!schedule.batchIds.some((id) => removed.has(id) || changed.has(id))) continue;
-      const remainingIds = schedule.batchIds.filter((id) => !removed.has(id));
-      const remaining = this.store.getMessages().filter((message) => remainingIds.includes(message.id) && message.status === 'pending');
-      if (!remaining.length) {
-        if (!await this.retireMessageSchedule(schedule)) retirementPending = true;
-        continue;
-      }
-      const prompt = this.messagePrompt(schedule.recipient, remaining);
-      if (schedule.status === 'running') {
-        retirementPending = true;
-        continue;
-      }
-      try {
-        if (schedule.daemonId && ['pending', 'active'].includes(schedule.status)) await this.cli.run(['schedule', 'update', schedule.daemonId, '--prompt', prompt, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
-        await this.store.updateMessageSchedule(schedule.id, { batchIds: remaining.map((message) => message.id), prompt });
-      } catch {
-        // Retire the stale generation before removing the automatic message.
-        // If daemon deletion also fails, retain both records for retry.
-        if (await this.retireMessageSchedule(schedule)) {
-          await this.store.updateMessageSchedule(schedule.id, { batchIds: remaining.map((message) => message.id), prompt });
-        } else retirementPending = true;
-      }
-    }
-    if (!retirementPending) await this.store.removeMessages(removed);
-    return retirementPending;
+    if (removed.size) await this.store.removeMessages(removed);
+    return false;
   }
 
   private async reconcileMessages(): Promise<void> {
+    // Convert pre-send transport records before considering new deliveries.
+    // This also removes any legacy heartbeat daemon without invoking schedule
+    // inspection/update/delete APIs.
+    try { await this.migrateLegacyMessageSchedules(); } catch { return; }
     for (const message of this.store.getMessages().filter((item) => item.status === 'cancelled')) {
       if (!await this.cleanupCancelledMessage(message.id)) await this.store.removeMessages([message.id]);
     }
@@ -918,7 +853,9 @@ export class CompanionService {
       await this.suppressRecoveryForChild(managerId, childId, reminderIds);
     }
     const recipients = new Set(this.store.getMessages().filter((message) => message.status === 'pending').map((message) => message.to));
-    for (const schedule of this.store.getMessageSchedules()) if (['pending', 'active', 'running'].includes(schedule.status)) recipients.add(schedule.recipient);
+    for (const schedule of this.store.getMessageSchedules()) {
+      if (['pending', 'active', 'running', 'completed'].includes(schedule.status)) recipients.add(schedule.recipient);
+    }
     for (const recipient of recipients) {
       try { await this.ensureMessageDelivery(recipient); } catch { /* retry next reconciliation */ }
     }
