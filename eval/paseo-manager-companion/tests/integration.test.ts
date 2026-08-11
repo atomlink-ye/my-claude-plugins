@@ -73,6 +73,66 @@ describe('HTTP integration through a paseo executable', () => {
     service.close();
   });
 
+  it('creates one manager-delivered child watch for an unparked child and none for a parked child', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-child-watch-park-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'watched child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    await service.addLedger({ type: 'park', target: childId, verdict: 'parked', reason: 'waiting' });
+    await service.reconcileOnce();
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    const park = service.listLedger('park', childId)[0] as any;
+    await service.revokeLedger(park.id, 'resume');
+    await service.reconcileOnce();
+    const watches = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
+    expect(watches).toHaveLength(1);
+    expect(watches[0]).toEqual(expect.objectContaining({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child' }));
+    expect(watches[0].prompt).toContain(`paseo inspect ${childId} --json`);
+    service.close();
+  });
+
+  it('keeps child-watch reconciliation idempotent across two passes', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-child-watch-idempotent-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'watched child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    await service.reconcileOnce();
+    await service.reconcileOnce();
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
+    expect(Object.keys(saved.heartbeats)).toHaveLength(1);
+    service.close();
+  });
+
+  it('gives the manager an independent watch for each child when one is idle and others run', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-child-watch-mixed-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const children = [];
+    for (const n of [1, 2, 3]) children.push(await service.spawn({ provider: 'shim', title: `child ${n}`, cwd: process.cwd(), prompt: 'work' }, 'manager-1'));
+    const saved = JSON.parse(await readFile(state, 'utf8'));
+    const idleId = String((children[0] as any).id);
+    saved.agents[idleId].Status = 'idle';
+    await writeFile(state, JSON.stringify(saved));
+    await service.reconcileOnce();
+    const watches = service.store.getReminders().filter((r) => r.kind === 'child-watch' && r.status === 'active');
+    expect(watches).toHaveLength(3);
+    expect(new Set(watches.map((r) => r.subjectChildId))).toEqual(new Set(children.map((child) => String((child as any).id))));
+    expect(watches.every((r) => r.agentId === 'manager-1')).toBe(true);
+    service.close();
+  });
+
   it('keeps all children visible when inspect fan-out exceeds the CLI concurrency threshold', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-concurrency-'));
     const shim = fileURLToPath(new URL('../fixtures/concurrency-shim.mjs', import.meta.url));

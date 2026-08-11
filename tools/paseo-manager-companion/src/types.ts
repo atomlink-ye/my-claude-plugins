@@ -1,9 +1,16 @@
 export type LedgerType = 'park' | 'known-red' | 'deferred';
+export type ReminderKind = 'generic' | 'compact-wake' | 'child-watch';
 
 export interface ReminderRecord {
   id: string;
   daemonId?: string;
   agentId: string;
+  /** The manager identity that receives/delivers the reminder. */
+  subjectChildId?: string;
+  /** Stable kind used to make child watches idempotent. */
+  kind?: ReminderKind;
+  /** Child-dimensional watch discriminator (kept separate from delivery identity). */
+  watchKind?: 'child';
   name: string;
   prompt: string;
   cron: string;
