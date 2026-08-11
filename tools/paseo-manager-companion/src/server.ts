@@ -34,6 +34,13 @@ export async function createServer(service = new CompanionService(undefined, und
       const pathname = url.pathname;
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
       if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats()); return; }
+      const heartbeatMatch = pathname.match(/^\/heartbeats\/([^/]+)$/);
+      if (method === 'DELETE' && heartbeatMatch) {
+        const body = await readBody(req);
+        const reason = required(body.reason, 'reason');
+        const result = await service.deleteHeartbeat(decodeURIComponent(heartbeatMatch[1]), reason);
+        send(res, typeof result === 'object' && result && 'retirementPending' in result && (result as any).retirementPending ? 202 : 200, result); return;
+      }
       if (method === 'GET' && pathname === '/children') {
         const agentId = required(url.searchParams.get('agentId'), 'agentId');
         send(res, 200, await service.listChildren(agentId)); return;
@@ -58,7 +65,20 @@ export async function createServer(service = new CompanionService(undefined, und
       if (method === 'DELETE' && reminderMatch) {
         const body = await readBody(req);
         const reason = required(body.reason, 'reason');
-        send(res, 200, await service.deleteReminder(decodeURIComponent(reminderMatch[1]), reason)); return;
+        const result = await service.deleteReminder(decodeURIComponent(reminderMatch[1]), reason);
+        send(res, typeof result === 'object' && result && 'retirementPending' in result && (result as any).retirementPending ? 202 : 200, result); return;
+      }
+      const childWatchMatch = pathname.match(/^\/children\/([^/]+)\/watch$/);
+      if ((method === 'DELETE' || method === 'PUT') && childWatchMatch) {
+        const body = await readBody(req);
+        const managerId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
+        const childId = decodeURIComponent(childWatchMatch[1]);
+        if (method === 'DELETE') {
+          const reason = required(body.reason, 'reason');
+          const result = await service.unsubscribeChildWatch(managerId, childId, reason);
+          send(res, result.retirementPending ? 202 : 200, result); return;
+        }
+        send(res, 200, await service.resubscribeChildWatch(managerId, childId, typeof body.reason === 'string' ? body.reason : undefined)); return;
       }
       if (method === 'POST' && pathname === '/compact-wake') {
         const body = await readBody(req);
@@ -86,7 +106,7 @@ export async function createServer(service = new CompanionService(undefined, und
       send(res, 404, { error: 'not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof HttpError ? error.status : (/reminder not found|ledger record not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|delaySeconds must be positive/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)));
+      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
       send(res, status, { error: message });
     }
   });

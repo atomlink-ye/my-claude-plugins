@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { commandIsPaseoWait } from '../../../tools/paseo-manager-companion/src/wait-source.js';
 
 describe('paseo manager companion', () => {
   it('exports a server factory', async () => {
@@ -41,5 +42,14 @@ describe('paseo manager companion', () => {
     await observer.scheduleInspect('s1');
     await observer.scheduleLogs('s1');
     expect(created).toBe(2);
+  });
+
+  it('matches full UUID waits launched with a safe prefix without shell self-matches', () => {
+    const id = '01d5fe32-c7f2-4c39-b973-e053c436b8a1';
+    expect(commandIsPaseoWait(`paseo wait ${id.slice(0, 8)} --timeout 1800`, id)).toBe(true);
+    expect(commandIsPaseoWait(`paseo wait ${id} --timeout 1800`, id.slice(0, 8))).toBe(true);
+    expect(commandIsPaseoWait(`sh -c "paseo wait ${id}"`, id)).toBe(false);
+    expect(commandIsPaseoWait(`paseo wait ${id.slice(0, 7)}`, id)).toBe(false);
+    expect(commandIsPaseoWait(`paseo wait ${id}-near-prefix`, id)).toBe(false);
   });
 });

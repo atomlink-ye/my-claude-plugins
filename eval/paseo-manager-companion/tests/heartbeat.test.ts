@@ -106,7 +106,7 @@ describe('durable heartbeat reconciliation', () => {
     expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
     expect(firstMessage.body).toContain('missed_fires=3');
     expect(firstMessage.body).toContain('last_delivered_at=2026-08-11T00:00:00Z');
-    expect(firstMessage.body).toMatch(/status=working; live_wakeup=(false|unknown); git_dirty=(true|false|unknown)/);
+    expect(firstMessage.body).toMatch(/status=working; paseo_wait=(false|unknown); companion_watch=(false|unknown); git_dirty=(true|false|unknown)/);
 
     observer.logs.set('hb-main', [...observer.logs.get('hb-main')!, run('run-4', '2026-08-11T00:04:00Z', 'failed')]);
     await service.reconcileReminders();
@@ -149,6 +149,102 @@ describe('durable heartbeat reconciliation', () => {
     expect(restarted.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
     expect(restarted.store.findReminder('local-heartbeat')!.observedRunIds).toEqual(['run-success', 'run-failed']);
     restarted.close();
+  });
+
+  it('deletes the id returned by GET and rejects an ambiguous heartbeat prefix', async () => {
+    const observer = new DirectPayloadObserver();
+    const first = reminder({ id: 'local-first', daemonId: 'deadbeef-1111', name: 'first' });
+    const second = reminder({ id: 'local-second', daemonId: 'deadbeef-2222', name: 'second' });
+    observer.schedules.set(first.daemonId!, { id: first.daemonId, status: 'active' });
+    observer.schedules.set(second.daemonId!, { id: second.daemonId, status: 'active' });
+    const { service } = await makeService(observer, [first, second]);
+    const saved = JSON.parse(await readFile((service.store.dir + '/state.json'))) as any;
+    saved.heartbeats[first.daemonId!] = { id: first.daemonId, status: 'active', logs: [] };
+    saved.heartbeats[second.daemonId!] = { id: second.daemonId, status: 'active', logs: [] };
+    await writeFile(service.store.dir + '/state.json', JSON.stringify(saved));
+    running = await createServer(service);
+    await new Promise<void>((resolve) => running!.server.listen(0, '127.0.0.1', resolve));
+    const address = running.server.address();
+    const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const listed = await (await fetch(`${base}/heartbeats`)).json() as any[];
+    const deleted = await fetch(`${base}/heartbeats/${listed[0].id}`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'done' }) });
+    expect(deleted.status).toBe(200);
+    expect(service.store.getReminders().find((item) => item.daemonId === listed[0].id)?.status).toBe('deleted');
+    const afterDelete = await (await fetch(`${base}/heartbeats`)).json() as any[];
+    expect(afterDelete.some((item) => item.id === listed[0].id)).toBe(false);
+    const ambiguous = await fetch(`${base}/heartbeats/deadbeef`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'ambiguous' }) });
+    expect(ambiguous.status).toBe(409);
+    const unique = await fetch(`${base}/heartbeats/deadbeef-2`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'done' }) });
+    expect(unique.status).toBe(200);
+    service.close();
+  });
+
+  it('suppresses opted-out automatic recovery while retaining an explicit message to the child', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.schedules.set('hb-main', { id: 'hb-main', status: 'active' });
+    observer.schedules.set('hb-child', { id: 'hb-child', status: 'active' });
+    const childWatch = reminder({ id: 'child-watch-local', daemonId: 'hb-child', kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1', missedFires: 2, missedRunIds: ['child-run-1', 'child-run-2'] });
+    const managerHeartbeat = reminder({ missedFires: 1, missedRunIds: ['manager-run-1'] });
+    const { service } = await makeService(observer, [managerHeartbeat, childWatch], {
+      'manager-1': { id: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
+      'child-1': { id: 'child-1', Id: 'child-1', ParentAgentId: 'manager-1', Status: 'working', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
+    });
+    await service.store.addMessage({ id: 'explicit-child', to: 'child-1', from: 'manager-1', body: 'keep this explicit message', urgency: 'normal', status: 'pending', createdAt: new Date().toISOString() });
+    await service.unsubscribeChildWatch('manager-1', 'child-1', 'no automatic recovery');
+    expect(service.store.getMessages().some((message) => message.kind === 'heartbeat-recovery' && message.body.includes('child-1'))).toBe(false);
+    expect(service.store.getMessages().some((message) => message.id === 'explicit-child')).toBe(true);
+    expect(service.store.findReminder('child-watch-local')?.missedFires).toBe(0);
+    service.close();
+  });
+
+  it('does not publish an active rebuilt child watch when unsubscribe races a blocked create', async () => {
+    const observer = new DirectPayloadObserver();
+    observer.modes.set('missing-watch', 'missing');
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-rebuild-race-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state; await chmod(shim, 0o755);
+    const real = new PaseoCli(shim);
+    let enteredResolve!: () => void; const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    let releaseResolve!: () => void; const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let blocked = false; let failDelete = true;
+    const cli = { run: async (args: string[], options?: any) => {
+      if (!blocked && args[0] === 'heartbeat' && args[1] === 'create') {
+        blocked = true; enteredResolve(); await release;
+      }
+      if (failDelete && args[0] === 'heartbeat' && args[1] === 'delete') throw new Error('temporary delete failure');
+      return real.run(args, options);
+    } };
+    const service = new CompanionService(cli as any, new Store(root), observer);
+    await service.init();
+    await service.store.addManager('manager-1');
+    await service.store.addReminder(reminder({ id: 'race-watch', daemonId: 'missing-watch', kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1' }));
+    const reconciling = service.reconcileReminders(); await entered;
+    const unsubscribing = service.unsubscribeChildWatch('manager-1', 'child-1', 'cancel during rebuild');
+    releaseResolve(); await Promise.all([reconciling, unsubscribing]);
+    expect(service.store.findReminder('race-watch')).toEqual(expect.objectContaining({ status: 'active', alive: 'unknown' }));
+    failDelete = false; await service.reconcileReminders();
+    expect(service.store.findReminder('race-watch')).toEqual(expect.objectContaining({ status: 'deleted' }));
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === 'child-1' && r.status === 'active')).toHaveLength(0);
+    service.close();
+  });
+
+  it('reports pending recovery retirement when schedule update and delete both fail', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-recovery-retire-fail-'));
+    const store = new Store(root); await store.init();
+    let fail = true;
+    const cli = { run: async (args: string[]) => {
+      if (fail && ((args[0] === 'schedule' && (args[1] === 'update' || args[1] === 'delete')))) throw new Error('temporary daemon failure');
+      return { value: { id: args[2], status: 'active' }, stdout: '', stderr: '' };
+    } };
+    const service = new CompanionService(cli as any, store, new DirectPayloadObserver());
+    await store.addReminder(reminder({ id: 'child-watch', daemonId: undefined, kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1' }));
+    await store.addMessage({ id: 'recovery', to: 'manager-1', from: 'companion', body: 'auto child-1', urgency: 'urgent', status: 'pending', createdAt: new Date().toISOString(), kind: 'heartbeat-recovery', recoveryManagerId: 'manager-1', recoveryCounts: { 'child-watch': 1 }, recoveryRunIds: { 'child-watch': ['run-1'] } });
+    await store.addMessage({ id: 'explicit', to: 'child-1', from: 'manager-1', body: 'keep explicit', urgency: 'normal', status: 'pending', createdAt: new Date().toISOString() });
+    await store.addMessageSchedule({ id: 'recovery-schedule', recipient: 'manager-1', generation: 'g1', daemonId: 'recovery-daemon', batchIds: ['recovery', 'explicit'], prompt: 'auto child-1 + keep explicit', status: 'running', createdAt: new Date().toISOString() });
+    const result = await service.unsubscribeChildWatch('manager-1', 'child-1', 'cancel recovery');
+    expect(result.retirementPending).toBe(true);
+    expect(store.getMessages().map((message) => message.id)).toEqual(expect.arrayContaining(['recovery', 'explicit']));
+    expect(store.getMessageSchedules().find((schedule) => schedule.id === 'recovery-schedule')?.status).toBe('running');
   });
 
   it('rebuilds an explicitly missing schedule once, while transient observer failures neither rebuild nor duplicate a local watch', async () => {

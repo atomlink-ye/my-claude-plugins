@@ -48,6 +48,8 @@ export interface AgentInfo {
   cwd?: string;
   worktree?: string;
   parked: boolean;
+  hasLivePaseoWait: boolean | 'unknown';
+  hasLiveCompanionWatch: boolean | 'unknown';
   hasLiveWakeupSource: boolean | 'unknown';
   gitDirty: boolean | 'unknown';
 }

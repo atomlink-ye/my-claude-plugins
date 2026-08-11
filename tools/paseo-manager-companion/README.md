@@ -16,7 +16,10 @@ Routes:
 |---|---|---|---|
 | GET | `/health` | — | uptime and reconciliation status |
 | GET | `/heartbeats` | — | registered heartbeat observations (`id`, `cron`, `last_fired_at`, `last_delivered_at`, `missed_fires`, `next_run`, `alive`) |
+| DELETE | `/heartbeats/:id` | `{reason}` | deletes by exact id or an unambiguous 8+ character prefix; child watches become a durable unsubscribe |
 | GET | `/children?agentId=` | — | `{children, selfWakeupSources, partial, failedCandidates}`; inspect failures are explicit |
+| DELETE | `/children/:childId/watch?agentId=` | `{reason}` | durably disables that manager/child watch pair and retires all copies |
+| PUT | `/children/:childId/watch?agentId=` | `{reason?}` | clears the durable opt-out and restores the default watch behaviour |
 | POST | `/spawn` | provider, model?, title, cwd, prompt, label? | spawned agent |
 | POST | `/reminders` | agentId, delaySeconds, message, context? | durable at-least-once reminder |
 | DELETE | `/reminders/:id` | `{reason}` | deletes daemon heartbeat and records acknowledgement |
@@ -37,6 +40,12 @@ after the recipient is available; they are not an interrupt and do not displace 
 currently running recipient. The one-minute cadence and reconciliation interval
 are not an exact-turn SLA. A failed busy run
 retains its batch and is re-armed; only the exact successful batch is removed.
+
+Child-watch cancellation is persisted in `child-watch-opt-outs.json` by manager
+and child id, so reconciliation never recreates it after a restart. A malformed
+opt-out file fails closed. Cancellation clears missed child-watch recovery state;
+explicit `/messages` between any agents are never removed. Use the PUT watch route
+to opt back in.
 
 Heartbeat observations are read from `schedule inspect` and `schedule logs`.
 Run timestamps come only from actual `startedAt`/`scheduledFor` entries; run ids

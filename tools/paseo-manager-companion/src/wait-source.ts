@@ -35,12 +35,22 @@ function tokenizeCommand(command: string): string[] {
 
 export function commandIsPaseoWait(command: string, agentId: string): boolean {
   const argv = tokenizeCommand(command);
-  if (path.basename(argv[0] ?? '') === 'paseo') return argv[1] === 'wait' && argv[2] === agentId;
+  if (path.basename(argv[0] ?? '') === 'paseo') return argv[1] === 'wait' && waitTargetMatches(argv[2], agentId);
   if (path.basename(argv[0] ?? '') !== 'node') return false;
   let index = 1;
   while (index < argv.length && argv[index].startsWith('-')) index++;
   if (path.basename(argv[index] ?? '') !== 'paseo') return false;
-  return argv[index + 1] === 'wait' && argv[index + 2] === agentId;
+  return argv[index + 1] === 'wait' && waitTargetMatches(argv[index + 2], agentId);
+}
+
+function waitTargetMatches(target: string | undefined, agentId: string): boolean {
+  if (!target || !agentId) return false;
+  if (target === agentId) return true;
+  // Paseo commonly runs waits with an 8-character id prefix. Accept either
+  // side as a prefix only when it is long enough to avoid accidental matches.
+  const fullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(agentId);
+  if (fullUuid) return target.length >= 8 && target.length < agentId.length && agentId.startsWith(target);
+  return (target.length >= 8 && agentId.startsWith(target)) || (agentId.length >= 8 && target.startsWith(agentId));
 }
 
 /** macOS-compatible implementation; it intentionally avoids a shell/grep pipeline. */

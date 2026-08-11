@@ -10,6 +10,8 @@ export class Store {
   private messages: MessageRecord[] = [];
   private messageSchedules: MessageScheduleRecord[] = [];
   private recoveryReceipts: Record<string, Record<string, { missedFires: number; missedRunIds: string[] }>> = {};
+  private childWatchOptOuts: Record<string, { reason: string; updatedAt: string }> = {};
+  private childWatchOptOutsCorrupt = false;
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
 
@@ -27,6 +29,18 @@ export class Store {
     this.recoveryReceipts = Array.isArray(receipts) ? Object.fromEntries(receipts.map((id) => [id, {}])) : receipts as any;
     const managerList = await this.load<string[]>('managers.json', []);
     this.managers = new Set(managerList);
+    try {
+      const optOuts = await this.loadDurable<Record<string, { reason?: string; updatedAt?: string }>>('child-watch-opt-outs.json', {});
+      if (!optOuts || Array.isArray(optOuts) || typeof optOuts !== 'object') throw new Error('invalid opt-outs');
+      this.childWatchOptOuts = Object.fromEntries(Object.entries(optOuts).map(([key, value]) => [key, {
+        reason: String(value?.reason ?? 'unspecified'), updatedAt: String(value?.updatedAt ?? new Date(0).toISOString()),
+      }]));
+    } catch {
+      // Fail closed: a malformed intent file must never cause a watch to be
+      // silently recreated.  Keep the service available for explicit recovery.
+      this.childWatchOptOutsCorrupt = true;
+      this.childWatchOptOuts = {};
+    }
   }
 
   private async load<T>(file: string, fallback: T): Promise<T> {
@@ -57,6 +71,23 @@ export class Store {
   }
   getManagers(): string[] { return [...this.managers]; }
 
+  private childWatchKey(managerId: string, childId: string): string { return `${managerId}\0${childId}`; }
+  isChildWatchOptedOut(managerId: string, childId: string): boolean {
+    return this.childWatchOptOutsCorrupt || Boolean(this.childWatchOptOuts[this.childWatchKey(managerId, childId)]);
+  }
+  getChildWatchOptOuts(): Record<string, { reason: string; updatedAt: string }> { return { ...this.childWatchOptOuts }; }
+  isChildWatchOptOutStateCorrupt(): boolean { return this.childWatchOptOutsCorrupt; }
+  async optOutChildWatch(managerId: string, childId: string, reason: string): Promise<void> {
+    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    this.childWatchOptOuts[this.childWatchKey(managerId, childId)] = { reason, updatedAt: new Date().toISOString() };
+    await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
+  }
+  async optInChildWatch(managerId: string, childId: string): Promise<void> {
+    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    delete this.childWatchOptOuts[this.childWatchKey(managerId, childId)];
+    await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
+  }
+
   getReminders(): ReminderRecord[] { return this.reminders; }
   async addReminder(record: ReminderRecord): Promise<void> { this.reminders.push(record); await this.save('reminders.json', this.reminders); }
   async updateReminder(id: string, patch: Partial<ReminderRecord>): Promise<ReminderRecord | undefined> {
@@ -65,6 +96,9 @@ export class Store {
     Object.assign(item, patch);
     await this.save('reminders.json', this.reminders);
     return item;
+  }
+  async clearReminderMissed(id: string): Promise<ReminderRecord | undefined> {
+    return this.updateReminder(id, { missedFires: 0, missedRunIds: [] });
   }
   findReminder(id: string): ReminderRecord | undefined { return this.reminders.find((r) => r.id === id || r.daemonId === id); }
 

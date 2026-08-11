@@ -163,6 +163,78 @@ describe('HTTP integration through a paseo executable', () => {
     service.close();
   });
 
+  it('persists a pair unsubscribe across reconciliation and restart, then restores only that child', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-optout-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await service.init();
+    const first = await service.spawn({ provider: 'shim', title: 'first', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const second = await service.spawn({ provider: 'shim', title: 'second', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const firstId = String((first as any).id); const secondId = String((second as any).id);
+    await service.reconcileOnce();
+    const unsubscribed = await service.unsubscribeChildWatch('manager-1', firstId, 'no longer waiting');
+    expect(unsubscribed).toEqual(expect.objectContaining({ status: 'unsubscribed', retirementPending: false }));
+    await service.reconcileOnce();
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === firstId && r.status === 'active')).toHaveLength(0);
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === secondId && r.status === 'active')).toHaveLength(1);
+    service.close();
+    const restarted = new CompanionService(new PaseoCli(paseoShim), new Store(root));
+    await restarted.init(); await restarted.reconcileOnce();
+    expect(restarted.store.getReminders().filter((r) => r.subjectChildId === firstId && r.status === 'active')).toHaveLength(0);
+    await restarted.resubscribeChildWatch('manager-1', firstId, 'watch again');
+    expect(restarted.store.getReminders().filter((r) => r.subjectChildId === firstId && r.status === 'active')).toHaveLength(1);
+    expect(restarted.store.getReminders().filter((r) => r.subjectChildId === secondId && r.status === 'active')).toHaveLength(1);
+    restarted.close();
+  });
+
+  it('turns deleting one child-watch reminder into a pair opt-out and retires every copy', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-delete-pair-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root)); await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'duplicate watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    const copyA = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'a', name: 'copy-a' });
+    const copyB = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'b', name: 'copy-b' });
+    await service.deleteReminder(copyA.id, 'stop watching');
+    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(true);
+    expect(service.store.findReminder(copyA.id)?.status).toBe('deleted');
+    expect(service.store.findReminder(copyB.id)?.status).toBe('deleted');
+    await service.reconcileOnce();
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    service.close();
+  });
+
+  it('serializes unsubscribe with ensure so a concurrent reconcile cannot leave a new watch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-race-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const detector = { detect: async () => false };
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root), undefined, detector); await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'race child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    await Promise.all([service.reconcileOnce(), service.unsubscribeChildWatch('manager-1', childId, 'race')]);
+    await service.reconcileOnce();
+    expect(service.store.isChildWatchOptedOut('manager-1', childId)).toBe(true);
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    service.close();
+  });
+
+  it('keeps a corrupt opt-out file fail-closed across restart and rejects mutations', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-corrupt-'));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    await writeFile(path.join(root, 'child-watch-opt-outs.json'), '{not-json');
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root)); await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'corrupt optout child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id); await service.reconcileOnce();
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    await expect(service.unsubscribeChildWatch('manager-1', childId, 'should fail closed')).rejects.toThrow(/opt-out state corrupt/);
+    await expect(service.resubscribeChildWatch('manager-1', childId)).rejects.toThrow(/opt-out state corrupt/);
+    service.close();
+  });
+
   it('recognizes a real full-id paseo wait and does not add a companion watch', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-wait-source-'));
     const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
@@ -191,6 +263,30 @@ describe('HTTP integration through a paseo executable', () => {
       waitProcess.kill();
       service.close();
     }
+  });
+
+  it('reports the live-source matrix for wait-only, companion-only, and aggregate sources', async () => {
+    const make = async (wait: boolean) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'companion-source-matrix-'));
+      const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+      process.env.PASEO_SHIM_STATE = state;
+      const detector = { live: wait, detect: async () => detector.live as boolean };
+      const service = new CompanionService(new PaseoCli(paseoShim), new Store(root), undefined, detector);
+      await service.init();
+      const child = await service.spawn({ provider: 'shim', title: 'matrix child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+      await service.reconcileOnce();
+      return { service, childId: String((child as any).id), detector };
+    };
+    const waitOnly = await make(true);
+    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: false, hasLiveWakeupSource: true }));
+    expect(waitOnly.service.store.getReminders().filter((r) => r.kind === 'child-watch' && r.status === 'active')).toHaveLength(0);
+    waitOnly.service.close();
+    const companionOnly = await make(false);
+    expect((await companionOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: false, hasLiveCompanionWatch: true, hasLiveWakeupSource: true }));
+    expect(companionOnly.service.store.getReminders().filter((r) => r.subjectChildId === companionOnly.childId && r.status === 'active')).toHaveLength(1);
+    companionOnly.detector.live = true;
+    expect((await companionOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: true, hasLiveWakeupSource: true }));
+    companionOnly.service.close();
   });
 
   it('gives the manager an independent watch for each child when one is idle and others run', async () => {

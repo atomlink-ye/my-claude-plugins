@@ -33,6 +33,9 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 | `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — repeats until you `DELETE` it, capped by a TTL (default 30-60min). The daemon delivers it even while you're busy or disconnected. |
 | `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are grouped by sender into one one-shot schedule per recipient (`--max-runs 1`), with urgent messages at the queue head. Delivery is attempted on the next scheduled turn after availability is observed; it never interrupts a running recipient. |
 | `DELETE /reminders/:id` `{reason}` | The explicit "I've decided not to wait anymore" action. `reason` is required — 400 without it. |
+| `DELETE /children/:childId/watch?agentId=` `{reason}` | Persistently stop automatic watch registration for one manager/child pair; all existing copies are retired. |
+| `PUT /children/:childId/watch?agentId=` `{reason?}` | Explicitly restore automatic watch registration for the pair. |
+| `DELETE /heartbeats/:id` `{reason}` | Delete a listed heartbeat id (or an unambiguous 8+ character prefix); child-watch deletion is treated as pair unsubscribe. |
 | `POST /compact-wake` `{agentId, resumeSteps}` | Call right before self-compact. Arms a fallback heartbeat immediately, then watches for you to go idle and *stay* idle for a debounce window before delivering `resumeSteps` — not a blind fixed delay. |
 | `GET /children/:id/briefing` | The "what happened while I was waiting" report §2 of PROPOSAL.md asks for: commits, uncommitted changes, diff stat. Reads git directly (not `paseo logs` — see UPSTREAM.md #6). |
 | `POST /ledger` `{type, target, verdict, reason, recovery?}` | park / known-red / deferred, unified. Missing `verdict` or `reason` → 400, always, no exceptions. |
