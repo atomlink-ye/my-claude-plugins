@@ -17,6 +17,27 @@ function runTar(args, cwd) {
   return result;
 }
 
+function archiveOwnerArgs(owner) {
+  if (!owner) return [];
+  const version = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  const versionText = `${version.stdout ?? ""}\n${version.stderr ?? ""}`;
+  if (/gnu tar/i.test(versionText)) {
+    return ["--owner", String(owner.uid), "--group", String(owner.gid), "--numeric-owner"];
+  }
+  if (/bsdtar|libarchive/i.test(versionText)) {
+    return ["--uid", String(owner.uid), "--gid", String(owner.gid), "--numeric-owner"];
+  }
+  const help = spawnSync("tar", ["--help"], { encoding: "utf8" });
+  const text = `${help.stdout ?? ""}\n${help.stderr ?? ""}`;
+  if (/--owner(?:[ =]|$)/.test(text) && /--group(?:[ =]|$)/.test(text)) {
+    return ["--owner", String(owner.uid), "--group", String(owner.gid), "--numeric-owner"];
+  }
+  if (/--uid(?:[ =]|$)/.test(text) && /--gid(?:[ =]|$)/.test(text)) {
+    return ["--uid", String(owner.uid), "--gid", String(owner.gid), "--numeric-owner"];
+  }
+  throw new Error("tar does not support explicit numeric archive ownership (--owner/--group or --uid/--gid)");
+}
+
 function listTarEntries(bundlePath) {
   const result = runTar(["-tzf", bundlePath], process.cwd());
   const entries = result.stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
@@ -65,6 +86,7 @@ function createBundle(inputPath, taskId, options = {}) {
   try {
     const exclusions = mode === "full" ? [".sandbox-ctl"] : [".env*", ".git", ".sandbox-ctl", "node_modules", ".claude", ".opencode-state", ".daytona", "dist", "build", "*.log", "logs"];
     const tarArgs = ["-czf", bundlePath];
+    tarArgs.push(...archiveOwnerArgs(options.archiveOwner));
     if (statSync(abs).isDirectory()) {
       for (const item of exclusions) tarArgs.push("--exclude", item);
       tarArgs.push("-C", abs, ".");
