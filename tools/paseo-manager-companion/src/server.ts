@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { CompanionService } from './service.js';
+import { PaseoScheduleObserver } from './schedule-observer.js';
 
 export interface CompanionServer {
   server: http.Server;
@@ -24,7 +25,7 @@ function required(value: unknown, name: string): string {
   return value;
 }
 
-export async function createServer(service = new CompanionService()): Promise<CompanionServer> {
+export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver())): Promise<CompanionServer> {
   await service.init();
   const server = http.createServer(async (req, res) => {
     try {
@@ -32,6 +33,7 @@ export async function createServer(service = new CompanionService()): Promise<Co
       const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
       const pathname = url.pathname;
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
+      if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats()); return; }
       if (method === 'GET' && pathname === '/children') {
         const agentId = required(url.searchParams.get('agentId'), 'agentId');
         send(res, 200, await service.listChildren(agentId)); return;
@@ -45,6 +47,12 @@ export async function createServer(service = new CompanionService()): Promise<Co
         const body = await readBody(req);
         required(body.agentId, 'agentId'); required(body.message, 'message');
         send(res, 201, await service.createReminder(body)); return;
+      }
+      if (method === 'POST' && pathname === '/messages') {
+        const body = await readBody(req);
+        required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
+        if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new HttpError(400, 'urgency must be normal or urgent');
+        send(res, 201, await service.postMessage(body)); return;
       }
       const reminderMatch = pathname.match(/^\/reminders\/([^/]+)$/);
       if (method === 'DELETE' && reminderMatch) {

@@ -31,12 +31,24 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 | `GET /children?agentId=<self>` | "What are my child agents doing, and does each one still have a live wakeup source?" Ground-truth enumeration via `ParentAgentId`, not dependent on having spawned through this service. |
 | `POST /spawn` | Fast-path wrapper over `paseo run -d`. Not required for correctness — the reconciliation loop (below) catches children spawned by raw `paseo run` too. |
 | `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — repeats until you `DELETE` it, capped by a TTL (default 30-60min). The daemon delivers it even while you're busy or disconnected. |
+| `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are grouped by sender into one one-shot schedule per recipient (`--max-runs 1`), with urgent messages at the queue head. Delivery is attempted on the next scheduled turn after availability is observed; it never interrupts a running recipient. |
 | `DELETE /reminders/:id` `{reason}` | The explicit "I've decided not to wait anymore" action. `reason` is required — 400 without it. |
 | `POST /compact-wake` `{agentId, resumeSteps}` | Call right before self-compact. Arms a fallback heartbeat immediately, then watches for you to go idle and *stay* idle for a debounce window before delivering `resumeSteps` — not a blind fixed delay. |
 | `GET /children/:id/briefing` | The "what happened while I was waiting" report §2 of PROPOSAL.md asks for: commits, uncommitted changes, diff stat. Reads git directly (not `paseo logs` — see UPSTREAM.md #6). |
 | `POST /ledger` `{type, target, verdict, reason, recovery?}` | park / known-red / deferred, unified. Missing `verdict` or `reason` → 400, always, no exceptions. |
 | `GET /ledger`, `POST /ledger/:id/revoke` | Query and unwind decisions (append-only — revocation doesn't erase history). |
 | `GET /health` | For your own bootstrap check; also referenced inside every reminder prompt so a dead service is discoverable through the same channel that delivers the reminder. |
+
+Worker message example:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8787/messages -H 'content-type: application/json' -d '{"to":"worker-id","from":"manager-id","body":"Please review the diff","urgency":"normal"}'
+```
+
+Decision guide: use `paseo send` for a deliberate follow-up when interruption is
+safe; `/reminders` for a repeated/time-based nudge needing explicit acknowledgement;
+`/messages` for durable asynchronous worker content that should be coalesced without
+interrupting a running worker.
 
 ## What it does NOT guarantee
 
@@ -52,6 +64,13 @@ Read `UPSTREAM.md` at the repo root before treating any of these as solved:
   daemon truth if the service's storage is lost between restarts; it self-heals via
   a `heartbeat update <id> --cron <unchanged>` probe at startup, but a total data
   loss produces harmless orphan heartbeats (extra noise), not silent failure.
+
+For messages, schedule existence and run outcome are checked with `schedule inspect`
+and `schedule logs`; the service does not use heartbeat update as a delivery probe.
+If a schedule fires while its recipient is busy, the failed batch remains durable
+and one replacement schedule is armed for the next scheduled attempt. Urgent means
+queue-head priority, not immediate interruption or an exact-turn SLA; the one-minute
+schedule cadence and reconciliation interval bound responsiveness.
 
 ## Full spec
 
