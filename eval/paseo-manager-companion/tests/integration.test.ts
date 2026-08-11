@@ -1,4 +1,5 @@
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +8,7 @@ import { PaseoCli } from '../../../tools/paseo-manager-companion/src/cli.js';
 import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
 import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
 import { createServer } from '../../../tools/paseo-manager-companion/src/server.js';
+import { ProcessWaitSourceDetector } from '../../../tools/paseo-manager-companion/src/wait-source.js';
 
 let running: Awaited<ReturnType<typeof createServer>> | undefined;
 const paseoShim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
@@ -18,6 +20,7 @@ afterEach(async () => {
   delete process.env.PASEO_AGENT_ID;
   delete process.env.PASEO_CONCURRENCY_STATE;
   delete process.env.PASEO_CONCURRENCY_FAIL;
+  delete process.env.PASEO_DELETE_TRANSIENT;
 });
 
 async function request(base: string, method: string, route: string, body?: unknown) {
@@ -94,7 +97,52 @@ describe('HTTP integration through a paseo executable', () => {
     expect(watches).toHaveLength(1);
     expect(watches[0]).toEqual(expect.objectContaining({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child' }));
     expect(watches[0].prompt).toMatch(/query companion health|inspect the relevant child/i);
-    expect(watches[0].prompt).not.toContain(childId);
+    expect(watches[0].prompt).toContain(childId);
+    expect(watches[0].prompt).toContain('"cwd"');
+    service.close();
+  });
+
+  it('auto-revokes a park only after a later parseable running activity', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-park-resume-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'parked child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    await service.addLedger({ type: 'park', target: childId, verdict: 'parked', reason: 'waiting' });
+    await service.reconcileOnce();
+    expect(service.listLedger('park', childId)).toHaveLength(1);
+    let saved = JSON.parse(await readFile(state, 'utf8'));
+    saved.agents[childId].Status = 'running';
+    saved.agents[childId].UpdatedAt = new Date(Date.now() + 10_000).toISOString();
+    await writeFile(state, JSON.stringify(saved));
+    await service.reconcileOnce();
+    expect(service.listLedger('park', childId)).toHaveLength(0);
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
+    service.close();
+  });
+
+  it('migrates a live pre-P0 child watch to an identified prompt without duplicating it', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-watch-migrate-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'old watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    process.env.PASEO_DELETE_TRANSIENT = '1';
+    const old = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'old', context: { watchKind: 'child' } });
+    await service.store.updateReminder(old.id, { prompt: 'old prompt\nStructured context: {"watchKind":"child"}' });
+    await service.reconcileOnce();
+    const active = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
+    expect(active).toHaveLength(2);
+    expect(active.filter((r) => r.prompt.includes(childId) && r.prompt.includes('"cwd"'))).toHaveLength(1);
+    expect(active.some((r) => r.prompt.startsWith('old prompt'))).toBe(true);
+    await service.reconcileOnce();
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(2);
     service.close();
   });
 
@@ -113,6 +161,36 @@ describe('HTTP integration through a paseo executable', () => {
     expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
     expect(Object.keys(saved.heartbeats)).toHaveLength(1);
     service.close();
+  });
+
+  it('recognizes a real full-id paseo wait and does not add a companion watch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-wait-source-'));
+    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
+    process.env.PASEO_SHIM_STATE = state;
+    const service = new CompanionService(new PaseoCli(shim), new Store(root));
+    await service.init();
+    const child = await service.spawn({ provider: 'shim', title: 'waited child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const childId = String((child as any).id);
+    const waitPaseo = fileURLToPath(new URL('../fixtures/paseo', import.meta.url));
+    await chmod(waitPaseo, 0o755);
+    const waitProcess = spawn(waitPaseo, ['wait', childId, '--timeout', '1800']);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const detector = new ProcessWaitSourceDetector();
+      let detected = false;
+      for (let attempt = 0; attempt < 5 && !detected; attempt++) {
+        detected = await detector.detect(childId) === true;
+        if (!detected) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(detected).toBe(true);
+      expect(await detector.detect(`${childId}-near-prefix`)).toBe(false);
+      await service.reconcileOnce();
+      expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
+    } finally {
+      waitProcess.kill();
+      service.close();
+    }
   });
 
   it('gives the manager an independent watch for each child when one is idle and others run', async () => {
