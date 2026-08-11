@@ -5,4 +5,41 @@ describe('paseo manager companion', () => {
     const mod = await import('../../../tools/paseo-manager-companion/src/server.js');
     expect(typeof mod.createServer).toBe('function');
   });
+
+  it('adapts direct daemon schedule RPC payloads without CLI presentation', async () => {
+    const { PaseoScheduleObserver, normalizePaseoWsHost } = await import('../../../tools/paseo-manager-companion/src/schedule-observer.js');
+    const calls: unknown[] = [];
+    const fake = {
+      async connect() { calls.push('connect'); },
+      async close() {},
+      async scheduleList() { return { payload: { schedules: [{ id: 's1', name: 'heartbeat', status: 'active', target: { type: 'agent', agentId: 'manager-1' } }] } }; },
+      async scheduleInspect(options: { id: string }) { calls.push(options); return { payload: { schedule: { id: options.id, status: 'active' } } }; },
+      async scheduleLogs() { return { payload: { runs: [{ id: 'r1', startedAt: '2026-08-11T00:00:00Z', scheduledFor: '2026-08-11T00:00:00Z', status: 'failed' }] } }; },
+    };
+    const observer = new PaseoScheduleObserver({ client: fake as any });
+    expect(normalizePaseoWsHost('tcp://127.0.0.1:6767')).toBe('ws://127.0.0.1:6767/ws');
+    expect(await observer.scheduleList()).toEqual(expect.objectContaining({ payload: expect.anything() }));
+    expect(await observer.scheduleInspect('s1')).toEqual(expect.objectContaining({ payload: expect.anything() }));
+    expect(await observer.scheduleLogs('s1')).toEqual(expect.objectContaining({ payload: expect.anything() }));
+    expect(calls).toContain('connect');
+  });
+
+  it('uses a fresh disposable client for each schedule RPC', async () => {
+    const { PaseoScheduleObserver } = await import('../../../tools/paseo-manager-companion/src/schedule-observer.js');
+    let created = 0;
+    const observer = new PaseoScheduleObserver({ clientFactory: () => {
+      let disposed = false;
+      created++;
+      return {
+        async connect() {},
+        async close() { disposed = true; },
+        async scheduleInspect() { if (disposed) throw new Error('disposed client reused'); return { schedule: { id: 's1', status: 'active' } }; },
+        async scheduleLogs() { if (disposed) throw new Error('disposed client reused'); return { runs: [] }; },
+        async scheduleList() { if (disposed) throw new Error('disposed client reused'); return { schedules: [] }; },
+      } as any;
+    } });
+    await observer.scheduleInspect('s1');
+    await observer.scheduleLogs('s1');
+    expect(created).toBe(2);
+  });
 });

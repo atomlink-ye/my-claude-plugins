@@ -9,6 +9,7 @@ export class Store {
   private ledger: LedgerRecord[] = [];
   private messages: MessageRecord[] = [];
   private messageSchedules: MessageScheduleRecord[] = [];
+  private recoveryReceipts: Record<string, Record<string, { missedFires: number; missedRunIds: string[] }>> = {};
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
 
@@ -22,6 +23,8 @@ export class Store {
     this.ledger = await this.load<LedgerRecord[]>('ledger.json', []);
     this.messages = await this.loadDurable<MessageRecord[]>('messages.json', []);
     this.messageSchedules = await this.loadDurable<MessageScheduleRecord[]>('message-schedules.json', []);
+    const receipts = await this.loadDurable<Record<string, any> | string[]>('recovery-receipts.json', {});
+    this.recoveryReceipts = Array.isArray(receipts) ? Object.fromEntries(receipts.map((id) => [id, {}])) : receipts as any;
     const managerList = await this.load<string[]>('managers.json', []);
     this.managers = new Set(managerList);
   }
@@ -67,10 +70,43 @@ export class Store {
 
   getMessages(): MessageRecord[] { return this.messages; }
   async addMessage(record: MessageRecord): Promise<void> { this.messages.push(record); await this.save('messages.json', this.messages); }
+  async updateMessage(id: string, patch: Partial<MessageRecord>): Promise<MessageRecord | undefined> {
+    const item = this.messages.find((message) => message.id === id);
+    if (!item) return undefined;
+    Object.assign(item, patch);
+    await this.save('messages.json', this.messages);
+    return item;
+  }
   async removeMessages(ids: Iterable<string>): Promise<void> {
     const remove = new Set(ids);
     this.messages = this.messages.filter((message) => !remove.has(message.id));
     await this.save('messages.json', this.messages);
+  }
+  async addRecoveryReceipt(id: string, targets: Record<string, { missedFires: number; missedRunIds: string[] }>): Promise<void> {
+    if (this.recoveryReceipts[id]) return;
+    this.recoveryReceipts[id] = targets;
+    await this.save('recovery-receipts.json', this.recoveryReceipts);
+  }
+  getRecoveryReceipt(id: string): Record<string, { missedFires: number; missedRunIds: string[] }> | undefined { return this.recoveryReceipts[id]; }
+  async applyRecoveryReceipt(id: string, covered: Record<string, { missedFires: number; missedRunIds: string[] }>): Promise<void> {
+    if (this.recoveryReceipts[id]) return;
+    const remaining: Record<string, { missedFires: number; missedRunIds: string[] }> = {};
+    for (const [reminderId, target] of Object.entries(covered)) {
+      const reminder = this.reminders.find((item) => item.id === reminderId);
+      if (!reminder) { remaining[reminderId] = { missedFires: 0, missedRunIds: [] }; continue; }
+      const coveredIds = new Set(target.missedRunIds);
+      const currentIds = reminder.missedRunIds ?? [];
+      const currentRemaining = currentIds.filter((runId) => !coveredIds.has(runId));
+      const missedFires = currentIds.length || coveredIds.size
+        ? currentRemaining.length
+        : Math.max(0, (reminder.missedFires ?? 0) - target.missedFires);
+      reminder.missedRunIds = currentRemaining;
+      reminder.missedFires = missedFires;
+      remaining[reminderId] = { missedFires, missedRunIds: currentRemaining };
+    }
+    this.recoveryReceipts[id] = remaining;
+    await this.save('reminders.json', this.reminders);
+    await this.save('recovery-receipts.json', this.recoveryReceipts);
   }
 
   getMessageSchedules(): MessageScheduleRecord[] { return this.messageSchedules; }

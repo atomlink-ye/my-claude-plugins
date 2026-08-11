@@ -19,6 +19,13 @@ export interface ReminderRecord {
   status: 'pending' | 'active' | 'dead' | 'deleted';
   nextRunAt?: string;
   lastRunAt?: string;
+  /** Observation state derived from schedule inspect/logs (durable across restarts). */
+  lastFiredAt?: string;
+  lastDeliveredAt?: string;
+  missedFires?: number;
+  observedRunIds?: string[];
+  missedRunIds?: string[];
+  alive?: boolean | 'unknown';
   createdAt: string;
 }
 
@@ -41,7 +48,8 @@ export interface AgentInfo {
   cwd?: string;
   worktree?: string;
   parked: boolean;
-  hasLiveWakeupSource: boolean;
+  hasLiveWakeupSource: boolean | 'unknown';
+  gitDirty: boolean | 'unknown';
 }
 
 export interface FailedCandidate {
@@ -67,6 +75,10 @@ export interface MessageRecord {
   status: 'pending' | 'delivered';
   createdAt: string;
   deliveredAt?: string;
+  kind?: 'heartbeat-recovery';
+  recoveryManagerId?: string;
+  recoveryCounts?: Record<string, number>;
+  recoveryRunIds?: Record<string, string[]>;
 }
 
 /** Local index for one generation of a recipient's one-shot delivery schedule. */

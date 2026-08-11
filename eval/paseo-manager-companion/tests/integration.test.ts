@@ -2,13 +2,15 @@ import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PaseoCli } from '../../../tools/paseo-manager-companion/src/cli.js';
 import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
 import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
 import { createServer } from '../../../tools/paseo-manager-companion/src/server.js';
 
 let running: Awaited<ReturnType<typeof createServer>> | undefined;
+const paseoShim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
+beforeEach(async () => { await chmod(paseoShim, 0o755); process.env.PASEO_AGENT_ID = 'manager-1'; });
 afterEach(async () => {
   if (running) { running.service.close(); await new Promise<void>((resolve) => running!.server.close(() => resolve())); }
   running = undefined;
@@ -91,7 +93,8 @@ describe('HTTP integration through a paseo executable', () => {
     const watches = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
     expect(watches).toHaveLength(1);
     expect(watches[0]).toEqual(expect.objectContaining({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child' }));
-    expect(watches[0].prompt).toContain(`paseo inspect ${childId} --json`);
+    expect(watches[0].prompt).toMatch(/query companion health|inspect the relevant child/i);
+    expect(watches[0].prompt).not.toContain(childId);
     service.close();
   });
 

@@ -15,6 +15,7 @@ Routes:
 | Method | Path | Body / query | Result |
 |---|---|---|---|
 | GET | `/health` | — | uptime and reconciliation status |
+| GET | `/heartbeats` | — | registered heartbeat observations (`id`, `cron`, `last_fired_at`, `last_delivered_at`, `missed_fires`, `next_run`, `alive`) |
 | GET | `/children?agentId=` | — | `{children, selfWakeupSources, partial, failedCandidates}`; inspect failures are explicit |
 | POST | `/spawn` | provider, model?, title, cwd, prompt, label? | spawned agent |
 | POST | `/reminders` | agentId, delaySeconds, message, context? | durable at-least-once reminder |
@@ -36,6 +37,12 @@ after the recipient is available; they are not an interrupt and do not displace 
 currently running recipient. The one-minute cadence and reconciliation interval
 are not an exact-turn SLA. A failed busy run
 retains its batch and is re-armed; only the exact successful batch is removed.
+
+Heartbeat observations are read from `schedule inspect` and `schedule logs`.
+Run timestamps come only from actual `startedAt`/`scheduledFor` entries; run ids
+and delivery counters are durable across restarts. Missing schedules are rebuilt
+by deterministic name (with duplicate adoption via `schedule ls`) and recorded in
+the decision ledger, while transient CLI failures remain unknown and are not rebuilt.
 
 One-line worker usage:
 

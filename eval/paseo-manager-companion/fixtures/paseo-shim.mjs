@@ -53,7 +53,7 @@ if (args[0] === 'ls') {
   const busy = target && ['running', 'working', 'busy'].includes(String(target.Status ?? target.status).toLowerCase());
   hb.logs = hb.logs || [];
   hb.lastRunAt = '2026-08-08T00:06:00.000Z';
-  hb.logs.push({ at: hb.lastRunAt, status: busy ? 'failed' : 'succeeded', reason: busy ? 'recipient busy' : 'delivered', prompt: hb.prompt });
+  hb.logs.push({ id: `run-${hb.logs.length + 1}`, scheduledFor: hb.lastRunAt, startedAt: hb.lastRunAt, endedAt: hb.lastRunAt, status: busy ? 'failed' : 'succeeded', reason: busy ? 'recipient busy' : 'delivered', prompt: hb.prompt });
   // A max-runs schedule is terminal after either outcome. Consumers must read
   // the run log to distinguish a delivered run from a busy failure.
   hb.status = 'completed';
