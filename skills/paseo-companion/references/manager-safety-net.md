@@ -28,11 +28,14 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 
 | Route | Use it for |
 |---|---|
-| `GET /children?agentId=<self>` | "What are my child agents doing, and does each one still have a live wakeup source?" Ground-truth enumeration via `ParentAgentId`, not dependent on having spawned through this service. |
+| `GET /children?agentId=<self>` | "What are my tracked child agents doing, and does each one still have a live wakeup source?" Discovery auto-enrolls only parseable post-start children; unparseable/old children stay untracked. |
 | `POST /spawn` | Fast-path wrapper over `paseo run -d`. Not required for correctness — the reconciliation loop (below) catches children spawned by raw `paseo run` too. |
 | `POST /reminders` `{agentId, delaySeconds, message, context?}` | `remind_me_in(seconds, message)`. At-least-once — the current reminder repeats until acknowledged with `DELETE`, capped by a TTL (default 30-60min). Acknowledging an automatic child-watch delivery does not unsubscribe that child; reconciliation arms its next watch. |
-| `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous message queue. Messages are persisted and grouped by sender, then handed to `paseo send --no-wait`; Paseo delivers the batch at the recipient's next turn boundary without interrupting the current turn. Local messages are removed only after an explicit `sent`/`accepted` response. |
-| `DELETE /messages/:id` `{reason}` | Cancel one message that is still locally pending. Once Paseo has accepted a send, the local record is already gone and daemon turn-boundary delivery owns completion. |
+| `POST /messages` `{to, from, body, urgency?}` | Durable asynchronous queue. Pending records are grouped and handed to `paseo send --no-wait`; acceptance marks ordinary records `delivered` (retained until per-ID acknowledgement). Recovery records are ephemeral after receipt application. |
+| `GET /messages?to=<agent-id>` | Observe durable pending/delivered records (optionally filtered by recipient) before acknowledging them. |
+| `DELETE /messages/:id` `{reason}` | Acknowledge/remove one pending or delivered record. Repeating a prior acknowledgement is idempotent; unknown IDs are 404. |
+| `PUT /children/:childId?agentId=` | Explicitly track a manager/child pair, clear opt-out, and ensure its watch. The `/watch` alias remains compatible. |
+| `DELETE /children/:childId?agentId=` `{reason}` | Persistently opt out and retire tracking/watch/recovery. The `/watch` alias remains compatible. |
 | `DELETE /reminders/:id` `{reason}` | Acknowledge this delivered reminder only. It clears that reminder's missed-fire state and has no subscription-policy side effect. `reason` is required — 400 without it. |
 | `DELETE /children/:childId/watch?agentId=` `{reason}` | Persistently stop automatic watch registration for one manager/child pair; all existing copies are retired. |
 | `PUT /children/:childId/watch?agentId=` `{reason?}` | Explicitly restore automatic watch registration for the pair. |
@@ -43,10 +46,21 @@ agent shell) — reminders and heartbeats target "this agent" through that env v
 | `GET /ledger`, `POST /ledger/:id/revoke` | Query and unwind decisions (append-only — revocation doesn't erase history). |
 | `GET /health` | For your own bootstrap check; also referenced inside every reminder prompt so a dead service is discoverable through the same channel that delivers the reminder. |
 
-Worker message example:
+Reminders are recurring cron prompts through the daemon's system/schedule wrapper.
+Repetition, TTL, and max-runs are explicit schedule behavior; a busy recipient may
+miss a fire, which is counted for recovery instead of assumed processed.
+
+Worker message example (acknowledge each returned ID separately):
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8787/messages -H 'content-type: application/json' -d '{"to":"worker-id","from":"manager-id","body":"Please review the diff","urgency":"normal"}'
+```
+
+Track or opt out a child explicitly:
+
+```sh
+curl -X PUT 'http://127.0.0.1:8787/children/child-id?agentId=manager-id'
+curl -X DELETE 'http://127.0.0.1:8787/children/child-id?agentId=manager-id' -H 'content-type: application/json' -d '{"reason":"closed lane"}'
 ```
 
 Decision guide: use `paseo send` for a deliberate follow-up when interruption is
@@ -55,8 +69,9 @@ safe; `/reminders` for a repeated/time-based nudge needing explicit acknowledgem
 interrupting a running worker.
 
 Heartbeat-recovery snapshots use the same turn-boundary send transport and are
-retired locally once Paseo accepts the batch. Child summary fields use the same camelCase names as
-`GET /children`: `hasLivePaseoWait`, `hasLiveCompanionWatch`, and `gitDirty`.
+retired locally once Paseo accepts the batch. They contain only missed total,
+last-delivered time, affected source/child IDs, compact current state, and a
+decision cue. Child summary fields use the same camelCase names as `GET /children`.
 Terminal message-delivery audit history is bounded to the newest 50 records.
 
 ## What it does NOT guarantee
@@ -74,10 +89,12 @@ Read `UPSTREAM.md` at the repo root before treating any of these as solved:
   a `heartbeat update <id> --cron <unchanged>` probe at startup, but a total data
   loss produces harmless orphan heartbeats (extra noise), not silent failure.
 
-For messages, the authoritative handoff is the `paseo send --no-wait` response.
-Missing, false, or failed status is not accepted as delivery evidence and leaves the
-batch durable for retry. Urgent means queue-head priority inside a coalesced batch,
-not immediate interruption or an exact-turn SLA.
+For messages, the authoritative handoff is the `paseo send --no-wait` response. In
+the installed CLI this still awaits `sendAgentMessage`; `--no-wait` only skips
+`waitForFinish`, so acceptance is daemon receipt rather than recipient processing.
+Missing, false, or failed status leaves the batch pending for 15-second retry.
+Urgent means queue-head priority inside a coalesced batch, not immediate interruption
+or an exact-turn SLA.
 
 ## Full spec
 

@@ -15,7 +15,7 @@ if (args[0] === 'ls') {
   out(a);
 } else if (args[0] === 'run') {
   const id = `child-${Object.keys(state.agents).length + 1}`;
-  state.agents[id] = { Id: id, id, agentId: id, ParentAgentId: agentId, Status: 'running', UpdatedAt: '2026-08-08T00:00:00.000Z', Cwd: args[args.indexOf('--cwd') + 1] || process.cwd(), Worktree: process.cwd() };
+  state.agents[id] = { Id: id, id, agentId: id, ParentAgentId: agentId, Status: 'running', CreatedAt: new Date().toISOString(), UpdatedAt: '2026-08-08T00:00:00.000Z', Cwd: args[args.indexOf('--cwd') + 1] || process.cwd(), Worktree: process.cwd() };
   out({ agentId: id, status: 'running', provider: 'shim', cwd: state.agents[id].Cwd });
 } else if (args[0] === 'heartbeat' && args[1] === 'create') {
   const id = `hb-${Object.keys(state.heartbeats).length + 1}`;

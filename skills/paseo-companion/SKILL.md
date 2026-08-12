@@ -21,20 +21,43 @@ curl -sS -X POST http://127.0.0.1:8787/messages \
 ```
 
 The queue persists each message before calling Paseo, groups pending messages by
-sender, and hands one coalesced batch to `paseo send --no-wait`. Paseo queues that
-send at the recipient's next turn boundary; it does not interrupt an in-flight
-turn. The companion removes the durable local batch only after Paseo explicitly
-returns `sent` or `accepted`. A failed or ambiguous response remains pending and
-is retried by reconciliation. Structured `message-delivery-accepted` and
-`message-delivery-failed` log records expose the transport decision.
+sender, and hands one coalesced batch to `paseo send --no-wait`. The installed CLI
+still awaits the `sendAgentMessage` RPC; `--no-wait` skips only `waitForFinish`.
+Therefore success means daemon acceptance, not recipient processing. Accepted
+ordinary records become `delivered` and remain visible until each ID is explicitly
+acknowledged; failed or ambiguous sends remain `pending` and reconciliation retries
+after 15 seconds. The prompt includes one DELETE instruction per message (never a
+batch auto-ack). Heartbeat-recovery records apply their receipt and are removed
+after acceptance.
 
 Automatic heartbeat-recovery snapshots and ordinary worker messages use the same
-turn-boundary send transport. `DELETE /messages/:id` remains an escape hatch for a
-message that is still locally pending; after Paseo accepts the send, the daemon owns
-delivery and the local record is already removed.
+turn-boundary send transport. `DELETE /messages/:id` acknowledges/removes either a
+pending or delivered record and is idempotent after a prior acknowledgement; an
+unknown ID is 404.
+
+Use `GET /messages?to=worker-id` to observe pending and delivered records before
+acknowledging them.
+
+Child tracking is explicit or discovered only for children whose parseable
+`CreatedAt`/`createdAt` is strictly after service startup. Missing timestamps are
+not auto-enrolled. `GET /children` returns tracked children only, with public
+tracking metadata in `source` and `addedAt`; use either
+`PUT /children/:childId?agentId=manager-id` or the compatible `/watch` alias to
+track a pair. Explicit PUT always ensures a companion child-watch even when a
+separate `paseo wait` source is already live. DELETE with a reason persists an opt-out:
+
+```sh
+curl -X PUT 'http://127.0.0.1:8787/children/child-id?agentId=manager-id'
+curl -X DELETE 'http://127.0.0.1:8787/children/child-id?agentId=manager-id' -H 'content-type: application/json' -d '{"reason":"no longer needed"}'
+```
 
 This supersedes the older “worker intermediate updates are unavailable” guidance:
 use `/messages` for durable updates, and reserve `send` for safe direct steering.
+
+Companion reminders are recurring cron prompts wrapped by the daemon's system/
+schedule runner. Their repetition, TTL, and max-runs behavior means a busy agent
+can miss a fire; missed runs are counted and surfaced by heartbeat recovery rather
+than treated as proof that the recipient processed the prompt.
 
 Choose the primitive by intent:
 

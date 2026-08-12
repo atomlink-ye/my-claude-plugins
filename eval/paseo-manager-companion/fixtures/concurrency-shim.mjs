@@ -18,7 +18,7 @@ if (args[0] === 'ls') {
   setTimeout(() => {
     fs.rmSync(token, { force: true });
     if (tooMany || forcedFailure) process.exit(1);
-    out({ Id: id, ParentAgentId: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-08T00:00:00.000Z', Cwd: process.cwd() });
+    out({ Id: id, ParentAgentId: 'manager-1', Status: 'idle', CreatedAt: new Date().toISOString(), UpdatedAt: '2026-08-08T00:00:00.000Z', Cwd: process.cwd() });
   }, 40);
 } else if (args[0] === 'heartbeat' && args[1] === 'update') {
   out({ id: args[2], status: 'active' });
