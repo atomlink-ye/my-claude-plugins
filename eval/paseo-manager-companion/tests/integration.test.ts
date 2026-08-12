@@ -63,7 +63,7 @@ describe('HTTP integration through a paseo executable', () => {
     expect(message.status).toBe(201);
     const visibleBeforeAck = await request(base, 'GET', '/messages?to=manager-1');
     expect(visibleBeforeAck.status).toBe(200);
-    expect(visibleBeforeAck.body.some((item: any) => item.id === message.body.id && item.status === 'delivered')).toBe(true);
+    expect(visibleBeforeAck.body.some((item: any) => item.id === message.body.id && item.status === 'pending')).toBe(true);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, {})).status).toBe(400);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'handled' })).status).toBe(200);
     const absentAfterAck = await request(base, 'GET', '/messages?to=manager-1');
@@ -177,7 +177,7 @@ describe('HTTP integration through a paseo executable', () => {
     await service.reconcileOnce();
     const saved = JSON.parse(await readFile(state, 'utf8'));
     expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
-    expect(Object.keys(saved.heartbeats)).toHaveLength(1);
+    expect(Object.keys(saved.heartbeats).length).toBeGreaterThanOrEqual(1);
     service.close();
   });
 
@@ -419,16 +419,15 @@ describe('HTTP integration through a paseo executable', () => {
     await reloaded.init();
     expect(reloaded.getMessages()).toHaveLength(15);
     const saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(saved.sends).toHaveLength(1);
-    const delivery = saved.sends[0];
-    expect(delivery.args).toEqual(['send', '--no-wait', '--json', 'manager-1', expect.any(String)]);
-    expect(delivery.prompt).toContain(`id=${posted[0].id}`);
+    expect(saved.sends ?? []).toHaveLength(0);
+    const delivery = Object.values(saved.heartbeats).find((item: any) => item.prompt?.includes(`id=${posted[0].id}`)) as any;
+    expect(delivery.maxRuns).toBe(1);
     expect(delivery.prompt).toContain('/messages/');
     expect(delivery.prompt.indexOf('message-14')).toBeLessThan(delivery.prompt.indexOf('message-0'));
     expect(posted).toHaveLength(15);
-    expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'accepted' && message.delivery.transport === 'paseo-send')).toBe(true);
+    expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'pending' && message.delivery.transport === 'heartbeat')).toBe(true);
     expect(service.getMessages()).toHaveLength(15);
-    expect(service.store.getMessageSchedules().every((item) => item.status !== 'active' && !item.daemonId)).toBe(true);
+    expect(service.store.getMessageSchedules().some((item) => item.transport === 'heartbeat' && item.status === 'active' && item.daemonId)).toBe(true);
     expect(await service.deleteMessage(posted[0].id, 'already delivered')).toEqual({ id: posted[0].id, status: 'deleted', retirementPending: false });
     expect(service.getMessages()).toHaveLength(14);
     await expect(service.deleteMessage('unknown-message-id', 'not present')).rejects.toThrow('message not found');
@@ -447,13 +446,13 @@ describe('HTTP integration through a paseo executable', () => {
     const posted = await service.postMessage({ to: 'manager-1', from: 'manager-1', body: 'keep this', urgency: 'normal' });
     expect(posted.status).toBe('pending');
     expect(posted.schedule).toBeNull();
-    expect(posted.delivery).toEqual(expect.objectContaining({ transport: 'paseo-send', status: 'pending', acceptedAt: null }));
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('failed');
+    expect(posted.delivery).toEqual(expect.objectContaining({ transport: 'heartbeat', status: 'pending', acceptedAt: null }));
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
     expect(service.getMessages()).toHaveLength(1);
     delete process.env.PASEO_SEND_FAIL;
     await service.reconcileOnce();
     expect(service.getMessages()).toHaveLength(1);
-    expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
     service.close();
   });
 
@@ -485,7 +484,7 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SEND_STATUS = 'false';
     const message = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'retain this' });
     expect(message.status).toBe('pending');
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('failed');
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
     expect(service.getMessages()).toHaveLength(1);
     delete process.env.PASEO_SEND_STATUS;
     await service.reconcileOnce();
@@ -525,11 +524,11 @@ describe('HTTP integration through a paseo executable', () => {
     const service = new CompanionService(new PaseoCli(paseoShim), store);
     await service.init();
     const recovery = await service.postMessage({ to: 'manager-1', from: 'companion', body: 'attempt once' });
-    expect(recovery.status).toBe('delivered');
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('completed');
+    expect(recovery.status).toBe('pending');
+    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
     expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
     await service.reconcileOnce();
-    expect(JSON.parse(await readFile(state, 'utf8')).sends).toHaveLength(1);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
     expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
     service.close();
   });
@@ -542,14 +541,15 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
+    const arrivals = [];
     for (let index = 0; index < 15; index++) {
-      void service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `staggered-${index}`, urgency: index === 14 ? 'urgent' : 'normal' });
+      arrivals.push(service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `staggered-${index}`, urgency: index === 14 ? 'urgent' : 'normal' }));
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await Promise.all(arrivals);
     const saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(saved.sends).toHaveLength(1);
-    expect(saved.sends[0].prompt).toContain('staggered-14');
-    expect(saved.sends[0].prompt.indexOf('staggered-14')).toBeLessThan(saved.sends[0].prompt.indexOf('staggered-0'));
+    expect(saved.sends ?? []).toHaveLength(0);
+    const staggered = Object.values(saved.heartbeats).find((item: any) => item.prompt?.includes('staggered-14')) as any;
+    expect(staggered.prompt.indexOf('staggered-14')).toBeLessThan(staggered.prompt.indexOf('staggered-0'));
     service.close();
   });
 
@@ -563,7 +563,7 @@ describe('HTTP integration through a paseo executable', () => {
     await service.init();
     process.env.PASEO_SEND_STATUS = 'false';
     await service.postMessage({ to: 'manager-1', from: 'manager-1', body: 'must retain' });
-    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(1);
+    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
     service.close();
   });
 
@@ -582,7 +582,7 @@ describe('HTTP integration through a paseo executable', () => {
     delete process.env.PASEO_DELETE_TRANSIENT;
     await service.reconcileOnce();
     const saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(saved.sends).toHaveLength(1);
+    expect(saved.sends ?? []).toHaveLength(0);
     expect(saved.heartbeats['legacy-daemon'].status).toBe('deleted');
     expect(service.store.getMessageSchedules()[0]).toEqual(expect.objectContaining({ status: 'deleted' }));
     expect(service.store.getMessageSchedules()[0].daemonId).toBeUndefined();
@@ -598,9 +598,9 @@ describe('HTTP integration through a paseo executable', () => {
     const failed = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
     await service.init();
-    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'accepted' });
+    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'accepted', immediate: true });
     process.env.PASEO_SEND_FAIL = '1';
-    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'failed' });
+    await service.postMessage({ to: 'manager-1', from: 'sender', body: 'failed', immediate: true });
     const acceptedRecord = JSON.parse(String(accepted.mock.calls.at(-1)?.[0]));
     const failedRecord = JSON.parse(String(failed.mock.calls.at(-1)?.[0]));
     expect(acceptedRecord).toEqual(expect.objectContaining({ type: 'message-delivery-accepted', recipient: 'manager-1', transport: 'paseo-send', generation: expect.any(String), batchIds: expect.any(Array) }));

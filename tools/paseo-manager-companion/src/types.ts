@@ -143,6 +143,8 @@ export interface MessageScheduleRecord {
   batchIds: string[];
   prompt: string;
   status: 'pending' | 'active' | 'running' | 'failed' | 'completed' | 'deleted';
+  transport?: 'heartbeat' | 'paseo-send';
+  transportReason?: string;
   createdAt: string;
   lastRunAt?: string;
 }

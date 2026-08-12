@@ -16,7 +16,7 @@ class FakeCli {
     if (args[0] === 'schedule' && args[1] === 'ls') return { value: { schedules: [] } };
     if (args[0] === 'schedule' && args[1] === 'inspect') return { value: { id: args[2], status: 'active' } };
     if (args[0] === 'schedule' && args[1] === 'logs') return { value: [] };
-    if (args[0] === 'heartbeat' && args[1] === 'create') { this.heartbeatArgs.push(args); return { value: { id: 'hb-1', status: 'active' } }; }
+    if (args[0] === 'heartbeat' && args[1] === 'create') { this.heartbeatArgs.push(args); if (String(args[2] ?? '').startsWith('AUTOMATED_COMPANION_EVENT')) this.sends.push(args[2] ?? ''); return { value: { id: 'hb-1', status: 'active' } }; }
     return { value: {} };
   }
 }

@@ -21,6 +21,10 @@ class WakeupCli {
       if (this.dead.has(args[2])) throw new Error('DaemonRpcError: heartbeat not found');
       return { value: { id: args[2], status: 'active' } };
     }
+    if (args[0] === 'heartbeat' && args[1] === 'create') {
+      if (String(args[2] ?? '').startsWith('AUTOMATED_COMPANION_EVENT')) this.sends.push(args[2] ?? '');
+      return { value: { id: 'hb-message', status: 'active' } };
+    }
     return { value: {} };
   }
 }

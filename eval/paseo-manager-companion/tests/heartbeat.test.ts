@@ -105,6 +105,11 @@ describe('durable heartbeat reconciliation', () => {
     saved.agents['manager-1'].Status = 'idle';
     await writeFile(state, JSON.stringify(saved));
     await service.reconcileReminders();
+    const armedSchedule = service.store.getMessageSchedules().find((item) => item.transport === 'heartbeat')!;
+    observer.schedules.set(armedSchedule.daemonId!, { id: armedSchedule.daemonId, status: 'completed' });
+    observer.logs.set(armedSchedule.daemonId!, [run('recovery-run', '2026-08-11T00:05:00Z', 'succeeded')]);
+    await service.reconcileReminders();
+    await (service as any).reconcileMessages();
     const firstSchedule = service.store.getMessageSchedules().find((item) => item.status === 'completed')!;
     expect(service.store.getMessages()).toHaveLength(0);
     expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(0);
@@ -116,15 +121,15 @@ describe('durable heartbeat reconciliation', () => {
 
     observer.logs.set('hb-main', [...observer.logs.get('hb-main')!, run('run-4', '2026-08-11T00:04:00Z', 'failed')]);
     await service.reconcileReminders();
-    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(0);
+    expect(service.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
     await service.reconcileOnce();
-    expect(service.store.findReminder('local-heartbeat')!.missedRunIds).toEqual([]);
-    expect(service.store.getMessages()).toHaveLength(0);
+    expect(service.store.findReminder('local-heartbeat')!.missedRunIds).toEqual(['run-4']);
+    expect(service.store.getMessages()).toHaveLength(1);
     const secondSchedules = service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status));
-    expect(secondSchedules).toHaveLength(0);
+    expect(secondSchedules).toHaveLength(1);
     await service.reconcileOnce();
-    expect(service.store.getMessages()).toHaveLength(0);
-    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(0);
+    expect(service.store.getMessages()).toHaveLength(1);
+    expect(service.store.getMessageSchedules().filter((item) => ['pending', 'active', 'running'].includes(item.status))).toHaveLength(1);
     service.close();
   });
 
@@ -142,7 +147,7 @@ describe('durable heartbeat reconciliation', () => {
     expect(response.status).toBe(200);
     const [heartbeat] = await response.json() as any[];
     expect(Object.keys(heartbeat).sort()).toEqual(['alive', 'cron', 'id', 'last_delivered_at', 'last_fired_at', 'missed_fires', 'next_run'].sort());
-    expect(heartbeat).toEqual({ id: 'hb-main', cron: '*/5 * * * *', last_fired_at: '2026-08-11T00:01:00Z', last_delivered_at: '2026-08-11T00:00:00Z', missed_fires: 0, next_run: '2026-08-11T01:00:00Z', alive: true });
+    expect(heartbeat).toEqual({ id: 'hb-main', cron: '*/5 * * * *', last_fired_at: '2026-08-11T00:01:00Z', last_delivered_at: '2026-08-11T00:00:00Z', missed_fires: 1, next_run: '2026-08-11T01:00:00Z', alive: true });
     service.close();
     running = undefined;
 
@@ -151,7 +156,7 @@ describe('durable heartbeat reconciliation', () => {
     restartedObserver.logs.set('hb-main', observer.logs.get('hb-main')!);
     const restarted = new CompanionService(new PaseoCli(shim), new Store(root), restartedObserver);
     await restarted.init();
-    expect(restarted.store.findReminder('local-heartbeat')!.missedFires).toBe(0);
+    expect(restarted.store.findReminder('local-heartbeat')!.missedFires).toBe(1);
     expect(restarted.store.findReminder('local-heartbeat')!.observedRunIds).toEqual(['run-success', 'run-failed']);
     restarted.close();
   });
@@ -272,7 +277,7 @@ describe('durable heartbeat reconciliation', () => {
     expect(calls.some((args) => args[0] === 'send')).toBe(false);
     fail = false;
     await service.reconcileOnce();
-    expect(calls.map((args) => args.slice(0, 2))).toEqual(expect.arrayContaining([['heartbeat', 'delete'], ['send', '--no-wait']]));
+    expect(calls.map((args) => args.slice(0, 2))).toEqual(expect.arrayContaining([['heartbeat', 'delete'], ['heartbeat', 'create']]));
     expect(store.getMessageSchedules().find((schedule) => schedule.id === 'recovery-schedule')?.status).toBe('deleted');
     service.close();
   });

@@ -65,6 +65,7 @@ export class CompanionService {
   /** Successful candidate-parent observations; child candidates are refreshed each listing. */
   private childParentCache = new Map<string, string>();
   private messageInFlight = new Map<string, Promise<void>>();
+  private immediateDeliveries = new Set<string>();
   private heartbeatReconcileInFlight?: Promise<void>;
   private parkReconcileInFlight = new Map<string, Promise<boolean>>();
   private readonly scheduleObserver?: ScheduleObserver;
@@ -832,9 +833,9 @@ export class CompanionService {
   }
 
   /** Persist before handing a coalesced batch to Paseo's turn-boundary queue. */
-  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<MessageRecord & {
+  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<MessageRecord & {
     schedule: null;
-    delivery: { id: string; transport: 'paseo-send'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
+    delivery: { id: string; transport: 'paseo-send' | 'heartbeat'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
   }> {
     if (!body.to?.trim() || !body.from?.trim() || !body.body?.trim()) throw new Error('to, from, and body are required');
     if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new Error('urgency must be normal or urgent');
@@ -853,11 +854,13 @@ export class CompanionService {
     };
     // This write deliberately precedes every daemon call.
     await this.store.addMessage(message);
-    await this.ensureMessageDelivery(message.to);
+    if (body.immediate) this.immediateDeliveries.add(message.to);
+    try { await this.ensureMessageDelivery(message.to); }
+    finally { if (body.immediate) this.immediateDeliveries.delete(message.to); }
     const audit = this.store.getMessageSchedules().find((item) => item.batchIds.includes(message.id)) ?? null;
     const delivery = audit ? {
       id: audit.id,
-      transport: 'paseo-send' as const,
+      transport: (audit.transport ?? 'paseo-send') as 'paseo-send' | 'heartbeat',
       status: audit.status === 'completed' ? 'accepted' as const : 'pending' as const,
       acceptedAt: audit.status === 'completed' ? audit.lastRunAt ?? null : null,
       batchIds: audit.batchIds,
@@ -888,13 +891,17 @@ export class CompanionService {
   }
 
   private async cleanupCancelledMessage(id: string): Promise<boolean> {
-    // Message delivery is now a one-shot `paseo send`; there is no live
-    // schedule to mutate or retire.  Keep the explicit DELETE/tombstone path
-    // durable until the cancelled receipt is removed locally.
     const schedules = this.store.getMessageSchedules().filter((schedule) => schedule.batchIds.includes(id));
     for (const schedule of schedules) {
       if (['pending', 'active', 'running'].includes(schedule.status)) {
-        await this.migrateLegacyMessageSchedule(schedule);
+        if (schedule.transport === 'heartbeat' && schedule.daemonId) {
+          try { await this.cli.run(['heartbeat', 'delete', schedule.daemonId, '--json'], { agentId: schedule.recipient }); }
+          catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/not found|no such heartbeat|unknown heartbeat|404/i.test(message)) return true;
+          }
+          await this.store.updateMessageSchedule(schedule.id, { status: 'deleted', daemonId: undefined });
+        } else await this.migrateLegacyMessageSchedule(schedule);
       }
     }
     return false;
@@ -918,9 +925,7 @@ export class CompanionService {
       sender.push(message);
       grouped.set(message.from, sender);
     }
-    const lines = [
-      `Deliver the queued messages below to ${recipient}. Do not send a response through the companion; process each message exactly once.`,
-    ];
+    const lines = [`Deliver the queued messages below to ${recipient}. Do not send a response through the companion; process each message exactly once.`];
     for (const [sender, senderMessages] of grouped) {
       lines.push(`From: ${sender}`);
       for (const message of senderMessages) {
@@ -937,6 +942,13 @@ export class CompanionService {
       lines.push(`curl -X DELETE http://127.0.0.1:${endpointPort}/messages/${message.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`);
     }
     return lines.join('\n');
+  }
+
+  private transportPrompt(prompt: string, transport: 'heartbeat' | 'paseo-send', reason?: string): string {
+    const marker = transport === 'heartbeat'
+      ? 'AUTOMATED_COMPANION_EVENT transport=heartbeat NOT_USER_INPUT'
+      : `AUTOMATED_COMPANION_EVENT transport=fallback-send NOT_USER_INPUT reason=${reason ?? 'explicit immediate=true'}`;
+    return `${marker}\n${prompt}`;
   }
 
   private async inspectMessageSchedule(schedule: MessageScheduleRecord): Promise<MessageScheduleInspection> {
@@ -982,8 +994,22 @@ export class CompanionService {
   /** Retire schedules written by releases that used heartbeat delivery. */
   private async migrateLegacyMessageSchedules(): Promise<void> {
     for (const schedule of this.store.getMessageSchedules()) {
-      if (!['pending', 'active', 'running'].includes(schedule.status)) continue;
+      if (schedule.transport === 'heartbeat' || !['pending', 'active', 'running'].includes(schedule.status)) continue;
       await this.migrateLegacyMessageSchedule(schedule);
+    }
+  }
+
+  private async reconcileHeartbeatMessageSchedules(): Promise<void> {
+    for (const schedule of this.store.getMessageSchedules().filter((item) => item.transport === 'heartbeat' && ['active', 'running'].includes(item.status))) {
+      const observed = await this.inspectMessageSchedule(schedule);
+      if (observed.state === 'success') {
+        const deliveredAt = new Date().toISOString();
+        await this.store.updateMessageSchedule(schedule.id, { status: 'completed', lastRunAt: deliveredAt });
+        try { await this.finalizeAcceptedMessageSchedule({ ...schedule, status: 'completed', lastRunAt: deliveredAt }); } catch { /* retry local cleanup later */ }
+      } else if (observed.state === 'failed' || observed.state === 'missing') {
+        await this.store.updateMessageSchedule(schedule.id, { status: 'failed' });
+        console.warn(JSON.stringify({ type: 'message-delivery-terminal', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'heartbeat', reason: observed.state }));
+      }
     }
   }
 
@@ -1030,10 +1056,42 @@ export class CompanionService {
       batchIds: batch.map((message) => message.id),
       prompt: this.messagePrompt(recipient, batch),
       status: 'pending',
+      transport: this.immediateDeliveries.has(recipient) ? 'paseo-send' : 'heartbeat',
       createdAt: new Date().toISOString(),
     };
+    const basePrompt = local.prompt;
     await this.store.addMessageSchedule(local);
+    if (local.transport === 'heartbeat') {
+      const cron = '* * * * *';
+      const name = `companion-message-${local.generation}`;
+      let daemonId: string | undefined;
+      try {
+        local.prompt = this.transportPrompt(basePrompt, 'heartbeat');
+        const value = asRecord((await this.cli.run([
+          'heartbeat', 'create', local.prompt, '--cron', cron, '--expires-in', '30m', '--max-runs', '1',
+          '--name', name, '--timezone', 'UTC', '--json',
+        ], { agentId: recipient })).value);
+        daemonId = String(value.id ?? value.heartbeatId ?? '') || undefined;
+        if (!daemonId) throw new Error('heartbeat create returned no id');
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const fallbackReason = `heartbeat-create-failed: ${reason}`;
+        local.transport = 'paseo-send';
+        local.transportReason = fallbackReason;
+        console.warn(JSON.stringify({ type: 'message-delivery-fallback', recipient, generation: local.generation, batchIds: local.batchIds, transport: 'paseo-send', reason: fallbackReason }));
+      }
+      if (daemonId) {
+        await this.store.updateMessageSchedule(local.id, { daemonId, status: 'active', transport: 'heartbeat', prompt: local.prompt });
+        console.log(JSON.stringify({ type: 'message-delivery-armed', recipient, generation: local.generation, batchIds: local.batchIds, transport: 'heartbeat', daemonId }));
+        return this.store.getMessageSchedules().find((item) => item.id === local.id);
+      }
+    }
     let acceptedAt: string;
+    if (local.transport === 'paseo-send') {
+      const reason = local.transportReason ?? 'explicit immediate=true';
+      local.prompt = this.transportPrompt(basePrompt, 'paseo-send', reason);
+      await this.store.updateMessageSchedule(local.id, { transport: 'paseo-send', prompt: local.prompt, transportReason: reason });
+    }
     try {
       const value = unwrapPayload((await this.cli.run(['send', '--no-wait', '--json', recipient, local.prompt])).value);
       const status = lowerStatus(value.status);
@@ -1042,13 +1100,13 @@ export class CompanionService {
       // Mark the local record terminal before receipt cleanup.  If local
       // cleanup fails after acceptance, reconcile can finish it without ever
       // issuing a duplicate send.
-      await this.store.updateMessageSchedule(local.id, { status: 'completed', lastRunAt: acceptedAt });
+      await this.store.updateMessageSchedule(local.id, { status: 'completed', lastRunAt: acceptedAt, transport: 'paseo-send' });
     } catch (error) {
       await this.store.updateMessageSchedule(local.id, { status: 'failed' });
-      console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', error: error instanceof Error ? error.message : String(error) }));
+      console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', reason: local.transportReason ?? 'explicit immediate=true', error: error instanceof Error ? error.message : String(error) }));
       return undefined;
     }
-    console.log(JSON.stringify({ type: 'message-delivery-accepted', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send' }));
+    console.log(JSON.stringify({ type: 'message-delivery-accepted', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', reason: local.transportReason ?? 'explicit immediate=true' }));
     try { await this.finalizeAcceptedMessageSchedule(local); } catch { /* retry cleanup without another send */ }
     return this.store.getMessageSchedules().find((item) => item.id === local.id);
   }
@@ -1072,7 +1130,7 @@ export class CompanionService {
       try { await this.finalizeAcceptedMessageSchedule(schedule); } catch { /* accepted send is terminal; retry local cleanup later */ }
     }
     const queued = this.store.getMessages().filter((message) => message.to === recipient && message.status === 'pending');
-    const accepted = new Set(this.store.getMessageSchedules().filter((item) => item.recipient === recipient && item.status === 'completed').flatMap((item) => item.batchIds));
+    const accepted = new Set(this.store.getMessageSchedules().filter((item) => item.recipient === recipient && ['active', 'running', 'failed', 'completed'].includes(item.status)).flatMap((item) => item.batchIds));
     const pending = queued.filter((message) => !accepted.has(message.id));
     if (!pending.length) return;
     await this.createMessageSchedule(recipient, this.sortMessages(pending));
@@ -1117,6 +1175,7 @@ export class CompanionService {
     for (const message of this.store.getMessages().filter((item) => item.status === 'cancelled')) {
       if (!await this.cleanupCancelledMessage(message.id)) await this.store.removeMessages([message.id]);
     }
+    await this.reconcileHeartbeatMessageSchedules();
     if (this.store.isChildWatchOptOutStateCorrupt()) {
       const pairs = new Map<string, string[]>();
       for (const reminder of this.store.getReminders()) {
