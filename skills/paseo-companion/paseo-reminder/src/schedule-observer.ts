@@ -37,7 +37,7 @@ export class PaseoScheduleObserver implements ScheduleObserver {
     else if (options.client) this.clientFactory = () => options.client!;
     else this.clientFactory = () => new DaemonClient({
         url: normalizePaseoWsHost(options.host ?? process.env.PASEO_HOST ?? process.env.PASEO_COMPANION_PASEO_HOST),
-        clientId: options.clientId ?? `paseo-manager-companion-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+        clientId: options.clientId ?? `paseo-reminder-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
         clientType: 'cli',
         webSocketFactory: options.webSocketFactory ?? ((url, wsOptions) => new WebSocket(url, wsOptions as any)),
         reconnect: { enabled: false },

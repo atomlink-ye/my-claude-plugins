@@ -2,8 +2,8 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
-import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
+import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
+import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
 
 class WakeupCli {
   agents: Record<string, any> = {};

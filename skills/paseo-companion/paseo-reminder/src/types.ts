@@ -1,6 +1,9 @@
 export type LedgerType = 'park' | 'known-red' | 'deferred';
 export type ReminderKind = 'generic' | 'compact-wake' | 'child-watch' | 'idle' | 'watchdog' | 'heartbeat-recovery';
 export type MessageUrgency = 'normal' | 'urgent';
+export type MessageDelivery = 'interrupt' | 'on-idle';
+export type MessageMode = 'notify' | 'ack' | 'reply';
+export type ReminderMode = 'once' | 'repeat';
 
 export interface ReminderRecord {
   id: string;
@@ -29,6 +32,15 @@ export interface ReminderRecord {
   createdAt: string;
   /** Optional finite delivery count. `1` makes this a one-shot reminder. */
   maxRuns?: number;
+  /** New local reminder contract. Legacy heartbeat fields remain optional. */
+  mode?: ReminderMode;
+  /** Execution mechanism; active records without nextRunAt are intentional only for cron/in-process scheduling. */
+  schedulingKind?: 'once' | 'repeat' | 'cron' | 'in-process';
+  targetAt?: string;
+  everySeconds?: number;
+  runsCompleted?: number;
+  delivery?: MessageDelivery;
+  deliveryMessageId?: string;
   eventType?: string;
   criterion?: string;
 }
@@ -135,9 +147,20 @@ export interface MessageRecord {
   from: string;
   body: string;
   urgency: MessageUrgency;
-  status: 'pending' | 'delivered' | 'cancelled';
+  delivery?: MessageDelivery;
+  mode?: MessageMode;
+  status: 'pending' | 'delivered' | 'unacknowledged' | 'acknowledged' | 'answered' | 'cancelled';
   createdAt: string;
   deliveredAt?: string;
+  ackDeadlineAt?: string;
+  unacknowledgedAt?: string;
+  replyTo?: string;
+  replyMessageId?: string;
+  answeredAt?: string;
+  acknowledgedAt?: string;
+  acknowledgementReason?: string;
+  promptKind?: 'message' | 'reminder' | 'watchdog' | 'compact-wake';
+  actionCommand?: string;
   kind?: 'heartbeat-recovery';
   recoveryManagerId?: string;
   recoveryCounts?: Record<string, number>;

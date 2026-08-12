@@ -2,6 +2,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { CompanionService } from './service.js';
 import { PaseoScheduleObserver } from './schedule-observer.js';
+import { CompanionError, invalidValue, missingField } from './errors.js';
 
 export interface CompanionServer {
   server: http.Server;
@@ -12,18 +13,33 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
   let data = '';
   for await (const chunk of req) data += String(chunk);
   if (!data.trim()) return {};
-  try { return JSON.parse(data); } catch { throw new HttpError(400, 'invalid JSON'); }
+  try { return JSON.parse(data); } catch { throw new CompanionError('invalid_value', 'invalid JSON'); }
 }
 function send(res: http.ServerResponse, status: number, value: unknown): void {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(value));
 }
-class HttpError extends Error { constructor(readonly status: number, message: string) { super(message); } }
 function required(value: unknown, name: string): string {
-  if (typeof value !== 'string' || !value.trim()) throw new HttpError(400, `${name} is required`);
+  if (typeof value !== 'string' || !value.trim()) missingField(name);
   return value;
 }
+
+const ROUTES = [
+  ['GET', '/health', []], ['GET', '/self/runtime', []], ['GET', '/heartbeats', []],
+  ['DELETE', '/heartbeats/:id', ['reason']], ['GET', '/wakeup-sources', ['agentId']],
+  ['PUT', '/wakeup-sources/:id', ['agentId', 'cadence']], ['DELETE', '/wakeup-sources/:id', ['agentId']],
+  ['GET', '/children', ['agentId']], ['PUT', '/children/:childId', ['agentId']],
+  ['DELETE', '/children/:childId', ['agentId', 'reason']], ['PUT', '/children/:childId/watch', ['agentId']],
+  ['DELETE', '/children/:childId/watch', ['agentId', 'reason']], ['GET', '/children/:id/briefing', []],
+  ['POST', '/reminders', ['agentId', 'message']], ['GET', '/reminders', []], ['GET', '/reminders/:id', []], ['DELETE', '/reminders/:id', ['reason']],
+  ['POST', '/idle-reminders', ['agentId', 'message', 'thresholdSeconds']], ['GET', '/idle-reminders', []],
+  ['DELETE', '/idle-reminders/:id', ['reason']], ['POST', '/messages', ['to', 'from', 'body']],
+  ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'resumeSteps']],
+  ['POST', '/ledger', ['type', 'target', 'verdict', 'reason']], ['GET', '/ledger', []],
+  ['POST', '/ledger/:id/revoke', ['reason']],
+] as const;
+const ERROR_STATUS: Record<string, number> = { missing_field: 400, invalid_value: 400, not_found: 404, ambiguous_id: 409, state_corrupt: 503, cli_error: 502 };
 
 export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver())): Promise<CompanionServer> {
   await service.init();
@@ -34,7 +50,7 @@ export async function createServer(service = new CompanionService(undefined, und
       const pathname = url.pathname;
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
       if (method === 'GET' && pathname === '/self/runtime') { send(res, 200, service.runtime()); return; }
-      if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats()); return; }
+      if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats(url.searchParams.get('includeDead') === '1')); return; }
       if (method === 'GET' && pathname === '/wakeup-sources') {
         const agentId = required(url.searchParams.get('agentId'), 'agentId');
         send(res, 200, await service.listWakeupSources(agentId)); return;
@@ -73,15 +89,14 @@ export async function createServer(service = new CompanionService(undefined, und
         }
         send(res, 200, await service.resubscribeChildWatch(managerId, childId, typeof body.reason === 'string' ? body.reason : undefined)); return;
       }
-      if (method === 'POST' && pathname === '/spawn') {
-        const body = await readBody(req);
-        required(body.provider, 'provider'); required(body.title, 'title'); required(body.cwd, 'cwd'); required(body.prompt, 'prompt');
-        send(res, 201, await service.spawn(body, process.env.PASEO_AGENT_ID)); return;
-      }
       if (method === 'POST' && pathname === '/reminders') {
         const body = await readBody(req);
-        required(body.agentId, 'agentId'); required(body.message, 'message');
-        send(res, 201, await service.createReminder(body)); return;
+        if (body.id !== undefined) invalidValue('caller-supplied reminder id is not supported', 'id');
+        const agentId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId'); required(body.message, 'message');
+        send(res, 201, await service.createReminder({ ...body, agentId })); return;
+      }
+      if (method === 'GET' && pathname === '/reminders') {
+        send(res, 200, service.listReminders(url.searchParams.get('agentId') || undefined)); return;
       }
       if (method === 'POST' && pathname === '/idle-reminders') {
         const body = await readBody(req);
@@ -100,11 +115,17 @@ export async function createServer(service = new CompanionService(undefined, und
       if (method === 'POST' && pathname === '/messages') {
         const body = await readBody(req);
         required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
-        if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new HttpError(400, 'urgency must be normal or urgent');
-        send(res, 201, await service.postMessage(body)); return;
+        if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') invalidValue('urgency must be normal or urgent', 'urgency', ['normal', 'urgent']);
+        const { promptKind: _internalPromptKind, actionCommand: _internalActionCommand, kind: _internalKind, recoveryManagerId: _internalRecoveryManagerId, recoveryCounts: _internalRecoveryCounts, recoveryRunIds: _internalRecoveryRunIds, ...publicBody } = body;
+        send(res, 201, await service.postMessage(publicBody)); return;
       }
       if (method === 'GET' && pathname === '/messages') {
-        send(res, 200, service.getMessages(url.searchParams.get('to') || undefined)); return;
+        send(res, 200, service.getMessages({
+          to: url.searchParams.get('to') || undefined,
+          from: url.searchParams.get('from') || undefined,
+          status: url.searchParams.get('status') || undefined,
+          replyTo: url.searchParams.get('replyTo') || undefined,
+        })); return;
       }
       const messageMatch = pathname.match(/^\/messages\/([^/]+)$/);
       if (method === 'DELETE' && messageMatch) {
@@ -114,6 +135,9 @@ export async function createServer(service = new CompanionService(undefined, und
         send(res, result.retirementPending ? 202 : 200, result); return;
       }
       const reminderMatch = pathname.match(/^\/reminders\/([^/]+)$/);
+      if (method === 'GET' && reminderMatch) {
+        send(res, 200, service.getReminder(decodeURIComponent(reminderMatch[1]))); return;
+      }
       if (method === 'DELETE' && reminderMatch) {
         const body = await readBody(req);
         const reason = required(body.reason, 'reason');
@@ -155,11 +179,11 @@ export async function createServer(service = new CompanionService(undefined, und
         const reason = required(body.reason, 'reason');
         send(res, 200, await service.revokeLedger(decodeURIComponent(revokeMatch[1]), reason)); return;
       }
-      send(res, 404, { error: 'not found' });
+      send(res, 404, { error: 'not found', code: 'not_found', routes: ROUTES.map(([routeMethod, path, requiredFields]) => ({ method: routeMethod, path, requiredFields, possibleCodes: ['missing_field', 'invalid_value', 'not_found', 'ambiguous_id', 'state_corrupt', 'cli_error'] })) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|idle reminder not found|message not found|ledger record not found|heartbeat not found|wakeup source not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|maxRuns must be a positive integer|thresholdSeconds must be positive|agentId, childId, and reason|agentId and childId|heartbeatId, agentId, and cadence/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
-      send(res, status, { error: message });
+      const companionError = error instanceof CompanionError ? error : new CompanionError('cli_error', message);
+      send(res, ERROR_STATUS[companionError.code] ?? 500, { error: companionError.message, code: companionError.code, ...(companionError.field ? { field: companionError.field } : {}), ...(companionError.allowed ? { allowed: companionError.allowed } : {}) });
     }
   });
   return { server, service };
@@ -169,5 +193,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT || 8787);
   const app = await createServer();
   app.service.setPort(port);
-  app.server.listen(port, '127.0.0.1', () => console.log(`paseo-manager-companion listening on http://127.0.0.1:${port}`));
+  app.server.listen(port, '127.0.0.1', () => console.log(`paseo-reminder listening on http://127.0.0.1:${port}`));
 }

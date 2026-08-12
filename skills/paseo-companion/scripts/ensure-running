@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then
+  echo "arguments are not accepted; set PORT and PASEO_COMPANION_DATA as needed" >&2
+  exit 2
+fi
+
+: "${PORT:=8787}"
+case "$PORT" in
+  (*[!0-9]*|'') echo "PORT must be numeric" >&2; exit 2 ;;
+esac
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+plugin_root=$(cd "$script_dir/../../.." && pwd)
+package_root="$plugin_root/skills/paseo-companion/paseo-reminder"
+server="$package_root/dist/server.js"
+if [[ ! -f "$server" ]]; then
+  echo "paseo companion build is missing: $server (run pnpm --dir '$package_root' build)" >&2
+  exit 1
+fi
+
+state_root="${PASEO_COMPANION_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME:?HOME is required}}/paseo-companion}"
+data_dir="${PASEO_COMPANION_DATA:-$state_root/data}"
+log_file="${PASEO_COMPANION_LOG:-$state_root/companion.log}"
+pid_file="${PASEO_COMPANION_PID:-$state_root/companion.pid}"
+mkdir -p "$state_root" "$data_dir" "$(dirname "$log_file")" "$(dirname "$pid_file")"
+base="http://127.0.0.1:${PORT}"
+
+json_runtime_is_companion() {
+  node -e '
+    try {
+      const v = JSON.parse(process.argv[1]);
+      if (!Number.isInteger(v?.pid) || !v?.dataDir || !Number.isInteger(v?.port)) process.exit(1);
+    } catch { process.exit(1); }
+  ' "$1"
+}
+
+health_runtime() {
+  local health runtime
+  health=$(curl -fsS --max-time 1 "$base/health" 2>/dev/null) || return 1
+  runtime=$(curl -fsS --max-time 1 "$base/self/runtime" 2>/dev/null) || return 1
+  json_runtime_is_companion "$runtime" || return 2
+  printf '%s\n' "$runtime"
+}
+
+listener_pids() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :$PORT" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u || true
+  fi
+}
+
+if runtime=$(health_runtime); then
+  printf '%s\n' "$runtime"
+  exit 0
+elif [[ $? -eq 2 ]]; then
+  echo "loopback port $PORT is occupied by a non-companion HTTP service" >&2
+  exit 1
+fi
+
+# Serialize initialization as well as the final port bind: service startup
+# reconciles durable state before listen(), so two contenders must not initialize
+# the same data directory concurrently.
+start_lock="$state_root/start.lock"
+lock_owned=false
+if mkdir "$start_lock" 2>/dev/null; then
+  lock_owned=true
+  printf '%s\n' "$$" >"$start_lock/pid"
+else
+  for _ in {1..80}; do
+    if runtime=$(health_runtime); then printf '%s\n' "$runtime"; exit 0; fi
+    owner=$(cat "$start_lock/pid" 2>/dev/null || true)
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      unlink "$start_lock/pid" 2>/dev/null || true
+      rmdir "$start_lock" 2>/dev/null || true
+      if mkdir "$start_lock" 2>/dev/null; then
+        lock_owned=true
+        printf '%s\n' "$$" >"$start_lock/pid"
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+  if [[ "$lock_owned" != true ]]; then
+    echo "timed out waiting for companion startup lock: $start_lock" >&2
+    exit 1
+  fi
+fi
+release_lock() {
+  if [[ "$lock_owned" == true ]]; then
+    unlink "$start_lock/pid" 2>/dev/null || true
+    rmdir "$start_lock" 2>/dev/null || true
+  fi
+}
+trap release_lock EXIT
+
+existing=$(listener_pids)
+if [[ -n "$existing" ]]; then
+  echo "loopback port $PORT is occupied (listener pid(s): $existing), but it is not a healthy paseo companion" >&2
+  exit 1
+fi
+
+# The startup lock prevents concurrent state reconciliation. The loopback bind
+# remains the final guard against instances started outside this launcher.
+env -u PASEO_AGENT_ID PORT="$PORT" PASEO_COMPANION_DATA="$data_dir" \
+  nohup node "$server" >"$log_file" 2>&1 </dev/null &
+started_pid=$!
+
+for _ in {1..80}; do
+  if runtime=$(health_runtime); then
+    printf '%s\n' "$runtime"
+    actual_pid=$(node -e 'const v=JSON.parse(process.argv[1]); process.stdout.write(String(v.pid))' "$runtime")
+    # Do not replace a live winner's pid file during a concurrent start.
+    if [[ ! -e "$pid_file" ]] || ! kill -0 "$(cat "$pid_file" 2>/dev/null || true)" 2>/dev/null; then
+      printf '%s\n' "$actual_pid" >"$pid_file"
+    fi
+    exit 0
+  fi
+  # A contender losing the bind can exit while another contender becomes
+  # healthy; keep polling before declaring failure.
+  if ! kill -0 "$started_pid" 2>/dev/null; then
+    if runtime=$(health_runtime); then printf '%s\n' "$runtime"; exit 0; fi
+    existing=$(listener_pids)
+    if [[ -n "$existing" ]]; then
+      echo "companion failed to bind port $PORT; listener pid(s): $existing" >&2
+      exit 1
+    fi
+    echo "paseo companion failed to start; see $log_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if runtime=$(health_runtime); then printf '%s\n' "$runtime"; exit 0; fi
+echo "paseo companion health check timed out on 127.0.0.1:$PORT; see $log_file" >&2
+exit 1
+

@@ -14,6 +14,12 @@ node_modules/
 # Tool build artifacts
 tools/*/dist/
 tools/*/node_modules/
+skills/*/*/dist/
+skills/*/*/node_modules/
+
+# paseo-reminder runtime state / backups (not source)
+skills/paseo-companion/paseo-reminder/.paseo-reminder/
+skills/paseo-companion/paseo-reminder/companion-data-*.tar.gz
 # Python build artifacts
 __pycache__/
 *.pyc

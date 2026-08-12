@@ -2,6 +2,7 @@ import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
+import { CompanionError } from './errors.js';
 
 export class Store {
   readonly dir: string;
@@ -19,13 +20,21 @@ export class Store {
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
 
-  constructor(dir = process.env.PASEO_COMPANION_DATA || path.join(process.cwd(), '.paseo-manager-companion')) {
+  constructor(dir = process.env.PASEO_COMPANION_DATA || path.join(process.cwd(), '.paseo-reminder')) {
     this.dir = dir;
   }
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
     this.reminders = await this.load<ReminderRecord[]>('reminders.json', []);
+    let reminderStateMigrated = false;
+    for (const reminder of this.reminders) {
+      reminderStateMigrated = this.normalizeReminderScheduling(reminder) || reminderStateMigrated;
+      if (reminder.status === 'active' && !reminder.nextRunAt && !['cron', 'in-process'].includes(reminder.schedulingKind ?? '')) {
+        reminder.status = 'dead'; reminder.alive = false; reminderStateMigrated = true;
+      }
+    }
+    if (reminderStateMigrated) await this.save('reminders.json', this.reminders);
     this.idleReminders = await this.loadDurable<IdleReminderRecord[]>('idle-reminders.json', []);
     this.watchdogSnapshots = await this.loadDurable<Record<string, WatchdogSnapshot>>('watchdog-snapshots.json', {});
     this.ledger = await this.load<LedgerRecord[]>('ledger.json', []);
@@ -64,6 +73,8 @@ export class Store {
     }
     if (migrated) await this.save('tracked-children.json', this.trackedChildren);
     await this.pruneMessageSchedules();
+    await this.pruneMessages();
+    await this.pruneReminders();
   }
 
   private async load<T>(file: string, fallback: T): Promise<T> {
@@ -84,7 +95,7 @@ export class Store {
       return JSON.parse(await readFile(path.join(this.dir, file), 'utf8')) as T;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback;
-      throw new Error(`corrupt durable companion state: ${file}`);
+      throw new CompanionError('state_corrupt', `corrupt durable companion state: ${file}`);
     }
   }
   async addManager(id: string | undefined): Promise<void> {
@@ -101,12 +112,12 @@ export class Store {
   getChildWatchOptOuts(): Record<string, { reason: string; updatedAt: string }> { return { ...this.childWatchOptOuts }; }
   isChildWatchOptOutStateCorrupt(): boolean { return this.childWatchOptOutsCorrupt; }
   async optOutChildWatch(managerId: string, childId: string, reason: string): Promise<void> {
-    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    if (this.childWatchOptOutsCorrupt) throw new CompanionError('state_corrupt', 'child-watch opt-out state corrupt');
     this.childWatchOptOuts[this.childWatchKey(managerId, childId)] = { reason, updatedAt: new Date().toISOString() };
     await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
   }
   async optInChildWatch(managerId: string, childId: string): Promise<void> {
-    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    if (this.childWatchOptOutsCorrupt) throw new CompanionError('state_corrupt', 'child-watch opt-out state corrupt');
     delete this.childWatchOptOuts[this.childWatchKey(managerId, childId)];
     await this.save('child-watch-opt-outs.json', this.childWatchOptOuts);
   }
@@ -118,7 +129,7 @@ export class Store {
     return Boolean(this.trackedChildren[this.childWatchKey(managerId, childId)]);
   }
   async trackChild(managerId: string, childId: string, source: TrackedChildSource): Promise<TrackedChildRecord> {
-    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    if (this.childWatchOptOutsCorrupt) throw new CompanionError('state_corrupt', 'child-watch opt-out state corrupt');
     delete this.childWatchOptOuts[this.childWatchKey(managerId, childId)];
     const key = this.childWatchKey(managerId, childId);
     const prior = this.trackedChildren[key];
@@ -130,7 +141,7 @@ export class Store {
     return record;
   }
   async untrackChild(managerId: string, childId: string, reason: string): Promise<void> {
-    if (this.childWatchOptOutsCorrupt) throw new Error('child-watch opt-out state corrupt');
+    if (this.childWatchOptOutsCorrupt) throw new CompanionError('state_corrupt', 'child-watch opt-out state corrupt');
     delete this.trackedChildren[this.childWatchKey(managerId, childId)];
     await this.save('tracked-children.json', this.trackedChildren);
     await this.optOutChildWatch(managerId, childId, reason);
@@ -154,7 +165,20 @@ export class Store {
   }
 
   getReminders(): ReminderRecord[] { return this.reminders; }
-  async addReminder(record: ReminderRecord): Promise<void> { this.reminders.push(record); await this.save('reminders.json', this.reminders); }
+  async addReminder(record: ReminderRecord): Promise<void> {
+    this.normalizeReminderScheduling(record);
+    if (record.status === 'active' && !record.nextRunAt && !['cron', 'in-process'].includes(record.schedulingKind ?? '')) {
+      throw new CompanionError('state_corrupt', 'active reminder has no scheduling mechanism');
+    }
+    this.reminders.push(record); await this.save('reminders.json', this.reminders);
+  }
+  private normalizeReminderScheduling(record: ReminderRecord): boolean {
+    if (record.schedulingKind) return false;
+    if (record.mode === 'once' || record.mode === 'repeat') record.schedulingKind = record.mode;
+    else if (record.kind === 'child-watch' || record.kind === 'watchdog' || record.kind === 'heartbeat-recovery') record.schedulingKind = 'in-process';
+    else if (record.daemonId || record.cron) record.schedulingKind = 'cron';
+    return Boolean(record.schedulingKind);
+  }
   async updateReminder(id: string, patch: Partial<ReminderRecord>): Promise<ReminderRecord | undefined> {
     const item = this.reminders.find((r) => r.id === id || r.daemonId === id);
     if (!item) return undefined;
@@ -166,6 +190,19 @@ export class Store {
     return this.updateReminder(id, { missedFires: 0, missedRunIds: [] });
   }
   findReminder(id: string): ReminderRecord | undefined { return this.reminders.find((r) => r.id === id || r.daemonId === id); }
+
+  /** Keep terminal reminder history bounded while never pruning active work. */
+  async pruneReminders(maxTerminal = 50): Promise<void> {
+    const live = new Set<ReminderRecord['status']>(['pending', 'active']);
+    const terminal = this.reminders
+      .filter((reminder) => !live.has(reminder.status))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const keep = new Set(terminal.slice(0, maxTerminal).map((reminder) => reminder.id));
+    const next = this.reminders.filter((reminder) => live.has(reminder.status) || keep.has(reminder.id));
+    if (next.length === this.reminders.length) return;
+    this.reminders = next;
+    await this.save('reminders.json', this.reminders);
+  }
 
   getIdleReminders(): IdleReminderRecord[] { return this.idleReminders; }
   async addIdleReminder(record: IdleReminderRecord): Promise<void> {
@@ -205,6 +242,18 @@ export class Store {
   async removeMessages(ids: Iterable<string>): Promise<void> {
     const remove = new Set(ids);
     this.messages = this.messages.filter((message) => !remove.has(message.id));
+    await this.save('messages.json', this.messages);
+  }
+  /** Keep acknowledged/answered message history bounded while retaining actionable records. */
+  async pruneMessages(maxTerminal = 50): Promise<void> {
+    const terminal = new Set<MessageRecord['status']>(['acknowledged', 'answered']);
+    const history = this.messages
+      .filter((message) => terminal.has(message.status))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const keep = new Set(history.slice(0, maxTerminal).map((message) => message.id));
+    const next = this.messages.filter((message) => !terminal.has(message.status) || keep.has(message.id));
+    if (next.length === this.messages.length) return;
+    this.messages = next;
     await this.save('messages.json', this.messages);
   }
   async addRecoveryReceipt(id: string, targets: Record<string, { missedFires: number; missedRunIds: string[] }>): Promise<void> {

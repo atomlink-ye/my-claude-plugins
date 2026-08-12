@@ -2,9 +2,9 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
-import { createServer } from '../../../tools/paseo-manager-companion/src/server.js';
-import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
+import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
+import { createServer } from '../../../skills/paseo-companion/paseo-reminder/src/server.js';
+import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
 
 class Round9Cli {
   agents: Record<string, any> = {};
@@ -20,6 +20,7 @@ class Round9Cli {
     if (args[0] === 'heartbeat' && args[1] === 'delete') return { value: { id: args[2], status: 'deleted' } };
     if (args[0] === 'schedule' && args[1] === 'inspect') return { value: { id: args[2], status: 'active' } };
     if (args[0] === 'schedule' && args[1] === 'logs') return { value: [] };
+    if (args[0] === 'send') { this.prompts.push(args.at(-1) ?? ''); return { value: { status: 'sent' } }; }
     return { value: {} };
   }
 }

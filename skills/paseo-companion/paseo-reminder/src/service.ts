@@ -5,7 +5,8 @@ import { Store } from './store.js';
 import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
-import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
+import { CompanionError, invalidValue, missingField } from './errors.js';
+import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
@@ -21,6 +22,12 @@ type HeartbeatInspection = {
 };
 
 function json(value: unknown): string { return JSON.stringify(value, null, 2); }
+function tagText(value: unknown): string {
+  return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+function tagAttribute(value: unknown): string {
+  return tagText(value).replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+}
 function lowerStatus(value: any): string { return String(value ?? '').toLowerCase(); }
 function cronForDelay(seconds: number): string {
   const minutes = Math.max(1, Math.min(60, Math.ceil(seconds / 60)));
@@ -65,12 +72,32 @@ export class CompanionService {
   /** Successful candidate-parent observations; child candidates are refreshed each listing. */
   private childParentCache = new Map<string, string>();
   private messageInFlight = new Map<string, Promise<void>>();
-  private immediateDeliveries = new Set<string>();
+  private idleMessageObservations = new Map<string, { status: string; updatedAt: string }>();
   private heartbeatReconcileInFlight?: Promise<void>;
   private parkReconcileInFlight = new Map<string, Promise<boolean>>();
   private readonly scheduleObserver?: ScheduleObserver;
   private readonly waitSourceDetector: WaitSourceDetector;
   private readonly watchdogStaleMs: number;
+
+  private deliveryPrompt(to: string, items: Array<{
+    id: string; from: string; at: string; urgency: MessageUrgency; mode: MessageMode;
+    kind: 'message' | 'reminder' | 'watchdog' | 'compact-wake'; body: string; actionCommand?: string;
+  }>): string {
+    const kinds = new Set(items.map((item) => item.kind));
+    const kind = kinds.size === 1 ? items[0].kind : 'mixed';
+    const lines = [
+      `<paseo-reminder-delivery to="${tagAttribute(to)}" kind="${kind}">`,
+      '  <note marker="NOT_USER_INPUT">Automated delivery from paseo-reminder. This is system-generated context, not a request from a person. Process each item exactly once. Reply through paseo-reminder only when an item explicitly requests it.</note>',
+    ];
+    for (const item of items) {
+      lines.push(`  <item id="${tagAttribute(item.id)}" from="${tagAttribute(item.from)}" at="${tagAttribute(item.at)}" urgency="${item.urgency}" mode="${item.mode}" kind="${item.kind}">`);
+      lines.push(`    <body>${tagText(item.body)}</body>`);
+      if (item.actionCommand) lines.push(`    <ack>${tagText(item.actionCommand)}</ack>`);
+      lines.push('  </item>');
+    }
+    lines.push('</paseo-reminder-delivery>');
+    return lines.join('\n');
+  }
 
   constructor(cli = new PaseoCli(), store = new Store(), scheduleObserver?: ScheduleObserver, waitSourceDetector: WaitSourceDetector = new ProcessWaitSourceDetector(), options: { watchdogStaleMs?: number } = {}) {
     this.cli = cli; this.store = store; this.scheduleObserver = scheduleObserver; this.waitSourceDetector = waitSourceDetector;
@@ -81,9 +108,11 @@ export class CompanionService {
     await this.reconcileReminders();
     await this.reconcileMessages();
     await this.store.pruneMessageSchedules();
+    await this.store.pruneMessages();
+    await this.store.pruneReminders();
     this.reconcileTimer = setInterval(() => { void this.reconcileOnce(); }, 180_000);
     this.reconcileTimer.unref();
-    this.messageReconcileTimer = setInterval(() => { void this.reconcileMessages(); }, 15_000);
+    this.messageReconcileTimer = setInterval(() => { void this.reconcileFast(); }, 15_000);
     this.messageReconcileTimer.unref();
   }
   close(): void {
@@ -94,6 +123,7 @@ export class CompanionService {
     if (this.scheduleObserver && 'close' in this.scheduleObserver && typeof this.scheduleObserver.close === 'function') void this.scheduleObserver.close();
   }
   setPort(port: number): void { this.port = port; }
+  private endpointBase(): string { return `http://127.0.0.1:${this.port || Number(process.env.PORT || 8787)}`; }
   health(): Record<string, unknown> {
     return { status: 'ok', uptimeSeconds: Math.floor((Date.now() - Date.parse(this.startedAt)) / 1000), startedAt: this.startedAt, lastReconcileAt: this.lastReconcileAt ?? null };
   }
@@ -128,7 +158,7 @@ export class CompanionService {
         try {
           const cachedParent = this.childParentCache.get(id);
           if (cachedParent !== undefined && cachedParent !== agentId) continue;
-          const inspected = await this.inspectWithRetry(id);
+          const inspected = await this.inspectWithRetry(id, agentId);
           const parent = inspected.ParentAgentId ?? inspected.parentAgentId;
           const observedParent = Object.prototype.hasOwnProperty.call(inspected, 'ParentAgentId')
             || Object.prototype.hasOwnProperty.call(inspected, 'parentAgentId');
@@ -147,7 +177,7 @@ export class CompanionService {
             this.resolveChildCwd(inspected, c),
             this.hasLivePaseoWait(childId),
             this.hasLiveCompanionWatch(childId),
-            this.isParked(childId, status, inspected.UpdatedAt ?? inspected.updatedAt),
+            this.isParked(childId, status, inspected.UpdatedAt ?? inspected.updatedAt, agentId),
           ]);
           const tracked = this.store.getTrackedChildren(agentId).find((item) => item.childId === childId);
           const git = await this.gitSnapshot(resolvedCwd);
@@ -237,7 +267,9 @@ export class CompanionService {
   }
 
   async registerWakeupSource(heartbeatId: string, agentId: string, cadence: string): Promise<WakeupSourceRecord> {
-    if (!heartbeatId?.trim() || !agentId?.trim() || !cadence?.trim()) throw new Error('heartbeatId, agentId, and cadence are required');
+    if (!heartbeatId?.trim()) missingField('heartbeatId');
+    if (!agentId?.trim()) missingField('agentId');
+    if (!cadence?.trim()) missingField('cadence');
     const source = await this.store.upsertWakeupSource({
       heartbeatId: heartbeatId.trim(), agentId: agentId.trim(), cadence: cadence.trim(), status: 'dead', registeredAt: new Date().toISOString(),
     });
@@ -253,16 +285,16 @@ export class CompanionService {
 
   async deleteWakeupSource(heartbeatId: string, agentId?: string): Promise<{ heartbeatId: string; status: 'deleted' }> {
     const source = this.store.getWakeupSource(heartbeatId);
-    if (!source || (agentId && source.agentId !== agentId)) throw new Error('wakeup source not found');
+    if (!source || (agentId && source.agentId !== agentId)) throw new CompanionError('not_found', 'wakeup source not found');
     await this.store.removeWakeupSource(heartbeatId);
     return { heartbeatId, status: 'deleted' };
   }
 
-  private async inspectWithRetry(id: string): Promise<Record<string, any>> {
+  private async inspectWithRetry(id: string, agentId?: string): Promise<Record<string, any>> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const value = asRecord((await this.cli.run(['inspect', id, '--json'], { timeoutMs: 5_000 })).value);
+        const value = asRecord((await this.cli.run(['inspect', id, '--json'], { agentId, timeoutMs: 5_000 })).value);
         if (!Object.keys(value).length) throw new Error('paseo inspect returned an empty response');
         return value;
       } catch (error) { lastError = error; }
@@ -297,38 +329,12 @@ export class CompanionService {
     try { return await this.waitSourceDetector.detect(agentId); } catch { return 'unknown'; }
   }
 
-  private async hasLiveWakeupSource(agentId: string): Promise<boolean | 'unknown'> {
-    const [wait, companion] = await Promise.all([this.hasLivePaseoWait(agentId), this.hasLiveCompanionWatch(agentId)]);
-    return this.unionLiveSources(wait, companion);
-  }
   private unionLiveSources(wait: boolean | 'unknown', companion: boolean | 'unknown'): boolean | 'unknown' {
     if (wait === true || companion === true) return true;
     if (wait === 'unknown' || companion === 'unknown') return 'unknown';
     return false;
   }
 
-  /** Compatibility alias retained for callers from the previous rounds. */
-  private async hasLiveWakeup(agentId: string): Promise<boolean | 'unknown'> {
-    let unknown = false;
-    let local = false;
-    for (const reminder of this.store.getReminders()) {
-      // Child watches are delivered to their manager, so subjectChildId is the
-      // wakeup identity for this query while agentId remains the delivery identity.
-      const matches = reminder.subjectChildId === agentId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child');
-      if (matches && reminder.status === 'active') {
-        const live = await this.probeReminder(reminder);
-        if (live === true) local = true;
-        if (reminder.alive === 'unknown') unknown = true;
-      }
-    }
-    const external = await this.hasLivePaseoWait(agentId);
-    // Always inspect both sources. A proven external wait wins over an
-    // uncertain local reminder; uncertainty propagates only when no source is
-    // proven live.
-    if (external === true || local) return true;
-    if (unknown) return 'unknown';
-    return external;
-  }
   private async gitSnapshot(cwd: unknown): Promise<{ gitDirty: boolean | 'unknown'; latestCommit?: string }> {
     if (typeof cwd !== 'string' || !cwd) return { gitDirty: 'unknown' };
     try {
@@ -360,15 +366,15 @@ export class CompanionService {
     return undefined;
   }
 
-  private async isParked(childId: string, status: string, updatedAt: unknown): Promise<boolean> {
+  private async isParked(childId: string, status: string, updatedAt: unknown, agentId?: string): Promise<boolean> {
     const existing = this.parkReconcileInFlight.get(childId);
     if (existing) return existing;
-    const operation = this.isParkedOnce(childId, status, updatedAt);
+    const operation = this.isParkedOnce(childId, status, updatedAt, agentId);
     this.parkReconcileInFlight.set(childId, operation);
     try { return await operation; } finally { this.parkReconcileInFlight.delete(childId); }
   }
 
-  private async isParkedOnce(childId: string, status: string, updatedAt: unknown): Promise<boolean> {
+  private async isParkedOnce(childId: string, status: string, updatedAt: unknown, agentId?: string): Promise<boolean> {
     const parks = this.store.getLedger().filter((record) => record.type === 'park' && record.target === childId && !record.revokedAt);
     if (!parks.length) return false;
     const running = lowerStatus(status) === 'running';
@@ -383,7 +389,7 @@ export class CompanionService {
       }
       const active = this.store.getLedger().filter((record) => record.type === 'park' && record.target === childId && !record.revokedAt);
       if (!active.length) {
-        try { await this.cli.run(['agent', 'update', childId, '--label', 'parked=false', '--json']); } catch { /* best effort */ }
+        try { await this.cli.run(['agent', 'update', childId, '--label', 'parked=false', '--json'], { agentId }); } catch { /* best effort */ }
         return this.store.getLedger().some((record) => record.type === 'park' && record.target === childId && !record.revokedAt);
       }
       return true;
@@ -590,31 +596,85 @@ export class CompanionService {
     }
   }
 
-  async spawn(body: { provider: string; model?: string; title: string; cwd: string; prompt: string; label?: string; waitTimeoutSeconds?: number }, managerId?: string): Promise<unknown> {
-    await this.store.addManager(managerId);
-    const args = ['run', '-d', '--provider', body.provider, ...(body.model ? ['--model', body.model] : []), '--title', body.title, '--cwd', body.cwd];
-    if (body.label) args.push('--label', body.label);
-    args.push('--json', body.prompt);
-    const result = asRecord((await this.cli.run(args)).value);
-    return { ...result, id: result.agentId ?? result.id };
+  async createReminder(body: { agentId: string; delaySeconds?: number; targetAt?: string; message: string; context?: object; ackRequired?: boolean; subjectChildId?: string; kind?: ReminderKind; watchKind?: 'child'; name?: string; maxRuns?: number; eventType?: string; criterion?: string; mode?: ReminderMode; cron?: string; everySeconds?: number; delivery?: MessageDelivery; urgency?: MessageUrgency }): Promise<ReminderRecord> {
+    if ((body as any).id !== undefined) invalidValue('caller-supplied reminder id is not supported', 'id');
+    if (body.mode !== undefined && !['once', 'repeat'].includes(body.mode)) invalidValue('mode must be once or repeat', 'mode', ['once', 'repeat']);
+    // Child watches and explicit heartbeat kinds retain their legacy daemon
+    // implementation. Generic reminders use the direct-send contract below.
+    if (body.kind === 'child-watch' || body.watchKind === 'child' || body.kind === 'compact-wake' || body.kind === 'watchdog' || body.kind === 'heartbeat-recovery') {
+      return this.createLegacyReminder(body as any);
+    }
+    await this.store.addManager(body.agentId);
+    const mode: ReminderMode = body.mode ?? (body.everySeconds || body.cron ? 'repeat' : 'once');
+    let targetAt = body.targetAt;
+    if (!targetAt && body.delaySeconds !== undefined) {
+      if (!Number.isFinite(body.delaySeconds) || body.delaySeconds <= 0) invalidValue('delaySeconds must be positive', 'delaySeconds');
+      targetAt = new Date(Date.now() + body.delaySeconds * 1000).toISOString();
+    }
+    if (mode === 'once' && (!targetAt || !Number.isFinite(Date.parse(targetAt)))) invalidValue('once reminders require delaySeconds or an absolute targetAt', 'targetAt');
+    if (mode === 'repeat' && !(Number.isFinite(body.everySeconds) && (body.everySeconds ?? 0) > 0)) invalidValue('repeat reminders require explicit everySeconds', 'everySeconds');
+    if (mode === 'repeat' && !targetAt) targetAt = new Date(Date.now() + Number(body.everySeconds) * 1000).toISOString();
+    if (body.maxRuns !== undefined && (!Number.isSafeInteger(body.maxRuns) || body.maxRuns <= 0)) invalidValue('maxRuns must be a positive integer', 'maxRuns');
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    const reminder: ReminderRecord = {
+      id, agentId: body.agentId.trim(), name: body.name ?? `companion-reminder-${id.slice(0, 8)}`,
+      prompt: [
+        `type=reminder id=${id} target=${body.agentId.trim()} event=${mode === 'once' ? 'scheduled-once' : 'scheduled-repeat'} criterion=${mode === 'once' ? `targetAt=${targetAt}` : `everySeconds=${body.everySeconds}`} triggeredAt=pending`,
+        body.message,
+        body.context ? `Structured context: ${json(body.context)}` : '',
+        `Cancel this reminder with: ${this.cancelCommand(id)}`,
+      ].filter(Boolean).join('\n'),
+      cron: body.cron ?? (body.everySeconds ? `every ${body.everySeconds}s` : ''), expiresIn: '', status: 'active', createdAt,
+      mode, schedulingKind: mode, ...(targetAt ? { targetAt, nextRunAt: targetAt } : {}), ...(body.everySeconds ? { everySeconds: body.everySeconds } : {}),
+      ...(body.maxRuns !== undefined ? { maxRuns: body.maxRuns } : {}), runsCompleted: 0,
+      delivery: body.delivery ?? (body.urgency === 'urgent' ? 'interrupt' : 'on-idle'),
+      ...(body.kind ? { kind: body.kind } : {}), ...(body.eventType ? { eventType: body.eventType } : {}),
+      ...(body.criterion ? { criterion: body.criterion } : {}), ...(body.subjectChildId ? { subjectChildId: body.subjectChildId } : {}),
+      ...(body.watchKind ? { watchKind: body.watchKind } : {}),
+    };
+    await this.store.addReminder(reminder);
+    await this.reconcileReminders();
+    return this.store.findReminder(id)!;
   }
 
-  async createReminder(body: { agentId: string; delaySeconds: number; message: string; context?: object; ackRequired?: boolean; subjectChildId?: string; kind?: ReminderKind; watchKind?: 'child'; name?: string; maxRuns?: number; eventType?: string; criterion?: string }): Promise<ReminderRecord> {
+  listReminders(agentId?: string): ReminderRecord[] {
+    return this.store.getReminders().filter((reminder) => !agentId || reminder.agentId === agentId).map((reminder) => this.withSchedulingKind(reminder));
+  }
+
+  getReminder(id: string): ReminderRecord {
+    const reminder = this.store.findReminder(id);
+    if (!reminder) throw new CompanionError('not_found', 'reminder not found');
+    return this.withSchedulingKind(reminder);
+  }
+
+  private withSchedulingKind(reminder: ReminderRecord): ReminderRecord {
+    if (reminder.schedulingKind) return reminder;
+    if (reminder.mode === 'once' || reminder.mode === 'repeat') return { ...reminder, schedulingKind: reminder.mode };
+    if (reminder.kind === 'child-watch' || reminder.kind === 'watchdog' || reminder.kind === 'heartbeat-recovery') return { ...reminder, schedulingKind: 'in-process' };
+    if (reminder.daemonId || reminder.cron) return { ...reminder, schedulingKind: 'cron' };
+    return reminder;
+  }
+
+  private async createLegacyReminder(body: { agentId: string; delaySeconds: number; message: string; context?: object; ackRequired?: boolean; subjectChildId?: string; kind?: ReminderKind; watchKind?: 'child'; name?: string; maxRuns?: number; eventType?: string; criterion?: string }): Promise<ReminderRecord> {
     await this.store.addManager(body.agentId);
-    if (!Number.isFinite(body.delaySeconds) || body.delaySeconds <= 0) throw new Error('delaySeconds must be positive');
-    if (body.maxRuns !== undefined && (!Number.isSafeInteger(body.maxRuns) || body.maxRuns <= 0)) throw new Error('maxRuns must be a positive integer');
+    if (!Number.isFinite(body.delaySeconds) || body.delaySeconds <= 0) invalidValue('delaySeconds must be positive', 'delaySeconds');
+    if (body.maxRuns !== undefined && (!Number.isSafeInteger(body.maxRuns) || body.maxRuns <= 0)) invalidValue('maxRuns must be a positive integer', 'maxRuns');
     const localId = randomUUID();
     const cron = cronForDelay(body.delaySeconds);
     const expiresIn = ttlForDelay(body.delaySeconds);
-    const endpointPort = this.port || Number(process.env.PORT || 8787);
-    const ack = `curl -X DELETE http://127.0.0.1:${endpointPort}/reminders/${localId} -H 'content-type: application/json' -d '{"reason":"acknowledged"}'`;
-    const prompt = [
+    const ack = `curl -X DELETE ${this.endpointBase()}/reminders/${localId} -H 'content-type: application/json' -d '{"reason":"acknowledged"}'`;
+    const reminderBody = [
       `type=reminder id=${localId} target=${body.agentId} event=${body.kind ?? 'generic'} criterion=wall-clock-delay:${body.delaySeconds}s triggeredAt=${new Date().toISOString()}`,
       body.message, body.context ? `Structured context: ${json(body.context)}` : 'Structured context: {}',
-      `Cancel/acknowledge this reminder with: ${ack}`,
       body.maxRuns && body.maxRuns > 1 ? `This reminder repeats up to ${body.maxRuns} times; the next run follows its cron schedule.` : body.maxRuns === undefined ? 'This reminder repeats on its cron schedule; the next run is reported by the companion. Cancel it before the next run if no longer needed.' : '',
       body.ackRequired === false ? '' : 'Do not drop this reminder without an explicit acknowledgement.',
     ].filter(Boolean).join('\n');
+    const prompt = this.deliveryPrompt(body.agentId, [{
+      id: localId, from: 'paseo-reminder', at: new Date().toISOString(), urgency: 'normal', mode: 'ack',
+      kind: body.kind === 'compact-wake' ? 'compact-wake' : body.kind === 'watchdog' || body.kind === 'heartbeat-recovery' ? 'watchdog' : 'reminder',
+      body: reminderBody, actionCommand: ack,
+    }]);
     const pending: ReminderRecord = {
       id: localId,
       agentId: body.agentId,
@@ -625,6 +685,7 @@ export class CompanionService {
       cron,
       expiresIn,
       status: 'pending',
+      schedulingKind: 'cron',
       createdAt: new Date().toISOString(),
       ...(body.maxRuns !== undefined ? { maxRuns: body.maxRuns } : {}),
       ...(body.eventType ? { eventType: body.eventType } : {}),
@@ -656,7 +717,7 @@ export class CompanionService {
     const idle = this.store.findIdleReminder(id);
     if (idle) return this.deleteIdleReminder(id, reason);
     const reminder = this.store.findReminder(id);
-    if (!reminder) throw new Error('reminder not found');
+    if (!reminder) throw new CompanionError('not_found', 'reminder not found');
     const childWatch = Boolean(reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child'));
     const markDeleted = async () => {
       await this.store.clearReminderMissed(reminder.id);
@@ -702,14 +763,13 @@ export class CompanionService {
   }
 
   private cancelCommand(id: string): string {
-    const endpointPort = this.port || Number(process.env.PORT || 8787);
-    return `curl -X DELETE http://127.0.0.1:${endpointPort}/reminders/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    return `curl -X DELETE ${this.endpointBase()}/reminders/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
   }
 
   async createIdleReminder(body: { agentId: string; thresholdSeconds: number; message: string; once?: boolean }): Promise<IdleReminderRecord> {
     await this.store.addManager(body.agentId);
-    if (!Number.isFinite(body.thresholdSeconds) || body.thresholdSeconds <= 0) throw new Error('thresholdSeconds must be positive');
-    if (!body.message?.trim()) throw new Error('message is required');
+    if (!Number.isFinite(body.thresholdSeconds) || body.thresholdSeconds <= 0) invalidValue('thresholdSeconds must be positive', 'thresholdSeconds');
+    if (!body.message?.trim()) missingField('message');
     const record: IdleReminderRecord = {
       id: randomUUID(), agentId: body.agentId, message: body.message, thresholdSeconds: body.thresholdSeconds,
       once: body.once === true, status: 'active', createdAt: new Date().toISOString(),
@@ -718,14 +778,21 @@ export class CompanionService {
     return record;
   }
 
+  private async observeAgentIdle(agentId: string): Promise<{ status: string; updatedAt: string; available: boolean }> {
+    const inspected = await this.inspectWithRetry(agentId, agentId);
+    const status = lowerStatus(inspected.Status ?? inspected.status);
+    const updatedAt = String(inspected.UpdatedAt ?? inspected.updatedAt ?? '');
+    return { status, updatedAt, available: ['idle', 'waiting'].includes(status) && Boolean(updatedAt) };
+  }
+
   private async observeIdleReminder(reminder: IdleReminderRecord, now = Date.now()): Promise<IdleReminderRecord> {
     if (reminder.status !== 'active') return reminder;
     let status = '';
     let updated = '';
     try {
-      const inspected = await this.inspectWithRetry(reminder.agentId);
-      status = lowerStatus(inspected.Status ?? inspected.status);
-      updated = String(inspected.UpdatedAt ?? inspected.updatedAt ?? '');
+      const observed = await this.observeAgentIdle(reminder.agentId);
+      status = observed.status;
+      updated = observed.updatedAt;
     } catch { return reminder; }
     if (status !== 'idle' || !updated) {
       if (reminder.idleSince || reminder.lastObservedUpdatedAt !== updated) {
@@ -743,10 +810,10 @@ export class CompanionService {
     const body = [
       `type=idle-reminder id=${current.id} target=${current.agentId} event=manager-idle criterion=status=idle and updatedAt unchanged for ${current.thresholdSeconds}s triggeredAt=${new Date(now).toISOString()}`,
       current.message,
-      `Cancel this reminder with: ${this.cancelCommand(current.id)}`,
       current.once ? 'This reminder is one-shot and will self-delete after delivery.' : `This reminder repeats; after this delivery it will begin a new ${current.thresholdSeconds}s idle window.`,
     ].join('\n');
-    await this.postMessage({ to: current.agentId, from: 'companion', body });
+    const actionCommand = `curl -X DELETE ${this.endpointBase()}/idle-reminders/${current.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    await this.postMessage({ to: current.agentId, from: 'companion', body, delivery: 'interrupt', mode: 'notify', promptKind: 'reminder', actionCommand });
     if (current.once) {
       await this.store.updateIdleReminder(current.id, { status: 'deleted', idleSince: undefined, lastTriggeredAt: new Date(now).toISOString() });
     } else {
@@ -769,9 +836,9 @@ export class CompanionService {
   }
 
   async deleteIdleReminder(id: string, reason: string): Promise<{ id: string; status: 'deleted' }> {
-    if (!reason?.trim()) throw new Error('reason is required');
+    if (!reason?.trim()) missingField('reason');
     const record = this.store.findIdleReminder(id);
-    if (!record) throw new Error('idle reminder not found');
+    if (!record) throw new CompanionError('not_found', 'idle reminder not found');
     if (record.status !== 'deleted') {
       await this.store.updateIdleReminder(id, { status: 'deleted', idleSince: undefined });
       await this.store.addLedger({ type: 'deferred', target: id, verdict: 'reminder-deleted', reason });
@@ -793,7 +860,7 @@ export class CompanionService {
     if (existing?.status === 'deleted') return undefined;
     if (existing) return existing;
     const record: ReminderRecord = {
-      id, agentId: managerId, name: id, prompt: '', cron: '', expiresIn: '', status: 'active', createdAt: new Date().toISOString(),
+      id, agentId: managerId, name: id, prompt: '', cron: '', expiresIn: '', status: 'active', schedulingKind: 'in-process', createdAt: new Date().toISOString(),
       kind: 'watchdog', eventType, criterion,
     };
     await this.store.addReminder(record);
@@ -809,10 +876,9 @@ export class CompanionService {
       `type=watchdog id=${reminder.id} target=${managerId} event=${eventType} criterion=${criterion} triggeredAt=${new Date().toISOString()}`,
       `snapshot: child=${snapshot.childId} status=${snapshot.status} updatedAt=${snapshot.updatedAt ?? 'unknown'} hasLivePaseoWait=${snapshot.hasLivePaseoWait ?? 'unknown'} gitDirty=${snapshot.gitDirty ?? 'unknown'} latestCommit=${snapshot.latestCommit ?? 'unknown'}`,
       detail,
-      `Cancel this alert with: ${this.cancelCommand(reminder.id)}`,
       ephemeral ? 'This health alert is non-acknowledgement based; the alert ID remains cancellable.' : 'Acknowledge this completion alert after review; future matching transitions remain deduplicated by this ID.',
     ].join('\n');
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'interrupt', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
     snapshot.notified = [...notified, eventType];
     return true;
   }
@@ -846,7 +912,11 @@ export class CompanionService {
     const managerSnapshot = this.store.getWatchdogSnapshot(managerId, '__manager__') ?? { managerId, childId: '__manager__', status: '', notified: [] };
     const observedManagerWait = managerWait ?? await this.hasLivePaseoWait(managerId);
     managerSnapshot.hasLivePaseoWait = observedManagerWait;
-    const managerNoWakeup = running.length > 0 && snapshotResult.companionKnownWakeupSources.length === 0 && observedManagerWait === false;
+    // A live wait owned by any currently running child also covers the manager:
+    // the child can yield the next turn without requiring a manager wakeup.
+    const runningChildWait = running.some((child) => child.hasLivePaseoWait === true);
+    const managerNoWakeup = running.length > 0 && snapshotResult.companionKnownWakeupSources.length === 0
+      && observedManagerWait === false && !runningChildWait;
     const managerBareCriterion = 'running child status observed, no live companion-created or registered wakeup source observed, and no live paseo wait; external sources may be invisible';
     const managerBareDetail = `manager=${managerId} has ${running.length} running child(ren); companion checked only companion-created and registered sources, so external wakeup sources may be invisible`;
     if (managerNoWakeup) await this.notifyWatchdog(managerId, '__manager__', 'manager-bare', managerBareCriterion, managerBareDetail, true, managerSnapshot);
@@ -859,20 +929,33 @@ export class CompanionService {
   }
 
   /** Persist before handing a coalesced batch to Paseo's turn-boundary queue. */
-  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<MessageRecord & {
+  async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; delivery?: MessageDelivery; mode?: MessageMode; ackDeadlineAt?: string; ackDeadlineSeconds?: number; replyTo?: string; promptKind?: MessageRecord['promptKind']; actionCommand?: string; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<Omit<MessageRecord, 'delivery'> & {
     schedule: null;
     delivery: { id: string; transport: 'paseo-send' | 'heartbeat'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
   }> {
-    if (!body.to?.trim() || !body.from?.trim() || !body.body?.trim()) throw new Error('to, from, and body are required');
-    if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') throw new Error('urgency must be normal or urgent');
+    if (!body.to?.trim()) missingField('to');
+    if (!body.from?.trim()) missingField('from');
+    if (!body.body?.trim()) missingField('body');
+    if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') invalidValue('urgency must be normal or urgent', 'urgency', ['normal', 'urgent']);
+    const deliveryMode = body.delivery ?? (body.immediate || body.urgency === 'urgent' ? 'interrupt' : 'on-idle');
+    if (deliveryMode !== 'interrupt' && deliveryMode !== 'on-idle') invalidValue('delivery must be interrupt or on-idle', 'delivery', ['interrupt', 'on-idle']);
+    const mode = body.mode ?? 'notify';
+    if (!['notify', 'ack', 'reply'].includes(mode)) invalidValue('mode must be notify, ack, or reply', 'mode', ['notify', 'ack', 'reply']);
+    if (mode === 'reply' && !body.replyTo?.trim()) missingField('replyTo');
+    if (body.replyTo && !this.store.getMessages().some((item) => item.id === body.replyTo)) throw new CompanionError('not_found', 'reply parent message not found');
     const message: MessageRecord = {
       id: randomUUID(),
       to: body.to.trim(),
       from: body.from.trim(),
       body: body.body,
       urgency: body.urgency ?? 'normal',
+      delivery: deliveryMode, mode,
       status: 'pending',
       createdAt: new Date().toISOString(),
+      ...(body.ackDeadlineAt ? { ackDeadlineAt: body.ackDeadlineAt } : body.ackDeadlineSeconds ? { ackDeadlineAt: new Date(Date.now() + body.ackDeadlineSeconds * 1000).toISOString() } : {}),
+      ...(body.replyTo ? { replyTo: body.replyTo } : {}),
+      ...(body.promptKind ? { promptKind: body.promptKind } : {}),
+      ...(body.actionCommand ? { actionCommand: body.actionCommand } : {}),
       ...(body.kind ? { kind: body.kind } : {}),
       ...(body.recoveryManagerId ? { recoveryManagerId: body.recoveryManagerId } : {}),
       ...(body.recoveryCounts ? { recoveryCounts: body.recoveryCounts } : {}),
@@ -880,33 +963,48 @@ export class CompanionService {
     };
     // This write deliberately precedes every daemon call.
     await this.store.addMessage(message);
-    if (body.immediate) this.immediateDeliveries.add(message.to);
-    try { await this.ensureMessageDelivery(message.to); }
-    finally { if (body.immediate) this.immediateDeliveries.delete(message.to); }
+    if (message.replyTo) await this.store.updateMessage(message.replyTo, { status: 'answered', replyMessageId: message.id, answeredAt: message.createdAt });
+    await this.ensureMessageDelivery(message.to);
     const audit = this.store.getMessageSchedules().find((item) => item.batchIds.includes(message.id)) ?? null;
-    const delivery = audit ? {
+    const receipt = audit ? {
       id: audit.id,
       transport: (audit.transport ?? 'paseo-send') as 'paseo-send' | 'heartbeat',
       status: audit.status === 'completed' ? 'accepted' as const : 'pending' as const,
       acceptedAt: audit.status === 'completed' ? audit.lastRunAt ?? null : null,
       batchIds: audit.batchIds,
     } : null;
-    if (audit?.status === 'completed') return { ...message, status: 'delivered', deliveredAt: audit.lastRunAt, schedule: null, delivery };
-    return { ...message, schedule: null, delivery };
+    if (audit?.status === 'completed') {
+      const delivered: MessageRecord = { ...message, status: 'delivered', deliveredAt: audit.lastRunAt };
+      const { delivery: _delivery, ...withoutDelivery } = delivered;
+      return { ...withoutDelivery, schedule: null, delivery: receipt };
+    }
+    const { delivery: _delivery, ...withoutDelivery } = message;
+    return { ...withoutDelivery, schedule: null, delivery: receipt };
   }
 
-  getMessages(to?: string): MessageRecord[] {
-    return this.store.getMessages().filter((message) => !to || message.to === to);
+  getMessages(filters?: string | { to?: string; from?: string; status?: string; replyTo?: string }): MessageRecord[] {
+    const query = typeof filters === 'string' ? { to: filters } : (filters ?? {});
+    return this.store.getMessages().filter((message) =>
+      (!query.to || message.to === query.to) && (!query.from || message.from === query.from)
+      && (!query.status || message.status === query.status) && (!query.replyTo || message.replyTo === query.replyTo));
   }
 
-  async deleteMessage(id: string, reason: string): Promise<{ id: string; status: 'deleted'; retirementPending: boolean }> {
-    if (!reason?.trim()) throw new Error('reason is required');
+  async deleteMessage(id: string, reason: string): Promise<{ id: string; status: 'deleted' | 'acknowledged'; retirementPending: boolean }> {
+    if (!reason?.trim()) missingField('reason');
     const message = this.store.getMessages().find((item) => item.id === id);
     if (!message) {
       const retired = this.store.getLedger().some((record) => record.type === 'deferred' && record.target === id
         && (record.verdict === 'message-acknowledged' || record.verdict === 'message-deleted'));
-      if (retired) return { id, status: 'deleted', retirementPending: false };
-      throw new Error('message not found');
+      const autoCleared = this.store.getMessageSchedules().some((schedule) => schedule.status === 'completed' && schedule.batchIds.includes(id));
+      if (retired || autoCleared) return { id, status: 'deleted', retirementPending: false };
+      throw new CompanionError('not_found', 'message not found');
+    }
+    if (message.status === 'acknowledged') return { id, status: 'acknowledged', retirementPending: false };
+    if ((message.mode ?? 'notify') === 'ack' && ['delivered', 'unacknowledged'].includes(message.status)) {
+      await this.store.updateMessage(id, { status: 'acknowledged', acknowledgedAt: new Date().toISOString(), acknowledgementReason: reason });
+      await this.store.addLedger({ type: 'deferred', target: id, verdict: 'message-acknowledged', reason });
+      await this.store.pruneMessages();
+      return { id, status: 'acknowledged', retirementPending: false };
     }
     const wasDelivered = message.status === 'delivered';
     await this.store.updateMessage(id, { status: 'cancelled' });
@@ -945,36 +1043,19 @@ export class CompanionService {
   }
 
   private messagePrompt(recipient: string, messages: MessageRecord[]): string {
-    const grouped = new Map<string, MessageRecord[]>();
-    for (const message of this.sortMessages(messages)) {
-      const sender = grouped.get(message.from) ?? [];
-      sender.push(message);
-      grouped.set(message.from, sender);
-    }
-    const lines = [`Deliver the queued messages below to ${recipient}. Do not send a response through the companion; process each message exactly once.`];
-    for (const [sender, senderMessages] of grouped) {
-      lines.push(`From: ${sender}`);
-      for (const message of senderMessages) {
-        lines.push(`- [id=${message.id}] [${message.createdAt}] (${message.urgency}) ${message.body}`);
-      }
-    }
-    // Recovery transport remains self-cleaning at delivery time; its durable
-    // reminder record is the cancellation handle, so do not append a message
-    // acknowledgement endpoint to that ephemeral transport payload.
-    const acknowledgements = this.sortMessages(messages).filter((message) => message.kind !== 'heartbeat-recovery');
-    if (acknowledgements.length) lines.push('After processing, acknowledge each message separately (no batch acknowledgement) with:');
-    for (const message of acknowledgements) {
-      const endpointPort = this.port || Number(process.env.PORT || 8787);
-      lines.push(`curl -X DELETE http://127.0.0.1:${endpointPort}/messages/${message.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`);
-    }
-    return lines.join('\n');
-  }
-
-  private transportPrompt(prompt: string, transport: 'heartbeat' | 'paseo-send', reason?: string): string {
-    const marker = transport === 'heartbeat'
-      ? 'AUTOMATED_COMPANION_EVENT transport=heartbeat NOT_USER_INPUT'
-      : `AUTOMATED_COMPANION_EVENT transport=fallback-send NOT_USER_INPUT reason=${reason ?? 'explicit immediate=true'}`;
-    return `${marker}\n${prompt}`;
+    const sorted = this.sortMessages(messages);
+    return this.deliveryPrompt(recipient, sorted.map((message) => ({
+      id: message.id,
+      from: message.from,
+      at: message.createdAt,
+      urgency: message.urgency,
+      mode: message.mode ?? 'notify',
+      kind: message.promptKind ?? 'message',
+      body: message.body,
+      actionCommand: message.actionCommand ?? (message.kind !== 'heartbeat-recovery' && (message.mode ?? 'notify') === 'ack'
+        ? `curl -X DELETE ${this.endpointBase()}/messages/${message.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`
+        : undefined),
+    })));
   }
 
   private async inspectMessageSchedule(schedule: MessageScheduleRecord): Promise<MessageScheduleInspection> {
@@ -1068,7 +1149,12 @@ export class CompanionService {
         await this.completeRecovery(message);
         await this.store.removeMessages([message.id]);
       } else if (message.status === 'pending') {
-        await this.store.updateMessage(message.id, { status: 'delivered', deliveredAt });
+        const mode = message.mode ?? 'notify';
+        if (mode === 'notify') await this.store.removeMessages([message.id]);
+        else await this.store.updateMessage(message.id, { status: 'delivered', deliveredAt });
+        if (message.replyTo) {
+          await this.store.updateMessage(message.replyTo, { status: 'answered', replyMessageId: message.id, answeredAt: deliveredAt });
+        }
       }
     }
   }
@@ -1082,44 +1168,14 @@ export class CompanionService {
       batchIds: batch.map((message) => message.id),
       prompt: this.messagePrompt(recipient, batch),
       status: 'pending',
-      transport: this.immediateDeliveries.has(recipient) ? 'paseo-send' : 'heartbeat',
+      transport: 'paseo-send',
       createdAt: new Date().toISOString(),
     };
-    const basePrompt = local.prompt;
     await this.store.addMessageSchedule(local);
-    if (local.transport === 'heartbeat') {
-      const cron = '* * * * *';
-      const name = `companion-message-${local.generation}`;
-      let daemonId: string | undefined;
-      try {
-        local.prompt = this.transportPrompt(basePrompt, 'heartbeat');
-        const value = asRecord((await this.cli.run([
-          'heartbeat', 'create', local.prompt, '--cron', cron, '--expires-in', '30m', '--max-runs', '1',
-          '--name', name, '--timezone', 'UTC', '--json',
-        ], { agentId: recipient })).value);
-        daemonId = String(value.id ?? value.heartbeatId ?? '') || undefined;
-        if (!daemonId) throw new Error('heartbeat create returned no id');
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        const fallbackReason = `heartbeat-create-failed: ${reason}`;
-        local.transport = 'paseo-send';
-        local.transportReason = fallbackReason;
-        console.warn(JSON.stringify({ type: 'message-delivery-fallback', recipient, generation: local.generation, batchIds: local.batchIds, transport: 'paseo-send', reason: fallbackReason }));
-      }
-      if (daemonId) {
-        await this.store.updateMessageSchedule(local.id, { daemonId, status: 'active', transport: 'heartbeat', prompt: local.prompt });
-        console.log(JSON.stringify({ type: 'message-delivery-armed', recipient, generation: local.generation, batchIds: local.batchIds, transport: 'heartbeat', daemonId }));
-        return this.store.getMessageSchedules().find((item) => item.id === local.id);
-      }
-    }
     let acceptedAt: string;
-    if (local.transport === 'paseo-send') {
-      const reason = local.transportReason ?? 'explicit immediate=true';
-      local.prompt = this.transportPrompt(basePrompt, 'paseo-send', reason);
-      await this.store.updateMessageSchedule(local.id, { transport: 'paseo-send', prompt: local.prompt, transportReason: reason });
-    }
     try {
-      const value = unwrapPayload((await this.cli.run(['send', '--no-wait', '--json', recipient, local.prompt])).value);
+      const senderAgentId = batch[0]?.from;
+      const value = unwrapPayload((await this.cli.run(['send', '--no-wait', '--json', recipient, local.prompt], { agentId: senderAgentId })).value);
       const status = lowerStatus(value.status);
       if (!['sent', 'accepted'].includes(status)) throw new Error(`paseo send did not confirm sent status (status=${String(value.status)})`);
       acceptedAt = new Date().toISOString();
@@ -1129,7 +1185,7 @@ export class CompanionService {
       await this.store.updateMessageSchedule(local.id, { status: 'completed', lastRunAt: acceptedAt, transport: 'paseo-send' });
     } catch (error) {
       await this.store.updateMessageSchedule(local.id, { status: 'failed' });
-      console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', reason: local.transportReason ?? 'explicit immediate=true', error: error instanceof Error ? error.message : String(error) }));
+      console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', error: error instanceof Error ? error.message : String(error) }));
       return undefined;
     }
     console.log(JSON.stringify({ type: 'message-delivery-accepted', recipient, generation, batchIds: local.batchIds, transport: 'paseo-send', reason: local.transportReason ?? 'explicit immediate=true' }));
@@ -1156,10 +1212,23 @@ export class CompanionService {
       try { await this.finalizeAcceptedMessageSchedule(schedule); } catch { /* accepted send is terminal; retry local cleanup later */ }
     }
     const queued = this.store.getMessages().filter((message) => message.to === recipient && message.status === 'pending');
-    const accepted = new Set(this.store.getMessageSchedules().filter((item) => item.recipient === recipient && ['active', 'running', 'failed', 'completed'].includes(item.status)).flatMap((item) => item.batchIds));
+    // A failed terminal run did not hand the batch to the recipient. Keep the
+    // pending messages eligible for the next delivery generation; only live,
+    // in-flight, or successful generations block duplicate delivery.
+    const accepted = new Set(this.store.getMessageSchedules().filter((item) => item.recipient === recipient && ['active', 'running', 'completed'].includes(item.status)).flatMap((item) => item.batchIds));
     const pending = queued.filter((message) => !accepted.has(message.id));
     if (!pending.length) return;
-    await this.createMessageSchedule(recipient, this.sortMessages(pending));
+    const interrupt = pending.filter((message) => (message.delivery ?? (message.urgency === 'urgent' ? 'interrupt' : 'on-idle')) === 'interrupt');
+    if (interrupt.length) await this.createMessageSchedule(recipient, this.sortMessages(interrupt));
+    const idle = pending.filter((message) => !interrupt.includes(message));
+    if (!idle.length) return;
+    let observed: { status: string; updatedAt: string; available: boolean };
+    try { observed = await this.observeAgentIdle(recipient); } catch { return; }
+    const { status, updatedAt } = observed;
+    const prior = this.idleMessageObservations.get(recipient);
+    const stable = observed.available && prior?.status === status && prior.updatedAt === updatedAt;
+    this.idleMessageObservations.set(recipient, { status, updatedAt });
+    if (stable) await this.createMessageSchedule(recipient, this.sortMessages(idle));
   }
 
   private async completeRecovery(message: MessageRecord): Promise<void> {
@@ -1201,6 +1270,11 @@ export class CompanionService {
     for (const message of this.store.getMessages().filter((item) => item.status === 'cancelled')) {
       if (!await this.cleanupCancelledMessage(message.id)) await this.store.removeMessages([message.id]);
     }
+    const now = Date.now();
+    for (const message of this.store.getMessages()) {
+      if (message.mode !== 'ack' || message.status !== 'delivered' || !message.ackDeadlineAt) continue;
+      if (Date.parse(message.ackDeadlineAt) <= now) await this.store.updateMessage(message.id, { status: 'unacknowledged', unacknowledgedAt: message.unacknowledgedAt ?? new Date(now).toISOString() });
+    }
     await this.reconcileHeartbeatMessageSchedules();
     if (this.store.isChildWatchOptOutStateCorrupt()) {
       const pairs = new Map<string, string[]>();
@@ -1230,15 +1304,29 @@ export class CompanionService {
       try { await this.ensureMessageDelivery(recipient); } catch { /* retry next reconciliation */ }
     }
     await this.store.pruneMessageSchedules();
+    await this.store.pruneMessages();
+  }
+
+  private async reconcileFast(): Promise<void> {
+    await this.reconcileMessages();
+    for (const reminder of this.store.getReminders()) {
+      if ((reminder.status === 'pending' || reminder.status === 'active') &&
+          (reminder.mode === 'once' || reminder.mode === 'repeat' || reminder.targetAt || reminder.everySeconds)) {
+        await this.reconcileLocalReminder(reminder);
+      }
+    }
+    await this.reconcileIdleReminders();
   }
 
   async compactWake(body: { agentId: string; resumeSteps: string }): Promise<unknown> {
     await this.store.addManager(body.agentId);
     const cron = '*/5 * * * *';
     const localId = randomUUID();
-    const prompt = `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=compaction completed and manager has not resumed triggeredAt=${new Date().toISOString()}\n${body.resumeSteps}\nThis is a compact recovery reminder; resume all listed steps.\nHealth check: curl -sf http://127.0.0.1:${this.port || Number(process.env.PORT || 8787)}/health || echo "COMPANION DOWN"\nCancel this reminder with: ${this.cancelCommand(localId)}`;
+    const createdAt = new Date().toISOString();
+    const compactBody = `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=compaction completed and manager has not resumed triggeredAt=${createdAt}\n${body.resumeSteps}\nThis is a compact recovery reminder; resume all listed steps.\nHealth check: curl -sf ${this.endpointBase()}/health || echo "COMPANION DOWN"`;
+    const prompt = this.deliveryPrompt(body.agentId, [{ id: localId, from: 'paseo-reminder', at: createdAt, urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: compactBody, actionCommand: this.cancelCommand(localId) }]);
     const name = `compact-wake-${randomUUID().slice(0, 8)}`;
-    const pending: ReminderRecord = { id: localId, agentId: body.agentId, name, prompt, cron, expiresIn: '30m', status: 'pending', kind: 'compact-wake', createdAt: new Date().toISOString() };
+    const pending: ReminderRecord = { id: localId, agentId: body.agentId, name, prompt, cron, expiresIn: '30m', status: 'pending', schedulingKind: 'cron', kind: 'compact-wake', createdAt: new Date().toISOString() };
     await this.store.addReminder(pending);
     try {
       const value = asRecord((await this.cli.run(['heartbeat', 'create', prompt, '--cron', cron, '--expires-in', '30m', '--name', name, '--timezone', 'UTC', '--json'], { agentId: body.agentId })).value);
@@ -1257,12 +1345,12 @@ export class CompanionService {
   private async observeCompact(agentId: string, resumeSteps: string, heartbeatId: string, localId: string, signal: AbortSignal): Promise<void> {
     const deadline = Date.now() + 15 * 60 * 1000;
     try {
-      await this.cli.run(['wait', agentId, '--timeout', '900', '--json'], { timeoutMs: 15 * 60 * 1000 + 5_000, signal });
+      await this.cli.run(['wait', agentId, '--timeout', '900', '--json'], { agentId, timeoutMs: 15 * 60 * 1000 + 5_000, signal });
       let stableSince: number | undefined;
       let previousUpdated: string | undefined;
       while (Date.now() < deadline && !signal.aborted) {
         try {
-          const inspect = asRecord((await this.cli.run(['inspect', agentId, '--json'], { signal, timeoutMs: 5_000 })).value);
+          const inspect = asRecord((await this.cli.run(['inspect', agentId, '--json'], { agentId, signal, timeoutMs: 5_000 })).value);
           const status = lowerStatus(inspect.Status ?? inspect.status);
           const updated = String(inspect.UpdatedAt ?? inspect.updatedAt ?? '');
           const now = Date.now();
@@ -1272,12 +1360,12 @@ export class CompanionService {
           previousUpdated = updated;
           if (stableSince && now - stableSince >= 60_000) {
             if (this.store.findReminder(localId)?.status === 'deleted') return;
-            const prompt = [
+            const compactBody = [
               `type=compact-wake id=${localId} target=${agentId} event=compact-recovery criterion=status=idle and updatedAt unchanged for 60s triggeredAt=${new Date(now).toISOString()}`,
               resumeSteps,
-              `Cancel this reminder with: ${this.cancelCommand(localId)}`,
             ].join('\n');
-            await this.cli.run(['send', agentId, prompt], { signal });
+            const prompt = this.deliveryPrompt(agentId, [{ id: localId, from: 'paseo-reminder', at: new Date(now).toISOString(), urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: compactBody, actionCommand: this.cancelCommand(localId) }]);
+            await this.cli.run(['send', agentId, prompt], { agentId, signal });
             await this.cli.run(['heartbeat', 'delete', heartbeatId, '--json'], { agentId, signal });
             await this.store.updateReminder(localId, { status: 'deleted' });
             return;
@@ -1303,8 +1391,9 @@ export class CompanionService {
   }
 
   async addLedger(body: { type: string; target: string; verdict: string; reason: string; recovery?: string }): Promise<unknown> {
-    if (!['park', 'known-red', 'deferred'].includes(body.type)) throw new Error('invalid ledger type');
-    if (!body.verdict?.trim() || !body.reason?.trim()) throw new Error('verdict and reason are required');
+    if (!['park', 'known-red', 'deferred'].includes(body.type)) invalidValue('type must be park, known-red, or deferred', 'type', ['park', 'known-red', 'deferred']);
+    if (!body.verdict?.trim()) missingField('verdict');
+    if (!body.reason?.trim()) missingField('reason');
     const record = await this.store.addLedger({ type: body.type as LedgerType, target: body.target, verdict: body.verdict, reason: body.reason, recovery: body.recovery });
     if (body.type === 'park') {
       try { await this.cli.run(['agent', 'update', body.target, '--label', 'parked=true', '--json']); } catch { /* label is best effort */ }
@@ -1316,7 +1405,7 @@ export class CompanionService {
   }
   async revokeLedger(id: string, reason: string): Promise<unknown> {
     const record = this.store.getLedger().find((r) => r.id === id);
-    if (!record || record.revokedAt) throw new Error('ledger record not found');
+    if (!record || record.revokedAt) throw new CompanionError('not_found', 'ledger record not found');
     await this.store.revokeLedger(record, reason);
     if (record.type === 'park' && !this.store.getLedger().some((item) => item.type === 'park' && item.target === record.target && !item.revokedAt)) {
       try { await this.cli.run(['agent', 'update', record.target, '--label', 'parked=false', '--json']); } catch { /* best effort */ }
@@ -1334,6 +1423,10 @@ export class CompanionService {
   private async reconcileRemindersOnce(): Promise<void> {
     for (const reminder of this.store.getReminders()) {
       if (reminder.status !== 'pending' && reminder.status !== 'active') continue;
+      if (reminder.mode === 'once' || reminder.mode === 'repeat' || reminder.targetAt || reminder.everySeconds) {
+        await this.reconcileLocalReminder(reminder);
+        continue;
+      }
       if (reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child') && this.store.isChildWatchOptedOut(reminder.agentId, reminder.subjectChildId)) {
         await this.store.clearReminderMissed(reminder.id);
         await this.retireChildWatch(reminder);
@@ -1350,11 +1443,34 @@ export class CompanionService {
       try { await this.ensureHeartbeatRecovery(managerId); } catch { /* retry on next reconciliation */ }
     }
     await this.reconcileIdleReminders();
+    await this.store.pruneReminders();
+  }
+
+  private async reconcileLocalReminder(reminder: ReminderRecord, now = Date.now()): Promise<void> {
+    const dueAt = Date.parse(reminder.nextRunAt ?? reminder.targetAt ?? '');
+    if (!Number.isFinite(dueAt) || dueAt > now) return;
+    const priorDelivery = reminder.deliveryMessageId ? this.store.getMessages().find((message) => message.id === reminder.deliveryMessageId) : undefined;
+    if (priorDelivery) return;
+    const firedAt = new Date(now).toISOString();
+    const deliveryPrompt = reminder.prompt.replace('triggeredAt=pending', `triggeredAt=${firedAt}`);
+    const actionCommand = this.cancelCommand(reminder.id);
+    const body = deliveryPrompt.replace(/\nCancel this reminder with: .*$/, '');
+    const sent = await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: reminder.delivery ?? 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
+    const runsCompleted = (reminder.runsCompleted ?? 0) + 1;
+    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
+    if (reminder.mode === 'repeat' || reminder.everySeconds) {
+      const seconds = reminder.everySeconds ?? 0;
+      if (reminder.maxRuns !== undefined && runsCompleted >= reminder.maxRuns) await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });
+      else if (seconds > 0) await this.store.updateReminder(reminder.id, { nextRunAt: new Date(now + seconds * 1000).toISOString(), runsCompleted });
+      else await this.store.updateReminder(reminder.id, { lastRunAt: new Date(now).toISOString() });
+    } else {
+      await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });
+    }
   }
 
   private async managerIsIdle(managerId: string): Promise<boolean> {
     try {
-      const inspected = await this.inspectWithRetry(managerId);
+      const inspected = await this.inspectWithRetry(managerId, managerId);
       return ['idle', 'waiting', 'parked'].includes(lowerStatus(inspected.Status ?? inspected.status));
     } catch { return false; }
   }
@@ -1392,13 +1508,12 @@ export class CompanionService {
       'Affected sources:', sourceLines,
       'Affected tracked children:', childLines,
       ...(children.partial ? ['Some affected child inspections were unavailable; re-check before acting.'] : []),
-      `Cancel this recovery with: ${this.cancelCommand(deterministicName('companion-recovery', managerId))}`,
     ].join('\n');
     const recoveryReminderId = deterministicName('companion-recovery', managerId);
     const recoveryReminder = this.store.findReminder(recoveryReminderId);
     if (recoveryReminder?.status === 'deleted') return;
     if (!recoveryReminder) await this.store.addReminder({
-      id: recoveryReminderId, agentId: managerId, name: recoveryReminderId, prompt: body, cron: '', expiresIn: '', status: 'active',
+      id: recoveryReminderId, agentId: managerId, name: recoveryReminderId, prompt: body, cron: '', expiresIn: '', status: 'active', schedulingKind: 'in-process',
       kind: 'heartbeat-recovery', eventType: 'missed-heartbeat', criterion: 'failed heartbeat runs while manager busy', createdAt: new Date().toISOString(),
     });
     const existing = this.store.getMessages().find((message) => message.status === 'pending' && message.kind === 'heartbeat-recovery' && message.recoveryManagerId === managerId);
@@ -1408,13 +1523,13 @@ export class CompanionService {
       // a prompt that may already be in flight.
       return;
     }
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: 'urgent', kind: 'heartbeat-recovery', recoveryManagerId: managerId, recoveryCounts: counts, recoveryRunIds: runIds });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: 'urgent', promptKind: 'watchdog', actionCommand: this.cancelCommand(recoveryReminderId), kind: 'heartbeat-recovery', recoveryManagerId: managerId, recoveryCounts: counts, recoveryRunIds: runIds });
   }
 
-  async listHeartbeats(): Promise<Array<Record<string, unknown>>> {
+  async listHeartbeats(includeDead = false): Promise<Array<Record<string, unknown>>> {
     await this.reconcileReminders();
     const now = Date.now();
-    return this.store.getReminders().filter((reminder) => reminder.status !== 'deleted').map((reminder) => {
+    const rows = this.store.getReminders().filter((reminder) => reminder.status !== 'deleted' && (includeDead || reminder.status !== 'dead')).map((reminder) => {
       const expired = reminderExpired(reminder, now);
       return ({
       id: reminder.daemonId ?? reminder.id,
@@ -1424,8 +1539,21 @@ export class CompanionService {
       missed_fires: reminder.missedFires ?? 0,
       next_run: reminder.nextRunAt ?? null,
       alive: expired || reminder.status === 'dead' ? false : (reminder.alive ?? (reminder.status === 'active')),
+      _createdAt: reminder.createdAt,
       });
     });
+    const byId = new Map<string, Record<string, unknown>>();
+    const rank = (row: Record<string, unknown>): [number, number] => [
+      row.alive === true ? 1 : 0,
+      Number.isFinite(Date.parse(String(row._createdAt ?? ''))) ? Date.parse(String(row._createdAt)) : -Infinity,
+    ];
+    for (const row of rows) {
+      const prior = byId.get(String(row.id));
+      const [alive, created] = rank(row);
+      const [priorAlive, priorCreated] = prior ? rank(prior) : [-1, -Infinity];
+      if (!prior || alive > priorAlive || (alive === priorAlive && created > priorCreated)) byId.set(String(row.id), row);
+    }
+    return [...byId.values()].map(({ _createdAt: _ignored, ...row }) => row);
   }
 
   private resolveHeartbeat(id: string): ReminderRecord | undefined {
@@ -1433,14 +1561,14 @@ export class CompanionService {
     if (exact) return exact;
     if (id.length < 8) return undefined;
     const matches = this.store.getReminders().filter((reminder) => reminder.id.startsWith(id) || Boolean(reminder.daemonId?.startsWith(id)));
-    if (matches.length > 1) throw new Error('heartbeat id ambiguous');
+    if (matches.length > 1) throw new CompanionError('ambiguous_id', 'heartbeat id ambiguous');
     return matches[0];
   }
 
   async deleteHeartbeat(id: string, reason: string): Promise<unknown> {
-    if (!reason?.trim()) throw new Error('reason is required');
+    if (!reason?.trim()) missingField('reason');
     const reminder = this.resolveHeartbeat(id);
-    if (!reminder) throw new Error('heartbeat not found');
+    if (!reminder) throw new CompanionError('not_found', 'heartbeat not found');
     if (reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child')) {
       return this.unsubscribeChildWatch(reminder.agentId, reminder.subjectChildId, reason);
     }
@@ -1501,12 +1629,12 @@ export class CompanionService {
     const existing = this.store.findReminder(id);
     const prompt = `Local-poll child-watch subscription for child=${childId}; the companion rechecks it on the existing 300s reconciliation loop. Structured context: ${json({ watchKind: 'child', subjectChildId: childId, cwd: cwd ?? 'unknown' })}`;
     if (existing) {
-      await this.store.updateReminder(id, { status: 'active', alive: true, daemonId: undefined, prompt, cron: '*/5 * * * *', expiresIn: '' });
+      await this.store.updateReminder(id, { status: 'active', alive: true, daemonId: undefined, prompt, cron: '*/5 * * * *', expiresIn: '', schedulingKind: 'in-process' });
       return this.store.findReminder(id)!;
     }
     const record: ReminderRecord = {
       id, agentId: managerId, subjectChildId: childId, kind: 'child-watch', watchKind: 'child',
-      name: id, prompt, cron: '*/5 * * * *', expiresIn: '', status: 'active', alive: true,
+      name: id, prompt, cron: '*/5 * * * *', expiresIn: '', status: 'active', alive: true, schedulingKind: 'in-process',
       createdAt: new Date().toISOString(),
     };
     await this.store.addReminder(record);
@@ -1600,7 +1728,9 @@ export class CompanionService {
   }
 
   async unsubscribeChildWatch(managerId: string, childId: string, reason: string): Promise<Record<string, unknown>> {
-    if (!managerId?.trim() || !childId?.trim() || !reason?.trim()) throw new Error('agentId, childId, and reason are required');
+    if (!managerId?.trim()) missingField('agentId');
+    if (!childId?.trim()) missingField('childId');
+    if (!reason?.trim()) missingField('reason');
     const key = `${managerId}\0${childId}`;
     await this.store.untrackChild(managerId, childId, reason);
     const existing = this.childWatchInFlight.get(key);
@@ -1612,8 +1742,9 @@ export class CompanionService {
   }
 
   async resubscribeChildWatch(managerId: string, childId: string, reason?: string): Promise<Record<string, unknown>> {
-    if (!managerId?.trim() || !childId?.trim()) throw new Error('agentId and childId are required');
-    if (this.store.isChildWatchOptOutStateCorrupt()) throw new Error('child-watch opt-out state corrupt');
+    if (!managerId?.trim()) missingField('agentId');
+    if (!childId?.trim()) missingField('childId');
+    if (this.store.isChildWatchOptOutStateCorrupt()) throw new CompanionError('state_corrupt', 'child-watch opt-out state corrupt');
     const key = `${managerId}\0${childId}`;
     const existing = this.childWatchInFlight.get(key);
     if (existing) await existing;
@@ -1653,7 +1784,9 @@ export class CompanionService {
           const existingLedger = this.store.getLedger().find((record) => record.type === 'known-red' && record.target === managerId && record.verdict === 'wakeup-source-missing' && !record.revokedAt);
           if (!existingLedger) await this.store.addLedger({ type: 'known-red', target: managerId, verdict: 'wakeup-source-missing', reason: 'reconciliation found no live wakeup source for completed children' });
         }
-      } catch { /* a transient CLI failure is retried next round */ }
+      } catch (error) {
+        console.warn(JSON.stringify({ type: 'reconcile-manager-failed', managerId, error: error instanceof Error ? error.message : String(error) }));
+      }
     }
   }
 }

@@ -4,11 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { PaseoCli } from '../../../tools/paseo-manager-companion/src/cli.js';
-import { Store } from '../../../tools/paseo-manager-companion/src/store.js';
-import { CompanionService } from '../../../tools/paseo-manager-companion/src/service.js';
-import { createServer } from '../../../tools/paseo-manager-companion/src/server.js';
-import { ProcessWaitSourceDetector } from '../../../tools/paseo-manager-companion/src/wait-source.js';
+import { PaseoCli } from '../../../skills/paseo-companion/paseo-reminder/src/cli.js';
+import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
+import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
+import { createServer } from '../../../skills/paseo-companion/paseo-reminder/src/server.js';
+import { ProcessWaitSourceDetector } from '../../../skills/paseo-companion/paseo-reminder/src/wait-source.js';
 
 let running: Awaited<ReturnType<typeof createServer>> | undefined;
 const paseoShim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
@@ -31,6 +31,14 @@ async function request(base: string, method: string, route: string, body?: unkno
   return { status: response.status, body: await response.json() as any };
 }
 
+async function createChild(shim: string, title: string, managerId = 'manager-1'): Promise<Record<string, any>> {
+  const value = await new PaseoCli(shim).run([
+    'run', '-d', '--provider', 'shim', '--title', title, '--cwd', process.cwd(), '--json', 'work',
+  ], { agentId: managerId });
+  const result = value.value as Record<string, any>;
+  return { ...result, id: result.agentId ?? result.id };
+}
+
 describe('HTTP integration through a paseo executable', () => {
   it('exercises every route and enforces ledger/reminder reasons', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-'));
@@ -47,17 +55,31 @@ describe('HTTP integration through a paseo executable', () => {
     const address = running.server.address();
     const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
     expect((await request(base, 'GET', '/health')).status).toBe(200);
-    const spawned = await request(base, 'POST', '/spawn', { provider: 'shim', title: 'child', cwd: process.cwd(), prompt: 'work' });
-    expect(spawned.status).toBe(201);
-    const childId = spawned.body.id;
+    expect((await request(base, 'POST', '/spawn', { agentId: 'manager-1', provider: 'shim', title: 'child', cwd: process.cwd(), prompt: 'work' })).status).toBe(404);
+    const spawned = await createChild(shim, 'child');
+    const childId = spawned.id;
+    expect((await request(base, 'PUT', `/children/${childId}?agentId=manager-1`)).status).toBe(200);
     const children = await request(base, 'GET', '/children?agentId=manager-1');
     expect(children.status).toBe(200); expect(children.body.children.some((c: any) => c.id === childId)).toBe(true);
     expect(children.body.children.some((c: any) => c.id === 'pre-start-child')).toBe(true);
     expect(children.body.children.find((c: any) => c.id === 'pre-start-child')?.tracked).toBe(false);
-    expect(children.body.children.find((c: any) => c.id === childId)?.trackedSource).toBe('auto');
+    expect(children.body.children.find((c: any) => c.id === childId)?.trackedSource).toBe('explicit');
     expect((await request(base, 'GET', `/children/${childId}/briefing`)).status).toBe(200);
     const reminder = await request(base, 'POST', '/reminders', { agentId: 'manager-1', delaySeconds: 60, message: 'check' });
     expect(reminder.status).toBe(201);
+    expect(reminder.body).toEqual(expect.objectContaining({ schedulingKind: 'once', nextRunAt: expect.any(String) }));
+    const queryIdentityReminder = await request(base, 'POST', '/reminders?agentId=manager-1', { delaySeconds: 60, message: 'query identity' });
+    expect(queryIdentityReminder.status).toBe(201);
+    const invalidMode = await request(base, 'POST', '/reminders', { agentId: 'manager-1', mode: 'eventually', message: 'zombie' });
+    expect(invalidMode).toEqual({ status: 400, body: { error: 'mode must be once or repeat', code: 'invalid_value', field: 'mode', allowed: ['once', 'repeat'] } });
+    const customId = await request(base, 'POST', '/reminders', { id: 'my-custom-id', agentId: 'manager-1', delaySeconds: 60, message: 'custom' });
+    expect(customId).toEqual({ status: 400, body: { error: 'caller-supplied reminder id is not supported', code: 'invalid_value', field: 'id' } });
+    const listedReminders = await request(base, 'GET', '/reminders?agentId=manager-1');
+    expect(listedReminders.status).toBe(200); expect(listedReminders.body.some((item: any) => item.id === reminder.body.id)).toBe(true);
+    expect(listedReminders.body.some((item: any) => item.kind === 'child-watch' && item.schedulingKind === 'in-process' && item.nextRunAt === undefined)).toBe(true);
+    const exactReminder = await request(base, 'GET', `/reminders/${reminder.body.id}`);
+    expect(exactReminder.status).toBe(200); expect(exactReminder.body).toEqual(expect.objectContaining({ id: reminder.body.id, mode: 'once', status: 'active' }));
+    expect((await request(base, 'GET', '/reminders/unknown-reminder-id')).status).toBe(404);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, { reason: 'done' })).status).toBe(200);
     expect((await request(base, 'DELETE', `/reminders/${reminder.body.id}`, {})).status).toBe(400);
     const message = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'explicit message' });
@@ -71,76 +93,23 @@ describe('HTTP integration through a paseo executable', () => {
     expect(absentAfterAck.body.some((item: any) => item.id === message.body.id)).toBe(false);
     expect((await request(base, 'DELETE', `/messages/${message.body.id}`, { reason: 'retry handled' })).status).toBe(200);
     expect((await request(base, 'DELETE', '/messages/unknown-message-id', { reason: 'not present' })).status).toBe(404);
+    const notify = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'auto clear', delivery: 'interrupt', mode: 'notify' });
+    expect(notify.status).toBe(201);
+    expect((await request(base, 'DELETE', `/messages/${notify.body.id}`, { reason: 'cleanup' })).body).toEqual({ id: notify.body.id, status: 'deleted', retirementPending: false });
+    const ackMessage = await request(base, 'POST', '/messages', { to: 'manager-1', from: 'child-1', body: 'acknowledge me', delivery: 'interrupt', mode: 'ack' });
+    expect(ackMessage.status).toBe(201);
+    const acknowledged = await request(base, 'DELETE', `/messages/${ackMessage.body.id}`, { reason: 'processed' });
+    expect(acknowledged.body.status).toBe('acknowledged');
+    const acknowledgedRows = await request(base, 'GET', '/messages?status=acknowledged');
+    expect(acknowledgedRows.body).toEqual(expect.arrayContaining([expect.objectContaining({ id: ackMessage.body.id, acknowledgementReason: 'processed' })]));
     expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', resumeSteps: 'read state; continue' })).status).toBe(202);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: 'parked', reason: 'waiting', recovery: 'resume later' })).status).toBe(201);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: '', reason: '' })).status).toBe(400);
+    expect(await request(base, 'POST', '/ledger', { type: 'later', target: childId, verdict: 'x', reason: 'x' })).toEqual({
+      status: 400, body: { error: 'type must be park, known-red, or deferred', code: 'invalid_value', field: 'type', allowed: ['park', 'known-red', 'deferred'] },
+    });
     const ledger = await request(base, 'GET', `/ledger?target=${childId}`); expect(ledger.status).toBe(200); expect(ledger.body.length).toBe(1);
     expect((await request(base, 'POST', `/ledger/${ledger.body[0].id}/revoke`, { reason: 'resume' })).status).toBe(200);
-  });
-
-  it('replays the reverse-check: completed children without a wakeup are ledgered', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-replay-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state; process.env.PASEO_AGENT_ID = 'manager-1';
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'done child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
-    const saved = JSON.parse(await readFile(state, 'utf8'));
-    const childId = String((child as any).id);
-    saved.agents[childId].Status = 'idle';
-    await writeFile(state, JSON.stringify(saved));
-    await service.reconcileOnce();
-    expect(service.listLedger('known-red', 'manager-1')).toHaveLength(1);
-    expect(service.store.getReminders().some((r) => r.status === 'active' && r.kind === 'generic')).toBe(false);
-    service.close();
-  });
-
-  it('creates one manager-delivered child watch for an unparked child and none for a parked child', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-child-watch-park-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'watched child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
-    const childId = String((child as any).id);
-    await service.addLedger({ type: 'park', target: childId, verdict: 'parked', reason: 'waiting' });
-    await service.reconcileOnce();
-    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
-    const park = service.listLedger('park', childId)[0] as any;
-    await service.revokeLedger(park.id, 'resume');
-    await service.reconcileOnce();
-    const watches = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
-    expect(watches).toHaveLength(1);
-    expect(watches[0]).toEqual(expect.objectContaining({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child' }));
-    expect(watches[0].prompt).toMatch(/local-poll|reconciliation loop/i);
-    expect(watches[0].prompt).toContain(childId);
-    expect(watches[0].prompt).toContain('"cwd"');
-    service.close();
-  });
-
-  it('auto-revokes a park only after a later parseable running activity', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-park-resume-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'parked child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
-    const childId = String((child as any).id);
-    await service.addLedger({ type: 'park', target: childId, verdict: 'parked', reason: 'waiting' });
-    await service.reconcileOnce();
-    expect(service.listLedger('park', childId)).toHaveLength(1);
-    let saved = JSON.parse(await readFile(state, 'utf8'));
-    saved.agents[childId].Status = 'running';
-    saved.agents[childId].UpdatedAt = new Date(Date.now() + 10_000).toISOString();
-    await writeFile(state, JSON.stringify(saved));
-    await service.reconcileOnce();
-    expect(service.listLedger('park', childId)).toHaveLength(0);
-    expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
-    service.close();
   });
 
   it('migrates a live pre-P0 child watch to an identified prompt without duplicating it', async () => {
@@ -150,8 +119,9 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'old watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(shim, 'old watch child');
     const childId = String((child as any).id);
+    await service.resubscribeChildWatch('manager-1', childId, 'explicit test tracking');
     process.env.PASEO_DELETE_TRANSIENT = '1';
     const old = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'old', context: { watchKind: 'child' } });
     await service.store.updateReminder(old.id, { prompt: 'old prompt\nStructured context: {"watchKind":"child"}' });
@@ -172,13 +142,14 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'watched child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(shim, 'watched child');
     const childId = String((child as any).id);
+    await service.resubscribeChildWatch('manager-1', childId, 'explicit test tracking');
     await service.reconcileOnce();
     await service.reconcileOnce();
     const saved = JSON.parse(await readFile(state, 'utf8'));
     expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(1);
-    expect(Object.keys(saved.heartbeats).length).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(saved.heartbeats)).toHaveLength(0);
     service.close();
   });
 
@@ -188,9 +159,11 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
     await service.init();
-    const first = await service.spawn({ provider: 'shim', title: 'first', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
-    const second = await service.spawn({ provider: 'shim', title: 'second', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const first = await createChild(paseoShim, 'first');
+    const second = await createChild(paseoShim, 'second');
     const firstId = String((first as any).id); const secondId = String((second as any).id);
+    await service.resubscribeChildWatch('manager-1', firstId, 'explicit test tracking');
+    await service.resubscribeChildWatch('manager-1', secondId, 'explicit test tracking');
     await service.reconcileOnce();
     const unsubscribed = await service.unsubscribeChildWatch('manager-1', firstId, 'no longer waiting');
     expect(unsubscribed).toEqual(expect.objectContaining({ status: 'unsubscribed', retirementPending: false }));
@@ -212,7 +185,7 @@ describe('HTTP integration through a paseo executable', () => {
     const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root)); await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'ack watch child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(paseoShim, 'ack watch child');
     const childId = String((child as any).id);
     const watch = await service.createReminder({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child', delaySeconds: 300, message: 'watch' });
     await service.store.updateReminder(watch.id, { missedFires: 2, missedRunIds: ['ack-run'] });
@@ -237,7 +210,7 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const detector = { detect: async () => false };
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root), undefined, detector); await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'race child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(paseoShim, 'race child');
     const childId = String((child as any).id);
     await Promise.all([service.reconcileOnce(), service.unsubscribeChildWatch('manager-1', childId, 'race')]);
     await service.reconcileOnce();
@@ -252,7 +225,7 @@ describe('HTTP integration through a paseo executable', () => {
     await writeFile(path.join(root, 'child-watch-opt-outs.json'), '{not-json');
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(paseoShim), new Store(root)); await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'corrupt optout child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(paseoShim, 'corrupt optout child');
     const childId = String((child as any).id); await service.reconcileOnce();
     expect(service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active')).toHaveLength(0);
     await expect(service.unsubscribeChildWatch('manager-1', childId, 'should fail closed')).rejects.toThrow(/opt-out state corrupt/);
@@ -267,7 +240,7 @@ describe('HTTP integration through a paseo executable', () => {
     process.env.PASEO_SHIM_STATE = state;
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
-    const child = await service.spawn({ provider: 'shim', title: 'waited child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+    const child = await createChild(shim, 'waited child');
     const childId = String((child as any).id);
     const waitPaseo = fileURLToPath(new URL('../fixtures/paseo', import.meta.url));
     await chmod(waitPaseo, 0o755);
@@ -298,13 +271,13 @@ describe('HTTP integration through a paseo executable', () => {
       const detector = { live: wait, detect: async () => detector.live as boolean };
       const service = new CompanionService(new PaseoCli(paseoShim), new Store(root), undefined, detector);
       await service.init();
-      const child = await service.spawn({ provider: 'shim', title: 'matrix child', cwd: process.cwd(), prompt: 'work' }, 'manager-1');
+      const child = await createChild(paseoShim, 'matrix child');
+      await service.resubscribeChildWatch('manager-1', String((child as any).id), 'explicit test tracking');
       await service.reconcileOnce();
       return { service, childId: String((child as any).id), detector };
     };
     const waitOnly = await make(true);
-    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: false, hasLiveWakeupSource: true, source: 'auto', addedAt: expect.any(String) }));
-    expect(waitOnly.service.store.getReminders().filter((r) => r.kind === 'child-watch' && r.status === 'active')).toHaveLength(0);
+    expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: true, hasLiveWakeupSource: true, source: 'explicit', addedAt: expect.any(String) }));
     const forced = await waitOnly.service.resubscribeChildWatch('manager-1', waitOnly.childId, 'operator override');
     expect(forced.watch).not.toBeNull();
     expect((await waitOnly.service.listChildren('manager-1')).children[0]).toEqual(expect.objectContaining({ hasLivePaseoWait: true, hasLiveCompanionWatch: true }));
@@ -325,7 +298,8 @@ describe('HTTP integration through a paseo executable', () => {
     const service = new CompanionService(new PaseoCli(shim), new Store(root));
     await service.init();
     const children = [];
-    for (const n of [1, 2, 3]) children.push(await service.spawn({ provider: 'shim', title: `child ${n}`, cwd: process.cwd(), prompt: 'work' }, 'manager-1'));
+    for (const n of [1, 2, 3]) children.push(await createChild(shim, `child ${n}`));
+    for (const child of children) await service.resubscribeChildWatch('manager-1', String((child as any).id), 'explicit test tracking');
     const saved = JSON.parse(await readFile(state, 'utf8'));
     const idleId = String((children[0] as any).id);
     saved.agents[idleId].Status = 'idle';
@@ -407,56 +381,6 @@ describe('HTTP integration through a paseo executable', () => {
     service.close();
   });
 
-  it('coalesces a burst into one real one-shot run and retains delivered records until ack', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    const posted = await Promise.all(Array.from({ length: 15 }, (_, index) => service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `message-${index}`, urgency: index === 14 ? 'urgent' : 'normal' })));
-    const reloaded = new Store(root);
-    await reloaded.init();
-    expect(reloaded.getMessages()).toHaveLength(15);
-    const saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(saved.sends ?? []).toHaveLength(0);
-    const delivery = Object.values(saved.heartbeats).find((item: any) => item.prompt?.includes(`id=${posted[0].id}`)) as any;
-    expect(delivery.maxRuns).toBe(1);
-    expect(delivery.prompt).toContain('/messages/');
-    expect(delivery.prompt.indexOf('message-14')).toBeLessThan(delivery.prompt.indexOf('message-0'));
-    expect(posted).toHaveLength(15);
-    expect(posted.every((message) => message.schedule === null && message.delivery?.status === 'pending' && message.delivery.transport === 'heartbeat')).toBe(true);
-    expect(service.getMessages()).toHaveLength(15);
-    expect(service.store.getMessageSchedules().some((item) => item.transport === 'heartbeat' && item.status === 'active' && item.daemonId)).toBe(true);
-    expect(await service.deleteMessage(posted[0].id, 'already delivered')).toEqual({ id: posted[0].id, status: 'deleted', retirementPending: false });
-    expect(service.getMessages()).toHaveLength(14);
-    await expect(service.deleteMessage('unknown-message-id', 'not present')).rejects.toThrow('message not found');
-    service.close();
-  });
-
-  it('retains a failed send and retries it on reconciliation', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-busy-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    process.env.PASEO_SEND_FAIL = '1';
-    const posted = await service.postMessage({ to: 'manager-1', from: 'manager-1', body: 'keep this', urgency: 'normal' });
-    expect(posted.status).toBe('pending');
-    expect(posted.schedule).toBeNull();
-    expect(posted.delivery).toEqual(expect.objectContaining({ transport: 'heartbeat', status: 'pending', acceptedAt: null }));
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
-    expect(service.getMessages()).toHaveLength(1);
-    delete process.env.PASEO_SEND_FAIL;
-    await service.reconcileOnce();
-    expect(service.getMessages()).toHaveLength(1);
-    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
-    service.close();
-  });
-
   it('deletes one queued message while preserving the other batch item', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-delete-'));
     const state = path.join(root, 'state.json');
@@ -472,24 +396,6 @@ describe('HTTP integration through a paseo executable', () => {
     expect(result).toEqual(expect.objectContaining({ id: first.id, status: 'deleted', retirementPending: false }));
     expect(service.getMessages().map((message) => message.id)).toEqual([second.id]);
     expect(service.getMessages().map((message) => message.id)).toEqual([second.id]);
-    service.close();
-  });
-
-  it('does not claim acceptance when send status is false', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-message-delete-retry-'));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(paseoShim), new Store(root));
-    await service.init();
-    process.env.PASEO_SEND_STATUS = 'false';
-    const message = await service.postMessage({ to: 'manager-1', from: 'sender', body: 'retain this' });
-    expect(message.status).toBe('pending');
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
-    expect(service.getMessages()).toHaveLength(1);
-    delete process.env.PASEO_SEND_STATUS;
-    await service.reconcileOnce();
-    expect(service.getMessages()).toHaveLength(1);
     service.close();
   });
 
@@ -512,46 +418,6 @@ describe('HTTP integration through a paseo executable', () => {
     expect(store.getMessageSchedules().some((item) => item.id === 'live')).toBe(true);
     expect(store.getMessageSchedules().some((item) => item.id === 'terminal-59')).toBe(true);
     expect(store.getMessageSchedules().some((item) => item.id === 'terminal-0')).toBe(false);
-  });
-
-  it('does not duplicate an accepted send when local cleanup fails once', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-recovery-receipt-retry-'));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const store = new Store(root);
-    const removeMessages = store.removeMessages.bind(store);
-    vi.spyOn(store, 'removeMessages').mockRejectedValueOnce(new Error('disk unavailable')).mockImplementation(removeMessages);
-    const service = new CompanionService(new PaseoCli(paseoShim), store);
-    await service.init();
-    const recovery = await service.postMessage({ to: 'manager-1', from: 'companion', body: 'attempt once' });
-    expect(recovery.status).toBe('pending');
-    expect(service.store.getMessageSchedules().at(-1)?.status).toBe('active');
-    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
-    await service.reconcileOnce();
-    expect(JSON.parse(await readFile(state, 'utf8')).sends ?? []).toHaveLength(0);
-    expect(service.getMessages().some((item) => item.id === recovery.id)).toBe(true);
-    service.close();
-  });
-
-  it('coalesces only concurrent arrivals and preserves urgent queue order', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'companion-messages-staggered-'));
-    const shim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));
-    const state = path.join(root, 'state.json');
-    await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
-    process.env.PASEO_SHIM_STATE = state;
-    const service = new CompanionService(new PaseoCli(shim), new Store(root));
-    await service.init();
-    const arrivals = [];
-    for (let index = 0; index < 15; index++) {
-      arrivals.push(service.postMessage({ to: 'manager-1', from: `sender-${index % 3}`, body: `staggered-${index}`, urgency: index === 14 ? 'urgent' : 'normal' }));
-    }
-    await Promise.all(arrivals);
-    const saved = JSON.parse(await readFile(state, 'utf8'));
-    expect(saved.sends ?? []).toHaveLength(0);
-    const staggered = Object.values(saved.heartbeats).find((item: any) => item.prompt?.includes('staggered-14')) as any;
-    expect(staggered.prompt.indexOf('staggered-14')).toBeLessThan(staggered.prompt.indexOf('staggered-0'));
-    service.close();
   });
 
   it('does not infer delivery from a completed wrapper with no terminal run log', async () => {

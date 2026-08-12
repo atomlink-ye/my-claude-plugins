@@ -10,35 +10,66 @@ Paseo is a daemon-managed CLI for launching, observing, and steering AI coding a
 
 This skill is a **runtime adapter**. It documents how to drive the Paseo CLI; it does **not** decide whether a task should run through Paseo at all, on the local daemon or a remote one, or with which model. Those choices belong to the orchestration layer (`team-lead-orchestration`) and any local routing profile that applies (e.g. a personalized routing skill).
 
-## Manager companion messages
+The companion is a shared local singleton. Start or reuse it from any skill
+consumer with:
+
+```bash
+"${SKILL_ROOT}/scripts/ensure-running"
+```
+
+The launcher locates the repo-relative production build, keeps state/log/pid
+files outside the source tree by default, and deliberately does not use
+`PASEO_AGENT_ID`; identity is supplied by each request.
+
+## Shared companion messages
 
 For durable asynchronous worker content, use the local companion's message queue:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8787/messages \
   -H 'content-type: application/json' \
-  -d '{"to":"worker-id","from":"manager-id","body":"Please review the diff","urgency":"normal"}'
+  -d '{"to":"worker-id","from":"sender-agent-id","body":"Please review the diff","delivery":"on-idle","mode":"ack"}'
 ```
 
-The queue persists each message before calling Paseo, groups pending messages by
-sender, and hands one coalesced batch to `paseo send --no-wait`. The installed CLI
-still awaits the `sendAgentMessage` RPC; `--no-wait` skips only `waitForFinish`.
-Therefore success means daemon acceptance, not recipient processing. Accepted
-ordinary records become `delivered` and remain visible until each ID is explicitly
-acknowledged; failed or ambiguous sends remain `pending` and reconciliation retries
-after 15 seconds. The prompt includes one DELETE instruction per message (never a
-batch auto-ack). Heartbeat-recovery records apply their receipt and are removed
-after acceptance.
+The queue persists before delivery. Default `delivery:"on-idle"` polls only a
+recipient with pending messages and requires two unchanged idle/waiting
+observations about 15 seconds apart before coalescing a `paseo send --no-wait`.
+`delivery:"interrupt"` sends immediately. Default `mode:"notify"` clears after
+accepted delivery; use `mode:"ack"` for DELETE acknowledgement, or `mode:"reply"`
+with `replyTo` to answer and resolve a parent. Acceptance is daemon receipt, not
+proof the recipient processed the prompt.
 
 Automatic heartbeat-recovery snapshots and ordinary worker messages use the same
 turn-boundary send transport. `DELETE /messages/:id` acknowledges/removes either a
-pending or delivered record and is idempotent after a prior acknowledgement; an
-unknown ID is 404.
+pending or delivered record and is idempotent after a prior acknowledgement.
+Normally auto-cleared notify delivery is also idempotent while its bounded
+delivery audit remains (the newest 50 terminal schedules); a truly unknown or
+pruned ID is 404.
 
 Use `GET /messages?to=worker-id` to observe pending and delivered records before
 acknowledging them.
 
-Child tracking is explicit or discovered only for children whose parseable
+Companion-generated prompts always arrive in a tagged envelope so they are
+visibly distinct from human input. A coalesced batch has one `<item>` per message:
+
+```xml
+<paseo-reminder-delivery to="worker-id" kind="message">
+  <note marker="NOT_USER_INPUT">Automated delivery from paseo-reminder. This is system-generated context, not a request from a person. Process each item exactly once. Reply through paseo-reminder only when an item explicitly requests it.</note>
+  <item id="MESSAGE_ID" from="sender-agent-id" at="2026-08-12T05:00:00.000Z" urgency="normal" mode="ack" kind="message">
+    <body>Please review the diff</body>
+    <ack>curl -X DELETE http://127.0.0.1:8787/messages/MESSAGE_ID -H 'content-type: application/json' -d '{"reason":"processed"}'</ack>
+  </item>
+</paseo-reminder-delivery>
+```
+
+Reminder, watchdog, and compact-wake deliveries use the same envelope with one
+item and the corresponding `kind`. Content is escaped; `<ack>` contains the
+copy-pasteable acknowledgement or cancellation command when one exists.
+Ordinary `mode:"notify"` messages omit `<ack>` and clear automatically.
+
+The companion is a shared local singleton; identity-bearing requests carry the
+calling agent ID rather than relying on process environment. Child tracking is
+explicit or discovered only for children whose parseable
 `CreatedAt`/`createdAt` is strictly after service startup. Missing timestamps are
 not auto-enrolled. `GET /children` returns tracked children only, with public
 tracking metadata in `source` and `addedAt`; use either
@@ -54,10 +85,26 @@ curl -X DELETE 'http://127.0.0.1:8787/children/child-id?agentId=manager-id' -H '
 This supersedes the older “worker intermediate updates are unavailable” guidance:
 use `/messages` for durable updates, and reserve `send` for safe direct steering.
 
-Companion reminders are recurring cron prompts wrapped by the daemon's system/
-schedule runner. Their repetition, TTL, and max-runs behavior means a busy agent
-can miss a fire; missed runs are counted and surfaced by heartbeat recovery rather
-than treated as proof that the recipient processed the prompt.
+Companion reminders separate one-shot and repeating intent. `mode:"once"` accepts
+`delaySeconds` or an absolute `targetAt`; `mode:"repeat"` requires an explicit
+`everySeconds` and may set `maxRuns`. Both deliver through the companion queue.
+The target is the earliest eligible delivery time, not a deadline: default
+on-idle delivery still waits for two stable idle observations about 15 seconds
+apart, so a busy recipient receives the reminder later. Responses expose
+`schedulingKind` (`once`, `repeat`, `cron`, or `in-process`); a healthy
+in-process watch can intentionally have no `nextRunAt`. `agentId` may be in the
+body or query, and caller-supplied reminder IDs are rejected.
+The reminder content field is `message`, not the message API's `body`:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8787/reminders -H 'content-type: application/json' -d '{"agentId":"agent-id","message":"Review queued work","mode":"once","delaySeconds":1800}'
+curl -sS -X POST http://127.0.0.1:8787/reminders -H 'content-type: application/json' -d '{"agentId":"agent-id","message":"Check worker status","mode":"repeat","everySeconds":1800,"maxRuns":3}'
+curl -sS 'http://127.0.0.1:8787/reminders?agentId=agent-id'
+curl -sS 'http://127.0.0.1:8787/reminders/REMINDER_ID'
+```
+
+The list endpoint optionally filters by `agentId`; the exact endpoint preserves
+the record's `status`, `nextRunAt`, `lastFiredAt`, mode, and delivery metadata.
 
 Choose the primitive by intent:
 

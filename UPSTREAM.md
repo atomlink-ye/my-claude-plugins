@@ -2,7 +2,7 @@
 
 派发书要求（`tasks/active/paseo-companion-manager-skill-20260808/DISPATCH.md` §2/§4）：
 凡是 Skill/服务覆盖不了、必须 Paseo 产品本身做的能力，单列在这里，不要在 Skill 或
-`tools/paseo-manager-companion` 里假装做到了。每条都附实测证据，全部通过公开
+`skills/paseo-companion/paseo-reminder` 里假装做到了。每条都附实测证据，全部通过公开
 `paseo <cmd> --json` 黑盒验证得出（见 [feedback_paseo_cli_blackbox_only]），
 没有读任何内部实现源码。
 
@@ -15,7 +15,7 @@ error / 传输断开等终态时主动通知 parent。`paseo hooks <agent> <even
 活动"的写入口，不是回调注册。
 
 **影响**：这是 PROPOSAL §1 反向检查（"系统可断言至少有一个活着的唤醒源"）在纯客户端/
-纯服务侧永远做不到"事件驱动、零延迟"的根本原因。`tools/paseo-manager-companion` 用
+纯服务侧永远做不到"事件驱动、零延迟"的根本原因。`skills/paseo-companion/paseo-reminder` 用
 `paseo heartbeat` 重复投递 + 内部对账循环把它降级成"有界延迟（分钟级）能发现"，
 不是消除。
 
@@ -29,8 +29,7 @@ error / 传输断开等终态时主动通知 parent。`paseo hooks <agent> <even
 **现状**：只有 `create` / `update` / `delete` 三个子命令。已知 id 时唯一能反查真实状态
 的手段是 `paseo heartbeat update <id> --cron <原样传入不变的值> --json`——传相同值
 等价于只读探测，能拿回 `status/nextRunAt/lastRunAt`，但这是未文档化的副作用用法，
-不是正式契约。**没有任何手段枚举"当前有哪些 heartbeat 指向我"**——`tools/
-paseo-manager-companion` 因此必须自己维护一份本地记录（write-ahead + 启动时对账），
+不是正式契约。**没有任何手段枚举"当前有哪些 heartbeat 指向我"**——`skills/paseo-companion/paseo-reminder` 因此必须自己维护一份本地记录（write-ahead + 启动时对账），
 这份记录在服务重启且丢失存储的极端情况下会产生"孤儿 heartbeat"（后果是多投递一条
 噪音提醒，不是丢失，因为 heartbeat 本身还在 daemon 里跑）。
 
@@ -48,7 +47,7 @@ schedule 变 `completed`，这条提醒永远不会送达，且没有任何人�
 **黑盒复现路径**：给一条重复 cron 的心跳投递失败之后，`lastRunAt` 仍然前进但目标
 agent 没有收到消息（没有 ack）——这个"投递过但没送达"的模式是可观测的。
 
-**影响**：`tools/paseo-manager-companion` 因此禁止使用 `--max-runs 1`，一律改用
+**影响**：`skills/paseo-companion/paseo-reminder` 因此禁止使用 `--max-runs 1`，一律改用
 重复 cron + `--expires-in` 做 at-least-once，直到显式确认为止。这是绕过，不是修复。
 
 **请求**：忙时触发的一次性/定时投递应该重试或顺延，而不是静默计入完成次数。
@@ -62,7 +61,7 @@ agent 没有收到消息（没有 ack）——这个"投递过但没送达"的�
 但 `paseo inspect <id> --json` 的输出里完全没有 label 字段。
 
 **影响**：label 只能当"存在性信号"（能不能被过滤查到），不能当"内容存储"用——
-`tools/paseo-manager-companion` 的 park 状态权威记录因此必须落在服务自己的 ledger
+`skills/paseo-companion/paseo-reminder` 的 park 状态权威记录因此必须落在服务自己的 ledger
 里，label 只是尽力而为的可视化镜像，会漂移的一侧永远是 label 不是 ledger。
 
 **请求**：`inspect --json` 补上 `Labels` 字段。
@@ -90,7 +89,7 @@ N+1 模式。本机实测 73 个候选、8 并发上限下单次 `/children` 请
 对 `logs` 不生效，输出始终是给人看的 `[Bash] ...` 格式。
 
 **影响**：PROPOSAL §2 的巡检简报（"这段时间提交了什么、有没有裸奔的改动"）没法从
-Paseo 侧机器可读地获取，`tools/paseo-manager-companion` 的 `GET /children/:id/briefing`
+Paseo 侧机器可读地获取，`skills/paseo-companion/paseo-reminder` 的 `GET /children/:id/briefing`
 被迫直接对子 agent 的 cwd 跑 `git log`/`git status`/`git diff --stat`，绕开了
 Paseo，等 `logs` 支持 `--json` 后应该整块替换。
 
@@ -116,4 +115,4 @@ Paseo，等 `logs` 支持 `--json` 后应该整块替换。
 ## 参考
 
 - 已核实的完整 CLI 事实清单：`tasks/active/paseo-companion-manager-skill-20260808/DISPATCH-CODEX-SERVICE.md` §1
-- 服务实现里对每条缺口的具体规避方式：`tools/paseo-manager-companion/UPSTREAM.md`（更贴近实现细节的版本，二者应对照读）
+- 服务实现里对每条缺口的具体规避方式：`skills/paseo-companion/paseo-reminder/UPSTREAM.md`（更贴近实现细节的版本，二者应对照读）
