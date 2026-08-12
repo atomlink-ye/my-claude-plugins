@@ -1090,7 +1090,7 @@ async function handleList(options = {}) {
     const items = await paginator.nextItems();
     for (const info of items) sandboxes.push({ id: info.sandboxId, name: info.name, state: info.state, template: info.templateId });
   }
-  const result = { sandboxes };
+  const result = { ok: true, sandboxes };
   console.log(JSON.stringify(result, null, 2));
   return result;
 }

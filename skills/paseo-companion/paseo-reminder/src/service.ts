@@ -209,7 +209,11 @@ export class CompanionService {
     const selfWakeupSources = [];
     for (const reminder of this.store.getReminders()) {
       const childWatch = reminder.kind === 'child-watch' || reminder.watchKind === 'child' || Boolean(reminder.subjectChildId);
-      if (!childWatch && reminder.kind !== 'watchdog' && reminder.kind !== 'heartbeat-recovery' && reminder.agentId === agentId && reminder.status === 'active' && await this.probeReminder(reminder) === true) selfWakeupSources.push(reminder);
+      if (this.isLocalReminderWakeupSource(reminder, agentId)) {
+        selfWakeupSources.push(reminder);
+      } else if (!childWatch && reminder.kind !== 'watchdog' && reminder.kind !== 'heartbeat-recovery' && reminder.agentId === agentId && reminder.status === 'active' && await this.probeReminder(reminder) === true) {
+        selfWakeupSources.push(reminder);
+      }
     }
     // Idle reminders are local, durable wakeup sources rather than Paseo
     // heartbeat schedules. Treat an active one as a live source for watchdog
@@ -237,6 +241,22 @@ export class CompanionService {
     }
     const wakeupSourcesNote = 'companionKnownWakeupSources lists only companion-created and explicitly registered sources; external heartbeats are omitted unless PUT /wakeup-sources registers them.';
     return { children, companionKnownWakeupSources: selfWakeupSources, selfWakeupSources, wakeupSourcesComplete: false, wakeupSourcesNote, partial: failedCandidates.length > 0, failedCandidates };
+  }
+
+  private isLocalReminderWakeupSource(reminder: ReminderRecord, agentId: string): boolean {
+    const protectedReminder = reminder.kind === 'child-watch'
+      || reminder.watchKind === 'child'
+      || Boolean(reminder.subjectChildId)
+      || reminder.kind === 'compact-wake'
+      || reminder.kind === 'watchdog'
+      || reminder.kind === 'heartbeat-recovery';
+    const hasFiniteWakeupAt = [reminder.nextRunAt, reminder.targetAt].some((value) => typeof value === 'string' && Number.isFinite(Date.parse(value)));
+    return reminder.agentId === agentId
+      && reminder.status === 'active'
+      && !reminder.daemonId
+      && !protectedReminder
+      && (reminder.mode === 'once' || reminder.mode === 'repeat')
+      && hasFiniteWakeupAt;
   }
 
   private wakeupCron(cadence: string): string {
@@ -878,7 +898,7 @@ export class CompanionService {
       detail,
       ephemeral ? 'This health alert is non-acknowledgement based; the alert ID remains cancellable.' : 'Acknowledge this completion alert after review; future matching transitions remain deduplicated by this ID.',
     ].join('\n');
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'interrupt', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'on-idle', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
     snapshot.notified = [...notified, eventType];
     return true;
   }

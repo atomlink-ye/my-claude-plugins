@@ -452,9 +452,11 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
     const runner = command === "run" ? () => invokeRun(parsed, selectedAdapter) : () => invoke(parsed, selectedAdapter, alias);
     const jsonResult = (parsed.json || command === "run") ? await capture(runner) : { result: await runner(), logs: [], errors: [], writes: [] };
     const resultObject = jsonResult.result && typeof jsonResult.result === "object" ? jsonResult.result : {};
-    const exitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : (resultObject.ok === false ? 1 : 0);
+    const handlerFailed = resultObject.ok === false || Object.prototype.hasOwnProperty.call(resultObject, "error");
+    const reportedExitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : undefined;
+    const exitCode = handlerFailed ? (reportedExitCode !== undefined && reportedExitCode !== 0 ? reportedExitCode : 1) : (reportedExitCode ?? 0);
     if ((command === "exec" || command === "run") && typeof resultObject.exitCode === "number") process.exitCode = exitCode;
-    if (resultObject.ok === false && !((command === "exec" || command === "run") && typeof resultObject.exitCode === "number")) process.exitCode = 1;
+    if (handlerFailed && !((command === "exec" || command === "run") && typeof resultObject.exitCode === "number")) process.exitCode = 1;
     if (!parsed.json && command === "exec" && resultObject.error) {
       if (resultObject.warning) console.error(sanitizeError(resultObject.warning));
       console.error(sanitizeError(resultObject.error));
