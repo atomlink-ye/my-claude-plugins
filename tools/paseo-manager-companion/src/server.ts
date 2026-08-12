@@ -34,6 +34,21 @@ export async function createServer(service = new CompanionService(undefined, und
       const pathname = url.pathname;
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
       if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats()); return; }
+      if (method === 'GET' && pathname === '/wakeup-sources') {
+        const agentId = required(url.searchParams.get('agentId'), 'agentId');
+        send(res, 200, await service.listWakeupSources(agentId)); return;
+      }
+      const wakeupSourceMatch = pathname.match(/^\/wakeup-sources\/([^/]+)$/);
+      if (wakeupSourceMatch && method === 'PUT') {
+        const body = await readBody(req);
+        const agentId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
+        const cadence = required(body.cadence ?? url.searchParams.get('cadence'), 'cadence');
+        send(res, 200, await service.registerWakeupSource(decodeURIComponent(wakeupSourceMatch[1]), agentId, cadence)); return;
+      }
+      if (wakeupSourceMatch && method === 'DELETE') {
+        const agentId = required(url.searchParams.get('agentId'), 'agentId');
+        send(res, 200, await service.deleteWakeupSource(decodeURIComponent(wakeupSourceMatch[1]), agentId)); return;
+      }
       const heartbeatMatch = pathname.match(/^\/heartbeats\/([^/]+)$/);
       if (method === 'DELETE' && heartbeatMatch) {
         const body = await readBody(req);
@@ -142,7 +157,7 @@ export async function createServer(service = new CompanionService(undefined, und
       send(res, 404, { error: 'not found' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|idle reminder not found|message not found|ledger record not found|heartbeat not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|maxRuns must be a positive integer|thresholdSeconds must be positive|agentId, childId, and reason|agentId and childId/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
+      const status = error instanceof HttpError ? error.status : (/heartbeat id ambiguous/.test(message) ? 409 : (/child-watch opt-out state corrupt/.test(message) ? 503 : (/reminder not found|idle reminder not found|message not found|ledger record not found|heartbeat not found|wakeup source not found/.test(message) ? 404 : (/invalid ledger type|verdict and reason|reason is required|delaySeconds must be positive|maxRuns must be a positive integer|thresholdSeconds must be positive|agentId, childId, and reason|agentId and childId|heartbeatId, agentId, and cadence/.test(message) ? 400 : (message.includes('not found') ? 404 : 500)))));
       send(res, status, { error: message });
     }
   });

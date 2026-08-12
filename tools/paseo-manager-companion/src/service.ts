@@ -5,7 +5,7 @@ import { Store } from './store.js';
 import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
-import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderRecord, WatchdogSnapshot } from './types.js';
+import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
@@ -186,7 +186,69 @@ export class CompanionService {
         });
       }
     }
+    // Heartbeats created outside this process are only considered wakeup
+    // sources after an explicit registration and a probe using their original
+    // cadence.  The CLI cannot enumerate agent-scoped heartbeats for us.
+    for (const source of this.store.getWakeupSources(agentId)) {
+      if (await this.probeWakeupSource(source)) {
+        selfWakeupSources.push({
+          id: source.heartbeatId, daemonId: source.heartbeatId, agentId,
+          name: `registered-wakeup-${source.heartbeatId.slice(0, 8)}`,
+          prompt: 'Registered external wakeup source', cron: this.wakeupCron(source.cadence),
+          expiresIn: '', status: 'active' as const, alive: true, createdAt: source.registeredAt,
+        });
+      }
+    }
     return { children, selfWakeupSources, partial: failedCandidates.length > 0, failedCandidates };
+  }
+
+  private wakeupCron(cadence: string): string {
+    return cadence.startsWith('cron:') ? cadence.slice('cron:'.length) : cadence;
+  }
+
+  private async probeWakeupSource(source: WakeupSourceRecord): Promise<boolean> {
+    const probedAt = new Date().toISOString();
+    try {
+      const result = asRecord((await this.cli.run([
+        'heartbeat', 'update', source.heartbeatId, '--cron', this.wakeupCron(source.cadence), '--json',
+      ], { agentId: source.agentId, timeoutMs: 5_000 })).value);
+      const payload = unwrapPayload(result);
+      const status = lowerStatus(payload.status ?? payload.state ?? payload.Status);
+      const active = status === 'active';
+      await this.store.upsertWakeupSource({
+        ...source, status: active ? 'active' : 'dead', lastProbedAt: probedAt,
+        ...(active ? { lastProbeError: undefined } : { lastProbeError: `heartbeat status=${status || 'unknown'}` }),
+      });
+      return active;
+    } catch (error) {
+      await this.store.upsertWakeupSource({
+        ...source, status: 'dead', lastProbedAt: probedAt,
+        lastProbeError: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  async registerWakeupSource(heartbeatId: string, agentId: string, cadence: string): Promise<WakeupSourceRecord> {
+    if (!heartbeatId?.trim() || !agentId?.trim() || !cadence?.trim()) throw new Error('heartbeatId, agentId, and cadence are required');
+    const source = await this.store.upsertWakeupSource({
+      heartbeatId: heartbeatId.trim(), agentId: agentId.trim(), cadence: cadence.trim(), status: 'dead', registeredAt: new Date().toISOString(),
+    });
+    await this.probeWakeupSource(source);
+    return this.store.getWakeupSource(source.heartbeatId)!;
+  }
+
+  async listWakeupSources(agentId?: string): Promise<WakeupSourceRecord[]> {
+    const sources = this.store.getWakeupSources(agentId);
+    for (const source of sources) await this.probeWakeupSource(source);
+    return this.store.getWakeupSources(agentId);
+  }
+
+  async deleteWakeupSource(heartbeatId: string, agentId?: string): Promise<{ heartbeatId: string; status: 'deleted' }> {
+    const source = this.store.getWakeupSource(heartbeatId);
+    if (!source || (agentId && source.agentId !== agentId)) throw new Error('wakeup source not found');
+    await this.store.removeWakeupSource(heartbeatId);
+    return { heartbeatId, status: 'deleted' };
   }
 
   private async inspectWithRetry(id: string): Promise<Record<string, any>> {
@@ -211,11 +273,11 @@ export class CompanionService {
    * armed `paseo wait <full-agent-id>` process. Any failed inspection is
    * `unknown`, and reconciliation fails closed instead of adding a duplicate.
    */
-  private async hasLiveCompanionWatch(childId: string): Promise<boolean | 'unknown'> {
+  private async hasLiveCompanionWatch(childId: string, ignoreReminderId?: string): Promise<boolean | 'unknown'> {
     let unknown = false;
     let live = false;
     for (const reminder of this.store.getReminders()) {
-      if (!reminder.subjectChildId || reminder.subjectChildId !== childId || (reminder.kind !== 'child-watch' && reminder.watchKind !== 'child')) continue;
+      if (reminder.id === ignoreReminderId || !reminder.subjectChildId || reminder.subjectChildId !== childId || (reminder.kind !== 'child-watch' && reminder.watchKind !== 'child')) continue;
       if (reminder.status !== 'active') continue;
       const state = await this.probeReminder(reminder);
       if (state === true) live = true;
@@ -584,7 +646,8 @@ export class CompanionService {
         // Any explicit DELETE of a child-watch is an operator opt-out. Keep
         // that intent durable so reconciliation and restart cannot recreate
         // the cancelled watch under the same child/event identity.
-        await this.store.untrackChild(reminder.agentId, reminder.subjectChildId!, reason);
+        // The child remains tracked independently; only its watch is opted out.
+        await this.store.optOutChildWatch(reminder.agentId, reminder.subjectChildId!, reason);
         await this.suppressRecoveryForChild(reminder.agentId, reminder.subjectChildId!, [reminder.id]);
       }
       if (reminder.kind === 'heartbeat-recovery') {
@@ -757,7 +820,9 @@ export class CompanionService {
     }
     const managerSnapshot = this.store.getWatchdogSnapshot(managerId, '__manager__') ?? { managerId, childId: '__manager__', status: '', notified: [] };
     const managerNoWakeup = running.length > 0 && listed.selfWakeupSources.length === 0 && (await this.hasLivePaseoWait(managerId)) === false;
-    if (managerNoWakeup) await this.notifyWatchdog(managerId, '__manager__', 'manager-bare', 'tracked child status=running, selfWakeupSources empty, and no live paseo wait', `manager=${managerId} has ${running.length} running tracked child(ren) but no live self wakeup source`, true, managerSnapshot);
+    const managerBareCriterion = 'tracked child status=running, no live companion-created or registered wakeup source observed, and no live paseo wait; external sources may be invisible';
+    const managerBareDetail = `manager=${managerId} has ${running.length} running tracked child(ren); companion checked only companion-created and registered sources, so external wakeup sources may be invisible`;
+    if (managerNoWakeup) await this.notifyWatchdog(managerId, '__manager__', 'manager-bare', managerBareCriterion, managerBareDetail, true, managerSnapshot);
     else managerSnapshot.notified = (managerSnapshot.notified ?? []).filter((item) => item !== 'manager-bare');
     managerSnapshot.status = managerNoWakeup ? 'running-children' : 'covered';
     await this.store.setWatchdogSnapshot(managerSnapshot);
@@ -1213,7 +1278,17 @@ export class CompanionService {
     for (const reminder of this.store.getReminders()) {
       if (reminder.agentId === managerId && reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child') && this.store.isChildWatchOptedOut(managerId, reminder.subjectChildId) && (reminder.missedFires ?? 0) > 0) await this.store.clearReminderMissed(reminder.id);
     }
-    const missed = this.store.getReminders().filter((reminder) => reminder.agentId === managerId && !(reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child') && this.store.isChildWatchOptedOut(managerId, reminder.subjectChildId)) && (reminder.alive ?? true) === true && (reminder.missedFires ?? 0) > 0);
+    const missed: ReminderRecord[] = [];
+    for (const reminder of this.store.getReminders()) {
+      if (reminder.agentId !== managerId || (reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child') && this.store.isChildWatchOptedOut(managerId, reminder.subjectChildId)) || (reminder.alive ?? true) !== true || (reminder.missedFires ?? 0) <= 0) continue;
+      if (reminder.subjectChildId && (reminder.kind === 'child-watch' || reminder.watchKind === 'child')) {
+        // A child with either a live paseo wait or a live companion watch is
+        // already covered; recovery must not wake the manager redundantly.
+        const coverage = this.unionLiveSources(await this.hasLivePaseoWait(reminder.subjectChildId), await this.hasLiveCompanionWatch(reminder.subjectChildId, reminder.id));
+        if (coverage !== false) continue;
+      }
+      missed.push(reminder);
+    }
     if (!missed.length || !(await this.managerIsIdle(managerId))) return;
     const children = await this.listChildren(managerId);
     const total = missed.reduce((sum, reminder) => sum + (reminder.missedFires ?? 0), 0);
@@ -1368,6 +1443,16 @@ export class CompanionService {
         await this.store.updateReminder(reminder.id, { status: 'dead' });
       }
     }
+    // `paseo wait` is the primary wakeup source. If it appears after a
+    // companion watch was armed, retire the redundant watch but keep the child
+    // tracked so future state transitions remain visible to the manager.
+    const externalWakeup = await this.hasLivePaseoWait(childId);
+    if (externalWakeup === true && !force) {
+      for (const reminder of records) {
+        if (reminder.status === 'pending' || reminder.status === 'active') await this.retireChildWatch(reminder);
+      }
+      return undefined;
+    }
     if (live) {
       const expectedCwd = cwd ?? 'unknown';
       const correctedExisting = records.find((record) => record.status === 'active' && this.childWatchPromptMatches(record, childId, cwd));
@@ -1390,8 +1475,7 @@ export class CompanionService {
     if (uncertain && !force) return undefined;
     // `paseo wait` is the primary wakeup source. Unknown process inspection is
     // fail-closed: never add a companion watch unless absence is proven.
-    const wakeup = await this.hasLivePaseoWait(childId);
-    if (!force && wakeup !== false) return undefined;
+    if (!force && externalWakeup !== false) return undefined;
     return this.createReminder({
       agentId: managerId,
       subjectChildId: childId,
@@ -1405,7 +1489,9 @@ export class CompanionService {
   }
 
   private async unsubscribeChildWatchOnce(managerId: string, childId: string, reason: string): Promise<Record<string, unknown>> {
-    await this.store.untrackChild(managerId, childId, reason);
+    // Unsubscribing a watch opts out only that delivery source. Tracking is a
+    // separate observation concern and must survive this operation.
+    await this.store.optOutChildWatch(managerId, childId, reason);
     const records = this.store.getReminders().filter((reminder) => this.isChildWatch(reminder, managerId, childId));
     let retirementPending = false;
     let retired = 0;

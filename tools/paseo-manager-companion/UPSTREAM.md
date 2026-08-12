@@ -40,12 +40,21 @@ explicitly parked with `verdict`, `reason` and `recovery` still tripped the alar
 every ~5 minutes. A parked child is a recorded decision, not a forgotten one.
 Per-child watches now treat an unrevoked park record as the *only* exemption.
 
-**2. `selfWakeupSources` only counts this service's own reminders.** — ⚠️ **still open.**
-A manager whose live wakeup source is a harness-tracked background task (the normal
-way to arm a `paseo wait` or a long build) reads as having none. The practical
-workaround is to register a companion reminder that *represents* the external wakeup
-source, which keeps the invariant honest rather than silencing it — but it means the
-invariant measures "reminders registered here", not "wakeup sources that exist".
+**2. `selfWakeupSources` cannot enumerate externally-created heartbeats.** — ✅ **workaround shipped 2026-08-12.**
+The public `paseo` CLI has no heartbeat enumerate/list command: `paseo heartbeat`
+supports create/update/delete only, and agent-scoped heartbeats do not appear in
+`paseo schedule ls --json`. Therefore the companion cannot infer that a heartbeat
+created outside it exists from a global listing. It now exposes durable registration
+endpoints (`PUT/GET/DELETE /wakeup-sources`) where a manager records the full agent id,
+heartbeat id, and its `cadence` (for example `cron:*/30 * * * *`). Each registered
+source is probed with `paseo heartbeat update <id> --cron '<cadence expression>' --json`;
+only an explicit `status=active` response counts as live. Missing ids, daemon RPC
+errors, and non-active responses are dead and do not suppress `manager-bare`.
+The warning explicitly says coverage is limited to companion-created and registered
+sources, because unregistered external sources may remain invisible. If upstream adds
+heartbeat enumeration, registration and per-id update probes can be simplified to a
+daemon-backed list/identity check, while retaining registration as an opt-in boundary
+for manager ownership.
 
 ## Observed gap (2026-08-11, first live per-child watch)
 

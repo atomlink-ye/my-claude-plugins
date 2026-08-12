@@ -93,6 +93,18 @@ export interface TrackedChildRecord {
   addedAt: string;
 }
 
+/** A heartbeat created outside the companion and explicitly made visible to it. */
+export interface WakeupSourceRecord {
+  heartbeatId: string;
+  agentId: string;
+  /** The cadence as supplied by the daemon (for example a cron-prefixed expression). */
+  cadence: string;
+  status: 'active' | 'dead';
+  lastProbedAt?: string;
+  lastProbeError?: string;
+  registeredAt: string;
+}
+
 export interface FailedCandidate {
   id: string;
   error: string;

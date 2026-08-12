@@ -1,7 +1,7 @@
 import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WatchdogSnapshot } from './types.js';
+import type { IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 export class Store {
   readonly dir: string;
@@ -14,6 +14,7 @@ export class Store {
   private recoveryReceipts: Record<string, Record<string, { missedFires: number; missedRunIds: string[] }>> = {};
   private childWatchOptOuts: Record<string, { reason: string; updatedAt: string }> = {};
   private trackedChildren: Record<string, TrackedChildRecord> = {};
+  private wakeupSources: Record<string, WakeupSourceRecord> = {};
   private childWatchOptOutsCorrupt = false;
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
@@ -48,6 +49,8 @@ export class Store {
     }
     const tracked = await this.loadDurable<Record<string, TrackedChildRecord>>('tracked-children.json', {});
     if (tracked && typeof tracked === 'object' && !Array.isArray(tracked)) this.trackedChildren = tracked;
+    const wakeupSources = await this.loadDurable<Record<string, WakeupSourceRecord>>('wakeup-sources.json', {});
+    if (wakeupSources && typeof wakeupSources === 'object' && !Array.isArray(wakeupSources)) this.wakeupSources = wakeupSources;
     // Preserve upgrade state: any currently live/pending child-watch pair is
     // considered tracked, but does not clear an explicit opt-out.
     let migrated = false;
@@ -131,6 +134,23 @@ export class Store {
     delete this.trackedChildren[this.childWatchKey(managerId, childId)];
     await this.save('tracked-children.json', this.trackedChildren);
     await this.optOutChildWatch(managerId, childId, reason);
+  }
+
+  getWakeupSources(agentId?: string): WakeupSourceRecord[] {
+    return Object.values(this.wakeupSources).filter((item) => !agentId || item.agentId === agentId);
+  }
+  getWakeupSource(heartbeatId: string): WakeupSourceRecord | undefined { return this.wakeupSources[heartbeatId]; }
+  async upsertWakeupSource(record: WakeupSourceRecord): Promise<WakeupSourceRecord> {
+    const prior = this.wakeupSources[record.heartbeatId];
+    this.wakeupSources[record.heartbeatId] = prior ? { ...prior, ...record, registeredAt: prior.registeredAt } : record;
+    await this.save('wakeup-sources.json', this.wakeupSources);
+    return this.wakeupSources[record.heartbeatId];
+  }
+  async removeWakeupSource(heartbeatId: string): Promise<boolean> {
+    if (!this.wakeupSources[heartbeatId]) return false;
+    delete this.wakeupSources[heartbeatId];
+    await this.save('wakeup-sources.json', this.wakeupSources);
+    return true;
   }
 
   getReminders(): ReminderRecord[] { return this.reminders; }
