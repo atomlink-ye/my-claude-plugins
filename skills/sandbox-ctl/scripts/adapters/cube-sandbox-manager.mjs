@@ -12,7 +12,7 @@
 // and index.js) rather than guessing from docs:
 //   - `Sandbox` (default export, also named) exposes everything as *static*
 //     methods (`Sandbox.create`, `Sandbox.connect`, `Sandbox.list`,
-//     `Sandbox.getInfo`, `Sandbox.kill`) plus instance methods on a connected
+//     `Sandbox.getInfo`, `Sandbox.kill`, `Sandbox.pause`) plus instance methods on a connected
 //     sandbox (`sbx.commands`, `sbx.files`, `sbx.getHost(port)`, `sbx.kill()`).
 //     There is no separate client-instance object to construct the way
 //     Daytona's `new Daytona(options)` works; `createClient()` below resolves
@@ -48,8 +48,11 @@
 //   - `sbx.files.getInfo(path)` returns `{ type: 'file' | 'dir' | 'symlink', ... }`,
 //     used here to auto-detect the single-file transfer fast path for `pull`.
 //   - `sbx.getHost(port)` is an *instance* method (matches the plan doc).
-//   - Sandbox lifecycle is a single `timeoutMs` + optional
-//     `lifecycle: { onTimeout: 'pause' | 'kill', autoResume }` — there is no
+//   - Sandbox lifecycle is a single `timeoutMs`; manual pause uses the static
+//     `Sandbox.pause` call and resume uses `Sandbox.connect`. The SDK's
+//     top-level autoPause/autoResume serialization does not match Cube v0.6's
+//     nested lifecycle contract, so idle auto-pause is intentionally not sent.
+//     There is no
 //     Cube/e2b equivalent of Daytona's separate auto-stop/auto-archive/
 //     auto-delete three-timer model; `handleUp` reports this honestly instead
 //     of inventing a false mapping.
@@ -88,7 +91,7 @@ import { createDaemonClient, startDaemon } from "../lib/cube-sandbox-daemon.mjs"
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
-const STRING_FLAGS = ["--directory", "--task-id", "--template", "--name", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--branch", "--port", "--timeout"];
+const STRING_FLAGS = ["--directory", "--task-id", "--template", "--name", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--branch", "--port", "--timeout", "--workspace-owner"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const SENSITIVE_BASENAME_RE = /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|\.sandbox-ctl|logs|.+\.log)$/;
 const DEFAULT_EXEC_TIMEOUT_MS = 300_000;
@@ -123,6 +126,54 @@ function normalizeRemoteHome(remoteHome) {
     throw new Error(`Invalid remote home: ${remoteHome}`);
   }
   return normalized;
+}
+
+function normalizeWorkspaceOwner(value, source = "workspace owner") {
+  const match = /^([1-9]\d*):([1-9]\d*)$/.exec(String(value ?? "").trim());
+  if (!match) throw new Error(`Invalid ${source}: expected non-root positive UID:GID (for example 1000:1000)`);
+  const uid = Number(match[1]);
+  const gid = Number(match[2]);
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid <= 0 || gid <= 0) {
+    throw new Error(`Invalid ${source}: UID and GID must be non-root positive integers`);
+  }
+  return { uid, gid };
+}
+
+function workspaceOwnerKey(owner) {
+  return owner ? `${owner.uid}:${owner.gid}` : "";
+}
+
+function resolveWorkspaceOwner(options = {}, binding) {
+  const requested = options.workspaceOwner ?? options["workspace-owner"];
+  const requestedOwner = requested === undefined ? undefined : normalizeWorkspaceOwner(requested, "--workspace-owner");
+  const bindingOwner = binding?.workspaceOwner === undefined ? undefined : normalizeWorkspaceOwner(`${binding.workspaceOwner?.uid}:${binding.workspaceOwner?.gid}`, "binding workspaceOwner");
+  if (requestedOwner && bindingOwner && workspaceOwnerKey(requestedOwner) !== workspaceOwnerKey(bindingOwner)) {
+    throw new Error(`Workspace owner ${workspaceOwnerKey(requestedOwner)} differs from the bound workspace owner ${workspaceOwnerKey(bindingOwner)}; migrate the workspace explicitly before changing ownership`);
+  }
+  return requestedOwner ?? bindingOwner;
+}
+
+function workspaceProvisionCommand(remoteWorkspace, owner) {
+  const target = shellQuote(remoteWorkspace);
+  if (!owner) return `mkdir -p ${target}`;
+  const ownerValue = `${owner.uid}:${owner.gid}`;
+  return `set -eu
+target=${target}; expected_owner=${shellQuote(ownerValue)}
+if [ -e "$target" ] && [ ! -d "$target" ]; then echo "workspace path exists but is not a directory: $target" >&2; exit 78; fi
+if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+  actual_owner=$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)
+  if [ "$actual_owner" != "$expected_owner" ]; then
+    echo "workspace is non-empty and owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    exit 78
+  fi
+  mismatch=$(find "$target" -mindepth 1 \( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \) -print -quit 2>/dev/null || true)
+  if [ -n "$mismatch" ]; then
+    actual=$(stat -c '%u:%g' "$mismatch" 2>/dev/null || stat -f '%u:%g' "$mismatch" 2>/dev/null || true)
+    echo "workspace entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    exit 78
+  fi
+fi
+install -d -o ${owner.uid} -g ${owner.gid} -- "$target"`;
 }
 
 function toRemoteAbsolute(remotePath, remoteHome = process.env.CUBE_REMOTE_HOME) {
@@ -204,13 +255,13 @@ function addConnectionOptions(method, args, connection) {
   const result = [...args];
   const merge = (index) => { result[index] = { ...(result[index] ?? {}), ...connection }; };
   if (method === "create") merge(typeof result[0] === "string" ? 1 : 0);
-  else if (method === "connect" || method === "getInfo" || method === "kill" || method === "list") merge(method === "list" ? 0 : 1);
+  else if (method === "connect" || method === "getInfo" || method === "kill" || method === "pause" || method === "list") merge(method === "list" ? 0 : 1);
   return result;
 }
 
 function wrapCubeSandboxClient(Sandbox, connection) {
   if (!connection || !Object.values(connection).some((value) => value !== undefined && value !== "")) return Sandbox;
-  const methods = new Set(["create", "connect", "list", "getInfo", "kill"]);
+  const methods = new Set(["create", "connect", "list", "getInfo", "kill", "pause"]);
   return new Proxy(Sandbox, { get(target, property, receiver) {
     const value = Reflect.get(target, property, receiver);
     if (!methods.has(property) || typeof value !== "function") return value;
@@ -402,8 +453,9 @@ async function requireSandbox(options) {
   if (!paths.binding) throw new Error("No Cube Sandbox binding found for this directory. Run up first.");
   const client = options.client ?? await createClient();
   let sandbox;
+  const sandboxTimeoutMs = paths.binding.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
   try {
-    sandbox = await client.connect(paths.binding.sandboxId);
+    sandbox = await client.connect(paths.binding.sandboxId, { timeoutMs: sandboxTimeoutMs });
   } catch (error) {
     if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
     throw error;
@@ -413,6 +465,29 @@ async function requireSandbox(options) {
     try { upsertBinding(paths.directory, paths.binding.name, { remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* command can continue; retry persistence next invocation */ }
   }
   return { paths, sandbox, remoteHome };
+}
+
+/** Evict a cached daemon connection so the next exec cannot reuse a paused
+ * SDK object. The daemon is started on demand for lifecycle commands, while
+ * injected clients remain a deterministic test/rescue seam. */
+async function invalidateDaemonConnection(sandboxId, options = {}) {
+  if (!sandboxId) throw new Error("sandboxId is required to invalidate the daemon connection");
+  let daemon = options.daemonClient
+    ? (typeof options.daemonClient === "function" ? await options.daemonClient() : options.daemonClient)
+    : null;
+  const daemonOptions = options.daemon ?? {};
+  if (!daemon) {
+    await (options.startDaemon ?? startDaemon)(daemonOptions);
+    daemon = createDaemonClient(daemonOptions);
+  }
+  if (typeof daemon.invalidate !== "function") throw new Error("Cube Sandbox daemon client does not support connection invalidation");
+  const result = await daemon.invalidate(sandboxId);
+  const nonzeroExit = Number.isInteger(result?.exitCode) && result.exitCode !== 0;
+  if (nonzeroExit || result?.error || result?.ok === false) {
+    const detail = result?.error ? `: ${result.error}` : nonzeroExit ? ` (exit code ${result.exitCode})` : "";
+    throw new Error(`Could not invalidate the local Cube Sandbox daemon connection for ${sandboxId}${detail}; restart the local sandbox-ctl daemon (daemon stop, then daemon start) and retry`);
+  }
+  return result;
 }
 
 function remoteExitCode(value) {
@@ -482,12 +557,13 @@ async function handleUp(options) {
   const template = options.template ?? options.snapshot ?? existingBinding?.template;
   if (!existingBinding?.sandboxId && !template) throw new Error("Cube Sandbox up requires --template TEMPLATE_ID for a new sandbox");
   const client = options.client ?? await createClient();
+  const timeoutMs = options.timeoutMs ?? existingBinding?.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
+  const workspaceOwner = resolveWorkspaceOwner(options, existingBinding);
   let sandbox = null;
   if (existingBinding?.sandboxId) {
-    try { sandbox = await client.connect(existingBinding.sandboxId); }
+    try { sandbox = await client.connect(existingBinding.sandboxId, { timeoutMs }); }
     catch (error) { if (!isNotFoundError(error)) throw error; sandbox = null; }
   }
-  const timeoutMs = options.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
   let created = false;
   if (!sandbox) {
     if (!template) throw new Error("Cube Sandbox up requires --template TEMPLATE_ID when the bound sandbox no longer exists");
@@ -509,12 +585,14 @@ async function handleUp(options) {
   try {
     remoteHome = existingBinding?.remoteHome ?? await resolveRemoteHome(sandbox);
     const remoteWorkspace = toRemoteAbsolute(paths.remoteWorkspacePath, remoteHome);
-    const workspaceResult = await cubeSandboxExec(sandbox, `mkdir -p ${shellQuote(remoteWorkspace)}`);
+    const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
     assertRemoteCommandSuccess(workspaceResult, "workspace initialization");
     binding = upsertBinding(paths.directory, bindingName, {
       sandboxId,
       remoteHome,
       remoteWorkspace: paths.remoteWorkspacePath,
+      timeoutMs,
+      ...(workspaceOwner ? { workspaceOwner } : {}),
       template,
       projectIdentity: projectIdentity(paths.directory),
       name: options.name,
@@ -528,7 +606,7 @@ async function handleUp(options) {
         error.sandboxId = sandboxId;
         const recoveryName = `recovery-${String(sandboxId).replace(/[^A-Za-z0-9._-]+/g, "-")}`;
         try {
-          upsertBinding(paths.directory, recoveryName, { sandboxId, remoteHome, remoteWorkspace: paths.remoteWorkspacePath, projectIdentity: projectIdentity(paths.directory), updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" });
+          upsertBinding(paths.directory, recoveryName, { sandboxId, remoteHome, remoteWorkspace: paths.remoteWorkspacePath, timeoutMs, ...(workspaceOwner ? { workspaceOwner } : {}), projectIdentity: projectIdentity(paths.directory), updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" });
           error.nextActions = [`sandbox-ctl down --adapter cube-sandbox --directory ${shellQuote(paths.directory)} --sandbox ${shellQuote(recoveryName)}`];
         } catch {
           error.nextActions = [
@@ -552,9 +630,10 @@ async function handleStatus(options = {}) {
   const paths = resolveProjectPaths(options);
   if (!paths.binding) throw new Error("No Cube Sandbox binding found for this directory.");
   const client = options.client ?? await createClient();
+  if (typeof client.getInfo !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose getInfo; status will not connect to determine state");
   let info;
   try {
-    info = typeof client.getInfo === "function" ? await client.getInfo(paths.binding.sandboxId) : await client.connect(paths.binding.sandboxId);
+    info = await client.getInfo(paths.binding.sandboxId);
   } catch (error) {
     if (isNotFoundError(error)) return { ok: false, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: "not-found", binding: paths.binding };
     throw error;
@@ -580,13 +659,14 @@ async function handleAdopt(options = {}) {
   const directory = path.resolve(options.directory ?? process.cwd());
   const name = options.name ?? `adopted-${String(sandboxId).replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   const client = options.client ?? await createClient();
+  const timeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS;
   let info;
   if (typeof client.getInfo === "function") info = await client.getInfo(sandboxId);
-  const sandbox = await client.connect(sandboxId);
+  const sandbox = await client.connect(sandboxId, { timeoutMs });
   if (options.requireManagedPolicy && info) assertManagedSandboxInfo(info, projectIdentity(directory));
   const remoteHome = options.remoteHome ?? await resolveRemoteHome(sandbox);
-  const binding = upsertBinding(directory, name, { sandboxId, remoteHome, remoteWorkspace, projectIdentity: projectIdentity(directory), adoptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, { use: !options.noUse, adapter: "cube-sandbox" });
-  const result = { ok: true, sandboxId, name, remoteHome, remoteWorkspace, binding };
+  const binding = upsertBinding(directory, name, { sandboxId, remoteHome, remoteWorkspace, timeoutMs, projectIdentity: projectIdentity(directory), adoptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, { use: !options.noUse, adapter: "cube-sandbox" });
+  const result = { ok: true, sandboxId, name, remoteHome, remoteWorkspace, timeoutMs, binding };
   console.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -665,6 +745,7 @@ async function handleExecViaDaemon(options, command) {
       command: command.map(shellQuote).join(" "),
       cwd,
       remoteHome: paths.binding.remoteHome,
+      sandboxTimeoutMs: paths.binding.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS,
       timeoutMs: options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
       onStdout: (chunk) => { const text = String(chunk ?? ""); stdout.push(text); if (!options.json && !options.bufferOutput) process.stdout.write(text); },
       onStderr: (chunk) => { const text = String(chunk ?? ""); stderr.push(text); if (!options.json && !options.bufferOutput) process.stderr.write(text); },
@@ -692,7 +773,13 @@ async function handlePush(options) {
   const includeSensitive = Boolean(options.includeSensitive ?? options["include-sensitive"]);
   if (includeSensitive && mode !== "full") throw new Error("--include-sensitive is only valid with --mode full");
   if (mode === "full" && !includeSensitive) throw new Error("--mode full may upload credentials; pass --include-sensitive to confirm");
+  const ownerBinding = resolveProjectPaths(options);
+  const requestedWorkspaceOwner = resolveWorkspaceOwner(options, ownerBinding.binding);
+  if (mode === "git" && requestedWorkspaceOwner) {
+    throw new Error(`Git push is not supported with workspace owner ${requestedWorkspaceOwner.uid}:${requestedWorkspaceOwner.gid}; use push --mode bundle or push --mode full`);
+  }
   const { paths, sandbox, remoteHome } = await requireSandbox(options);
+  const workspaceOwner = resolveWorkspaceOwner(options, paths.binding);
   const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath, remoteHome);
 
   if (mode === "git") {
@@ -774,6 +861,8 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
   const localAbs = path.resolve(options.path);
   if (!existsSync(localAbs)) throw new Error(`Path not found: ${localAbs}`);
   assertSafeLocalTransferFile(localAbs);
+  const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
+  assertRemoteCommandSuccess(workspaceResult, "workspace ownership validation");
 
   // Single-file fast path (new relative to Daytona): auto-detected when the
   // local path is not a directory, using sbx.files.write directly with no tar
@@ -784,15 +873,20 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
     const explicitRemoteTarget = requestedRemotePath === paths.binding.remoteWorkspace ? undefined : requestedRemotePath;
     const remoteTarget = resolveSingleFileRemoteTarget(explicitRemoteTarget, remoteWorkspace, path.basename(localAbs), remoteHome);
     await uploadFile(sandbox, localAbs, remoteTarget);
+    if (workspaceOwner) {
+      const ownerResult = await cubeSandboxExec(sandbox, `chown ${workspaceOwner.uid}:${workspaceOwner.gid} -- ${shellQuote(remoteTarget)}`);
+      assertRemoteCommandSuccess(ownerResult, "single-file ownership update");
+    }
     console.log(`Uploaded file to ${remoteTarget}`);
     return { ok: true, mode: "file", remoteWorkspace: remoteTarget };
   }
 
-  const { bundlePath, cleanup } = createCubeSandboxBundle(options.path, paths.taskId, { mode, includeSensitive });
+  const { bundlePath, cleanup } = createCubeSandboxBundle(options.path, paths.taskId, { mode, includeSensitive, archiveOwner: workspaceOwner });
   try {
     const remoteBundle = `/tmp/cube-sandbox-input-${paths.taskId}.tar.gz`;
     await uploadFile(sandbox, bundlePath, remoteBundle);
-    const result = await cubeSandboxExec(sandbox, `mkdir -p ${shellQuote(remoteWorkspace)} && tar -xzf ${shellQuote(remoteBundle)} -C ${shellQuote(remoteWorkspace)}`);
+    const tarOwnerFlags = workspaceOwner ? "--same-owner --numeric-owner " : "";
+    const result = await cubeSandboxExec(sandbox, `tar ${tarOwnerFlags}--no-overwrite-dir -xzf ${shellQuote(remoteBundle)} -C ${shellQuote(remoteWorkspace)}`);
     assertRemoteCommandSuccess(result, "push extraction");
     console.log(`Uploaded ${mode} archive to ${remoteWorkspace}`);
     return { ok: true, mode, remoteWorkspace };
@@ -918,6 +1012,75 @@ async function handleDown(options) {
   return result;
 }
 
+async function handlePause(options = {}) {
+  const paths = resolveProjectPaths(options);
+  if (!paths.binding) throw new Error("No Cube Sandbox binding found for this directory.");
+  const client = options.client ?? await createClient();
+  let info;
+  try {
+    if (typeof client.getInfo !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose getInfo; cannot verify pause ownership");
+    info = await client.getInfo(paths.binding.sandboxId);
+  } catch (error) {
+    if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
+    throw error;
+  }
+  if (options.requireManagedPolicy) assertManagedSandboxInfo(info, paths.binding.projectIdentity);
+  const currentState = String(info?.state ?? "").toLowerCase();
+  if (currentState === "paused") {
+    await invalidateDaemonConnection(paths.binding.sandboxId, options);
+    const result = { ok: true, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: info.state, alreadyPaused: true, binding: paths.binding };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  if (typeof client.pause !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose pause");
+  // Evict before pausing so an old/incompatible daemon cannot leave the
+  // sandbox paused while this command reports an invalidation failure.
+  await invalidateDaemonConnection(paths.binding.sandboxId, options);
+  try {
+    await client.pause(paths.binding.sandboxId, { keepMemory: true });
+  } catch (error) {
+    if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
+    throw error;
+  }
+  const result = { ok: true, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: "paused", alreadyPaused: false, binding: paths.binding };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function handleResume(options = {}) {
+  const paths = resolveProjectPaths(options);
+  if (!paths.binding) throw new Error("No Cube Sandbox binding found for this directory.");
+  const client = options.client ?? await createClient();
+  let info;
+  try {
+    if (typeof client.getInfo !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose getInfo; cannot verify resume ownership");
+    info = await client.getInfo(paths.binding.sandboxId);
+  } catch (error) {
+    if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
+    throw error;
+  }
+  if (options.requireManagedPolicy) assertManagedSandboxInfo(info, paths.binding.projectIdentity);
+  const currentState = String(info?.state ?? "").toLowerCase();
+  // Cube/e2b resumes a paused sandbox by connecting to it. Evict first so
+  // the following daemon exec necessarily establishes a fresh SDK connection.
+  await invalidateDaemonConnection(paths.binding.sandboxId, options);
+  if (currentState === "running") {
+    const result = { ok: true, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: info.state, alreadyRunning: true, binding: paths.binding };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  try {
+    if (typeof client.connect !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose connect");
+    await client.connect(paths.binding.sandboxId, { timeoutMs: paths.binding.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS });
+  } catch (error) {
+    if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
+    throw error;
+  }
+  const result = { ok: true, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: "running", alreadyRunning: currentState === "running", binding: paths.binding };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 async function handleList(options = {}) {
   const client = options.client ?? await createClient();
   if (typeof client.list !== "function") throw new Error("Cube Sandbox/e2b SDK does not expose a list API.");
@@ -983,6 +1146,8 @@ export {
   handleConfig,
   handleAdopt,
   handleDown,
+  handlePause,
+  handleResume,
   handleExec,
   handleList,
   handlePreview,

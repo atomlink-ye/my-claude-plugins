@@ -48,6 +48,42 @@ unlike Daytona there is no separate stop/archive/delete ladder and no
 `--auto-delete -1` — so size the timeout to the work and pull artifacts before
 it expires.
 
+Cube workspace ownership is opt-in with `--workspace-owner UID:GID` (for
+example `1000:1000`); UID and GID must be non-root positive integers. `up`
+provisions the exact workspace root with that owner and refuses a non-empty
+existing root whose owner differs, rather than recursively changing ownership.
+It also checks every existing descendant for the same numeric owner and fails
+closed on mixed ownership; no recursive repair is attempted.
+The owner is stored in the binding. Bundle/full pushes normalize archive
+numeric ownership, preserve the provisioned workspace root metadata during
+extraction, and chown only an uploaded single file. Git push is refused when
+an owner contract is active; use bundle or full mode for that workspace.
+
+`sandbox-ctl pause` and `sandbox-ctl resume` are experimental command
+interfaces, not a default workflow. In the 2026-08-11 canary, pause remained
+in `pausing` and then returned 408; native recovery followed by a fresh
+connection failed during fetch. Complete state recovery and a stable data
+plane were not established, so these commands must not be an A/B prerequisite.
+The implementation requests `Sandbox.pause` with `keepMemory: true`, applies
+the binding ownership checks, and invalidates cached connections before a
+resume attempt, but this is an implementation description rather than a
+success guarantee. `down` remains the delete operation.
+When lifecycle recovery is available, the binding's idle timeout is retained
+across reconnects and a repeated resume of an already-running sandbox skips a
+second control-plane connect; these behaviors are not evidence that the
+experimental data plane is stable.
+`status` and `list` pass through the control-plane `state` (including
+`paused`); status does not use a connect merely to determine state.
+If lifecycle control reports an incompatible local daemon protocol, restart
+only the local daemon (`sandbox-ctl daemon stop` followed by `daemon start`)
+before retrying; this does not restart the Cube sandbox service.
+
+Automatic idle pause/resume is intentionally not supported yet. e2b SDK
+2.38.2 serializes `autoPause`/`autoResume` as top-level options, while Cube
+v0.6 expects those settings under a nested `lifecycle` object; do not pass the
+flags because they would not take effect. Daytona reports pause/resume as
+unsupported rather than routing either command to `down`.
+
 `cube` is retained only as a deprecated CLI/config compatibility spelling and
 is normalized to the canonical machine ID `cube-sandbox` and human name
 `Cube Sandbox` on read/write.

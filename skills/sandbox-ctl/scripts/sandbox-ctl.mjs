@@ -96,7 +96,7 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
       forwarded.push(arg);
       continue;
     }
-    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--artifacts" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in" || flag === "--timeout") {
+    if (flag === "--sandbox" || flag === "--directory" || flag === "--state-directory" || flag === "--task-id" || flag === "--snapshot" || flag === "--name" || flag === "--env-file" || flag === "--path" || flag === "--remote-path" || flag === "--mode" || flag === "--cwd" || flag === "--output" || flag === "--artifacts" || flag === "--sandbox-id" || flag === "--sandbox-name" || flag === "--class" || flag === "--cpu" || flag === "--memory" || flag === "--disk" || flag === "--gpu" || flag === "--branch" || flag === "--port" || flag === "--expires-in" || flag === "--timeout" || flag === "--workspace-owner") {
       const read = readValue(argv, index, flag, inlineValue);
       if (flag === "--sandbox") options.sandbox = read.value;
       else if (flag === "--directory") options.directory = read.value;
@@ -158,10 +158,11 @@ function buildLifecycleLabels(kind = "task", labels = {}, adapter = "daytona") {
 function usage() {
   return [
     "Usage: sandbox-ctl [--adapter daytona|cube-sandbox] [--json] <command> [options]",
-    "Commands: up, adopt, status, push, exec, run, pull, preview, smoke-test, down, list, doctor, daemon start|status|stop (Cube Sandbox)",
+    "Commands: up, adopt, status, pause, resume, push, exec, run, pull, preview, smoke-test, down, list, doctor, daemon start|status|stop (Cube Sandbox)",
     "Deprecated aliases: create, task up, project up (all use the unified up policy)",
     "Binding: use NAME_OR_ID (select active binding)",
     "Lifecycle: --label key=value (repeatable), --auto-stop N, --auto-archive N, --auto-delete N, --ephemeral",
+    "Cube Sandbox: --workspace-owner UID:GID (opt-in; non-root positive integers)",
   ].join("\n");
 }
 
@@ -365,12 +366,17 @@ async function invoke(parsed, adapter, alias) {
   if (alias.command === "down") {
     Object.assign(options, { requireManagedPolicy: true, expectedKind: "sandbox" });
   }
+  if (alias.command === "pause" || alias.command === "resume") {
+    Object.assign(options, { requireManagedPolicy: true, expectedKind: "sandbox" });
+  }
   if (alias.command === "push" && parsed.positionals[0] && options.path === undefined) options.path = parsed.positionals[0];
   if (alias.command === "pull" && parsed.positionals[0]) options["remote-path"] = parsed.positionals[0];
   if (alias.command === "use") return selectBinding(options.directory, parsed.positionals[0] ?? parsed.options.sandbox);
   const handler = {
     up: adapter.handleUp,
     down: adapter.handleDown,
+    pause: adapter.handlePause,
+    resume: adapter.handleResume,
     adopt: adapter.handleAdopt,
     status: adapter.handleStatus,
     push: adapter.handlePush,
@@ -381,7 +387,12 @@ async function invoke(parsed, adapter, alias) {
     list: adapter.handleList,
     doctor: adapter.handleDoctor,
   }[alias.command];
-  if (!handler) throw new Error(`Unknown command: ${parsed.command}`);
+  if (!handler) {
+    if (alias.command === "pause" || alias.command === "resume") {
+      throw new Error(`${alias.command} is not supported by the ${parsed.adapter} adapter; use down to delete the sandbox`);
+    }
+    throw new Error(`Unknown command: ${parsed.command}`);
+  }
   return handler(options);
 }
 

@@ -8,7 +8,7 @@ const SECRET_FIELD = /(?:secret|token|password|credential|authorization|cookie|h
 const ADAPTERS = new Set(["daytona", "cube-sandbox"]);
 const LEGACY_ADAPTERS = new Map([["cube", "cube-sandbox"]]);
 const CONFIG_FIELDS = new Set(["schemaVersion", "adapter", "active", "sandboxes"]);
-const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "template", "remoteWorkspace", "remoteHome", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
+const BINDING_FIELDS = new Set(["sandboxId", "snapshot", "template", "remoteWorkspace", "remoteHome", "timeoutMs", "workspaceOwner", "lifecycle", "sync", "name", "createdAt", "updatedAt", "adoptedAt", "projectIdentity", "legacyIdentity"]);
 const LIFECYCLE_FIELDS = new Set(["autoStopInterval", "autoArchiveInterval", "autoDeleteInterval", "ephemeral"]);
 const SYNC_FIELDS = new Set(["mode", "branch"]);
 const LEGACY_IDENTITY_FIELDS = new Set(["taskId", "projectIdentity"]);
@@ -155,6 +155,13 @@ function validateConfig(input) {
     const remoteWorkspace = binding.remoteWorkspace ?? binding.remoteWorkspacePath;
     if (typeof sandboxId !== "string" || !sandboxId.trim()) throw new Error(`Malformed sandbox config: binding ${name} requires sandboxId`);
     if (typeof remoteWorkspace !== "string" || !remoteWorkspace.trim()) throw new Error(`Malformed sandbox config: binding ${name} requires remoteWorkspace`);
+    if (binding.timeoutMs !== undefined && (!Number.isSafeInteger(binding.timeoutMs) || binding.timeoutMs <= 0)) throw new Error(`Malformed sandbox config: binding ${name} has invalid timeoutMs`);
+    if (binding.workspaceOwner !== undefined) {
+      const owner = binding.workspaceOwner;
+      if (!owner || typeof owner !== "object" || Array.isArray(owner) || Object.keys(owner).some((key) => !["uid", "gid"].includes(key)) || !Number.isSafeInteger(owner.uid) || !Number.isSafeInteger(owner.gid) || owner.uid <= 0 || owner.gid <= 0) {
+        throw new Error(`Malformed sandbox config: binding ${name} has invalid workspaceOwner (expected non-root positive uid/gid)`);
+      }
+    }
     if (binding.remoteHome !== undefined && (typeof binding.remoteHome !== "string" || !binding.remoteHome.startsWith("/") || binding.remoteHome === "/" || binding.remoteHome.split("/").includes(".."))) throw new Error(`Malformed sandbox config: binding ${name} has invalid remoteHome`);
     sandboxes[name] = { ...binding, sandboxId: sandboxId.trim(), remoteWorkspace: remoteWorkspace.trim() };
     delete sandboxes[name].id;

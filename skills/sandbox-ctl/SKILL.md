@@ -14,6 +14,7 @@ worktree, pass the root explicitly.
 
 ```sh
 sandbox-ctl up --template TEMPLATE_ID [--name NAME]  # Cube Sandbox
+sandbox-ctl up --template TEMPLATE_ID --workspace-owner UID:GID
 sandbox-ctl use NAME
 sandbox-ctl exec -- COMMAND...                 # stream human output
 sandbox-ctl exec --timeout 30m -- COMMAND...   # default foreground timeout: 5m
@@ -21,6 +22,8 @@ sandbox-ctl exec --json -- COMMAND...          # buffer one JSON object
 sandbox-ctl exec --artifacts ./artifacts -- COMMAND...
 sandbox-ctl push --mode bundle
 sandbox-ctl pull --output ./artifacts
+sandbox-ctl pause --sandbox NAME       # experimental Cube lifecycle
+sandbox-ctl resume --sandbox NAME      # experimental Cube lifecycle
 sandbox-ctl down --sandbox NAME
 sandbox-ctl --adapter cube-sandbox daemon status
 sandbox-ctl --adapter cube-sandbox config set
@@ -49,7 +52,15 @@ deletion after 60 continuously-stopped minutes, and archive after 10080 minutes.
 Cube Sandbox uses a per-user background daemon for command execution and a
 single idle timeout (30 minutes by default); inspect it with `daemon status`,
 start it explicitly with `daemon start`, and stop it with `daemon stop`.
-Deletion normally happens first; archive is useful with `--auto-delete -1`.
+`pause` and `resume` are experimental Cube Sandbox command interfaces, not a
+default workflow. The 2026-08-11 canary pause remained in `pausing` and then
+returned 408; native recovery followed by a fresh connection failed during
+fetch. Complete state recovery and a stable data plane were not established,
+so do not use these commands as an A/B prerequisite. The implementation
+requests `pause` with memory retention and invalidates cached connections
+before reconnecting, but does not promise successful lifecycle recovery.
+`down` always deletes the sandbox (it is not an alias for pause). Deletion
+normally happens first; archive is useful with `--auto-delete -1`.
 `up` warns permanent deletion loses data. `--auto-delete 0` deletes immediately
 after stop; `--ephemeral` means zero deletion delay.
 
@@ -61,6 +72,12 @@ non-force branch. Git push includes tracked/untracked WIP by default;
 exclusive; git push only). Sensitive paths rejected; local state preserved;
 unrelated/dirty remotes refused. Pull requires a clean remote.
 
+Cube workspace ownership is opt-in with `--workspace-owner UID:GID` (non-root
+positive integers such as `1000:1000`). The exact workspace root is provisioned
+and checked fail-closed; no recursive ownership repair is performed. Bundle/full
+pushes preserve that owner contract, while Git push is refused for owned
+workspaces. Daytona behavior is unchanged.
+
 Agents stay local. No MCP, Paseo runtime, remote agent bootstrap, host cleanup,
 or registry garbage collection. Cube's per-user daemon owns only the local SDK
 connection. Cube credentials may be kept in the per-user global config (mode
@@ -70,3 +87,9 @@ and [maintenance](references/maintenance.md).
 
 Legacy `create`, `task up`, and `project up` aliases are deprecated pointers to
 `up`; use the canonical command in new scripts.
+
+Cube Sandbox idle timeout remains a kill by default. Automatic idle pause is
+not advertised: e2b SDK 2.38.2 serializes `autoPause`/`autoResume` at the
+top level, while Cube v0.6 requires the nested lifecycle shape, so sending
+those flags would not enable the feature. Daytona does not support the
+`pause`/`resume` commands.

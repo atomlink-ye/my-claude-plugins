@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { materializeCubeSandboxEnv } from "./cube-sandbox-user-config.mjs";
 
 const PROTOCOL_VERSION = 1;
+const DEFAULT_SANDBOX_TIMEOUT_MS = 1_800_000;
 // Keep the daemon address stable across agent shells and login sessions.  In
 // particular, TMPDIR and XDG_RUNTIME_DIR can differ between the human shell
 // and a paseo-launched agent, which must still attach to the same per-user
@@ -199,7 +200,7 @@ export function createDaemonServer(options = {}) {
     }
   }
 
-  async function getConnection(sandboxId, remoteHome) {
+  async function getConnection(sandboxId, remoteHome, sandboxTimeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS) {
     if (!sandboxId) throw protocolError("sandboxId is required");
     let entry = connections.get(sandboxId);
     if (!entry) {
@@ -207,7 +208,10 @@ export function createDaemonServer(options = {}) {
         if (typeof createClient !== "function") throw protocolError("Cube Sandbox daemon has no client factory");
         client = await createClient();
       }
-      const sandbox = await client.connect(sandboxId);
+      const timeoutMs = Number.isSafeInteger(Number(sandboxTimeoutMs)) && Number(sandboxTimeoutMs) > 0
+        ? Number(sandboxTimeoutMs)
+        : DEFAULT_SANDBOX_TIMEOUT_MS;
+      const sandbox = await client.connect(sandboxId, { timeoutMs });
       const home = remoteHome || (typeof resolveRemoteHome === "function" ? await resolveRemoteHome(sandbox) : undefined);
       entry = { sandbox, remoteHome: home };
       connections.set(sandboxId, entry);
@@ -224,8 +228,16 @@ export function createDaemonServer(options = {}) {
       version: PROTOCOL_VERSION,
       ...(options.proxyUrl ? { proxyUrl: sanitizeUrl(options.proxyUrl) } : {}),
     };
+    if (request.op === "invalidate") {
+      if (!request.sandboxId) throw protocolError("sandboxId is required");
+      const entry = connections.get(request.sandboxId);
+      if (!entry) return { ok: true, invalidated: false, sandboxId: request.sandboxId };
+      connections.delete(request.sandboxId);
+      await closeResource(entry.sandbox);
+      return { ok: true, invalidated: true, sandboxId: request.sandboxId };
+    }
     if (request.op !== "exec") throw protocolError(`Unsupported daemon operation: ${request.op}`);
-    const { sandbox, remoteHome } = await getConnection(request.sandboxId, request.remoteHome);
+    const { sandbox, remoteHome } = await getConnection(request.sandboxId, request.remoteHome, request.sandboxTimeoutMs);
     const stdout = [];
     const stderr = [];
     const emit = (kind, chunk) => {
@@ -337,7 +349,12 @@ export function createDaemonClient(options = {}) {
       socket.on("close", () => { if (!settled) { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon closed before returning a result`, { accepted })); } });
     });
   }
-  return { socketPath, ping: () => request({ op: "ping" }), exec: (requestOptions) => request({ op: "exec", ...requestOptions }, requestOptions) };
+  return {
+    socketPath,
+    ping: () => request({ op: "ping" }),
+    invalidate: (sandboxId) => request({ op: "invalidate", sandboxId }),
+    exec: (requestOptions) => request({ op: "exec", ...requestOptions }, requestOptions),
+  };
 }
 
 function sameFingerprint(left, right) {
