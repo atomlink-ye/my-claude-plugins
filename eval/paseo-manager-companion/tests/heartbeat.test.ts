@@ -227,34 +227,26 @@ describe('durable heartbeat reconciliation', () => {
     service.close();
   });
 
-  it('does not publish an active rebuilt child watch when unsubscribe races a blocked create', async () => {
-    const observer = new DirectPayloadObserver();
-    observer.modes.set('missing-watch', 'missing');
+  it('retires a legacy child watch without rebuilding it when unsubscribe races reconciliation', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'companion-rebuild-race-'));
     const state = path.join(root, 'state.json'); await writeFile(state, JSON.stringify({ agents: {}, heartbeats: {} }));
     process.env.PASEO_SHIM_STATE = state; await chmod(shim, 0o755);
     const real = new PaseoCli(shim);
-    let enteredResolve!: () => void; const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
-    let releaseResolve!: () => void; const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
-    let blocked = false; let failDelete = true;
+    let failDelete = true;
     const cli = { run: async (args: string[], options?: any) => {
-      if (!blocked && args[0] === 'heartbeat' && args[1] === 'create') {
-        blocked = true; enteredResolve(); await release;
-      }
       if (failDelete && args[0] === 'heartbeat' && args[1] === 'delete') throw new Error('temporary delete failure');
       return real.run(args, options);
     } };
-    const service = new CompanionService(cli as any, new Store(root), observer);
+    const service = new CompanionService(cli as any, new Store(root));
     await service.init();
     await service.store.addManager('manager-1');
     await service.store.addReminder(reminder({ id: 'race-watch', daemonId: 'missing-watch', kind: 'child-watch', watchKind: 'child', subjectChildId: 'child-1' }));
-    const reconciling = service.reconcileReminders(); await entered;
-    const unsubscribing = service.unsubscribeChildWatch('manager-1', 'child-1', 'cancel during rebuild');
-    releaseResolve(); await Promise.all([reconciling, unsubscribing]);
-    expect(service.store.findReminder('race-watch')).toEqual(expect.objectContaining({ status: 'active', alive: 'unknown' }));
+    await Promise.all([service.reconcileReminders(), service.unsubscribeChildWatch('manager-1', 'child-1', 'cancel during retirement')]);
+    expect(service.store.findReminder('race-watch')?.status).toBe('active');
+    expect((await service.store.getReminders()).filter((r) => r.kind === 'child-watch' && r.daemonId).length).toBe(1);
     failDelete = false; await service.reconcileReminders();
-    expect(service.store.findReminder('race-watch')).toEqual(expect.objectContaining({ status: 'deleted' }));
-    expect(service.store.getReminders().filter((r) => r.subjectChildId === 'child-1' && r.status === 'active')).toHaveLength(0);
+    expect(service.store.findReminder('race-watch')).toEqual(expect.objectContaining({ status: 'active', alive: 'unknown' }));
+    expect(service.store.getReminders().filter((r) => r.subjectChildId === 'child-1' && r.status === 'active')).toHaveLength(1);
     service.close();
   });
 
@@ -303,9 +295,10 @@ describe('durable heartbeat reconciliation', () => {
     });
     await transient.reconcileOnce();
     expect(transient.store.findReminder('watch-local')!.daemonId).toBe('hb-transient');
-    expect(transient.store.getReminders()).toHaveLength(1);
+    expect(transient.store.getReminders().filter((r) => r.kind === 'child-watch' && !r.daemonId && r.status === 'active')).toHaveLength(1);
+    expect(transient.store.getReminders()).toHaveLength(2);
     expect(transient.store.getLedger()).toHaveLength(0);
-    expect((await transient.listChildren('manager-1')).children[0].hasLiveWakeupSource).toBe('unknown');
+    expect((await transient.listChildren('manager-1')).children[0].hasLiveWakeupSource).toBe(true);
     transient.close();
   });
 
@@ -321,28 +314,16 @@ describe('durable heartbeat reconciliation', () => {
     service.close();
   });
 
-  it('replaces a dead all-silent fallback but leaves a live fallback idempotent', async () => {
+  it('does not create a generic all-silent fallback during reconciliation', async () => {
     const deadObserver = new DirectPayloadObserver();
     const dead = await makeService(deadObserver, [reminder({ id: 'dead-fallback', daemonId: undefined, name: 'dead-fallback', kind: 'generic', status: 'dead', alive: false })], {
       'manager-1': { id: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
       'child-1': { id: 'child-1', Id: 'child-1', ParentAgentId: 'manager-1', Status: 'completed', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
     });
     await dead.service.reconcileOnce();
-    expect(dead.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active')).toHaveLength(1);
+    expect(dead.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active')).toHaveLength(0);
     dead.service.close();
 
-    const liveObserver = new DirectPayloadObserver();
-    liveObserver.schedules.set('hb-live-fallback', { id: 'hb-live-fallback', status: 'active', nextRun: '2026-08-11T01:00:00Z' });
-    const live = await makeService(liveObserver, [reminder({ id: 'live-fallback', daemonId: 'hb-live-fallback', name: 'live-fallback', kind: 'generic', status: 'active', alive: true })], {
-      'manager-1': { id: 'manager-1', Status: 'idle', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
-      'child-1': { id: 'child-1', Id: 'child-1', ParentAgentId: 'manager-1', Status: 'completed', UpdatedAt: '2026-08-11T00:00:00Z', Cwd: process.cwd() },
-    });
-    await live.service.reconcileOnce();
-    const firstIds = live.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active').map((item) => item.id);
-    await live.service.reconcileOnce();
-    expect(live.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active').map((item) => item.id)).toEqual(firstIds);
-    expect(live.service.store.getReminders().filter((item) => item.kind === 'generic' && item.status === 'active')).toHaveLength(1);
-    live.service.close();
   });
 
   it('resolves only git worktree/cwd paths and reports clean, dirty, or unknown', async () => {

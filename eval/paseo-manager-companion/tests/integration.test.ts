@@ -52,7 +52,8 @@ describe('HTTP integration through a paseo executable', () => {
     const childId = spawned.body.id;
     const children = await request(base, 'GET', '/children?agentId=manager-1');
     expect(children.status).toBe(200); expect(children.body.children.some((c: any) => c.id === childId)).toBe(true);
-    expect(children.body.children.some((c: any) => c.id === 'pre-start-child')).toBe(false);
+    expect(children.body.children.some((c: any) => c.id === 'pre-start-child')).toBe(true);
+    expect(children.body.children.find((c: any) => c.id === 'pre-start-child')?.tracked).toBe(false);
     expect(children.body.children.find((c: any) => c.id === childId)?.trackedSource).toBe('auto');
     expect((await request(base, 'GET', `/children/${childId}/briefing`)).status).toBe(200);
     const reminder = await request(base, 'POST', '/reminders', { agentId: 'manager-1', delaySeconds: 60, message: 'check' });
@@ -92,7 +93,7 @@ describe('HTTP integration through a paseo executable', () => {
     await writeFile(state, JSON.stringify(saved));
     await service.reconcileOnce();
     expect(service.listLedger('known-red', 'manager-1')).toHaveLength(1);
-    expect(service.store.getReminders().some((r) => r.status === 'active')).toBe(true);
+    expect(service.store.getReminders().some((r) => r.status === 'active' && r.kind === 'generic')).toBe(false);
     service.close();
   });
 
@@ -114,7 +115,7 @@ describe('HTTP integration through a paseo executable', () => {
     const watches = service.store.getReminders().filter((r) => r.subjectChildId === childId && r.status === 'active');
     expect(watches).toHaveLength(1);
     expect(watches[0]).toEqual(expect.objectContaining({ agentId: 'manager-1', subjectChildId: childId, kind: 'child-watch', watchKind: 'child' }));
-    expect(watches[0].prompt).toMatch(/query companion health|inspect the relevant child/i);
+    expect(watches[0].prompt).toMatch(/local-poll|reconciliation loop/i);
     expect(watches[0].prompt).toContain(childId);
     expect(watches[0].prompt).toContain('"cwd"');
     service.close();

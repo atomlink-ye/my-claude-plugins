@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then echo "source directory arguments are not accepted; set PORT" >&2; exit 2; fi
+: "${PORT:?PORT is required}"
+case "$PORT" in (*[!0-9]*|'') echo "PORT must be numeric" >&2; exit 2;; esac
+runtime=$(curl -fsS "http://127.0.0.1:${PORT}/self/runtime")
+data_dir=$(node -e 'const v=JSON.parse(process.argv[1]); if (!v.dataDir) process.exit(2); process.stdout.write(v.dataDir)' "$runtime")
+if [[ ! -d "$data_dir" ]]; then
+  echo "runtime dataDir is not a directory: $data_dir" >&2
+  exit 1
+fi
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+archive="${PWD}/companion-data-${stamp}.tar.gz"
+tar -czf "$archive" -C "$data_dir" .
+printf '%s\n' "$archive"

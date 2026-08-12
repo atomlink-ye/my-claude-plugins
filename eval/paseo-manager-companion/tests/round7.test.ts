@@ -101,7 +101,7 @@ describe('round7 registered wakeup sources', () => {
       expiresIn: '1h', status: 'active', alive: true, createdAt: new Date().toISOString(),
     });
     await service.reconcileOnce();
-    expect(result.store.findReminder('existing-watch')?.status).toBe('active');
+    expect(result.store.findReminder('existing-watch')?.status).toBe('deleted');
     waitLive = true;
     await service.reconcileOnce();
     expect(result.store.findReminder('existing-watch')?.status).toBe('deleted');

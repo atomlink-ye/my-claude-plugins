@@ -33,6 +33,7 @@ export async function createServer(service = new CompanionService(undefined, und
       const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
       const pathname = url.pathname;
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
+      if (method === 'GET' && pathname === '/self/runtime') { send(res, 200, service.runtime()); return; }
       if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats()); return; }
       if (method === 'GET' && pathname === '/wakeup-sources') {
         const agentId = required(url.searchParams.get('agentId'), 'agentId');

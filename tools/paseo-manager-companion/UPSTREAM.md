@@ -1,5 +1,18 @@
 # Upstream limitations
 
+## R9 delivery design
+
+Child-watch records are durable local-poll subscriptions with stable ids and no
+daemon heartbeat. The existing 180-second reconciliation pass is the poller;
+legacy child-watch daemons are retired best-effort and never rebuilt. Watchdog
+messages are emitted only for concrete transitions/anomalies (completion,
+wait-loss, no-wakeup, or stale state) and include the current snapshot facts.
+The unified rule is: **if the alert does not already contain what is wrong and
+what the recipient must check to determine whether it is actually wrong, send
+nothing.**
+
+统一判据原话：**报警内容必须已经包含哪里不对，需要收件人去查才知道对不对的一条不发。**
+
 The public Paseo CLI does not expose a push/event subscription for a parent when a
 child reaches an idle, error, or disconnected terminal state. This service therefore
 uses global `paseo ls -g --json` plus `paseo inspect --json` for visibility and a

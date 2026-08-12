@@ -38,6 +38,9 @@ export interface WatchdogSnapshot {
   childId: string;
   status: string;
   updatedAt?: string;
+  hasLivePaseoWait?: boolean | 'unknown';
+  gitDirty?: boolean | 'unknown';
+  latestCommit?: string;
   notified?: string[];
 }
 
@@ -73,10 +76,12 @@ export interface AgentInfo {
   cwd?: string;
   worktree?: string;
   parked: boolean;
+  tracked: boolean;
   hasLivePaseoWait: boolean | 'unknown';
   hasLiveCompanionWatch: boolean | 'unknown';
   hasLiveWakeupSource: boolean | 'unknown';
   gitDirty: boolean | 'unknown';
+  latestCommit?: string;
   createdAt?: string;
   trackedSource?: TrackedChildSource;
   trackedAddedAt?: string;
@@ -113,7 +118,12 @@ export interface FailedCandidate {
 
 export interface ChildrenResult {
   children: AgentInfo[];
+  /** Canonical companion-visible wakeup set; external daemon heartbeats are omitted unless registered. */
+  companionKnownWakeupSources: ReminderRecord[];
+  /** Backward-compatible alias of companionKnownWakeupSources. */
   selfWakeupSources: ReminderRecord[];
+  wakeupSourcesComplete: false;
+  wakeupSourcesNote: string;
   partial: boolean;
   failedCandidates: FailedCandidate[];
 }
