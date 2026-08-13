@@ -41,6 +41,8 @@ export interface ReminderRecord {
   runsCompleted?: number;
   delivery?: MessageDelivery;
   deliveryMessageId?: string;
+  /** Delivery audit for the most recent locally-fired run. */
+  deliveryStatus?: 'pending' | 'delivered';
   eventType?: string;
   criterion?: string;
 }
@@ -167,7 +169,7 @@ export interface MessageRecord {
   recoveryRunIds?: Record<string, string[]>;
 }
 
-/** Local index for one generation of a recipient's one-shot delivery schedule. */
+/** Local index for one generation of a recipient's delivery transport. */
 export interface MessageScheduleRecord {
   id: string;
   recipient: string;
@@ -178,6 +180,7 @@ export interface MessageScheduleRecord {
   status: 'pending' | 'active' | 'running' | 'failed' | 'completed' | 'deleted';
   transport?: 'heartbeat' | 'paseo-send';
   transportReason?: string;
+  cron?: string;
   createdAt: string;
   lastRunAt?: string;
 }

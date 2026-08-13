@@ -13,6 +13,8 @@ const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
 type MessageScheduleInspection = {
   state: 'live' | 'running' | 'success' | 'failed' | 'missing' | 'unknown';
   hasRun: boolean;
+  lastRunAt?: string;
+  endedAt?: string;
 };
 type HeartbeatRun = Record<string, any>;
 type HeartbeatInspection = {
@@ -72,7 +74,6 @@ export class CompanionService {
   /** Successful candidate-parent observations; child candidates are refreshed each listing. */
   private childParentCache = new Map<string, string>();
   private messageInFlight = new Map<string, Promise<void>>();
-  private idleMessageObservations = new Map<string, { status: string; updatedAt: string }>();
   private heartbeatReconcileInFlight?: Promise<void>;
   private parkReconcileInFlight = new Map<string, Promise<boolean>>();
   private readonly scheduleObserver?: ScheduleObserver;
@@ -948,7 +949,7 @@ export class CompanionService {
     void activeChildren;
   }
 
-  /** Persist before handing a coalesced batch to Paseo's turn-boundary queue. */
+  /** Persist before handing a coalesced batch to its selected Paseo transport. */
   async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; delivery?: MessageDelivery; mode?: MessageMode; ackDeadlineAt?: string; ackDeadlineSeconds?: number; replyTo?: string; promptKind?: MessageRecord['promptKind']; actionCommand?: string; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<Omit<MessageRecord, 'delivery'> & {
     schedule: null;
     delivery: { id: string; transport: 'paseo-send' | 'heartbeat'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
@@ -1093,18 +1094,29 @@ export class CompanionService {
         ? await this.scheduleObserver.scheduleLogs(schedule.daemonId)
         : (await this.cli.run(['schedule', 'logs', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 })).value;
       const logsRecord = unwrapPayload(logsValue);
-      if (!Array.isArray(logsValue) && !Array.isArray(logsRecord.logs) && !Array.isArray(logsRecord.runs) && !Array.isArray(logsRecord.entries)) return { state: 'unknown', hasRun: false };
-      const logs = Array.isArray(logsValue) ? logsValue : (logsRecord.logs ?? logsRecord.runs ?? logsRecord.entries ?? []);
-      const latest = Array.isArray(logs) && logs.length ? asRecord(logs[logs.length - 1]) : {};
-      const hasRun = Array.isArray(logs) && logs.length > 0;
+      const rawLogs = Array.isArray(logsValue)
+        ? logsValue
+        : (logsRecord.logs ?? logsRecord.runs ?? logsRecord.entries ?? logsRecord.data);
+      if (!Array.isArray(rawLogs)) return { state: 'unknown', hasRun: false };
+      const logs = rawLogs.map(asRecord);
+      const latest = logs.reduce<Record<string, any>>((current, candidate) => {
+        const currentAt = Date.parse(String(current.endedAt ?? current.ended_at ?? current.startedAt ?? current.started_at ?? current.scheduledFor ?? current.scheduled_for ?? ''));
+        const candidateAt = Date.parse(String(candidate.endedAt ?? candidate.ended_at ?? candidate.startedAt ?? candidate.started_at ?? candidate.scheduledFor ?? candidate.scheduled_for ?? ''));
+        return Number.isFinite(candidateAt) && (!Number.isFinite(currentAt) || candidateAt >= currentAt) ? candidate : current;
+      }, {});
+      const hasRun = logs.length > 0;
       const runStatus = lowerStatus(latest.status ?? latest.state ?? latest.outcome ?? latest.result);
       const scheduleStatus = lowerStatus(inspected.status ?? inspected.Status ?? inspected.state ?? inspected.State);
       // A terminal run log is authoritative over the wrapper schedule status:
-      // Paseo may report a max-runs schedule as completed after a busy failure.
+      // Paseo may report a completed schedule after a busy failure.
       if (runStatus) {
         if (/running|in.?progress|started/.test(runStatus)) return { state: 'running', hasRun };
         if (/fail|error|timeout|busy/.test(runStatus)) return { state: 'failed', hasRun };
-        if (/success|succeed|complete|ok/.test(runStatus)) return { state: 'success', hasRun };
+        if (/success|succeed|complete|ok/.test(runStatus)) {
+          const endedAt = String(latest.endedAt ?? latest.ended_at ?? '') || undefined;
+          const lastRunAt = String(latest.lastRunAt ?? latest.last_run_at ?? inspected.lastRunAt ?? inspected.last_run_at ?? '') || undefined;
+          return { state: 'success', hasRun, ...(endedAt ? { endedAt } : {}), ...((endedAt ?? lastRunAt) ? { lastRunAt: endedAt ?? lastRunAt } : {}) };
+        }
         return { state: 'unknown', hasRun };
       }
       // A completed wrapper without a terminal successful/failed run log is
@@ -1118,10 +1130,10 @@ export class CompanionService {
     }
   }
 
-  /** Retire schedules written by releases that used heartbeat delivery. */
+  /** Retire pre-redesign non-heartbeat schedules that were left in flight. */
   private async migrateLegacyMessageSchedules(): Promise<void> {
     for (const schedule of this.store.getMessageSchedules()) {
-      if (schedule.transport === 'heartbeat' || !['pending', 'active', 'running'].includes(schedule.status)) continue;
+      if (schedule.transport !== undefined || !['pending', 'active', 'running'].includes(schedule.status)) continue;
       await this.migrateLegacyMessageSchedule(schedule);
     }
   }
@@ -1130,10 +1142,14 @@ export class CompanionService {
     for (const schedule of this.store.getMessageSchedules().filter((item) => item.transport === 'heartbeat' && ['active', 'running'].includes(item.status))) {
       const observed = await this.inspectMessageSchedule(schedule);
       if (observed.state === 'success') {
-        const deliveredAt = new Date().toISOString();
+        const deliveredAt = observed.lastRunAt ?? new Date().toISOString();
         await this.store.updateMessageSchedule(schedule.id, { status: 'completed', lastRunAt: deliveredAt });
         try { await this.finalizeAcceptedMessageSchedule({ ...schedule, status: 'completed', lastRunAt: deliveredAt }); } catch { /* retry local cleanup later */ }
-      } else if (observed.state === 'failed' || observed.state === 'missing') {
+        try {
+          await this.cli.run(['heartbeat', 'delete', schedule.daemonId!, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
+          await this.store.updateMessageSchedule(schedule.id, { daemonId: undefined });
+        } catch { /* delivered state is authoritative; retry retirement next tick */ }
+      } else if (observed.state === 'missing') {
         await this.store.updateMessageSchedule(schedule.id, { status: 'failed' });
         console.warn(JSON.stringify({ type: 'message-delivery-terminal', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'heartbeat', reason: observed.state }));
       }
@@ -1177,9 +1193,21 @@ export class CompanionService {
         }
       }
     }
+    for (const reminder of this.store.getReminders().filter((item) => item.deliveryMessageId && schedule.batchIds.includes(item.deliveryMessageId))) {
+      await this.store.updateReminder(reminder.id, { lastDeliveredAt: deliveredAt, deliveryStatus: 'delivered' });
+    }
   }
 
-  private async createMessageSchedule(recipient: string, batch: MessageRecord[]): Promise<MessageScheduleRecord | undefined> {
+  private async retireCompletedHeartbeatSchedules(): Promise<void> {
+    for (const schedule of this.store.getMessageSchedules().filter((item) => item.transport === 'heartbeat' && item.status === 'completed' && item.daemonId)) {
+      try {
+        await this.cli.run(['heartbeat', 'delete', schedule.daemonId!, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
+        await this.store.updateMessageSchedule(schedule.id, { daemonId: undefined });
+      } catch { /* retry before the next cron tick */ }
+    }
+  }
+
+  private async createMessageSchedule(recipient: string, batch: MessageRecord[], transport: 'heartbeat' | 'paseo-send'): Promise<MessageScheduleRecord | undefined> {
     const generation = randomUUID();
     const local: MessageScheduleRecord = {
       id: randomUUID(),
@@ -1188,10 +1216,28 @@ export class CompanionService {
       batchIds: batch.map((message) => message.id),
       prompt: this.messagePrompt(recipient, batch),
       status: 'pending',
-      transport: 'paseo-send',
+      transport,
+      ...(transport === 'heartbeat' ? { cron: '* * * * *' } : {}),
       createdAt: new Date().toISOString(),
     };
     await this.store.addMessageSchedule(local);
+    if (transport === 'heartbeat') {
+      try {
+        const value = asRecord((await this.cli.run([
+          'heartbeat', 'create', local.prompt, '--cron', local.cron!, '--expires-in', '30m',
+          '--name', `paseo-reminder-message-${generation.slice(0, 8)}`, '--timezone', 'UTC', '--json',
+        ], { agentId: recipient })).value);
+        const daemonId = String(value.id ?? value.heartbeatId ?? value.scheduleId ?? '');
+        if (!daemonId) throw new Error('heartbeat create returned no id');
+        await this.store.updateMessageSchedule(local.id, { daemonId, status: 'active', lastRunAt: value.lastRunAt });
+        console.log(JSON.stringify({ type: 'message-delivery-armed', recipient, generation, batchIds: local.batchIds, transport: 'heartbeat', daemonId }));
+        return this.store.getMessageSchedules().find((item) => item.id === local.id);
+      } catch (error) {
+        await this.store.updateMessageSchedule(local.id, { status: 'failed' });
+        console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'heartbeat', error: error instanceof Error ? error.message : String(error) }));
+        return undefined;
+      }
+    }
     let acceptedAt: string;
     try {
       const senderAgentId = batch[0]?.from;
@@ -1239,16 +1285,10 @@ export class CompanionService {
     const pending = queued.filter((message) => !accepted.has(message.id));
     if (!pending.length) return;
     const interrupt = pending.filter((message) => (message.delivery ?? (message.urgency === 'urgent' ? 'interrupt' : 'on-idle')) === 'interrupt');
-    if (interrupt.length) await this.createMessageSchedule(recipient, this.sortMessages(interrupt));
+    if (interrupt.length) await this.createMessageSchedule(recipient, this.sortMessages(interrupt), 'paseo-send');
     const idle = pending.filter((message) => !interrupt.includes(message));
     if (!idle.length) return;
-    let observed: { status: string; updatedAt: string; available: boolean };
-    try { observed = await this.observeAgentIdle(recipient); } catch { return; }
-    const { status, updatedAt } = observed;
-    const prior = this.idleMessageObservations.get(recipient);
-    const stable = observed.available && prior?.status === status && prior.updatedAt === updatedAt;
-    this.idleMessageObservations.set(recipient, { status, updatedAt });
-    if (stable) await this.createMessageSchedule(recipient, this.sortMessages(idle));
+    await this.createMessageSchedule(recipient, this.sortMessages(idle), 'heartbeat');
   }
 
   private async completeRecovery(message: MessageRecord): Promise<void> {
@@ -1296,6 +1336,7 @@ export class CompanionService {
       if (Date.parse(message.ackDeadlineAt) <= now) await this.store.updateMessage(message.id, { status: 'unacknowledged', unacknowledgedAt: message.unacknowledgedAt ?? new Date(now).toISOString() });
     }
     await this.reconcileHeartbeatMessageSchedules();
+    await this.retireCompletedHeartbeatSchedules();
     if (this.store.isChildWatchOptOutStateCorrupt()) {
       const pairs = new Map<string, string[]>();
       for (const reminder of this.store.getReminders()) {
@@ -1477,7 +1518,7 @@ export class CompanionService {
     const body = deliveryPrompt.replace(/\nCancel this reminder with: .*$/, '');
     const sent = await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: reminder.delivery ?? 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
     const runsCompleted = (reminder.runsCompleted ?? 0) + 1;
-    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
+    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, deliveryStatus: 'pending', prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
     if (reminder.mode === 'repeat' || reminder.everySeconds) {
       const seconds = reminder.everySeconds ?? 0;
       if (reminder.maxRuns !== undefined && runsCompleted >= reminder.maxRuns) await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });

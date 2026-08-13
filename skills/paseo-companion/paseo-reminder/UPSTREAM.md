@@ -113,3 +113,30 @@ paseo schedule inspect <id>       # => Schedule not found / DaemonRpcError
 
 **顺带**：`DELETE /reminders/<id>` 对 4 条已过期的记录返回 500 `schedule_request_failed`
 （inspect 找不到就整个失败），对使用者表现为"删不掉"。删一条已经不存在的排程应当是幂等成功。
+
+---
+
+## Observed gap 4 · heartbeat delivery is idle-only but transcript-invisible (2026-08-12)
+
+Empirical testing established two distinct public transports. `paseo send
+--no-wait` reaches a running recipient and appears as a complete prompt turn in
+`paseo logs`; paseo-reminder uses it for `delivery:"interrupt"`. A repeating
+heartbeat skips ticks while the recipient is busy and runs on a later tick after
+idle; paseo-reminder uses it for default `delivery:"on-idle"`.
+
+Heartbeat prompt content is not rendered in `paseo logs`. Its `lastRunAt`, read
+through `heartbeat update <id> --cron <unchanged>`, is therefore the only public
+delivery evidence. The companion records that timestamp in its message/reminder
+audit and retires the repeating heartbeat after confirmation. Busy skipped ticks
+leave `lastRunAt` empty and must not be treated as delivery or failure.
+
+The public CLI surface was checked through `paseo --help` and the help for
+`send`, `chat post/read/wait`, `agent update`, `inspect`, `logs`, `schedule`,
+`heartbeat`, and `hooks`. No passive/background notification primitive is
+exposed. Chat persists messages in a separate room, but the recipient must
+explicitly run `chat read` or `chat wait`; posting does not surface content in
+an agent session. Agent metadata supports only name/labels and likewise requires
+explicit `inspect` polling. Hooks record activity, schedules/heartbeats execute
+prompts, and logs/inspect are observation-only. There is still no passive channel
+that is both transcript-visible and non-interrupting; heartbeat is the accepted
+idle-only transport with the audit limitation above.

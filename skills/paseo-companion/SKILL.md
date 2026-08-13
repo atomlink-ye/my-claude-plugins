@@ -31,13 +31,20 @@ curl -sS -X POST http://127.0.0.1:8787/messages \
   -d '{"to":"worker-id","from":"sender-agent-id","body":"Please review the diff","delivery":"on-idle","mode":"ack"}'
 ```
 
-The queue persists before delivery. Default `delivery:"on-idle"` polls only a
-recipient with pending messages and requires two unchanged idle/waiting
-observations about 15 seconds apart before coalescing a `paseo send --no-wait`.
-`delivery:"interrupt"` sends immediately. Default `mode:"notify"` clears after
+The queue persists before delivery. Default `delivery:"on-idle"` arms a
+repeating one-minute heartbeat for the coalesced batch. Busy ticks are silently
+skipped and the next tick retries. `delivery:"interrupt"` sends immediately via
+`paseo send --no-wait`. Default `mode:"notify"` clears after
 accepted delivery; use `mode:"ack"` for DELETE acknowledgement, or `mode:"reply"`
 with `replyTo` to answer and resolve a parent. Acceptance is daemon receipt, not
 proof the recipient processed the prompt.
+
+Delivery controls both timing and the Paseo transport. `interrupt` genuinely
+interrupts a busy recipient and its complete prompt is visible in `paseo logs`.
+`on-idle` uses a heartbeat that runs only once the recipient is idle; its prompt
+is not visible in `paseo logs`. Confirm on-idle delivery from `GET /messages`
+(ack/reply modes) or `GET /reminders/:id`, whose audit is updated only after the
+heartbeat reports `lastRunAt`. See `paseo-reminder/UPSTREAM.md`.
 
 Automatic heartbeat-recovery snapshots and ordinary worker messages use the same
 turn-boundary send transport. `DELETE /messages/:id` acknowledges/removes either a
@@ -89,8 +96,8 @@ Companion reminders separate one-shot and repeating intent. `mode:"once"` accept
 `delaySeconds` or an absolute `targetAt`; `mode:"repeat"` requires an explicit
 `everySeconds` and may set `maxRuns`. Both deliver through the companion queue.
 The target is the earliest eligible delivery time, not a deadline: default
-on-idle delivery still waits for two stable idle observations about 15 seconds
-apart, so a busy recipient receives the reminder later. Responses expose
+on-idle delivery still waits for an idle heartbeat tick, so a busy recipient
+receives the reminder later. Responses expose
 `schedulingKind` (`once`, `repeat`, `cron`, or `in-process`); a healthy
 in-process watch can intentionally have no `nextRunAt`. `agentId` may be in the
 body or query, and caller-supplied reminder IDs are rejected.
@@ -112,7 +119,7 @@ Choose the primitive by intent:
 |---|---|
 | Deliberate immediate follow-up and interruption is safe | `paseo send` |
 | Repeating/time-based nudge with explicit acknowledgement | Companion `POST /reminders` |
-| Durable asynchronous worker content, coalesced without interruption | Companion `POST /messages` |
+| Durable asynchronous worker content, coalesced and delivered on an idle heartbeat tick | Companion `POST /messages` |
 
 ```bash
 paseo <command> [options]

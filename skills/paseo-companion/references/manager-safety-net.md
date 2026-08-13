@@ -27,7 +27,7 @@ send their identity in each identity-bearing request. From a loaded skill, run:
 | `paseo run -d ...` then `PUT /children/:childId?agentId=` | Create a child through the authoritative Paseo CLI, then explicitly track the manager/child pair and ensure its watch. Reconciliation still discovers parseable children spawned by raw `paseo run`. |
 | `POST /reminders` | `agentId` may be in the body or query. `mode:"once"` accepts `delaySeconds` or `targetAt`; `mode:"repeat"` requires `everySeconds` and optionally `maxRuns`. Caller-supplied IDs are rejected. |
 | `GET /reminders?agentId=`, `GET /reminders/:id` | Observe persisted reminder status and timing metadata, optionally scoped to one agent. |
-| `POST /messages` `{to, from, body, delivery?, mode?, replyTo?}` | `on-idle` waits for two stable idle/waiting polls; `interrupt` sends now. `notify` clears, `ack` remains observable, and `reply` resolves its parent. |
+| `POST /messages` `{to, from, body, delivery?, mode?, replyTo?}` | `on-idle` arms a repeating heartbeat that fires when idle; `interrupt` sends now. `notify` clears, `ack` remains observable, and `reply` resolves its parent. |
 | `GET /messages?to=&from=&status=&replyTo=` | Observe filtered pending, delivered, unacknowledged, acknowledged, or answered records. |
 | `DELETE /messages/:id` `{reason}` | Cancel a pending record or transition a delivered ack-mode record to terminal `acknowledged`. Prior acknowledgements and normally auto-cleared notify deliveries are idempotent while bounded audit remains; truly unknown/pruned IDs are 404. |
 | `PUT /children/:childId?agentId=` | Explicitly track a manager/child pair, clear opt-out, and ensure its watch. The `/watch` alias remains compatible. |
@@ -80,6 +80,13 @@ Bodies and attributes are escaped so delivered content cannot forge structural
 tags. Commands in `<ack>` remain copy-pasteable; ordinary `mode:"notify"`
 messages omit `<ack>` because successful delivery clears them automatically.
 
+`delivery:"interrupt"` uses `paseo send --no-wait`, interrupts a busy recipient,
+and is fully visible in `paseo logs`. `delivery:"on-idle"` uses a repeating
+heartbeat: busy cron ticks are silently skipped and a later tick retries after
+idle. Heartbeat-delivered content is not visible in `paseo logs`; confirm it via
+`GET /messages` or `GET /reminders/:id` delivery state instead. See
+`paseo-reminder/UPSTREAM.md`.
+
 Track or opt out a child explicitly:
 
 ```sh
@@ -89,12 +96,12 @@ curl -X DELETE 'http://127.0.0.1:8787/children/child-id?agentId=manager-id' -H '
 
 Decision guide: use interrupt delivery for deliberate immediate steering,
 `/reminders` for time-based self-wakeup, and on-idle delivery for durable content
-that should not interrupt a running worker.
+that should wait for an idle heartbeat tick.
 
 Reminder `delaySeconds`/`targetAt` is the earliest eligible delivery time, not a
-deadline. Default on-idle delivery still requires two stable idle observations
-about 15 seconds apart, so delivery is later if the recipient is busy at the
-target. `schedulingKind` distinguishes `once`, `repeat`, daemon `cron`, and
+deadline. Default on-idle delivery waits for an idle heartbeat tick, so delivery
+is later if the recipient is busy at the target. `schedulingKind` distinguishes
+`once`, `repeat`, daemon `cron`, and
 intentional `in-process` records; the latter can be healthy without `nextRunAt`.
 
 Heartbeat-recovery snapshots use the same turn-boundary send transport and are
@@ -111,16 +118,16 @@ Read `UPSTREAM.md` at the repo root before treating any of these as solved:
   The reconciliation loop inside the service polls at a period (minutes), so the
   real guarantee is "detected within N minutes," not "detected immediately." Say
   this out loud when using it — don't let it read as a stronger guarantee than it is.
-- **Reminder and on-idle delivery are poll bounded**, not exact-second. The fast
-  observer runs every 15 seconds; child reconciliation remains slower.
+- **Reminder and on-idle delivery are heartbeat bounded**, not exact-second.
+  Busy ticks are skipped; delivery waits for a later cron tick after idle.
 - Service-local records (which heartbeat id maps to which reminder) can drift from
   daemon truth if the service's storage is lost between restarts; it self-heals via
   a `heartbeat update <id> --cron <unchanged>` probe at startup, but a total data
   loss produces harmless orphan heartbeats (extra noise), not silent failure.
 
-For messages, the authoritative handoff is the `paseo send --no-wait` response. In
-the installed CLI this still awaits `sendAgentMessage`; `--no-wait` only skips
-`waitForFinish`, so acceptance is daemon receipt rather than recipient processing.
-Missing, false, or failed status leaves the batch pending for 15-second retry.
+For interrupt messages, the authoritative handoff is the `paseo send --no-wait`
+response. For on-idle messages, only a heartbeat `lastRunAt` later than the local
+generation's creation time marks delivery; the daemon then retires that repeating
+heartbeat. A missing/failed creation leaves the batch pending for retry.
 Unmatched routes return the generated route manifest instead of relying on a
 stale hand-count in prose.
