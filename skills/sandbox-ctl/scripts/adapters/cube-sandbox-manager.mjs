@@ -166,7 +166,7 @@ if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/nu
     echo "workspace is non-empty and owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
     exit 78
   fi
-  mismatch=$(find "$target" -mindepth 1 \( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \) -print -quit 2>/dev/null || true)
+  mismatch=$(find "$target" -mindepth 1 \\( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \\) -print -quit 2>/dev/null || true)
   if [ -n "$mismatch" ]; then
     actual=$(stat -c '%u:%g' "$mismatch" 2>/dev/null || stat -f '%u:%g' "$mismatch" 2>/dev/null || true)
     echo "workspace entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
