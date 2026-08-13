@@ -239,6 +239,7 @@ async function invokeRun(parsed, adapter) {
   }
   const directory = parsed.options.directory ?? adapterParsed.options.directory ?? process.cwd();
   const bindingName = makeRunTaskId();
+  if (adapterParsed.options.node !== undefined) return makeControlFailure({ directory, bindingName, error: "--node is only supported with up", adapter: parsed.adapter });
   const selector = parsed.options.sandbox ?? parsed.options.sandboxSelector ?? adapterParsed.options.sandbox ?? adapterParsed.options["sandbox-id"] ?? adapterParsed.options["sandbox-name"];
   const transferMode = parsed.options.mode ?? adapterParsed.options.mode;
   const includeSensitive = Boolean(parsed.options.includeSensitive ?? adapterParsed.options.includeSensitive ?? adapterParsed.options["include-sensitive"]);

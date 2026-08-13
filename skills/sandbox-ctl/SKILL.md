@@ -14,6 +14,7 @@ worktree, pass the root explicitly.
 
 ```sh
 sandbox-ctl up --template TEMPLATE_ID [--name NAME]  # Cube Sandbox
+sandbox-ctl --adapter cube-sandbox up --node NODE_OR_ALIAS --template TEMPLATE_ID
 sandbox-ctl up --template TEMPLATE_ID --workspace-owner UID:GID
 sandbox-ctl use NAME
 sandbox-ctl exec -- COMMAND...                 # stream human output
@@ -30,6 +31,16 @@ sandbox-ctl --adapter cube-sandbox config set
 sandbox-ctl --adapter cube-sandbox config status
 sandbox-ctl --adapter cube-sandbox config path
 ```
+
+`cube-sandbox up --node` is the explicit self-hosted scheduler path. It SSHes
+to the configured Cube control host, renders the template, extracts only its
+`api_request`, and runs one `multirun` targeted at the resolved node before
+connecting locally and writing the binding/workspace. Success requires
+`code:200`, `totalRunSuccCnt:1`, `totalRunErr:0`, and one non-empty sandbox ID;
+process exit code alone is not sufficient. It requires scheduler settings in
+the user config and does not change the normal SDK `up` path. Node mode is
+new-binding-only: if the selected project already has a sandbox binding, use
+`--name` for a separate binding or omit `--node` to reuse it.
 
 `--directory DIR` selects a project; `--sandbox NAME_OR_ID` selects a binding
 without changing it. Bare `adopt` requires `--remote-path PATH` unless the

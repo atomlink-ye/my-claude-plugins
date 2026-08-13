@@ -11,6 +11,22 @@ The default is `~/Library/Application Support/sandbox-ctl/config.json` on macOS,
 `$XDG_CONFIG_HOME/sandbox-ctl/config.json` when set, and `~/.config/sandbox-ctl/config.json`
 otherwise; `SANDBOX_CTL_USER_CONFIG` overrides it.
 
+For a fixed scheduler node, configure the separate SSH fallback with
+`CUBE_SCHEDULER_SSH_HOST`, `CUBE_SCHEDULER_CLI_PATH`, and optionally
+`CUBE_SCHEDULER_NODES='{"daytona":"10.77.0.1"}'`, then run
+`sandbox-ctl --adapter cube-sandbox config set`. These values are stored under
+`adapters.cube-sandbox.scheduler` as `sshHost`, `cliPath`, and `nodes`.
+`up --node NODE_OR_ALIAS --template TEMPLATE_ID` resolves a configured alias
+or accepts a bare IP, then uses argv-based local `ssh` with a remote temporary
+directory. The render output is not persisted in the project or printed:
+only `.api_request` is passed to
+`multirun --norm --printall --fail_exit --async_retry_max 0 --hostid ...`.
+The command fails closed unless the strict success counters and non-empty
+sandbox ID are all present, and it does not create a binding on failure.
+`--node` is Cube `up`-only; Daytona and other commands reject it.
+Node mode is new-binding-only when the selected project already has a
+binding; pass a distinct `--name` to create a separate binding explicitly.
+
 Each field resolves independently as `CUBE_*` environment value, then global
 config, then the corresponding `E2B_*` value. Stored config files are mode 0600
 inside a mode 0700 directory and are written atomically. A configured `caPath`
