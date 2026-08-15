@@ -7,9 +7,15 @@ operator API endpoint. The control plane needs an API endpoint and API key from
 `sandbox-ctl --adapter cube-sandbox config set`; project
 `.sandbox-ctl/config.json` remains secret-free. `config status` reports only
 booleans, sanitized URLs, and the config path. `config path` prints the path.
-The default is `~/Library/Application Support/sandbox-ctl/config.json` on macOS,
-`$XDG_CONFIG_HOME/sandbox-ctl/config.json` when set, and `~/.config/sandbox-ctl/config.json`
-otherwise; `SANDBOX_CTL_USER_CONFIG` overrides it.
+`SANDBOX_CTL_USER_CONFIG` takes precedence, followed by
+`$XDG_CONFIG_HOME/sandbox-ctl/config.json`. Otherwise, the real home directory
+is resolved from `os.userInfo().homedir` (falling back to `os.homedir()`), and an
+existing `<realHome>/.sandbox-ctl/config.json` takes precedence over the legacy
+macOS `<realHome>/Library/Application Support/sandbox-ctl/config.json` or
+other-platform `<realHome>/.config/sandbox-ctl/config.json`. `HOME` is not used
+for this default resolution. If neither default file exists, the modern path
+is used for new writes and status/path reporting; an existing legacy config is
+preserved. Explicit overrides remain unchanged.
 
 For a fixed scheduler node, configure the separate SSH fallback with
 `CUBE_SCHEDULER_SSH_HOST`, `CUBE_SCHEDULER_CLI_PATH`, and optionally

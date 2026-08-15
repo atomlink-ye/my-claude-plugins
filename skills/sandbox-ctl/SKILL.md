@@ -103,7 +103,14 @@ is attempted. Cube `list` exposes each item's API-provided `id`, `name`, `state`
 Agents stay local. No MCP, Paseo runtime, remote agent bootstrap, host cleanup,
 or registry garbage collection. Cube's per-user daemon owns only the local SDK
 connection. Cube credentials may be kept in the per-user global config (mode
-0600); project `.sandbox-ctl/config.json` remains secret-free. See
+0600); project `.sandbox-ctl/config.json` remains secret-free. The user config
+path honors `SANDBOX_CTL_USER_CONFIG`, then `XDG_CONFIG_HOME`; otherwise it uses
+`<realHome>/.sandbox-ctl/config.json` when that file exists and falls back to
+the legacy macOS or other-platform default when that file exists. If neither
+file exists, the modern path is the new default. `<realHome>` comes from
+`os.userInfo().homedir`, falling back to `os.homedir()`; `HOME` is not used for
+default resolution. New writes use the modern path when no existing config
+needs to be preserved. See
 [Daytona](references/daytona.md), [Cube Sandbox](references/cube-sandbox.md),
 and [maintenance](references/maintenance.md).
 

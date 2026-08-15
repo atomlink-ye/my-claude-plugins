@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -25,11 +25,28 @@ const ENV_FIELDS = {
 };
 let appliedCaPath;
 
-function configuredPath(env = process.env, platform = process.platform, home = os.homedir()) {
+function resolveHome(home) {
+  if (home !== undefined) return home;
+  try { return os.userInfo().homedir || os.homedir(); }
+  catch { return os.homedir(); }
+}
+
+function configuredPaths(env = process.env, platform = process.platform, home) {
+  const realHome = resolveHome(home);
+  const modern = path.join(realHome, ".sandbox-ctl", "config.json");
+  const legacy = platform === "darwin"
+    ? path.join(realHome, "Library", "Application Support", "sandbox-ctl", "config.json")
+    : path.join(realHome, ".config", "sandbox-ctl", "config.json");
+  return { modern, legacy };
+}
+
+function configuredPath(env = process.env, platform = process.platform, home) {
   if (env.SANDBOX_CTL_USER_CONFIG) return path.resolve(String(env.SANDBOX_CTL_USER_CONFIG));
   if (env.XDG_CONFIG_HOME) return path.join(path.resolve(String(env.XDG_CONFIG_HOME)), "sandbox-ctl", "config.json");
-  if (platform === "darwin") return path.join(home, "Library", "Application Support", "sandbox-ctl", "config.json");
-  return path.join(home, ".config", "sandbox-ctl", "config.json");
+  const { modern, legacy } = configuredPaths(env, platform, home);
+  if (existsSync(modern)) return modern;
+  if (existsSync(legacy)) return legacy;
+  return home !== undefined ? legacy : modern;
 }
 
 function assertNoSymlink(filePath) {
@@ -119,7 +136,7 @@ function validateConfig(input) {
 
 function readCubeSandboxUserConfig(options = {}) {
   if (typeof options === "string") options = { path: options };
-  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   assertNoSymlink(filePath);
   try {
     const directoryInfo = lstatSync(path.dirname(filePath));
@@ -140,7 +157,7 @@ function readCubeSandboxUserConfig(options = {}) {
 
 function writeCubeSandboxUserConfig(config, options = {}) {
   if (typeof options === "string") options = { path: options };
-  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   const normalized = validateConfig(config);
   const directory = path.dirname(filePath);
   assertNoSymlink(directory);
@@ -220,7 +237,7 @@ function sanitizeUrl(value) {
 }
 
 function configStatus(options = {}) {
-  const pathValue = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const pathValue = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   const loaded = readCubeSandboxUserConfig({ ...options, path: pathValue });
   const resolved = resolveCubeSandboxValues({ env: options.env ?? process.env, config: loaded });
   const configured = {};

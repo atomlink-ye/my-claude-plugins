@@ -327,12 +327,13 @@ function buildUserConfigFromEnvironment(options = {}) {
 
 async function handleConfig(options = {}) {
   const command = options.configCommand ?? options.command ?? "status";
-  const configPathValue = configuredPath(options.env ?? process.env);
+  const configOptions = { env: options.env ?? process.env, platform: options.platform, home: options.home };
+  const configPathValue = configuredPath(configOptions.env, configOptions.platform ?? process.platform, configOptions.home);
   if (command === "path") return { ok: true, path: configPathValue };
-  if (command === "status") return { ok: true, ...configStatus({ env: options.env ?? process.env }) };
+  if (command === "status") return { ok: true, ...configStatus(configOptions) };
   if (command !== "set") throw new Error("Usage: sandbox-ctl --adapter cube-sandbox config set|status|path");
   const config = buildUserConfigFromEnvironment(options);
-  const filePath = writeCubeSandboxUserConfig(config, { env: options.env ?? process.env });
+  const filePath = writeCubeSandboxUserConfig(config, configOptions);
   const fields = [];
   for (const [group, values] of Object.entries(config.adapters["cube-sandbox"])) for (const field of Object.keys(values)) fields.push(`${group}.${field}`);
   return { ok: true, path: filePath, configuredFields: fields };
