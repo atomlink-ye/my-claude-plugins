@@ -43,8 +43,11 @@ new-binding-only: if the selected project already has a sandbox binding, use
 `--name` for a separate binding or omit `--node` to reuse it.
 
 `--directory DIR` selects a project; `--sandbox NAME_OR_ID` selects a binding
-without changing it. Bare `adopt` requires `--remote-path PATH` unless the
-binding already records a workspace. `up --name` creates/reuses; `use NAME`
+without changing it. `adopt --remote-path PATH [--timeout DURATION]` adopts a
+Cube sandbox and applies its lifecycle timeout before persisting the binding;
+the default is 30 minutes when omitted, and adoption fails if the connected
+sandbox does not expose `setTimeout`. Bare `adopt` requires `--remote-path PATH`
+unless the binding already records a workspace. `up --name` creates/reuses; `use NAME`
 selects. A new Cube Sandbox binding requires `--template`; reuse reads the
 stored template. `--snapshot` is Daytona-only. Adapter priority is explicit flag,
 exact config, then Cube Sandbox. Use `cube-sandbox`; `cube` is deprecated.
@@ -94,7 +97,8 @@ Daemon or proxy transport failures return control exit 125 and an actionable
 diagnostic on stderr; restart the local path with `sandbox-ctl daemon stop &&
 sandbox-ctl daemon start`, then retry. Workspace-owner contract failures are
 fail-closed and identify the ownership mismatch; no recursive ownership repair
-is attempted. Details in [Cube Sandbox](references/cube-sandbox.md).
+is attempted. Cube `list` exposes each item's API-provided `id`, `name`, `state`,
+`template`, `startedAt`, and `endAt`. Details in [Cube Sandbox](references/cube-sandbox.md).
 
 Agents stay local. No MCP, Paseo runtime, remote agent bootstrap, host cleanup,
 or registry garbage collection. Cube's per-user daemon owns only the local SDK

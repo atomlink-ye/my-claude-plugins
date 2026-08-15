@@ -274,6 +274,10 @@ export function createDaemonServer(options = {}) {
 
   function accept(socket) {
     sockets.add(socket);
+    // A client may time out or disconnect while a long remote command is
+    // still running. Consume connection-level failures so the daemon remains
+    // available for other clients when its later writes hit EPIPE/ECONNRESET.
+    socket.on("error", () => {});
     socket.once("close", () => sockets.delete(socket));
     let buffer = "";
     const send = (value) => { if (!socket.destroyed) socket.write(`${JSON.stringify(value)}\n`); };

@@ -51,18 +51,21 @@ restart and is detected by a non-secret fingerprint.
 New directories default to Cube Sandbox. An existing project config remains
 authoritative; legacy configs without an adapter continue to mean Daytona.
 
-## Templates and timeouts are per-call, not defaults
+## Templates and timeouts
 
 `up` has no built-in template default that works here: the upstream SDK falls
 back to a template literally named `base`, which does not exist on our operator
 node and fails with CubeMaster `130404`. **Always pass `--template`.** The node
 exposes no template-listing command; query the API's `/templates` endpoint.
 
-Likewise pass `--timeout` per call rather than relying on the 30-minute sandbox
-default or the 5-minute `exec` default. Idle expiry **kills** the sandbox —
-unlike Daytona there is no separate stop/archive/delete ladder and no
-`--auto-delete -1` — so size the timeout to the work and pull artifacts before
-it expires.
+`up` uses a 30-minute sandbox idle timeout unless overridden with `--timeout`;
+`exec` has an independent 5-minute local wait default. `adopt` accepts the same
+`--timeout` duration, defaults to 30 minutes when omitted, and applies it via
+the connected sandbox instance's `setTimeout` before persisting the binding. If
+that capability is unavailable, adoption fails instead of claiming the timeout
+was changed. Idle expiry **kills** the sandbox — unlike Daytona there is no
+separate stop/archive/delete ladder and no `--auto-delete -1` — so size the
+timeout to the work and pull artifacts before it expires.
 
 Cube workspace ownership is opt-in with `--workspace-owner UID:GID` (for
 example `1000:1000`); UID and GID must be non-root positive integers. `up`
@@ -81,6 +84,12 @@ Streaming and JSON `exec` preserve the remote command's actual exit code. If
 the local daemon or its proxy transport is unavailable, `exec` returns control
 exit 125 and writes an actionable diagnostic to stderr. Restart only the local
 path with `sandbox-ctl daemon stop && sandbox-ctl daemon start`, then retry.
+
+If a local CLI client times out or disconnects during a long `exec`, a later
+daemon write can target the dead Unix socket and produce `EPIPE`/`ECONNRESET`.
+The daemon consumes that connection-level error so it remains available for
+other clients; the interrupted command is not resumed, and the client still
+receives a control failure.
 
 Workspace-owner contract failures are reported as an ownership mismatch, not a
 network or fetch failure. The check remains fail-closed and never recursively
@@ -111,7 +120,11 @@ across reconnects and a repeated resume of an already-running sandbox skips a
 second control-plane connect; these behaviors are not evidence that the
 experimental data plane is stable.
 `status` and `list` pass through the control-plane `state` (including
-`paused`); status does not use a connect merely to determine state.
+`paused`); status does not use a connect merely to determine state. Cube `list`
+also returns the API-provided lifecycle timing fields `startedAt` and `endAt`
+alongside each item's `id`, `name`, and `template`. `list.state` is
+control-plane metadata, not a data-plane liveness check; a successful `exec`
+is the liveness check for the command path.
 If lifecycle control reports an incompatible local daemon protocol, restart
 only the local daemon (`sandbox-ctl daemon stop` followed by `daemon start`)
 before retrying; this does not restart the Cube sandbox service.

@@ -813,11 +813,15 @@ async function handleAdopt(options = {}) {
   const directory = path.resolve(options.directory ?? process.cwd());
   const name = options.name ?? `adopted-${String(sandboxId).replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   const client = options.client ?? await createClient();
-  const timeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
   let info;
   if (typeof client.getInfo === "function") info = await client.getInfo(sandboxId);
   const sandbox = await client.connect(sandboxId, { timeoutMs });
   if (options.requireManagedPolicy && info) assertManagedSandboxInfo(info, projectIdentity(directory));
+  if (typeof sandbox?.setTimeout !== "function") {
+    throw new Error("Cube Sandbox adopt cannot set lifecycle timeout: sandbox.setTimeout is unavailable");
+  }
+  await sandbox.setTimeout(timeoutMs);
   const remoteHome = options.remoteHome ?? await resolveRemoteHome(sandbox);
   const binding = upsertBinding(directory, name, { sandboxId, remoteHome, remoteWorkspace, timeoutMs, projectIdentity: projectIdentity(directory), adoptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, { use: !options.noUse, adapter: "cube-sandbox" });
   const result = { ok: true, sandboxId, name, remoteHome, remoteWorkspace, timeoutMs, binding };
@@ -1249,7 +1253,7 @@ async function handleList(options = {}) {
   const sandboxes = [];
   while (paginator.hasNext) {
     const items = await paginator.nextItems();
-    for (const info of items) sandboxes.push({ id: info.sandboxId, name: info.name, state: info.state, template: info.templateId });
+    for (const info of items) sandboxes.push({ id: info.sandboxId, name: info.name, state: info.state, template: info.templateId, startedAt: info.startedAt, endAt: info.endAt });
   }
   const result = { ok: true, sandboxes };
   console.log(JSON.stringify(result, null, 2));
