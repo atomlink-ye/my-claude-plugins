@@ -89,16 +89,12 @@ and checked fail-closed; no recursive ownership repair is performed. Bundle/full
 pushes preserve that owner contract, while Git push is refused for owned
 workspaces. Daytona behavior is unchanged.
 
-**Exit codes lie in both directions.** `exec` can return 0 when the daemon proxy
-is down and the command never reached the sandbox; `push` can return non-zero
-after the transfer actually succeeded. Verify by landed artifact (rc file, log
-mtime, remote checksums), not by exit status. `exec`'s streaming wrapper does
-not propagate the remote exit code — use `cmd > log 2>&1; echo $? > rc`.
-A `fetch failed` from `exec` while `list` still reports `running` means the
-local daemon proxy died: `daemon stop && daemon start`. Workspace ownership
-regresses whenever root runs git inside the sandbox, and resurfaces as a `push`
-failure; re-`chown -R` and push again. Details in
-[Cube Sandbox](references/cube-sandbox.md).
+`exec` propagates the remote command exit code in streaming and JSON modes.
+Daemon or proxy transport failures return control exit 125 and an actionable
+diagnostic on stderr; restart the local path with `sandbox-ctl daemon stop &&
+sandbox-ctl daemon start`, then retry. Workspace-owner contract failures are
+fail-closed and identify the ownership mismatch; no recursive ownership repair
+is attempted. Details in [Cube Sandbox](references/cube-sandbox.md).
 
 Agents stay local. No MCP, Paseo runtime, remote agent bootstrap, host cleanup,
 or registry garbage collection. Cube's per-user daemon owns only the local SDK

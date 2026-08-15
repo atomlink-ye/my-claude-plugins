@@ -75,55 +75,25 @@ numeric ownership, preserve the provisioned workspace root metadata during
 extraction, and chown only an uploaded single file. Git push is refused when
 an owner contract is active; use bundle or full mode for that workspace.
 
-## Exit codes are not trustworthy; landed artifacts are
+## Exec failures and workspace ownership
 
-Observed 2026-08-15 over one 160-minute session. **`sandbox-ctl` exit codes lie
-in both directions**, so treat them as a hint and verify the actual artifact:
+Streaming and JSON `exec` preserve the remote command's actual exit code. If
+the local daemon or its proxy transport is unavailable, `exec` returns control
+exit 125 and writes an actionable diagnostic to stderr. Restart only the local
+path with `sandbox-ctl daemon stop && sandbox-ctl daemon start`, then retry.
 
-- **False `RC=0`.** When the local daemon's proxy channel is down, `exec` writes
-  `2: [unknown] fetch failed` to stdout but still exits 0. The command never
-  reached the sandbox — no rc file, no log, nothing ran. A caller that checks
-  only the exit code concludes the remote job succeeded.
-- **False `RC=1`.** `push --mode git` reported failure (`terminated`) while the
-  transfer had in fact completed: all files present remotely, `git rev-parse
-  HEAD` matching the expected SHA.
-
-**The only reliable check is what landed**: does the rc file exist, is the log's
-mtime what you expect, do the remote file count and content checksums match.
-Exit codes are meaningful only after you have confirmed an artifact exists. Note
-that `exec`'s streaming wrapper does not propagate the remote exit code at all —
-run `cmd > log 2>&1; echo $? > rc` and read `rc` separately.
-
-## The local daemon proxy dies, repeatedly
-
-In that same session the per-user daemon's proxy died **seven times**. Symptom:
-`exec` reports `fetch failed`, or silently returns no output, while
-`sandbox-ctl list` still shows the sandbox as `running`.
-
-That combination is the diagnostic: `list` working proves the control plane and
-the sandbox are fine, so the fault is local. `sandbox-ctl daemon stop && sandbox-ctl
-daemon start`, wait a few seconds, retry. Do not rebuild the sandbox, and do not
-conclude the control plane is down.
-
-The same `fetch failed` string covers three unrelated faults; check in this order:
-
-1. `list` cannot show the sandbox, or it is not `running` — the sandbox itself
-   (quite possibly already idle-killed).
-2. `list` fine but `exec` also fails — the local daemon proxy, as above.
-3. `list` and `exec` fine, only `push` fails — workspace ownership, see below.
-
-## Workspace ownership regresses and must be re-applied
+Workspace-owner contract failures are reported as an ownership mismatch, not a
+network or fetch failure. The check remains fail-closed and never recursively
+repairs ownership.
 
 `--workspace-owner` refuses a non-empty root with a different owner
 (`exit 78: workspace is non-empty and owned by 0:0`). That is the documented
 fail-closed behavior, not a bug: `chown -R UID:GID` the workspace explicitly
 first, then run `up --workspace-owner`. Retrying the same `up` will never work.
 
-More importantly, **the owner contract is not enforced against writes from
-inside the sandbox**. Any git command run as root in that workspace writes
-`.git/index` back to `0:0`, after which the next `push` fails — and it surfaces
-as `fetch failed`, which points at the network rather than at ownership. The
-remedy is routine, not a diagnosis: `chown -R` then `push`. Expect to repeat it.
+If ownership has intentionally changed, migrate it explicitly before retrying;
+`up --workspace-owner` with a non-empty wrong-owned directory continues to
+return exit 78.
 
 ## Experimental lifecycle commands
 

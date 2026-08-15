@@ -504,9 +504,13 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
       else console.error(payload.error);
       return payload;
     }
-    if (!requestedJson) throw error;
-    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
-    process.exitCode = 1;
+    if (!requestedJson) {
+      if (Number.isInteger(error?.exitCode)) process.exitCode = error.exitCode;
+      throw error;
+    }
+    const exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), exitCode, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    process.exitCode = exitCode;
     console.log(JSON.stringify(payload));
     return payload;
   }
@@ -609,7 +613,7 @@ if (isDirectExecution) {
     const wantsJson = process.argv.includes("--json");
     if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: findEffectiveAdapter(directArgv), error: sanitizeError(error) }));
     else console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
   });
 }
 

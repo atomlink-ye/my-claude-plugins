@@ -174,10 +174,15 @@ function daemonRequestDeadline(payload = {}, options = {}) {
 }
 
 function normalizeResult(result, stdout, stderr) {
+  const hasExitCode = Number.isInteger(result?.exitCode);
   return {
-    exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : 0,
+    // A daemon response without an explicit command exit code is not a
+    // successful remote command. Treat it as a control/transport failure so a
+    // proxy response that only contains diagnostic output cannot become RC=0.
+    exitCode: hasExitCode ? result.exitCode : 125,
     stdout: stdout.join(""),
     stderr: stderr.join(""),
+    ...(!hasExitCode ? { error: String(result?.error || "Cube Sandbox daemon/proxy returned no remote exit code") } : {}),
   };
 }
 

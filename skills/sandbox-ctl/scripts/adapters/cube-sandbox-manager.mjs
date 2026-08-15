@@ -170,13 +170,13 @@ if [ -e "$target" ] && [ ! -d "$target" ]; then echo "workspace path exists but 
 if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then
   actual_owner=$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)
   if [ "$actual_owner" != "$expected_owner" ]; then
-    echo "workspace is non-empty and owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    echo "workspace ownership mismatch: non-empty workspace is owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
     exit 78
   fi
   mismatch=$(find "$target" -mindepth 1 \\( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \\) -print -quit 2>/dev/null || true)
   if [ -n "$mismatch" ]; then
     actual=$(stat -c '%u:%g' "$mismatch" 2>/dev/null || stat -f '%u:%g' "$mismatch" 2>/dev/null || true)
-    echo "workspace entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    echo "workspace ownership mismatch: entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
     exit 78
   fi
 fi
@@ -360,8 +360,8 @@ async function cubeSandboxExec(sandbox, cmd, opts = {}) {
     const result = await sandbox.commands.run(cmd, { background: false, ...opts });
     return { exitCode: result.exitCode, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   } catch (error) {
-    if (typeof error?.exitCode === "number" && typeof error?.stdout === "string" && typeof error?.stderr === "string") {
-      return { exitCode: error.exitCode, stdout: error.stdout, stderr: error.stderr };
+    if (typeof error?.exitCode === "number") {
+      return { exitCode: error.exitCode, stdout: error.stdout ?? "", stderr: error.stderr ?? "" };
     }
     throw error;
   }
@@ -535,6 +535,25 @@ function redactExecFailure(error) {
     if (SECRET_KEY_RE.test(key) && value && value.length > 3) message = message.split(value).join("[redacted]");
   }
   return sanitizeDiagnosticUrls(message);
+}
+
+function daemonUnavailableDiagnostic(error) {
+  const detail = redactExecFailure(error);
+  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Run sandbox-ctl daemon stop && sandbox-ctl daemon start, then retry.`;
+}
+
+function assertWorkspaceOwnership(result, action = "workspace ownership validation") {
+  try {
+    return assertRemoteCommandSuccess(result, action);
+  } catch (error) {
+    if (result?.exitCode === 78) {
+      const details = [result.stderr, result.stdout].filter(Boolean).map((value) => String(value).trim()).filter(Boolean).join(" ");
+      const mismatch = new Error(`Workspace ownership mismatch: ${details || error.message}`);
+      mismatch.exitCode = 78;
+      throw mismatch;
+    }
+    throw error;
+  }
 }
 
 function assertSchedulerToken(value, source, { pathValue = false } = {}) {
@@ -720,7 +739,7 @@ async function handleUp(options) {
     remoteHome = existingBinding?.remoteHome ?? await resolveRemoteHome(sandbox);
     const remoteWorkspace = toRemoteAbsolute(paths.remoteWorkspacePath, remoteHome);
     const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
-    assertRemoteCommandSuccess(workspaceResult, "workspace initialization");
+    assertWorkspaceOwnership(workspaceResult, "workspace initialization");
     binding = upsertBinding(paths.directory, bindingName, {
       sandboxId,
       remoteHome,
@@ -865,6 +884,8 @@ async function handleExec(options, command) {
 
 async function handleExecViaDaemon(options, command) {
   let paths;
+  const stdout = [];
+  const stderr = [];
   try {
     paths = resolveProjectPaths(options);
     if (!paths.binding?.sandboxId) return null;
@@ -873,8 +894,6 @@ async function handleExecViaDaemon(options, command) {
       : createDaemonClient(options.daemon ?? {});
     if (!options.daemonClient) await (options.startDaemon ?? startDaemon)(options.daemon ?? {});
     const cwd = options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath;
-    const stdout = [];
-    const stderr = [];
     const result = await daemon.exec({
       sandboxId: paths.binding.sandboxId,
       command: command.map(shellQuote).join(" "),
@@ -889,14 +908,21 @@ async function handleExecViaDaemon(options, command) {
     if (result.remoteHome && !paths.binding.remoteHome) {
       try { upsertBinding(paths.directory, paths.binding.name, { remoteHome: result.remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* preserve command result; next direct run can retry */ }
     }
-    if (result.error) normalized.error = redactExecFailure(result.error);
+    if (result.error) {
+      const diagnostic = daemonUnavailableDiagnostic(result.error);
+      normalized.exitCode = 125;
+      normalized.error = diagnostic;
+      normalized.stderr = normalized.stderr ? `${normalized.stderr}${normalized.stderr.endsWith("\n") ? "" : "\n"}${diagnostic}\n` : `${diagnostic}\n`;
+    }
     if (options.artifacts && !normalized.error) {
       try { normalized.artifactPath = writeExecArtifacts(options.artifacts, { ...normalized, command, cwd }); }
       catch (error) { return { ...normalized, exitCode: 125, error: redactExecFailure(error) }; }
     }
     return normalized;
   } catch (error) {
-    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error) };
+    const diagnostic = daemonUnavailableDiagnostic(error);
+    const priorStderr = stderr.join("");
+    return { exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic };
   }
 }
 
@@ -997,7 +1023,7 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
   if (!existsSync(localAbs)) throw new Error(`Path not found: ${localAbs}`);
   assertSafeLocalTransferFile(localAbs);
   const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
-  assertRemoteCommandSuccess(workspaceResult, "workspace ownership validation");
+  assertWorkspaceOwnership(workspaceResult);
 
   // Single-file fast path (new relative to Daytona): auto-detected when the
   // local path is not a directory, using sbx.files.write directly with no tar
