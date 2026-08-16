@@ -113,6 +113,19 @@ curl -sS 'http://127.0.0.1:8787/reminders/REMINDER_ID'
 The list endpoint optionally filters by `agentId`; the exact endpoint preserves
 the record's `status`, `nextRunAt`, `lastFiredAt`, mode, and delivery metadata.
 
+> **A reminder is a nudge, not a compliance gate.** Three limits, all observed in production
+> (2026-08-13 round: 8 deliveries fired, 3 were self-exempted by the recipient):
+>
+> - `on-idle` **skips busy ticks** — "an `everySeconds=2700` timer exists" does NOT mean
+>   "a processable deadline arrives every 45 minutes." One 45-minute gap had no instance at all.
+> - `lastFiredAt` / delivery status prove **transmission**, not **processing**, and never **closure**.
+> - A reminder addressed to the same agent that owes the obligation enforces nothing:
+>   that agent can always decide this particular firing doesn't matter.
+>
+> A timed obligation is enforced only when an **independent recipient** performs it and a
+> durable `ACCEPT`/`REFUSE` record closes it. If your design can't do that, label the state
+> `UNENFORCED` rather than calling it a gate.
+
 Choose the primitive by intent:
 
 | Need | Use |

@@ -83,6 +83,33 @@ export interface LedgerRecord {
   revokeReason?: string;
 }
 
+export type CorrectionResolution = 'ACCEPT' | 'REFUSE';
+export type CorrectionStatus = 'open' | 'closed';
+
+/** A finding raised by an external correction auditor. */
+export interface CorrectionResolutionRecord {
+  verdict: CorrectionResolution;
+  note: string;
+  at: string;
+}
+
+export interface CorrectionFinding {
+  id: string;
+  text: string;
+  resolution: CorrectionResolutionRecord | null;
+}
+
+/** Durable correction instance used by the external correction gate. */
+export interface CorrectionInstance {
+  id: string;
+  managerId: string;
+  auditorId: string;
+  createdAt: string;
+  status: CorrectionStatus;
+  findings: CorrectionFinding[];
+  closedAt: string | null;
+}
+
 export interface AgentInfo {
   id: string;
   status: string;

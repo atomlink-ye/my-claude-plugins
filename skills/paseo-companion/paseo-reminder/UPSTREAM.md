@@ -140,3 +140,83 @@ explicit `inspect` polling. Hooks record activity, schedules/heartbeats execute
 prompts, and logs/inspect are observation-only. There is still no passive channel
 that is both transcript-visible and non-interrupting; heartbeat is the accepted
 idle-only transport with the audit limitation above.
+
+## Self-compact is not atomic with respect to reminder delivery
+
+**Observed 2026-08-14, twice in one session, on a Manager agent running an all-night lane round.**
+
+The Manager registers a `compact-wake`, then sends itself `/compact`. Between the decision to
+compact and the compaction actually completing, **any reminder / message / watchdog delivery
+interrupts the turn and cancels the compaction**. The agent stays uncompacted, keeps growing,
+and the registered `compact-wake` fires against an agent that never compacted.
+
+Failure shape:
+
+```
+1. context crosses threshold  → register compact-wake  → send /compact
+2. a queued notify/reminder is delivered mid-turn
+3. compaction is canceled; the agent resumes normal work
+4. compact-wake later fires "compact-recovery" for a compaction that never happened
+```
+
+Two aggravating factors observed in the same session:
+
+- **`notify`-mode messages stick in `pending` with `deliveredAt=null` and are re-delivered
+  repeatedly** (see the delivery-accounting note above). A busy Manager therefore has a
+  *continuous* stream of interrupts, so the window in which a self-compact can complete
+  is effectively never open.
+- The busier the agent (which is exactly when it needs to compact), the higher the
+  interrupt rate — **the mechanism fails hardest under the condition it exists for**.
+
+### What the recipient cannot do about it today
+
+Nothing reliable. Retrying `/compact` only re-enters the same race. Draining the queue first
+does not help, because new deliveries arrive during the compaction itself.
+
+### Wanted from upstream
+
+Any one of these would close it:
+
+1. **A quiet window**: allow an agent to request "hold all non-`interrupt` deliveries for N seconds",
+   so a self-compact can complete. `interrupt`-delivery messages would still get through.
+2. **Delivery deferral during compaction**: the coordinator observes the target is compacting and
+   queues everything (it already tracks agent status).
+3. **A compaction-completed signal** the coordinator can key on, so `compact-wake` fires only after
+   a compaction *actually* happened, instead of on an idle/debounce heuristic.
+
+Until then the practical fallback is: **do not rely on self-compact under load; let the harness
+auto-compact, and make sure `compact-wake` resumeSteps are fully stateless** so that recovery
+works regardless of whether the compaction was self-initiated or automatic.
+
+## ~~`DELETE /messages/:id` 不是"已读销账"~~ —— **本条已自我更正，原判断是错的**
+
+2026-08-14 我先记了一条"DELETE 只是退订、上游没有 ack 动词"，**那是错的，是我用法不对**。
+
+**正确用法（companion 自己在投递块的 `<ack>` 里给出）**：
+```sh
+curl -X DELETE http://127.0.0.1:8787/messages/<id> \
+  -H 'content-type: application/json' -d '{"reason":"processed"}'
+```
+⚠️ **要带 JSON body `{"reason":"processed"}`。** 我之前写的是 `DELETE /messages/<id>?agentId=<self>`
+（query 参数、无 body）—— 返回成功但**没有销账**，消息随后被原样重投。
+
+⇒ **重复投递不是上游缺陷，是我没正确 ack 的后果。** 上游行为正确。
+
+**留下的真教训**：`<ack>` 块里已经写好了该跑的命令，**照抄即可，不要自己拼 DELETE 的参数形式**。
+
+---
+
+## 🔴 `POST /messages` 向不存在的 `agentId` 发送时不报错（这条成立，且更严重）
+
+照常返回 200、照常 `delivery.status:"accepted"`，消息就此消失在空地址里。
+
+2026-08-14 实例：我把一个 Codex Manager 的 id 记成了前 8 位相同、后半段不同的 UUID，
+两条关键裁定全部发进空地址，**对方在 20 分钟里一直是"以为自己交付完成"的 idle 状态，
+而我以为已经止血并据此向 Owner 汇报了。**
+
+**真判据（响应里一直有）**：`"status":"delivered"` + `deliveredAt` 非空。
+❌ **不要看 `delivery.status`** —— 它对空地址一样是 `accepted`，测的是"进了队列"不是"对方收到"。
+
+**上游可能的修法**：`to` 不在已知 agent 列表时直接 4xx，而不是静默接受。
+
+**兜底**：agent id 一律从 `GET /children?agentId=<self>` 现取，不凭记忆写；发完核 `status`。

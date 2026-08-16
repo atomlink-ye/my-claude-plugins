@@ -6,7 +6,7 @@ import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
 import { CompanionError, invalidValue, missingField } from './errors.js';
-import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
+import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, CorrectionResolution, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
@@ -1473,6 +1473,73 @@ export class CompanionService {
     }
     return { ...record, status: 'revoked' };
   }
+
+  async createCorrection(body: {
+    managerId: string;
+    auditorId: string;
+    findings?: unknown[];
+    finding?: unknown;
+  }): Promise<CorrectionInstance> {
+    if (!body.managerId?.trim()) missingField('managerId');
+    if (!body.auditorId?.trim()) missingField('auditorId');
+    const rawFindings = Array.isArray(body.findings) ? body.findings : body.finding === undefined ? [] : [body.finding];
+    if (rawFindings.length === 0) invalidValue('findings must contain at least one finding', 'findings');
+    const findings: CorrectionFinding[] = rawFindings.map((raw, index) => {
+      const input = typeof raw === 'string' ? { text: raw } : (raw && typeof raw === 'object' ? raw as Record<string, unknown> : {});
+      const id = String(input.id ?? input.findingId ?? `finding-${index + 1}-${randomUUID().slice(0, 8)}`);
+      const text = String(input.text ?? input.finding ?? '').trim();
+      if (!text) invalidValue('each finding requires text', 'findings');
+      return { id, text, resolution: null };
+    });
+    const instance: CorrectionInstance = {
+      id: randomUUID(),
+      managerId: body.managerId.trim(),
+      auditorId: body.auditorId.trim(),
+      createdAt: new Date().toISOString(),
+      status: 'open',
+      findings,
+      closedAt: null,
+    };
+    await this.store.addManager(instance.managerId);
+    return this.store.addCorrection(instance);
+  }
+
+  listCorrections(managerId?: string, status?: string): CorrectionInstance[] {
+    return this.store.getCorrections().filter((item) => (!managerId || item.managerId === managerId) && (!status || item.status === status));
+  }
+
+  async resolveCorrection(id: string, body: { findingId?: string; verdict?: string; note?: string }): Promise<CorrectionInstance> {
+    const instance = this.store.findCorrection(id);
+    if (!instance) throw new CompanionError('not_found', 'correction instance not found');
+    const findingId = body.findingId;
+    if (!findingId) {
+      missingField('findingId');
+    }
+    const resolutionValue = String(body.verdict ?? '').toUpperCase();
+    if (resolutionValue !== 'ACCEPT' && resolutionValue !== 'REFUSE') invalidValue('resolution must be ACCEPT or REFUSE', 'resolution', ['ACCEPT', 'REFUSE']);
+    const note = typeof body.note === 'string' ? body.note.trim() : undefined;
+    if (resolutionValue === 'REFUSE' && !note) missingField('note');
+    const resolved = await this.store.resolveCorrection(id, findingId, resolutionValue as CorrectionResolution, note);
+    if (!resolved) throw new CompanionError('not_found', 'correction finding not found');
+    return resolved;
+  }
+
+  getCorrectionGate(managerId: string): { blocked: boolean; openInstances: CorrectionInstance[]; reason: string } {
+    const openInstances = this.listCorrections(managerId, 'open').filter((item) => item.findings.some((finding) => finding.resolution === null));
+    const blocked = openInstances.length > 0;
+    if (!blocked) return { blocked: false, openInstances: [], reason: 'correction gate clear' };
+    const base = this.endpointBase();
+    const details = openInstances.map((instance) => {
+      const findings = instance.findings.filter((finding) => finding.resolution === null).map((finding) => {
+        const body = JSON.stringify({ findingId: finding.id, verdict: 'ACCEPT' });
+        return `${finding.id}: ${finding.text} (resolve: curl -sS -X POST ${base}/corrections/${instance.id}/resolve -H 'content-type: application/json' -d '${body}')`;
+      });
+      return `instance ${instance.id}; unresolved finding(s): ${findings.join('; ')}`;
+    }).join(' | ');
+    return { blocked: true, openInstances, reason: `correction gate blocked: ${details}` };
+  }
+
+  getGate(managerId: string): ReturnType<CompanionService['getCorrectionGate']> { return this.getCorrectionGate(managerId); }
 
   async reconcileReminders(): Promise<void> {
     if (this.heartbeatReconcileInFlight) return this.heartbeatReconcileInFlight;

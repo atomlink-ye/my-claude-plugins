@@ -1,7 +1,7 @@
 import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
+import type { CorrectionInstance, CorrectionResolution, IdleReminderRecord, LedgerRecord, MessageRecord, MessageScheduleRecord, ReminderRecord, TrackedChildRecord, TrackedChildSource, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 import { CompanionError } from './errors.js';
 
 export class Store {
@@ -10,6 +10,7 @@ export class Store {
   private idleReminders: IdleReminderRecord[] = [];
   private watchdogSnapshots: Record<string, WatchdogSnapshot> = {};
   private ledger: LedgerRecord[] = [];
+  private corrections: CorrectionInstance[] = [];
   private messages: MessageRecord[] = [];
   private messageSchedules: MessageScheduleRecord[] = [];
   private recoveryReceipts: Record<string, Record<string, { missedFires: number; missedRunIds: string[] }>> = {};
@@ -38,6 +39,7 @@ export class Store {
     this.idleReminders = await this.loadDurable<IdleReminderRecord[]>('idle-reminders.json', []);
     this.watchdogSnapshots = await this.loadDurable<Record<string, WatchdogSnapshot>>('watchdog-snapshots.json', {});
     this.ledger = await this.load<LedgerRecord[]>('ledger.json', []);
+    this.corrections = await this.loadDurable<CorrectionInstance[]>('corrections.json', []);
     this.messages = await this.loadDurable<MessageRecord[]>('messages.json', []);
     this.messageSchedules = await this.loadDurable<MessageScheduleRecord[]>('message-schedules.json', []);
     const receipts = await this.loadDurable<Record<string, any> | string[]>('recovery-receipts.json', {});
@@ -320,5 +322,30 @@ export class Store {
     record.revokeReason = reason;
     await this.save('ledger.json', this.ledger);
     await appendFile(path.join(this.dir, 'ledger-resolved.jsonl'), JSON.stringify({ ...record, resolutionReason: reason }) + '\n');
+  }
+
+  getCorrections(): CorrectionInstance[] { return this.corrections; }
+  findCorrection(id: string): CorrectionInstance | undefined {
+    return this.corrections.find((item) => item.id === id);
+  }
+  async addCorrection(record: CorrectionInstance): Promise<CorrectionInstance> {
+    this.corrections.push(record);
+    await this.save('corrections.json', this.corrections);
+    return record;
+  }
+  async resolveCorrection(id: string, findingId: string, resolution: CorrectionResolution, note?: string): Promise<CorrectionInstance | undefined> {
+    const instance = this.findCorrection(id);
+    if (!instance) return undefined;
+    const finding = instance.findings.find((item) => item.id === findingId);
+    if (!finding) return undefined;
+    if (finding.resolution !== null) return instance;
+    const at = new Date().toISOString();
+    finding.resolution = { verdict: resolution, note: note ?? '', at };
+    if (instance.findings.every((item) => item.resolution !== null)) {
+      instance.status = 'closed';
+      instance.closedAt = at;
+    }
+    await this.save('corrections.json', this.corrections);
+    return instance;
   }
 }
