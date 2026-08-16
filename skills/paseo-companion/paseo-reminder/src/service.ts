@@ -6,13 +6,15 @@ import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
 import { CompanionError, invalidValue, missingField } from './errors.js';
-import type { AgentInfo, ChildrenResult, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
+import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, CorrectionResolution, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
 type MessageScheduleInspection = {
   state: 'live' | 'running' | 'success' | 'failed' | 'missing' | 'unknown';
   hasRun: boolean;
+  lastRunAt?: string;
+  endedAt?: string;
 };
 type HeartbeatRun = Record<string, any>;
 type HeartbeatInspection = {
@@ -72,7 +74,6 @@ export class CompanionService {
   /** Successful candidate-parent observations; child candidates are refreshed each listing. */
   private childParentCache = new Map<string, string>();
   private messageInFlight = new Map<string, Promise<void>>();
-  private idleMessageObservations = new Map<string, { status: string; updatedAt: string }>();
   private heartbeatReconcileInFlight?: Promise<void>;
   private parkReconcileInFlight = new Map<string, Promise<boolean>>();
   private readonly scheduleObserver?: ScheduleObserver;
@@ -209,7 +210,11 @@ export class CompanionService {
     const selfWakeupSources = [];
     for (const reminder of this.store.getReminders()) {
       const childWatch = reminder.kind === 'child-watch' || reminder.watchKind === 'child' || Boolean(reminder.subjectChildId);
-      if (!childWatch && reminder.kind !== 'watchdog' && reminder.kind !== 'heartbeat-recovery' && reminder.agentId === agentId && reminder.status === 'active' && await this.probeReminder(reminder) === true) selfWakeupSources.push(reminder);
+      if (this.isLocalReminderWakeupSource(reminder, agentId)) {
+        selfWakeupSources.push(reminder);
+      } else if (!childWatch && reminder.kind !== 'watchdog' && reminder.kind !== 'heartbeat-recovery' && reminder.agentId === agentId && reminder.status === 'active' && await this.probeReminder(reminder) === true) {
+        selfWakeupSources.push(reminder);
+      }
     }
     // Idle reminders are local, durable wakeup sources rather than Paseo
     // heartbeat schedules. Treat an active one as a live source for watchdog
@@ -237,6 +242,22 @@ export class CompanionService {
     }
     const wakeupSourcesNote = 'companionKnownWakeupSources lists only companion-created and explicitly registered sources; external heartbeats are omitted unless PUT /wakeup-sources registers them.';
     return { children, companionKnownWakeupSources: selfWakeupSources, selfWakeupSources, wakeupSourcesComplete: false, wakeupSourcesNote, partial: failedCandidates.length > 0, failedCandidates };
+  }
+
+  private isLocalReminderWakeupSource(reminder: ReminderRecord, agentId: string): boolean {
+    const protectedReminder = reminder.kind === 'child-watch'
+      || reminder.watchKind === 'child'
+      || Boolean(reminder.subjectChildId)
+      || reminder.kind === 'compact-wake'
+      || reminder.kind === 'watchdog'
+      || reminder.kind === 'heartbeat-recovery';
+    const hasFiniteWakeupAt = [reminder.nextRunAt, reminder.targetAt].some((value) => typeof value === 'string' && Number.isFinite(Date.parse(value)));
+    return reminder.agentId === agentId
+      && reminder.status === 'active'
+      && !reminder.daemonId
+      && !protectedReminder
+      && (reminder.mode === 'once' || reminder.mode === 'repeat')
+      && hasFiniteWakeupAt;
   }
 
   private wakeupCron(cadence: string): string {
@@ -878,7 +899,7 @@ export class CompanionService {
       detail,
       ephemeral ? 'This health alert is non-acknowledgement based; the alert ID remains cancellable.' : 'Acknowledge this completion alert after review; future matching transitions remain deduplicated by this ID.',
     ].join('\n');
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'interrupt', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'on-idle', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
     snapshot.notified = [...notified, eventType];
     return true;
   }
@@ -928,7 +949,7 @@ export class CompanionService {
     void activeChildren;
   }
 
-  /** Persist before handing a coalesced batch to Paseo's turn-boundary queue. */
+  /** Persist before handing a coalesced batch to its selected Paseo transport. */
   async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; delivery?: MessageDelivery; mode?: MessageMode; ackDeadlineAt?: string; ackDeadlineSeconds?: number; replyTo?: string; promptKind?: MessageRecord['promptKind']; actionCommand?: string; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<Omit<MessageRecord, 'delivery'> & {
     schedule: null;
     delivery: { id: string; transport: 'paseo-send' | 'heartbeat'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
@@ -1073,18 +1094,29 @@ export class CompanionService {
         ? await this.scheduleObserver.scheduleLogs(schedule.daemonId)
         : (await this.cli.run(['schedule', 'logs', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 })).value;
       const logsRecord = unwrapPayload(logsValue);
-      if (!Array.isArray(logsValue) && !Array.isArray(logsRecord.logs) && !Array.isArray(logsRecord.runs) && !Array.isArray(logsRecord.entries)) return { state: 'unknown', hasRun: false };
-      const logs = Array.isArray(logsValue) ? logsValue : (logsRecord.logs ?? logsRecord.runs ?? logsRecord.entries ?? []);
-      const latest = Array.isArray(logs) && logs.length ? asRecord(logs[logs.length - 1]) : {};
-      const hasRun = Array.isArray(logs) && logs.length > 0;
+      const rawLogs = Array.isArray(logsValue)
+        ? logsValue
+        : (logsRecord.logs ?? logsRecord.runs ?? logsRecord.entries ?? logsRecord.data);
+      if (!Array.isArray(rawLogs)) return { state: 'unknown', hasRun: false };
+      const logs = rawLogs.map(asRecord);
+      const latest = logs.reduce<Record<string, any>>((current, candidate) => {
+        const currentAt = Date.parse(String(current.endedAt ?? current.ended_at ?? current.startedAt ?? current.started_at ?? current.scheduledFor ?? current.scheduled_for ?? ''));
+        const candidateAt = Date.parse(String(candidate.endedAt ?? candidate.ended_at ?? candidate.startedAt ?? candidate.started_at ?? candidate.scheduledFor ?? candidate.scheduled_for ?? ''));
+        return Number.isFinite(candidateAt) && (!Number.isFinite(currentAt) || candidateAt >= currentAt) ? candidate : current;
+      }, {});
+      const hasRun = logs.length > 0;
       const runStatus = lowerStatus(latest.status ?? latest.state ?? latest.outcome ?? latest.result);
       const scheduleStatus = lowerStatus(inspected.status ?? inspected.Status ?? inspected.state ?? inspected.State);
       // A terminal run log is authoritative over the wrapper schedule status:
-      // Paseo may report a max-runs schedule as completed after a busy failure.
+      // Paseo may report a completed schedule after a busy failure.
       if (runStatus) {
         if (/running|in.?progress|started/.test(runStatus)) return { state: 'running', hasRun };
         if (/fail|error|timeout|busy/.test(runStatus)) return { state: 'failed', hasRun };
-        if (/success|succeed|complete|ok/.test(runStatus)) return { state: 'success', hasRun };
+        if (/success|succeed|complete|ok/.test(runStatus)) {
+          const endedAt = String(latest.endedAt ?? latest.ended_at ?? '') || undefined;
+          const lastRunAt = String(latest.lastRunAt ?? latest.last_run_at ?? inspected.lastRunAt ?? inspected.last_run_at ?? '') || undefined;
+          return { state: 'success', hasRun, ...(endedAt ? { endedAt } : {}), ...((endedAt ?? lastRunAt) ? { lastRunAt: endedAt ?? lastRunAt } : {}) };
+        }
         return { state: 'unknown', hasRun };
       }
       // A completed wrapper without a terminal successful/failed run log is
@@ -1098,10 +1130,10 @@ export class CompanionService {
     }
   }
 
-  /** Retire schedules written by releases that used heartbeat delivery. */
+  /** Retire pre-redesign non-heartbeat schedules that were left in flight. */
   private async migrateLegacyMessageSchedules(): Promise<void> {
     for (const schedule of this.store.getMessageSchedules()) {
-      if (schedule.transport === 'heartbeat' || !['pending', 'active', 'running'].includes(schedule.status)) continue;
+      if (schedule.transport !== undefined || !['pending', 'active', 'running'].includes(schedule.status)) continue;
       await this.migrateLegacyMessageSchedule(schedule);
     }
   }
@@ -1110,10 +1142,14 @@ export class CompanionService {
     for (const schedule of this.store.getMessageSchedules().filter((item) => item.transport === 'heartbeat' && ['active', 'running'].includes(item.status))) {
       const observed = await this.inspectMessageSchedule(schedule);
       if (observed.state === 'success') {
-        const deliveredAt = new Date().toISOString();
+        const deliveredAt = observed.lastRunAt ?? new Date().toISOString();
         await this.store.updateMessageSchedule(schedule.id, { status: 'completed', lastRunAt: deliveredAt });
         try { await this.finalizeAcceptedMessageSchedule({ ...schedule, status: 'completed', lastRunAt: deliveredAt }); } catch { /* retry local cleanup later */ }
-      } else if (observed.state === 'failed' || observed.state === 'missing') {
+        try {
+          await this.cli.run(['heartbeat', 'delete', schedule.daemonId!, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
+          await this.store.updateMessageSchedule(schedule.id, { daemonId: undefined });
+        } catch { /* delivered state is authoritative; retry retirement next tick */ }
+      } else if (observed.state === 'missing') {
         await this.store.updateMessageSchedule(schedule.id, { status: 'failed' });
         console.warn(JSON.stringify({ type: 'message-delivery-terminal', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'heartbeat', reason: observed.state }));
       }
@@ -1157,9 +1193,21 @@ export class CompanionService {
         }
       }
     }
+    for (const reminder of this.store.getReminders().filter((item) => item.deliveryMessageId && schedule.batchIds.includes(item.deliveryMessageId))) {
+      await this.store.updateReminder(reminder.id, { lastDeliveredAt: deliveredAt, deliveryStatus: 'delivered' });
+    }
   }
 
-  private async createMessageSchedule(recipient: string, batch: MessageRecord[]): Promise<MessageScheduleRecord | undefined> {
+  private async retireCompletedHeartbeatSchedules(): Promise<void> {
+    for (const schedule of this.store.getMessageSchedules().filter((item) => item.transport === 'heartbeat' && item.status === 'completed' && item.daemonId)) {
+      try {
+        await this.cli.run(['heartbeat', 'delete', schedule.daemonId!, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 });
+        await this.store.updateMessageSchedule(schedule.id, { daemonId: undefined });
+      } catch { /* retry before the next cron tick */ }
+    }
+  }
+
+  private async createMessageSchedule(recipient: string, batch: MessageRecord[], transport: 'heartbeat' | 'paseo-send'): Promise<MessageScheduleRecord | undefined> {
     const generation = randomUUID();
     const local: MessageScheduleRecord = {
       id: randomUUID(),
@@ -1168,10 +1216,28 @@ export class CompanionService {
       batchIds: batch.map((message) => message.id),
       prompt: this.messagePrompt(recipient, batch),
       status: 'pending',
-      transport: 'paseo-send',
+      transport,
+      ...(transport === 'heartbeat' ? { cron: '* * * * *' } : {}),
       createdAt: new Date().toISOString(),
     };
     await this.store.addMessageSchedule(local);
+    if (transport === 'heartbeat') {
+      try {
+        const value = asRecord((await this.cli.run([
+          'heartbeat', 'create', local.prompt, '--cron', local.cron!, '--expires-in', '30m',
+          '--name', `paseo-reminder-message-${generation.slice(0, 8)}`, '--timezone', 'UTC', '--json',
+        ], { agentId: recipient })).value);
+        const daemonId = String(value.id ?? value.heartbeatId ?? value.scheduleId ?? '');
+        if (!daemonId) throw new Error('heartbeat create returned no id');
+        await this.store.updateMessageSchedule(local.id, { daemonId, status: 'active', lastRunAt: value.lastRunAt });
+        console.log(JSON.stringify({ type: 'message-delivery-armed', recipient, generation, batchIds: local.batchIds, transport: 'heartbeat', daemonId }));
+        return this.store.getMessageSchedules().find((item) => item.id === local.id);
+      } catch (error) {
+        await this.store.updateMessageSchedule(local.id, { status: 'failed' });
+        console.warn(JSON.stringify({ type: 'message-delivery-failed', recipient, generation, batchIds: local.batchIds, transport: 'heartbeat', error: error instanceof Error ? error.message : String(error) }));
+        return undefined;
+      }
+    }
     let acceptedAt: string;
     try {
       const senderAgentId = batch[0]?.from;
@@ -1219,16 +1285,10 @@ export class CompanionService {
     const pending = queued.filter((message) => !accepted.has(message.id));
     if (!pending.length) return;
     const interrupt = pending.filter((message) => (message.delivery ?? (message.urgency === 'urgent' ? 'interrupt' : 'on-idle')) === 'interrupt');
-    if (interrupt.length) await this.createMessageSchedule(recipient, this.sortMessages(interrupt));
+    if (interrupt.length) await this.createMessageSchedule(recipient, this.sortMessages(interrupt), 'paseo-send');
     const idle = pending.filter((message) => !interrupt.includes(message));
     if (!idle.length) return;
-    let observed: { status: string; updatedAt: string; available: boolean };
-    try { observed = await this.observeAgentIdle(recipient); } catch { return; }
-    const { status, updatedAt } = observed;
-    const prior = this.idleMessageObservations.get(recipient);
-    const stable = observed.available && prior?.status === status && prior.updatedAt === updatedAt;
-    this.idleMessageObservations.set(recipient, { status, updatedAt });
-    if (stable) await this.createMessageSchedule(recipient, this.sortMessages(idle));
+    await this.createMessageSchedule(recipient, this.sortMessages(idle), 'heartbeat');
   }
 
   private async completeRecovery(message: MessageRecord): Promise<void> {
@@ -1276,6 +1336,7 @@ export class CompanionService {
       if (Date.parse(message.ackDeadlineAt) <= now) await this.store.updateMessage(message.id, { status: 'unacknowledged', unacknowledgedAt: message.unacknowledgedAt ?? new Date(now).toISOString() });
     }
     await this.reconcileHeartbeatMessageSchedules();
+    await this.retireCompletedHeartbeatSchedules();
     if (this.store.isChildWatchOptOutStateCorrupt()) {
       const pairs = new Map<string, string[]>();
       for (const reminder of this.store.getReminders()) {
@@ -1413,6 +1474,73 @@ export class CompanionService {
     return { ...record, status: 'revoked' };
   }
 
+  async createCorrection(body: {
+    managerId: string;
+    auditorId: string;
+    findings?: unknown[];
+    finding?: unknown;
+  }): Promise<CorrectionInstance> {
+    if (!body.managerId?.trim()) missingField('managerId');
+    if (!body.auditorId?.trim()) missingField('auditorId');
+    const rawFindings = Array.isArray(body.findings) ? body.findings : body.finding === undefined ? [] : [body.finding];
+    if (rawFindings.length === 0) invalidValue('findings must contain at least one finding', 'findings');
+    const findings: CorrectionFinding[] = rawFindings.map((raw, index) => {
+      const input = typeof raw === 'string' ? { text: raw } : (raw && typeof raw === 'object' ? raw as Record<string, unknown> : {});
+      const id = String(input.id ?? input.findingId ?? `finding-${index + 1}-${randomUUID().slice(0, 8)}`);
+      const text = String(input.text ?? input.finding ?? '').trim();
+      if (!text) invalidValue('each finding requires text', 'findings');
+      return { id, text, resolution: null };
+    });
+    const instance: CorrectionInstance = {
+      id: randomUUID(),
+      managerId: body.managerId.trim(),
+      auditorId: body.auditorId.trim(),
+      createdAt: new Date().toISOString(),
+      status: 'open',
+      findings,
+      closedAt: null,
+    };
+    await this.store.addManager(instance.managerId);
+    return this.store.addCorrection(instance);
+  }
+
+  listCorrections(managerId?: string, status?: string): CorrectionInstance[] {
+    return this.store.getCorrections().filter((item) => (!managerId || item.managerId === managerId) && (!status || item.status === status));
+  }
+
+  async resolveCorrection(id: string, body: { findingId?: string; verdict?: string; note?: string }): Promise<CorrectionInstance> {
+    const instance = this.store.findCorrection(id);
+    if (!instance) throw new CompanionError('not_found', 'correction instance not found');
+    const findingId = body.findingId;
+    if (!findingId) {
+      missingField('findingId');
+    }
+    const resolutionValue = String(body.verdict ?? '').toUpperCase();
+    if (resolutionValue !== 'ACCEPT' && resolutionValue !== 'REFUSE') invalidValue('resolution must be ACCEPT or REFUSE', 'resolution', ['ACCEPT', 'REFUSE']);
+    const note = typeof body.note === 'string' ? body.note.trim() : undefined;
+    if (resolutionValue === 'REFUSE' && !note) missingField('note');
+    const resolved = await this.store.resolveCorrection(id, findingId, resolutionValue as CorrectionResolution, note);
+    if (!resolved) throw new CompanionError('not_found', 'correction finding not found');
+    return resolved;
+  }
+
+  getCorrectionGate(managerId: string): { blocked: boolean; openInstances: CorrectionInstance[]; reason: string } {
+    const openInstances = this.listCorrections(managerId, 'open').filter((item) => item.findings.some((finding) => finding.resolution === null));
+    const blocked = openInstances.length > 0;
+    if (!blocked) return { blocked: false, openInstances: [], reason: 'correction gate clear' };
+    const base = this.endpointBase();
+    const details = openInstances.map((instance) => {
+      const findings = instance.findings.filter((finding) => finding.resolution === null).map((finding) => {
+        const body = JSON.stringify({ findingId: finding.id, verdict: 'ACCEPT' });
+        return `${finding.id}: ${finding.text} (resolve: curl -sS -X POST ${base}/corrections/${instance.id}/resolve -H 'content-type: application/json' -d '${body}')`;
+      });
+      return `instance ${instance.id}; unresolved finding(s): ${findings.join('; ')}`;
+    }).join(' | ');
+    return { blocked: true, openInstances, reason: `correction gate blocked: ${details}` };
+  }
+
+  getGate(managerId: string): ReturnType<CompanionService['getCorrectionGate']> { return this.getCorrectionGate(managerId); }
+
   async reconcileReminders(): Promise<void> {
     if (this.heartbeatReconcileInFlight) return this.heartbeatReconcileInFlight;
     const operation = this.reconcileRemindersOnce();
@@ -1457,7 +1585,7 @@ export class CompanionService {
     const body = deliveryPrompt.replace(/\nCancel this reminder with: .*$/, '');
     const sent = await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: reminder.delivery ?? 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
     const runsCompleted = (reminder.runsCompleted ?? 0) + 1;
-    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
+    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, deliveryStatus: 'pending', prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
     if (reminder.mode === 'repeat' || reminder.everySeconds) {
       const seconds = reminder.everySeconds ?? 0;
       if (reminder.maxRuns !== undefined && runsCompleted >= reminder.maxRuns) await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });

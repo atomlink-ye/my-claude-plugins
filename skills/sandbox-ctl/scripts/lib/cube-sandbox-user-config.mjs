@@ -1,12 +1,14 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import * as tls from "node:tls";
 
 const SCHEMA_VERSION = 1;
 const ADAPTER = "cube-sandbox";
 const API_FIELDS = new Set(["url", "key"]);
 const NETWORK_FIELDS = new Set(["apiNodeIp", "proxyNodeIp", "proxyPortHttps", "apiSandboxDomain", "proxyUrl", "caPath"]);
+const SCHEDULER_FIELDS = new Set(["nodes", "sshHost", "cliPath"]);
 const ROOT_FIELDS = new Set(["schemaVersion", "adapters"]);
 const ENV_FIELDS = {
   "api.url": ["CUBE_API_URL", "E2B_API_URL"],
@@ -17,14 +19,34 @@ const ENV_FIELDS = {
   "network.apiSandboxDomain": ["CUBE_API_SANDBOX_DOMAIN", "E2B_API_SANDBOX_DOMAIN"],
   "network.proxyUrl": ["CUBE_PROXY_URL", "E2B_PROXY_URL"],
   "network.caPath": ["CUBE_CA_PATH", "E2B_CA_PATH"],
+  "scheduler.nodes": ["CUBE_SCHEDULER_NODES"],
+  "scheduler.sshHost": ["CUBE_SCHEDULER_SSH_HOST"],
+  "scheduler.cliPath": ["CUBE_SCHEDULER_CLI_PATH"],
 };
 let appliedCaPath;
 
-function configuredPath(env = process.env, platform = process.platform, home = os.homedir()) {
+function resolveHome(home) {
+  if (home !== undefined) return home;
+  try { return os.userInfo().homedir || os.homedir(); }
+  catch { return os.homedir(); }
+}
+
+function configuredPaths(env = process.env, platform = process.platform, home) {
+  const realHome = resolveHome(home);
+  const modern = path.join(realHome, ".sandbox-ctl", "config.json");
+  const legacy = platform === "darwin"
+    ? path.join(realHome, "Library", "Application Support", "sandbox-ctl", "config.json")
+    : path.join(realHome, ".config", "sandbox-ctl", "config.json");
+  return { modern, legacy };
+}
+
+function configuredPath(env = process.env, platform = process.platform, home) {
   if (env.SANDBOX_CTL_USER_CONFIG) return path.resolve(String(env.SANDBOX_CTL_USER_CONFIG));
   if (env.XDG_CONFIG_HOME) return path.join(path.resolve(String(env.XDG_CONFIG_HOME)), "sandbox-ctl", "config.json");
-  if (platform === "darwin") return path.join(home, "Library", "Application Support", "sandbox-ctl", "config.json");
-  return path.join(home, ".config", "sandbox-ctl", "config.json");
+  const { modern, legacy } = configuredPaths(env, platform, home);
+  if (existsSync(modern)) return modern;
+  if (existsSync(legacy)) return legacy;
+  return home !== undefined ? legacy : modern;
 }
 
 function assertNoSymlink(filePath) {
@@ -42,6 +64,48 @@ function validateString(value, location) {
   if (value !== undefined && (typeof value !== "string" || !value.trim())) throw new Error(`Malformed Cube Sandbox user config: ${location} must be a non-empty string`);
 }
 
+function validateSchedulerNodeValue(value, location, { path = false } = {}) {
+  validateString(value, location);
+  if (value !== undefined && (value.length > 255 || /[\s\u0000-\u001f\u007f\\]/.test(value) || (!path && value.includes("/")) || value.startsWith("-"))) {
+    throw new Error(`Malformed Cube Sandbox user config: ${location} contains an unsafe node value`);
+  }
+}
+
+function validateScheduler(scheduler) {
+  if (scheduler === undefined) return undefined;
+  if (!scheduler || typeof scheduler !== "object" || Array.isArray(scheduler)) throw new Error("Malformed Cube Sandbox user config: scheduler must be an object");
+  for (const key of Object.keys(scheduler)) if (!SCHEDULER_FIELDS.has(key)) throw new Error(`Malformed Cube Sandbox user config: unsupported field scheduler.${key}`);
+  const clean = {};
+  if (scheduler.nodes !== undefined) {
+    if (!scheduler.nodes || typeof scheduler.nodes !== "object" || Array.isArray(scheduler.nodes)) throw new Error("Malformed Cube Sandbox user config: scheduler.nodes must be an object");
+    const nodes = {};
+    for (const [alias, value] of Object.entries(scheduler.nodes)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(alias)) throw new Error(`Malformed Cube Sandbox user config: scheduler.nodes alias is invalid: ${alias}`);
+      validateSchedulerNodeValue(value, `scheduler.nodes.${alias}`);
+      if (net.isIP(String(value)) === 0) throw new Error(`Malformed Cube Sandbox user config: scheduler.nodes.${alias} must be an IP address`);
+      nodes[alias] = value;
+    }
+    if (Object.keys(nodes).length) clean.nodes = nodes;
+  }
+  for (const field of ["sshHost", "cliPath"]) {
+    if (scheduler[field] === undefined) continue;
+    validateSchedulerNodeValue(scheduler[field], `scheduler.${field}`, { path: field === "cliPath" });
+    if (field === "sshHost" && !(/^[A-Za-z0-9][A-Za-z0-9._-]*(?:@[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(scheduler[field]) || net.isIP(scheduler[field]) > 0 || /^[A-Za-z0-9][A-Za-z0-9._-]*@[0-9A-Fa-f:]+$/.test(scheduler[field]))) throw new Error("Malformed Cube Sandbox user config: scheduler.sshHost is invalid");
+    if (field === "cliPath" && (!/^\/[A-Za-z0-9._/-]+$/.test(scheduler[field]) || scheduler[field].split("/").includes(".."))) throw new Error("Malformed Cube Sandbox user config: scheduler.cliPath is invalid");
+    clean[field] = scheduler[field];
+  }
+  return Object.keys(clean).length ? clean : undefined;
+}
+
+function parseSchedulerNodes(value) {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  let parsed;
+  try { parsed = JSON.parse(String(value)); }
+  catch (error) { throw new Error(`Malformed Cube Sandbox scheduler.nodes JSON: ${error.message}`); }
+  return parsed;
+}
+
 function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Malformed Cube Sandbox user config: expected an object");
   for (const key of Object.keys(input)) if (!ROOT_FIELDS.has(key)) throw new Error(`Malformed Cube Sandbox user config: unsupported field ${key}`);
@@ -51,7 +115,7 @@ function validateConfig(input) {
   const cube = input.adapters[ADAPTER];
   if (cube === undefined) return { schemaVersion: 1, adapters: {} };
   if (!cube || typeof cube !== "object" || Array.isArray(cube)) throw new Error("Malformed Cube Sandbox user config: cube-sandbox entry must be an object");
-  for (const key of Object.keys(cube)) if (!["api", "network"].includes(key)) throw new Error(`Malformed Cube Sandbox user config: unsupported cube-sandbox field ${key}`);
+  for (const key of Object.keys(cube)) if (!["api", "network", "scheduler"].includes(key)) throw new Error(`Malformed Cube Sandbox user config: unsupported cube-sandbox field ${key}`);
   const normalized = { schemaVersion: 1, adapters: { [ADAPTER]: {} } };
   for (const [group, allowed] of [["api", API_FIELDS], ["network", NETWORK_FIELDS]]) {
     if (cube[group] === undefined) continue;
@@ -64,13 +128,15 @@ function validateConfig(input) {
     }
     if (Object.keys(clean).length) normalized.adapters[ADAPTER][group] = clean;
   }
+  const scheduler = validateScheduler(cube.scheduler);
+  if (scheduler) normalized.adapters[ADAPTER].scheduler = scheduler;
   if (!Object.keys(normalized.adapters[ADAPTER]).length) delete normalized.adapters[ADAPTER];
   return normalized;
 }
 
 function readCubeSandboxUserConfig(options = {}) {
   if (typeof options === "string") options = { path: options };
-  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   assertNoSymlink(filePath);
   try {
     const directoryInfo = lstatSync(path.dirname(filePath));
@@ -91,7 +157,7 @@ function readCubeSandboxUserConfig(options = {}) {
 
 function writeCubeSandboxUserConfig(config, options = {}) {
   if (typeof options === "string") options = { path: options };
-  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const filePath = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   const normalized = validateConfig(config);
   const directory = path.dirname(filePath);
   assertNoSymlink(directory);
@@ -124,14 +190,20 @@ function resolveCubeSandboxValues({ env = process.env, config } = {}) {
   const values = {};
   for (const [key, names] of Object.entries(ENV_FIELDS)) {
     const [cubeName, e2bName] = names;
-    values[key] = firstValue(env[cubeName], valueAt(loaded, key), env[e2bName]);
+    values[key] = firstValue(env[cubeName], valueAt(loaded, key), e2bName ? env[e2bName] : undefined);
   }
+  const schedulerNodes = parseSchedulerNodes(values["scheduler.nodes"]);
+  const scheduler = {};
+  if (schedulerNodes !== undefined) scheduler.nodes = validateScheduler({ nodes: schedulerNodes }).nodes;
+  if (values["scheduler.sshHost"] !== undefined) scheduler.sshHost = values["scheduler.sshHost"];
+  if (values["scheduler.cliPath"] !== undefined) scheduler.cliPath = values["scheduler.cliPath"];
   return {
     api: { url: values["api.url"], key: values["api.key"] },
     network: {
       apiNodeIp: values["network.apiNodeIp"], proxyNodeIp: values["network.proxyNodeIp"], proxyPortHttps: values["network.proxyPortHttps"],
       apiSandboxDomain: values["network.apiSandboxDomain"], proxyUrl: values["network.proxyUrl"], caPath: values["network.caPath"],
     },
+    scheduler,
   };
 }
 
@@ -165,7 +237,7 @@ function sanitizeUrl(value) {
 }
 
 function configStatus(options = {}) {
-  const pathValue = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home ?? os.homedir());
+  const pathValue = options.path ? path.resolve(options.path) : configuredPath(options.env ?? process.env, options.platform ?? process.platform, options.home);
   const loaded = readCubeSandboxUserConfig({ ...options, path: pathValue });
   const resolved = resolveCubeSandboxValues({ env: options.env ?? process.env, config: loaded });
   const configured = {};

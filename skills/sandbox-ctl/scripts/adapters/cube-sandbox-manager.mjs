@@ -67,6 +67,8 @@
 //     below checks `.name` instead of importing the error classes.
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn as nodeSpawn } from "node:child_process";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -91,7 +93,7 @@ import { createDaemonClient, startDaemon } from "../lib/cube-sandbox-daemon.mjs"
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
-const STRING_FLAGS = ["--directory", "--task-id", "--template", "--name", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--branch", "--port", "--timeout", "--workspace-owner"];
+const STRING_FLAGS = ["--directory", "--task-id", "--template", "--name", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--branch", "--port", "--timeout", "--workspace-owner", "--node"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const SENSITIVE_BASENAME_RE = /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|\.sandbox-ctl|logs|.+\.log)$/;
 const DEFAULT_EXEC_TIMEOUT_MS = 300_000;
@@ -103,7 +105,12 @@ const DEFAULT_SANDBOX_TIMEOUT_MS = 1_800_000;
 
 /** Cube's flag surface is fixed (BOOL_FLAGS/STRING_FLAGS); the parsing engine itself lives in lib/cli-shared.mjs so it's shared with Daytona's adapter. */
 function parseArgs(argv = process.argv.slice(2), config = { booleanFlags: BOOL_FLAGS, stringFlags: STRING_FLAGS }) {
-  return parseArgsGeneric(argv, config);
+  const parsed = parseArgsGeneric(argv, config);
+  const isUp = parsed.command === "up" || parsed.command === "create" || ((parsed.command === "task" || parsed.command === "project") && parsed.positionals[0] === "up");
+  if (parsed.options.node !== undefined && !isUp) {
+    throw new Error("--node is only supported with up");
+  }
+  return parsed;
 }
 
 function parsePort(value) {
@@ -163,13 +170,13 @@ if [ -e "$target" ] && [ ! -d "$target" ]; then echo "workspace path exists but 
 if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ]; then
   actual_owner=$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)
   if [ "$actual_owner" != "$expected_owner" ]; then
-    echo "workspace is non-empty and owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    echo "workspace ownership mismatch: non-empty workspace is owned by $actual_owner, expected $expected_owner; migrate ownership explicitly before retrying" >&2
     exit 78
   fi
-  mismatch=$(find "$target" -mindepth 1 \( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \) -print -quit 2>/dev/null || true)
+  mismatch=$(find "$target" -mindepth 1 \\( ! -uid ${owner.uid} -o ! -gid ${owner.gid} \\) -print -quit 2>/dev/null || true)
   if [ -n "$mismatch" ]; then
     actual=$(stat -c '%u:%g' "$mismatch" 2>/dev/null || stat -f '%u:%g' "$mismatch" 2>/dev/null || true)
-    echo "workspace entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
+    echo "workspace ownership mismatch: entry $mismatch is owned by $actual, expected $expected_owner; migrate ownership explicitly before retrying" >&2
     exit 78
   fi
 fi
@@ -310,17 +317,23 @@ function buildUserConfigFromEnvironment(options = {}) {
   const config = { schemaVersion: 1, adapters: { "cube-sandbox": { api: {}, network: {} } } };
   for (const [field, value] of Object.entries(resolved.api)) if (value !== undefined && value !== "") config.adapters["cube-sandbox"].api[field] = String(value);
   for (const [field, value] of Object.entries(resolved.network)) if (value !== undefined && value !== "") config.adapters["cube-sandbox"].network[field] = String(value);
+  if (Object.keys(resolved.scheduler ?? {}).length) config.adapters["cube-sandbox"].scheduler = {
+    ...(resolved.scheduler.nodes ? { nodes: resolved.scheduler.nodes } : {}),
+    ...(resolved.scheduler.sshHost ? { sshHost: String(resolved.scheduler.sshHost) } : {}),
+    ...(resolved.scheduler.cliPath ? { cliPath: String(resolved.scheduler.cliPath) } : {}),
+  };
   return config;
 }
 
 async function handleConfig(options = {}) {
   const command = options.configCommand ?? options.command ?? "status";
-  const configPathValue = configuredPath(options.env ?? process.env);
+  const configOptions = { env: options.env ?? process.env, platform: options.platform, home: options.home };
+  const configPathValue = configuredPath(configOptions.env, configOptions.platform ?? process.platform, configOptions.home);
   if (command === "path") return { ok: true, path: configPathValue };
-  if (command === "status") return { ok: true, ...configStatus({ env: options.env ?? process.env }) };
+  if (command === "status") return { ok: true, ...configStatus(configOptions) };
   if (command !== "set") throw new Error("Usage: sandbox-ctl --adapter cube-sandbox config set|status|path");
   const config = buildUserConfigFromEnvironment(options);
-  const filePath = writeCubeSandboxUserConfig(config, { env: options.env ?? process.env });
+  const filePath = writeCubeSandboxUserConfig(config, configOptions);
   const fields = [];
   for (const [group, values] of Object.entries(config.adapters["cube-sandbox"])) for (const field of Object.keys(values)) fields.push(`${group}.${field}`);
   return { ok: true, path: filePath, configuredFields: fields };
@@ -348,8 +361,8 @@ async function cubeSandboxExec(sandbox, cmd, opts = {}) {
     const result = await sandbox.commands.run(cmd, { background: false, ...opts });
     return { exitCode: result.exitCode, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   } catch (error) {
-    if (typeof error?.exitCode === "number" && typeof error?.stdout === "string" && typeof error?.stderr === "string") {
-      return { exitCode: error.exitCode, stdout: error.stdout, stderr: error.stderr };
+    if (typeof error?.exitCode === "number") {
+      return { exitCode: error.exitCode, stdout: error.stdout ?? "", stderr: error.stderr ?? "" };
     }
     throw error;
   }
@@ -525,6 +538,131 @@ function redactExecFailure(error) {
   return sanitizeDiagnosticUrls(message);
 }
 
+function daemonUnavailableDiagnostic(error) {
+  const detail = redactExecFailure(error);
+  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Run sandbox-ctl daemon stop && sandbox-ctl daemon start, then retry.`;
+}
+
+function assertWorkspaceOwnership(result, action = "workspace ownership validation") {
+  try {
+    return assertRemoteCommandSuccess(result, action);
+  } catch (error) {
+    if (result?.exitCode === 78) {
+      const details = [result.stderr, result.stdout].filter(Boolean).map((value) => String(value).trim()).filter(Boolean).join(" ");
+      const mismatch = new Error(`Workspace ownership mismatch: ${details || error.message}`);
+      mismatch.exitCode = 78;
+      throw mismatch;
+    }
+    throw error;
+  }
+}
+
+function assertSchedulerToken(value, source, { pathValue = false } = {}) {
+  const text = String(value ?? "");
+  if (!text || text.length > 255 || text.startsWith("-") || /[\s\u0000-\u001f\u007f\\'\"`;$(){}|<>]/.test(text) || (!pathValue && text.includes("/"))) {
+    throw new Error(`Invalid Cube scheduler ${source}`);
+  }
+  return text;
+}
+
+function assertSshHost(value) {
+  const text = assertSchedulerToken(value, "sshHost");
+  const validDestination = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:@[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(text)
+    || net.isIP(text) > 0
+    || /^[A-Za-z0-9][A-Za-z0-9._-]*@[0-9A-Fa-f:]+$/.test(text);
+  if (!validDestination) throw new Error("Invalid Cube scheduler sshHost");
+  return text;
+}
+
+function assertTemplateId(value) {
+  const text = String(value ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(text)) throw new Error("Invalid Cube scheduler template");
+  return text;
+}
+
+function assertCliPath(value) {
+  const text = String(value ?? "");
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(text) || text.split("/").includes("..")) throw new Error("Invalid Cube scheduler cliPath");
+  return text;
+}
+
+function resolveSchedulerNode(node, scheduler = {}) {
+  const requested = assertSchedulerToken(node, "node");
+  if (net.isIP(requested)) return requested;
+  const mapped = scheduler?.nodes?.[requested];
+  if (mapped === undefined) throw new Error(`Unknown Cube scheduler node alias: ${requested}; configure scheduler.nodes or pass a bare IP`);
+  const resolved = assertSchedulerToken(mapped, `node mapping ${requested}`);
+  if (net.isIP(resolved) === 0) throw new Error(`Cube scheduler node mapping ${requested} must resolve to an IP address`);
+  return resolved;
+}
+
+function resolveSchedulerConfig({ env = process.env } = {}) {
+  const resolved = resolveCubeSandboxValues({ env });
+  const scheduler = resolved.scheduler ?? {};
+  if (!scheduler.sshHost) throw new Error("Cube scheduler config is missing scheduler.sshHost (set CUBE_SCHEDULER_SSH_HOST or use config set)");
+  if (!scheduler.cliPath) throw new Error("Cube scheduler config is missing scheduler.cliPath (set CUBE_SCHEDULER_CLI_PATH or use config set)");
+  assertSshHost(scheduler.sshHost);
+  assertCliPath(scheduler.cliPath);
+  return scheduler;
+}
+
+const NODE_CREATE_SCRIPT = `set -eu
+tmpdir="$(mktemp -d "\${TMPDIR:-/tmp}/sandbox-ctl.XXXXXX")"
+trap 'rm -rf -- "$tmpdir"' EXIT HUP INT TERM
+render="$tmpdir/render.json"
+request="$tmpdir/request.json"
+if ! "$2" template render --template-id "$1" --json >"$render" 2>"$tmpdir/render.stderr"; then
+  echo "template render failed" >&2
+  exit 78
+fi
+if ! jq -e '.api_request != null and (.api_request | type == "object")' "$render" >/dev/null 2>&1; then
+  echo "template render did not return a valid api_request" >&2
+  exit 78
+fi
+jq -ce '.api_request' "$render" >"$request"
+"$2" multirun --norm --printall --fail_exit --async_retry_max 0 --hostid "$3" "$request" 2>&1
+`;
+
+function runSpawnedSsh({ sshHost, template, cliPath, node, spawnImpl = nodeSpawn } = {}) {
+  assertSshHost(sshHost);
+  assertTemplateId(template);
+  assertCliPath(cliPath);
+  if (net.isIP(String(node)) === 0) throw new Error("Cube scheduler node must be an IP address");
+  return new Promise((resolve, reject) => {
+    let child;
+    try { child = spawnImpl("ssh", ["--", sshHost, "sh", "-s", "--", template, cliPath, node], { stdio: ["pipe", "pipe", "pipe"] }); }
+    catch (error) { reject(error); return; }
+    const stdout = [];
+    const stderr = [];
+    child.stdout?.on("data", (chunk) => stdout.push(String(chunk)));
+    child.stderr?.on("data", (chunk) => stderr.push(String(chunk)));
+    child.on("error", reject);
+    child.on("close", (code, signal) => resolve({ exitCode: code ?? 255, signal, stdout: stdout.join(""), stderr: stderr.join("") }));
+    child.stdin?.end(NODE_CREATE_SCRIPT);
+  });
+}
+
+function parseNodeCreateResult({ exitCode, stdout = "", stderr = "" } = {}) {
+  const codes = [...String(stdout).matchAll(/\bcode:(-?\d+)\b/g)].map((match) => Number(match[1]));
+  const successCounts = [...String(stdout).matchAll(/\btotalRunSuccCnt:(\d+)\b/g)].map((match) => Number(match[1]));
+  const errorCounts = [...String(stdout).matchAll(/\btotalRunErr:(\d+)\b/g)].map((match) => Number(match[1]));
+  const sandboxIds = [...String(stdout).matchAll(/\bsandBoxId:([A-Fa-f0-9]{16,64})(?=,|\s|$)/g)].map((match) => match[1]).filter(Boolean);
+  const valid = exitCode === 0 && codes.length === 1 && codes[0] === 200 && successCounts.length === 1 && successCounts[0] === 1 && errorCounts.length === 1 && errorCounts[0] === 0 && sandboxIds.length === 1;
+  if (!valid) {
+    const details = `sshExit=${exitCode}; code=${codes.join(",") || "missing"}; totalRunSuccCnt=${successCounts.join(",") || "missing"}; totalRunErr=${errorCounts.join(",") || "missing"}; sandBoxId=${sandboxIds.length ? "present" : "missing"}`;
+    throw new Error(`Cube node sandbox creation failed strict success gates (${details})`);
+  }
+  return { sandboxId: sandboxIds[0], stdout, stderr };
+}
+
+async function createCubeSandboxOnNode({ template, node, env = process.env, spawnImpl = nodeSpawn } = {}) {
+  if (!template) throw new Error("Cube Sandbox up --node requires --template TEMPLATE_ID");
+  const scheduler = resolveSchedulerConfig({ env });
+  const resolvedNode = resolveSchedulerNode(node, scheduler);
+  const result = await runSpawnedSsh({ sshHost: scheduler.sshHost, template, cliPath: scheduler.cliPath, node: resolvedNode, spawnImpl });
+  return parseNodeCreateResult(result);
+}
+
 function writeExecArtifacts(artifactsPath, { stdout, stderr, exitCode, command, cwd }) {
   const target = path.resolve(String(artifactsPath));
   mkdirSync(target, { recursive: true });
@@ -555,16 +693,31 @@ async function handleUp(options) {
   else if (options.name) paths = resolveProjectPaths({ ...options, sandbox: options.name });
   const existingBinding = paths.binding;
   const template = options.template ?? options.snapshot ?? existingBinding?.template;
+  if (options.node !== undefined && existingBinding?.sandboxId) {
+    throw new Error("Cube Sandbox up --node only creates a new binding; an existing sandbox binding is already selected");
+  }
   if (!existingBinding?.sandboxId && !template) throw new Error("Cube Sandbox up requires --template TEMPLATE_ID for a new sandbox");
-  const client = options.client ?? await createClient();
+  const nodeMode = options.node !== undefined;
+  let client = options.client;
   const timeoutMs = options.timeoutMs ?? existingBinding?.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
   const workspaceOwner = resolveWorkspaceOwner(options, existingBinding);
   let sandbox = null;
-  if (existingBinding?.sandboxId) {
-    try { sandbox = await client.connect(existingBinding.sandboxId, { timeoutMs }); }
-    catch (error) { if (!isNotFoundError(error)) throw error; sandbox = null; }
+  if (nodeMode) {
+    const createdOnNode = await createCubeSandboxOnNode({ template, node: options.node, env: options.env ?? process.env, spawnImpl: options.spawnImpl ?? nodeSpawn });
+    client = client ?? await createClient();
+    try { sandbox = await client.connect(createdOnNode.sandboxId, { timeoutMs }); }
+    catch (error) {
+      try { await client.kill?.(createdOnNode.sandboxId); } catch { /* preserve the connection error; no binding was written */ }
+      throw error;
+    }
+  } else {
+    client = client ?? await createClient();
+    if (existingBinding?.sandboxId) {
+      try { sandbox = await client.connect(existingBinding.sandboxId, { timeoutMs }); }
+      catch (error) { if (!isNotFoundError(error)) throw error; sandbox = null; }
+    }
   }
-  let created = false;
+  let created = nodeMode;
   if (!sandbox) {
     if (!template) throw new Error("Cube Sandbox up requires --template TEMPLATE_ID when the bound sandbox no longer exists");
     const metadata = {
@@ -579,6 +732,7 @@ async function handleUp(options) {
     created = true;
   }
   const sandboxId = sandbox.sandboxId ?? sandbox.id;
+  if (!sandboxId) throw new Error("Cube Sandbox create did not return a sandbox ID");
   const bindingName = options.name ?? existingBinding?.name ?? paths.taskId;
   let remoteHome;
   let binding;
@@ -586,7 +740,7 @@ async function handleUp(options) {
     remoteHome = existingBinding?.remoteHome ?? await resolveRemoteHome(sandbox);
     const remoteWorkspace = toRemoteAbsolute(paths.remoteWorkspacePath, remoteHome);
     const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
-    assertRemoteCommandSuccess(workspaceResult, "workspace initialization");
+    assertWorkspaceOwnership(workspaceResult, "workspace initialization");
     binding = upsertBinding(paths.directory, bindingName, {
       sandboxId,
       remoteHome,
@@ -644,6 +798,7 @@ async function handleStatus(options = {}) {
     name: info?.name,
     createdAt: info?.createdAt,
     updatedAt: info?.updatedAt,
+    endAt: info?.endAt,
     metadata: info?.metadata && typeof info.metadata === "object" ? Object.fromEntries(Object.entries(info.metadata).filter(([key]) => !SECRET_KEY_RE.test(key))) : undefined,
   };
   const result = { ok: true, sandboxId: paths.binding.sandboxId, name: paths.binding.name, state: info?.state ?? "unknown", ...safeInfo, binding: paths.binding };
@@ -659,11 +814,15 @@ async function handleAdopt(options = {}) {
   const directory = path.resolve(options.directory ?? process.cwd());
   const name = options.name ?? `adopted-${String(sandboxId).replace(/[^A-Za-z0-9._-]+/g, "-")}`;
   const client = options.client ?? await createClient();
-  const timeoutMs = DEFAULT_SANDBOX_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS;
   let info;
   if (typeof client.getInfo === "function") info = await client.getInfo(sandboxId);
   const sandbox = await client.connect(sandboxId, { timeoutMs });
   if (options.requireManagedPolicy && info) assertManagedSandboxInfo(info, projectIdentity(directory));
+  if (typeof sandbox?.setTimeout !== "function") {
+    throw new Error("Cube Sandbox adopt cannot set lifecycle timeout: sandbox.setTimeout is unavailable");
+  }
+  await sandbox.setTimeout(timeoutMs);
   const remoteHome = options.remoteHome ?? await resolveRemoteHome(sandbox);
   const binding = upsertBinding(directory, name, { sandboxId, remoteHome, remoteWorkspace, timeoutMs, projectIdentity: projectIdentity(directory), adoptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, { use: !options.noUse, adapter: "cube-sandbox" });
   const result = { ok: true, sandboxId, name, remoteHome, remoteWorkspace, timeoutMs, binding };
@@ -730,6 +889,8 @@ async function handleExec(options, command) {
 
 async function handleExecViaDaemon(options, command) {
   let paths;
+  const stdout = [];
+  const stderr = [];
   try {
     paths = resolveProjectPaths(options);
     if (!paths.binding?.sandboxId) return null;
@@ -738,8 +899,6 @@ async function handleExecViaDaemon(options, command) {
       : createDaemonClient(options.daemon ?? {});
     if (!options.daemonClient) await (options.startDaemon ?? startDaemon)(options.daemon ?? {});
     const cwd = options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath;
-    const stdout = [];
-    const stderr = [];
     const result = await daemon.exec({
       sandboxId: paths.binding.sandboxId,
       command: command.map(shellQuote).join(" "),
@@ -754,14 +913,21 @@ async function handleExecViaDaemon(options, command) {
     if (result.remoteHome && !paths.binding.remoteHome) {
       try { upsertBinding(paths.directory, paths.binding.name, { remoteHome: result.remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* preserve command result; next direct run can retry */ }
     }
-    if (result.error) normalized.error = redactExecFailure(result.error);
+    if (result.error) {
+      const diagnostic = daemonUnavailableDiagnostic(result.error);
+      normalized.exitCode = 125;
+      normalized.error = diagnostic;
+      normalized.stderr = normalized.stderr ? `${normalized.stderr}${normalized.stderr.endsWith("\n") ? "" : "\n"}${diagnostic}\n` : `${diagnostic}\n`;
+    }
     if (options.artifacts && !normalized.error) {
       try { normalized.artifactPath = writeExecArtifacts(options.artifacts, { ...normalized, command, cwd }); }
       catch (error) { return { ...normalized, exitCode: 125, error: redactExecFailure(error) }; }
     }
     return normalized;
   } catch (error) {
-    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error) };
+    const diagnostic = daemonUnavailableDiagnostic(error);
+    const priorStderr = stderr.join("");
+    return { exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic };
   }
 }
 
@@ -862,7 +1028,7 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
   if (!existsSync(localAbs)) throw new Error(`Path not found: ${localAbs}`);
   assertSafeLocalTransferFile(localAbs);
   const workspaceResult = await cubeSandboxExec(sandbox, workspaceProvisionCommand(remoteWorkspace, workspaceOwner));
-  assertRemoteCommandSuccess(workspaceResult, "workspace ownership validation");
+  assertWorkspaceOwnership(workspaceResult);
 
   // Single-file fast path (new relative to Daytona): auto-detected when the
   // local path is not a directory, using sbx.files.write directly with no tar
@@ -1088,9 +1254,9 @@ async function handleList(options = {}) {
   const sandboxes = [];
   while (paginator.hasNext) {
     const items = await paginator.nextItems();
-    for (const info of items) sandboxes.push({ id: info.sandboxId, name: info.name, state: info.state, template: info.templateId });
+    for (const info of items) sandboxes.push({ id: info.sandboxId, name: info.name, state: info.state, template: info.templateId, startedAt: info.startedAt, endAt: info.endAt });
   }
-  const result = { sandboxes };
+  const result = { ok: true, sandboxes };
   console.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -1158,11 +1324,16 @@ export {
   isNotFoundError,
   parseArgs,
   parsePort,
+  parseNodeCreateResult,
   projectIdentity,
   redactExecFailure,
   requireSandbox,
   resolveProjectPaths,
+  resolveSchedulerConfig,
+  resolveSchedulerNode,
   resolveRemoteHome,
+  runSpawnedSsh,
+  createCubeSandboxOnNode,
   runDoctorCheck,
   toRemoteAbsolute,
   uploadFile,

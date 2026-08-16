@@ -8,6 +8,7 @@ import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.
 class WakeupCli {
   agents: Record<string, any> = {};
   sends: string[] = [];
+  heartbeatArgs: string[][] = [];
   updates: string[][] = [];
   dead = new Set<string>();
   async run(args: string[], options: any = {}): Promise<any> {
@@ -22,7 +23,7 @@ class WakeupCli {
       return { value: { id: args[2], status: 'active' } };
     }
     if (args[0] === 'heartbeat' && args[1] === 'create') {
-      if (String(args[2] ?? '').startsWith('AUTOMATED_COMPANION_EVENT')) this.sends.push(args[2] ?? '');
+      this.heartbeatArgs.push(args);
       return { value: { id: 'hb-message', status: 'active' } };
     }
     return { value: {} };
@@ -30,6 +31,10 @@ class WakeupCli {
 }
 
 const detector = { detect: async () => false };
+
+function heartbeatPrompts(cli: WakeupCli): string[] {
+  return cli.heartbeatArgs.filter((args) => args[0] === 'heartbeat' && args[1] === 'create').map((args) => String(args[2] ?? ''));
+}
 
 async function makeService(cli = new WakeupCli()) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'companion-round7-'));
@@ -69,8 +74,10 @@ describe('round7 registered wakeup sources', () => {
     const source = await service.registerWakeupSource('missing-heartbeat', 'manager-1', 'cron:*/30 * * * *');
     expect(source.status).toBe('dead');
     await service.watchdogTick('manager-1');
-    const alert = cli.sends.find((body) => body.includes('event=manager-bare'));
+    const alert = heartbeatPrompts(cli).find((body) => body.includes('event=manager-bare'));
     expect(alert).toBeDefined();
+    expect(heartbeatPrompts(cli).filter((body) => body.includes('event=manager-bare'))).toHaveLength(1);
+    expect(cli.sends).toHaveLength(0);
     expect(alert).toContain('companion-created and registered');
     expect(alert).toContain('external wakeup sources may be invisible');
     expect(alert).not.toContain('no live self wakeup source');

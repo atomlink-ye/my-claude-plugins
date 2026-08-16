@@ -41,6 +41,8 @@ export interface ReminderRecord {
   runsCompleted?: number;
   delivery?: MessageDelivery;
   deliveryMessageId?: string;
+  /** Delivery audit for the most recent locally-fired run. */
+  deliveryStatus?: 'pending' | 'delivered';
   eventType?: string;
   criterion?: string;
 }
@@ -79,6 +81,33 @@ export interface LedgerRecord {
   createdAt: string;
   revokedAt?: string;
   revokeReason?: string;
+}
+
+export type CorrectionResolution = 'ACCEPT' | 'REFUSE';
+export type CorrectionStatus = 'open' | 'closed';
+
+/** A finding raised by an external correction auditor. */
+export interface CorrectionResolutionRecord {
+  verdict: CorrectionResolution;
+  note: string;
+  at: string;
+}
+
+export interface CorrectionFinding {
+  id: string;
+  text: string;
+  resolution: CorrectionResolutionRecord | null;
+}
+
+/** Durable correction instance used by the external correction gate. */
+export interface CorrectionInstance {
+  id: string;
+  managerId: string;
+  auditorId: string;
+  createdAt: string;
+  status: CorrectionStatus;
+  findings: CorrectionFinding[];
+  closedAt: string | null;
 }
 
 export interface AgentInfo {
@@ -167,7 +196,7 @@ export interface MessageRecord {
   recoveryRunIds?: Record<string, string[]>;
 }
 
-/** Local index for one generation of a recipient's one-shot delivery schedule. */
+/** Local index for one generation of a recipient's delivery transport. */
 export interface MessageScheduleRecord {
   id: string;
   recipient: string;
@@ -178,6 +207,7 @@ export interface MessageScheduleRecord {
   status: 'pending' | 'active' | 'running' | 'failed' | 'completed' | 'deleted';
   transport?: 'heartbeat' | 'paseo-send';
   transportReason?: string;
+  cron?: string;
   createdAt: string;
   lastRunAt?: string;
 }

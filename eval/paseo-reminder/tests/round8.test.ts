@@ -11,6 +11,7 @@ class DeliveryCli {
   status = 'running';
   updatedAt = '2026-01-01T00:00:00.000Z';
   failSend = false;
+  heartbeatRuns: Array<Record<string, unknown>> = [];
   async run(args: string[]): Promise<any> {
     this.calls.push(args);
     if (args[0] === 'inspect') return { value: { id: args[1], Status: this.status, UpdatedAt: this.updatedAt } };
@@ -19,6 +20,12 @@ class DeliveryCli {
       this.prompts.push(args.at(-1) ?? '');
       return { value: { status: 'sent' } };
     }
+    if (args[0] === 'heartbeat' && args[1] === 'create') {
+      this.prompts.push(args[2] ?? '');
+      return { value: { id: 'heartbeat-1', status: 'active', lastRunAt: null } };
+    }
+    if (args[0] === 'schedule' && args[1] === 'inspect') return { value: { schedule: { id: args[2], status: 'active' } } };
+    if (args[0] === 'schedule' && args[1] === 'logs') return { value: { runs: this.heartbeatRuns } };
     if (args[0] === 'heartbeat' && args[1] === 'delete') return { value: { status: 'deleted' } };
     return { value: [] };
   }
@@ -31,20 +38,37 @@ async function makeService(cli = new DeliveryCli()) {
 }
 
 describe('round8 message transport', () => {
-  it('keeps on-idle messages pending while the recipient is busy', async () => {
+  it('arms a repeating heartbeat and keeps on-idle messages pending until it runs', async () => {
     const { service, store, cli } = await makeService();
     const posted = await service.postMessage({ to: 'manager-1', from: 'worker', body: 'later', mode: 'ack' });
     await (service as any).reconcileMessages();
+    const create = cli.calls.find((args) => args[0] === 'heartbeat' && args[1] === 'create');
+    expect(create).toEqual(expect.arrayContaining(['--cron', '* * * * *', '--expires-in', '30m']));
+    expect(create).not.toContain('--max-runs');
     expect(cli.calls.some((args) => args[0] === 'send')).toBe(false);
     expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('pending');
   });
 
-  it('delivers on-idle only after two stable available observations', async () => {
+  it('keeps failed busy runs active, then delivers and retires after a succeeded run', async () => {
     const { service, store, cli } = await makeService();
     const posted = await service.postMessage({ to: 'manager-1', from: 'worker', body: 'stable', mode: 'ack' });
-    cli.status = 'idle';
     await (service as any).reconcileMessages();
-    expect(cli.prompts).toHaveLength(0);
+    expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('pending');
+    cli.heartbeatRuns = [{
+      id: 'run-busy', scheduledFor: new Date(Date.now() + 1_000).toISOString(),
+      startedAt: new Date(Date.now() + 1_000).toISOString(), endedAt: new Date(Date.now() + 1_001).toISOString(),
+      status: 'failed', error: 'recipient busy',
+    }];
+    await (service as any).reconcileMessages();
+    expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('pending');
+    expect(store.getMessageSchedules().find((item) => item.batchIds.includes(posted.id))?.status).toBe('active');
+    expect(cli.calls.some((args) => args[0] === 'heartbeat' && args[1] === 'delete')).toBe(false);
+
+    const endedAt = new Date(Date.now() + 2_000).toISOString();
+    cli.heartbeatRuns.push({
+      id: 'run-success', scheduledFor: endedAt, startedAt: endedAt, endedAt,
+      status: 'succeeded', error: null,
+    });
     await (service as any).reconcileMessages();
     expect(cli.prompts).toHaveLength(1);
     expect(cli.prompts[0]).toContain('<paseo-reminder-delivery to="manager-1" kind="message">');
@@ -54,15 +78,16 @@ describe('round8 message transport', () => {
     expect(cli.prompts[0]).toContain(`<ack>curl -X DELETE http://127.0.0.1:8787/messages/${posted.id}`);
     expect(cli.prompts[0]).toContain('</paseo-reminder-delivery>');
     expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('delivered');
+    expect(cli.calls).toContainEqual(['heartbeat', 'delete', 'heartbeat-1', '--json']);
+    expect(store.getMessageSchedules().find((item) => item.batchIds.includes(posted.id))).toEqual(expect.objectContaining({ status: 'completed', lastRunAt: endedAt }));
   });
 
   it('renders one escaped tagged item per coalesced message', async () => {
     const { service, cli } = await makeService();
-    const first = await service.postMessage({ to: 'manager-1', from: 'worker-a', body: 'first <item> & safe', mode: 'ack' });
-    const second = await service.postMessage({ to: 'manager-1', from: 'worker-b', body: 'second', mode: 'ack' });
-    cli.status = 'idle';
-    await (service as any).reconcileMessages();
-    await (service as any).reconcileMessages();
+    const [first, second] = await Promise.all([
+      service.postMessage({ to: 'manager-1', from: 'worker-a', body: 'first <item> & safe', mode: 'ack' }),
+      service.postMessage({ to: 'manager-1', from: 'worker-b', body: 'second', mode: 'ack' }),
+    ]);
     const prompt = cli.prompts.at(-1)!;
     expect(prompt.match(/  <item id=/g)).toHaveLength(2);
     expect(prompt).toContain(`<item id="${first.id}" from="worker-a"`);
@@ -74,6 +99,7 @@ describe('round8 message transport', () => {
     const { service, store, cli } = await makeService();
     const posted = await service.postMessage({ to: 'manager-1', from: 'worker', body: 'now', delivery: 'interrupt', mode: 'ack' });
     expect(cli.calls.some((args) => args[0] === 'inspect')).toBe(false);
+    expect(cli.calls.some((args) => args[0] === 'heartbeat')).toBe(false);
     expect(cli.prompts).toHaveLength(1);
     expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('delivered');
   });

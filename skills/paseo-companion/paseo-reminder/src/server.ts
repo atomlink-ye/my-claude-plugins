@@ -38,6 +38,8 @@ const ROUTES = [
   ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'resumeSteps']],
   ['POST', '/ledger', ['type', 'target', 'verdict', 'reason']], ['GET', '/ledger', []],
   ['POST', '/ledger/:id/revoke', ['reason']],
+  ['POST', '/corrections', ['managerId', 'auditorId', 'findings']], ['GET', '/corrections', []],
+  ['POST', '/corrections/:id/resolve', ['findingId', 'verdict']], ['GET', '/gate', ['managerId']],
 ] as const;
 const ERROR_STATUS: Record<string, number> = { missing_field: 400, invalid_value: 400, not_found: 404, ambiguous_id: 409, state_corrupt: 503, cli_error: 502 };
 
@@ -172,6 +174,28 @@ export async function createServer(service = new CompanionService(undefined, und
       }
       if (method === 'GET' && pathname === '/ledger') {
         send(res, 200, service.listLedger(url.searchParams.get('type') || undefined, url.searchParams.get('target') || undefined)); return;
+      }
+      if (method === 'POST' && pathname === '/corrections') {
+        const body = await readBody(req);
+        const managerId = required(body.managerId, 'managerId');
+        const auditorId = required(body.auditorId, 'auditorId');
+        send(res, 201, await service.createCorrection({ managerId, auditorId, findings: body.findings })); return;
+      }
+      if (method === 'GET' && pathname === '/corrections') {
+        send(res, 200, service.listCorrections(url.searchParams.get('managerId') || undefined, url.searchParams.get('status') || undefined)); return;
+      }
+      const correctionResolveMatch = pathname.match(/^\/corrections\/([^/]+)\/resolve$/);
+      if (method === 'POST' && correctionResolveMatch) {
+        const body = await readBody(req);
+        send(res, 200, await service.resolveCorrection(decodeURIComponent(correctionResolveMatch[1]), {
+          findingId: body.findingId,
+          verdict: body.verdict,
+          note: body.note,
+        })); return;
+      }
+      if (method === 'GET' && pathname === '/gate') {
+        const managerId = required(url.searchParams.get('managerId'), 'managerId');
+        send(res, 200, service.getCorrectionGate(managerId)); return;
       }
       const revokeMatch = pathname.match(/^\/ledger\/([^/]+)\/revoke$/);
       if (method === 'POST' && revokeMatch) {

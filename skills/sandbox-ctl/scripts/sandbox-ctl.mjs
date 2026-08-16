@@ -239,6 +239,7 @@ async function invokeRun(parsed, adapter) {
   }
   const directory = parsed.options.directory ?? adapterParsed.options.directory ?? process.cwd();
   const bindingName = makeRunTaskId();
+  if (adapterParsed.options.node !== undefined) return makeControlFailure({ directory, bindingName, error: "--node is only supported with up", adapter: parsed.adapter });
   const selector = parsed.options.sandbox ?? parsed.options.sandboxSelector ?? adapterParsed.options.sandbox ?? adapterParsed.options["sandbox-id"] ?? adapterParsed.options["sandbox-name"];
   const transferMode = parsed.options.mode ?? adapterParsed.options.mode;
   const includeSensitive = Boolean(parsed.options.includeSensitive ?? adapterParsed.options.includeSensitive ?? adapterParsed.options["include-sensitive"]);
@@ -452,9 +453,11 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
     const runner = command === "run" ? () => invokeRun(parsed, selectedAdapter) : () => invoke(parsed, selectedAdapter, alias);
     const jsonResult = (parsed.json || command === "run") ? await capture(runner) : { result: await runner(), logs: [], errors: [], writes: [] };
     const resultObject = jsonResult.result && typeof jsonResult.result === "object" ? jsonResult.result : {};
-    const exitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : (resultObject.ok === false ? 1 : 0);
+    const handlerFailed = resultObject.ok === false || Object.prototype.hasOwnProperty.call(resultObject, "error");
+    const reportedExitCode = (command === "exec" || command === "run") && typeof resultObject.exitCode === "number" ? resultObject.exitCode : undefined;
+    const exitCode = handlerFailed ? (reportedExitCode !== undefined && reportedExitCode !== 0 ? reportedExitCode : 1) : (reportedExitCode ?? 0);
     if ((command === "exec" || command === "run") && typeof resultObject.exitCode === "number") process.exitCode = exitCode;
-    if (resultObject.ok === false && !((command === "exec" || command === "run") && typeof resultObject.exitCode === "number")) process.exitCode = 1;
+    if (handlerFailed && !((command === "exec" || command === "run") && typeof resultObject.exitCode === "number")) process.exitCode = 1;
     if (!parsed.json && command === "exec" && resultObject.error) {
       if (resultObject.warning) console.error(sanitizeError(resultObject.warning));
       console.error(sanitizeError(resultObject.error));
@@ -501,9 +504,13 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
       else console.error(payload.error);
       return payload;
     }
-    if (!requestedJson) throw error;
-    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
-    process.exitCode = 1;
+    if (!requestedJson) {
+      if (Number.isInteger(error?.exitCode)) process.exitCode = error.exitCode;
+      throw error;
+    }
+    const exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), exitCode, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    process.exitCode = exitCode;
     console.log(JSON.stringify(payload));
     return payload;
   }
@@ -606,7 +613,7 @@ if (isDirectExecution) {
     const wantsJson = process.argv.includes("--json");
     if (wantsJson) console.log(JSON.stringify({ ok: false, command: "unknown", adapter: findEffectiveAdapter(directArgv), error: sanitizeError(error) }));
     else console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
   });
 }
 

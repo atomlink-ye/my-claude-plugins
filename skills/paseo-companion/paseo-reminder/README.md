@@ -31,7 +31,7 @@ Routes:
 | GET | `/reminders?agentId=` | optional agent filter | persisted reminder state, including `status`, `nextRunAt`, and `lastFiredAt` |
 | GET | `/reminders/:id` | — | one persisted reminder record |
 | DELETE | `/reminders/:id` | `{reason}` | deletes daemon heartbeat and records acknowledgement |
-| POST | `/messages` | `{to, from, body, delivery?, mode?, replyTo?, ackDeadlineSeconds?}` | durable interrupt or stable-idle delivery |
+| POST | `/messages` | `{to, from, body, delivery?, mode?, replyTo?, ackDeadlineSeconds?}` | durable interrupt or idle-heartbeat delivery |
 | GET | `/messages` | `to?`, `from?`, `status?`, `replyTo?` | filtered message state |
 | DELETE | `/messages/:id` | `{reason}` | cancel or acknowledge an ack-mode message |
 | POST | `/compact-wake` | agentId, resumeSteps | recovery heartbeat (observation is bounded) |
@@ -42,9 +42,10 @@ Routes:
 
 `POST /ledger` and `DELETE /reminders/:id` reject missing reasons (and ledger
 verdicts) with HTTP 400. Messages are persisted first. Default
-`delivery:"on-idle"` polls only recipients with pending work and requires two
-unchanged `idle`/`waiting` observations about 15 seconds apart before one coalesced
-`paseo send --no-wait`; `delivery:"interrupt"` sends immediately. Default
+`delivery:"on-idle"` arms a repeating one-minute heartbeat for the coalesced
+batch. Busy ticks are silently skipped and the next tick retries; after an actual
+run, reconciliation records `deliveredAt` and retires the heartbeat.
+`delivery:"interrupt"` uses `paseo send --no-wait` immediately. Default
 `mode:"notify"` clears after accepted delivery; `ack` remains visible until
 DELETE, then becomes `acknowledged` (bounded terminal history), and can become
 `unacknowledged`; `reply` requires `replyTo` and marks the parent `answered`.
@@ -57,9 +58,9 @@ newest 50 terminal schedules). A truly unknown or pruned ID returns 404.
 One-shot reminders store an absolute target and fire once. Repeating reminders
 require an explicit `everySeconds`, plus optional `maxRuns`; `delaySeconds` is no
 longer rounded into a recurring cron. `delaySeconds` and `targetAt` are the
-earliest eligible delivery time, not a deadline: default on-idle delivery still
-waits for two stable idle observations about 15 seconds apart and can arrive
-later while the recipient remains busy. Responses expose `schedulingKind`
+earliest eligible delivery time, not a deadline: default on-idle delivery waits
+for an idle heartbeat tick and can arrive later while the recipient remains busy.
+Responses expose `schedulingKind`
 (`once`, `repeat`, `cron`, or `in-process`), making an intentional in-process
 record without `nextRunAt` distinguishable from a dead schedule.
 
@@ -92,6 +93,9 @@ curl -sS -X POST http://127.0.0.1:8787/messages -H 'content-type: application/js
 
 Use interrupt delivery for a deliberate immediate follow-up, `/reminders` for
 time-based self-wakeup, and on-idle delivery for durable asynchronous content.
+Interrupt content appears as a complete turn in `paseo logs`. On-idle heartbeat
+content does not appear there; confirm it only through `GET /messages` (for
+observable ack/reply records) or `GET /reminders/:id` delivery metadata.
 
 Every prompt emitted by the service is visibly system-generated and uses the
 same escaped tagged envelope. Coalesced deliveries contain one `<item>` per

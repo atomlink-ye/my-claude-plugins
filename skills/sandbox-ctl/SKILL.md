@@ -14,6 +14,7 @@ worktree, pass the root explicitly.
 
 ```sh
 sandbox-ctl up --template TEMPLATE_ID [--name NAME]  # Cube Sandbox
+sandbox-ctl --adapter cube-sandbox up --node NODE_OR_ALIAS --template TEMPLATE_ID
 sandbox-ctl up --template TEMPLATE_ID --workspace-owner UID:GID
 sandbox-ctl use NAME
 sandbox-ctl exec -- COMMAND...                 # stream human output
@@ -31,9 +32,22 @@ sandbox-ctl --adapter cube-sandbox config status
 sandbox-ctl --adapter cube-sandbox config path
 ```
 
+`cube-sandbox up --node` is the explicit self-hosted scheduler path. It SSHes
+to the configured Cube control host, renders the template, extracts only its
+`api_request`, and runs one `multirun` targeted at the resolved node before
+connecting locally and writing the binding/workspace. Success requires
+`code:200`, `totalRunSuccCnt:1`, `totalRunErr:0`, and one non-empty sandbox ID;
+process exit code alone is not sufficient. It requires scheduler settings in
+the user config and does not change the normal SDK `up` path. Node mode is
+new-binding-only: if the selected project already has a sandbox binding, use
+`--name` for a separate binding or omit `--node` to reuse it.
+
 `--directory DIR` selects a project; `--sandbox NAME_OR_ID` selects a binding
-without changing it. Bare `adopt` requires `--remote-path PATH` unless the
-binding already records a workspace. `up --name` creates/reuses; `use NAME`
+without changing it. `adopt --remote-path PATH [--timeout DURATION]` adopts a
+Cube sandbox and applies its lifecycle timeout before persisting the binding;
+the default is 30 minutes when omitted, and adoption fails if the connected
+sandbox does not expose `setTimeout`. Bare `adopt` requires `--remote-path PATH`
+unless the binding already records a workspace. `up --name` creates/reuses; `use NAME`
 selects. A new Cube Sandbox binding requires `--template`; reuse reads the
 stored template. `--snapshot` is Daytona-only. Adapter priority is explicit flag,
 exact config, then Cube Sandbox. Use `cube-sandbox`; `cube` is deprecated.
@@ -78,10 +92,25 @@ and checked fail-closed; no recursive ownership repair is performed. Bundle/full
 pushes preserve that owner contract, while Git push is refused for owned
 workspaces. Daytona behavior is unchanged.
 
+`exec` propagates the remote command exit code in streaming and JSON modes.
+Daemon or proxy transport failures return control exit 125 and an actionable
+diagnostic on stderr; restart the local path with `sandbox-ctl daemon stop &&
+sandbox-ctl daemon start`, then retry. Workspace-owner contract failures are
+fail-closed and identify the ownership mismatch; no recursive ownership repair
+is attempted. Cube `list` exposes each item's API-provided `id`, `name`, `state`,
+`template`, `startedAt`, and `endAt`. Details in [Cube Sandbox](references/cube-sandbox.md).
+
 Agents stay local. No MCP, Paseo runtime, remote agent bootstrap, host cleanup,
 or registry garbage collection. Cube's per-user daemon owns only the local SDK
 connection. Cube credentials may be kept in the per-user global config (mode
-0600); project `.sandbox-ctl/config.json` remains secret-free. See
+0600); project `.sandbox-ctl/config.json` remains secret-free. The user config
+path honors `SANDBOX_CTL_USER_CONFIG`, then `XDG_CONFIG_HOME`; otherwise it uses
+`<realHome>/.sandbox-ctl/config.json` when that file exists and falls back to
+the legacy macOS or other-platform default when that file exists. If neither
+file exists, the modern path is the new default. `<realHome>` comes from
+`os.userInfo().homedir`, falling back to `os.homedir()`; `HOME` is not used for
+default resolution. New writes use the modern path when no existing config
+needs to be preserved. See
 [Daytona](references/daytona.md), [Cube Sandbox](references/cube-sandbox.md),
 and [maintenance](references/maintenance.md).
 

@@ -174,10 +174,15 @@ function daemonRequestDeadline(payload = {}, options = {}) {
 }
 
 function normalizeResult(result, stdout, stderr) {
+  const hasExitCode = Number.isInteger(result?.exitCode);
   return {
-    exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : 0,
+    // A daemon response without an explicit command exit code is not a
+    // successful remote command. Treat it as a control/transport failure so a
+    // proxy response that only contains diagnostic output cannot become RC=0.
+    exitCode: hasExitCode ? result.exitCode : 125,
     stdout: stdout.join(""),
     stderr: stderr.join(""),
+    ...(!hasExitCode ? { error: String(result?.error || "Cube Sandbox daemon/proxy returned no remote exit code") } : {}),
   };
 }
 
@@ -269,6 +274,10 @@ export function createDaemonServer(options = {}) {
 
   function accept(socket) {
     sockets.add(socket);
+    // A client may time out or disconnect while a long remote command is
+    // still running. Consume connection-level failures so the daemon remains
+    // available for other clients when its later writes hit EPIPE/ECONNRESET.
+    socket.on("error", () => {});
     socket.once("close", () => sockets.delete(socket));
     let buffer = "";
     const send = (value) => { if (!socket.destroyed) socket.write(`${JSON.stringify(value)}\n`); };

@@ -96,6 +96,13 @@ For early work, prefer this compact contract over a large speculative task break
 ```yaml
 stage: prove
 appetite: <time or effort budget>
+
+# Authority — freeze this BEFORE implementation, or the work reopens closed decisions
+authority: <the canonical decision source: which doc, which spec, which contract>
+base_revision: <branch @ commit sha the work starts from>
+settled: []          # decisions that are closed; seeing an older doc does not reopen them
+still_open: []       # what may still be re-argued
+
 baseline: <what happens without this change>
 outcome: <the one result this stage must prove>
 real_path: <real entry -> application/core -> real boundary -> observable result>
@@ -113,6 +120,8 @@ deferred:
 ```
 
 Do not create an exhaustive backlog before touching the real work. Prefer discovered tasks over imagined tasks.
+
+**Freeze the authority first.** Without an explicit `authority` / `base_revision` / `settled` block, a long task drifts: an older design doc surfaces mid-implementation and a decision that was already closed gets reopened, silently, with no one deciding to reopen it. Naming the settled set is what makes that drift visible.
 
 ## Stage Workflows
 
@@ -182,6 +191,108 @@ Apply the production bar appropriate to the risk:
 
 Hardening can cut product scope too. Production readiness is not an excuse to preserve every experimental feature.
 
+## Long-Task Execution
+
+Everything above decides *what* to build. This section decides *how to keep moving* when the work spans hours, sessions, or context compactions.
+
+**Assume interruption is always possible.** The tool window can end, a container can reset, the context can be compacted. So durable state lives in git, PRs, and repo docs — never only in the conversation, an unsaved patch, or a scratch container. Create the branch, the roadmap/execution plan, and a draft PR *before* substantial changes, not as a finishing step: their purpose is recovery, not tidiness.
+
+At all times keep four things explicit and writable down in one line each:
+
+```text
+CURRENT MAINLINE   what this whole round is for
+CURRENT SLICE      the one boundary being moved right now
+CURRENT PROOF      the cheapest check that would disprove it
+NEXT ACTION        what happens the moment the current slice lands
+```
+
+If you cannot state all four, you are not blocked on code — you are blocked on framing.
+
+### Semantic slices, not line counts
+
+Never use "run tests every N lines". The unit of work is a **semantic slice: the smallest change that can explain by itself what it altered.** The test is whether it forms a complete verifiable concept:
+
+```text
+interface + implementation + one real caller
+```
+
+A slice may be 50 lines or 800. Length is not the variable. What matters is that one slice moves **one** boundary or establishes **one** invariant.
+
+Per slice: `read only what this slice needs → change → prove → commit → push`. Do not combine an architecture change, a directory rename, a dependency upgrade, and a harness rewrite in one slice — when it breaks, nothing tells you which variable did it.
+
+**Commit budget: one coherent slice = one checkpoint.** Not hourly, not at the end. Before committing ask: *if the work stopped right now, does this commit explain itself?* If yes, push it.
+
+### Blocker triage — three kinds, three different responses
+
+Classifying the failure matters more than fixing it fast. Getting the class wrong is what turns a 10-minute problem into an afternoon.
+
+| Class | Looks like | Response |
+|---|---|---|
+| **Correctness blocker** | typecheck fails, this slice's core invariant fails, schema mismatch, partial state possible, ordering violated | **Stop and fix now.** Continuing corrupts every downstream signal |
+| **Tool / environment blocker** | download path blocked, connector API unavailable, no real provider credential here, no browser/E2E env, Docker unavailable | **Change route, do not stop the task.** Downgrade to fake/contract/characterization, keep the deterministic work moving, and record the real run as *pending verification* |
+| **Peripheral problem** | the neighbouring module is also ugly, a stale doc, a future edge case, unrelated lint debt | **Record, do not act** |
+
+The middle row is the one most often mishandled in both directions: a missing E2E environment is not permission to fake evidence, and it is also not a reason to halt all deterministic progress.
+
+### Budgets
+
+These are soft budgets for judgment, not enforced timers.
+
+**Retry budget — the same hypothesis, at most twice.** If two attempts fail and produce no new information, the third must change a variable: shrink the input, change the tool, read the source, move the observation point, build a different reproduction, or re-check the assumption. "Try again" is not a third attempt.
+
+**Progress budget — stuck and slow are not the same thing.** The question is never "how long has this taken", it is **"did the last attempt produce new information?"** Three failures that each localize the problem further (type error → mapping error → repository boundary) is progress, even at 40 minutes. Three failures that are the same timeout with a different flag is stuck, even at 6 minutes. Stop the path that yields nothing new.
+
+**Slice budget — 10–30 minutes for a normal slice.** Past that with no clear change, no known cause, and the same attempt repeating: the slice is too big or the blocker was misclassified. A genuine architecture/correctness blocker may exceed the budget, but it should then be **reduced to a minimal reproduction** rather than debugged in place — prove the invariant against fakes in isolation, then return to the mainline.
+
+**Exploration budget — progressive disclosure, not "read the repo first".** Read the entry point, the port/contract, the core implementation, the direct callers, and the related tests. The moment that is enough to start the first slice, **stop expanding**. Load more per slice, on demand.
+
+**Complexity budget — at most 1–2 large variables per round.** Architecture abstraction, DB migration, dependency upgrade, public API change, provider version bump, runtime behavior change, and test-harness change are each a large variable. Refactoring the architecture *and* upgrading the SDK in the same round means a failure cannot be attributed to either.
+
+**Verification budget — full suites are not per-slice.**
+
+| Level | What runs |
+|---|---|
+| Slice | typecheck + focused test |
+| Milestone (several related slices) | module suite, integration |
+| Convergence (mainline works) | repo deterministic verify, real DB, build |
+| Handoff | every deterministic lane that *can* run, **plus an explicit list of what could not** |
+
+**Failure budget — when moving on is allowed.**
+
+Allowed: real E2E unavailable but the deterministic contract is verified; an unrelated baseline failure confirmed not caused by this change; an unimplemented hardening item that is an explicit non-goal; provider live-verification that requires the owner's environment while fake/contract/mapper coverage is complete.
+
+Not allowed: typecheck failing; a core invariant not holding; callers not fully migrated to a new interface; partial state possible; silent data corruption possible; a failure whose cause is unknown *and* closely related to the change.
+
+### Timeouts: unknown is not failed
+
+A timeout means **the call did not return inside its window**. It does not mean the operation did not happen. So the response is decided by side-effect risk, not by impatience.
+
+- **Read-only / idempotent** (typecheck, grep, query, unit test): narrow the scope, split it, raise the timeout once, rerun. Low risk.
+- **Anything with an external side effect** (push, deploy, migration, external write, spawning an agent, submitting an order): **never retry by default.** Reconcile the external state first — did it happen? — *then* decide retry, continue, or compensate.
+
+```text
+timeout → side effects possible?
+   no  → narrow / rerun
+   yes → reconcile external state
+           already succeeded → move on, do not repeat
+           never executed    → safe to retry
+           state unknown     → stop automatic retry, escalate
+```
+
+**A slow or timing-out full suite is a signal to decompose, not to raise the limit.** Ask which signal is actually needed, then find the smallest failing lane: typecheck, focused unit, affected module, contract, real-DB. If every focused lane passes and only the full suite hangs, that points at harness/environment/performance — do not declare the feature broken. But record it exactly as it is: **`full suite not completed`, never `all tests passed`.**
+
+### Convergence — the phase most often skipped
+
+The mainline working is not the end of the round. Run one explicit convergence pass:
+
+- search for legacy references by name (old adapter names, old lookup helpers, `phase-`, `legacy`, `TODO`, `deprecated`)
+- remove compatibility shims the new path made unnecessary
+- **delete temporary migration tooling** — codemods, one-off generators, branch-only workflows are legitimate while refactoring, but the contract is `use → verify output → delete before handoff`. Left behind, every round permanently grows the harness debt
+- naming cleanup, dead-code search
+- broad deterministic verification
+- read the complete diff as a diff, not as a memory of what you intended
+- update the durable docs
+
 ## Testing Policy
 
 In `Probe` and `Prove`, do **not** default to Red-Green-Refactor for behavior whose contract is still being discovered. Use this order:
@@ -192,6 +303,22 @@ cheapest check needed to keep the experiment honest
 -> one real end-to-end canary
 -> one critical invalidation case, only when it would make the result false or unsafe
 ```
+
+**Run the cheapest test capable of disproving *this* change** — not the test that would prove the most.
+
+```text
+cheap  syntax / typecheck
+   |   focused unit
+   |   characterization
+   |   module test
+   |   integration / contract
+   |   repo deterministic verify
+   |   real DB
+   |   real runtime
+ costly real E2E
+```
+
+Pick by what the change could have broken, not by thoroughness. A pure mapper edit is disproved by one focused unit test; full E2E adds cost and no information. A change to session-binding persistence is disproved by the repository and resolver tests. The expensive rungs belong at milestone and convergence level, not after every slice.
 
 A test is worth adding when it protects at least one of these:
 
@@ -205,11 +332,74 @@ Mocks may accelerate local diagnosis, but they do not prove a real integration o
 
 In `Protect` and `Harden`, TDD and broader regression suites are appropriate. If the user explicitly requests TDD earlier, honor that instruction while keeping the appetite and test surface narrow.
 
+## 🔴 Prohibited by default: A/B tests and mutation arms
+
+**Unless the Owner explicitly asks for a test, do not build one. Direct demonstration is sufficient.**
+
+Specifically banned in `Probe` / `Prove` / `Protect` unless explicitly requested:
+
+- **mutation arms / red arms** — "delete X, prove the check goes red"
+- **A/B or differential harnesses** — running two variants to compare
+- **negative-control matrices** — proving a criterion is not vacuously true
+- **any work whose output is confidence in the instrument rather than a working path**
+
+```text
+✅ Can you directly demonstrate it works?   → demonstrate, ship
+❌ Would it go red if broken?               → not asked, do not build
+❌ Is this criterion precise enough?        → not asked, do not build
+❌ Could something else make it green?      → not asked, do not build
+```
+
+The last three questions **recurse without bound**. Every answer creates a new instrument that
+itself needs proving. One real round measured a **20:1 instrument-to-product commit ratio**
+(59k lines under `scripts/` vs 1.1k under `src/`, most of that import renames) — and **not one
+criterion ever went red during it**. The over-hardening accumulated entirely through steps that
+were each individually correct.
+
+### The one exception (do not over-correct)
+
+If, **while running the direct demonstration**, you hit a green that lies about the product —
+`exit 0` with zero tests executed, "succeeded" with no work done, a skipped step reported as passed —
+**fix it**. In that case the demonstration itself is fake, so you have not demonstrated anything.
+
+> **The distinction is: encountered during the demonstration, not constructed to go looking for it.**
+> Never design a test to hunt for lying greens.
+
+## Named over-hardening patterns (observed, not hypothetical)
+
+Each of these was a *correct* finding that was nonetheless **wrong to pursue** at MVE stage:
+
+| Pattern | What it looks like | Why it is off-path |
+|---|---|---|
+| **Criterion-precision recursion** | "This arm goes red, but for a reason broader than the claim" | Fixing it produces a better instrument, not a working product |
+| **Classification depth** | Building tri-state `PASS/FAIL/MISSING` where two states suffice | Exit code 0 / non-0 plus a human-readable log is enough at this stage |
+| **Simultaneity / provenance proofs** | Timestamp chains proving a control ran *during* a mutation; byte-level SHA binding of evidence | Proves the instrument is honest; proves nothing about the product |
+| **Reachability / partition proofs** | Enumerating an outcome space and proving the classification is a partition | Formalizing the evidence system. Zero product change |
+| **Retroactive audits** | "The rule changed, re-audit everything built under the old rule" | **Unbounded cost.** A corrected rule applies only to what is built *after* it |
+| **Gate design for infrastructure** | Designing a provable admission gate for load/capacity/scheduling | Scheduling problem, not an engineering one. Retry or serialize instead |
+| **Pre-paying next round's criteria** | Writing an assertion the current slice marks as vacuous | If the plan text says "vacuous this round", it does not belong in this round's gate |
+
+## Early-warning signals that you are over-hardening
+
+Both are cheap to measure and neither requires anyone's judgment:
+
+1. **Instrument-to-product commit ratio.** Count commits touching `scripts/ | tests/ | ci/`
+   against `src/ | app/ | lib/`. If the ratio exceeds roughly **3:1** over a work session, stop and re-read the roadmap's non-goals.
+2. **Frequency of self-corrected criteria.** If you keep discovering that your *own* criteria measured
+   the wrong thing, that is not a bad day — it is a readout that **you are building something too
+   complex for you to get right**. Criterion error rate correlates with criterion complexity.
+   In the round cited above, **8 self-corrections, all of them in the instrument layer, none in the product layer.**
+
+**Also check the roadmap's own Non-Goals section before adding any instrument.** In that round,
+`broad hardening` and `test coverage target` were listed there verbatim — the violation was of the
+project's *explicit written non-goals*, not of an abstract principle.
+
 ## Review Policy
 
 Classify every finding before deciding whether it blocks the current stage:
 
 - `BLOCKER-NOW`: the real path cannot complete, the evidence is false, a critical boundary is bypassed, or the experiment creates an unacceptable safety/data risk
+- `ENV-BLOCKED`: the work is correct but cannot be verified here (no credential, no runtime, no browser env). Route around it, keep the deterministic work moving, and carry it as *pending verification* — never as passed
 - `DEFERRED-FEATURE`: useful for the next product slice but not required for the current proof
 - `HARDENING`: reliability, recovery, security depth, performance, operability, edge cases, or polish for production
 - `QUESTION`: unresolved decision with an explicit, reversible temporary path
@@ -228,6 +418,7 @@ Do not require every correct review suggestion to be fixed in the same slice.
 
 - At the midpoint, if no real path exists, hammer scope before adding abstractions or tests.
 - When the appetite expires, stop and reshape instead of automatically extending.
+- Within a stage, pace by the retry / progress / slice budgets in **Long-Task Execution** — the stop signal is "no new information", not elapsed time.
 - When the exit condition is met, stop polishing and move to the next stage.
 - When the same issue recurs, promote it from a note into a regression, lint, skill, tool contract, or architecture rule.
 
