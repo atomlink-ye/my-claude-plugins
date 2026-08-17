@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, team-lead orchestration, helpers, and the schema-first Figma Desktop Bridge adapter.",
-      "version": "0.6.0",
+      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, team-lead orchestration, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
+      "version": "0.7.0",
       "author": {
         "name": "atomlink-ye"
       },
@@ -27,7 +27,8 @@
         "./skills/opencode-companion",
         "./skills/paseo-companion",
         "./skills/team-lead-orchestration",
-        "./skills/figma-console"
+        "./skills/figma-console",
+        "./skills/workspace-org-prac"
       ]
     },
     {
