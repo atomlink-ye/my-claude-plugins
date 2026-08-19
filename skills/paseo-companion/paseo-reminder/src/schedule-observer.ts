@@ -1,4 +1,4 @@
-import { DaemonClient } from '@getpaseo/client';
+import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 
 export interface ScheduleObserver {

@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@getpaseo/client':
-        specifier: 0.2.3
-        version: 0.2.3
+        specifier: 0.4.0
+        version: 0.4.0
       '@getpaseo/protocol':
-        specifier: 0.2.3
-        version: 0.2.3
+        specifier: 0.4.0
+        version: 0.4.0
       ws:
         specifier: ^8.21.3
         version: 8.21.3
@@ -192,14 +192,14 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@getpaseo/client@0.2.3':
-    resolution: {integrity: sha512-m1LV42jxTAI0WzXMdnc8C+h+IYIf082HziUDmjLqWJ9CpoNYG7ilGXadaLvuNJdyzrQu67osPqEBS6cYQK3OOA==}
+  '@getpaseo/client@0.4.0':
+    resolution: {integrity: sha512-PybAYOa9F3RlxC892+6n1KwrH41vLFZLlBUMyaI+kZWQs/sqgIhOaSeGW9QuSbiMgyDdVOB3/LHAAPzUrunepg==}
 
-  '@getpaseo/protocol@0.2.3':
-    resolution: {integrity: sha512-9Mu5KIONZMThCdw8um+N2u7hLyPzk17skB3LYBsUqxz65ap5KIxRTHRMbnLocEaM9XBsucoYq540YNsCip3YFA==}
+  '@getpaseo/protocol@0.4.0':
+    resolution: {integrity: sha512-SKAaIMNCW8/Eqq7EnMhKQjddAjKOR76fYBy2EFE2/Xf6uNF6iH7TLJtJg/Wj2YUhBFu0FfHctB+ibiEejiX1fA==}
 
-  '@getpaseo/relay@0.2.3':
-    resolution: {integrity: sha512-3PwuXkAqBqMTAEg763EBI01W0xGGu4UFcnhyOgVUaJSsSuL0X/DzleLoLtIBQmQ2J8YucNJNDXDaa5OqwyYQ/w==}
+  '@getpaseo/relay@0.4.0':
+    resolution: {integrity: sha512-67FTxSpPDPEeWLD1rQ2iNzD96e5chMYd+DAF9j14wDUxL9nQWvrfQO2goq1MVOSIt3nN4P0ixOA24ZqaqnulKQ==}
 
   '@jridgewell/sourcemap-codec@1.5.0':
     resolution: {integrity: sha512-gv3ZRaISU3fjPAgNsriBRqGWQL6quFx04YMPW/zD8XMLsU32mhCCbfbO6KZFLjvYpCZ8zyDEgqsgf+PwPaM7GQ==}
@@ -721,20 +721,20 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@getpaseo/client@0.2.3':
+  '@getpaseo/client@0.4.0':
     dependencies:
-      '@getpaseo/protocol': 0.2.3
-      '@getpaseo/relay': 0.2.3
+      '@getpaseo/protocol': 0.4.0
+      '@getpaseo/relay': 0.4.0
       zod: 4.4.3
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
 
-  '@getpaseo/protocol@0.2.3':
+  '@getpaseo/protocol@0.4.0':
     dependencies:
       zod: 4.4.3
 
-  '@getpaseo/relay@0.2.3':
+  '@getpaseo/relay@0.4.0':
     dependencies:
       base64-js: 1.5.1
       tweetnacl: 1.0.3
