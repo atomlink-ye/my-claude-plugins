@@ -88,11 +88,15 @@ export interface IdleReminderRecord {
   crossedCount?: number;
   /** context-percent only: last observed absolute token count, kept even while not crossed. */
   lastObservedValue?: number;
-  /** Present only when this threshold subscription drives a coordinator-issued compact. */
+  /**
+   * Present only when this threshold subscription is a compact reminder. Owner 2026-08-19:
+   * crossing a context threshold NEVER compacts on its own -- it only notifies the agent
+   * with the command text. There is no 'auto' mode; the compact/wake text here is payload
+   * for that notice, not something the coordinator will send.
+   */
   compactWake?: {
     compact: string;
     wake?: string;
-    mode: 'notify' | 'auto';
     delaySeconds: number;
     /** Set once the 2nd consecutive crossing is confirmed; starts the delaySeconds grace. */
     crossedAt?: string;

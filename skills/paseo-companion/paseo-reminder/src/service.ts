@@ -97,7 +97,6 @@ export class CompanionService {
    * second line of defense (after §3.4-6's post-compact verification) against any compaction
    * loop this design did not anticipate. Not persisted -- a coordinator restart resets it,
    * which is acceptable since a restart is already a rare, human-visible event. */
-  private readonly lastAutoCompactAt = new Map<string, number>();
 
   private deliveryPrompt(to: string, items: Array<{
     id: string; from: string; at: string; urgency: MessageUrgency; mode: MessageMode;
@@ -974,40 +973,39 @@ export class CompanionService {
     }
     const crossedAtMs = Date.parse(cw.crossedAt);
     if (!Number.isFinite(crossedAtMs) || now - crossedAtMs < cw.delaySeconds * 1000) return reminder;
-    // The compact-wake registration is the consent token (D-10); consume it synchronously,
-    // before kicking off the (possibly long-running) compact flow in the background, so the
-    // next reconcile tick cannot re-fire this subscription while one run is still in flight.
+    // Owner 2026-08-19: crossing the threshold only ever NOTIFIES. Auto-compacting on a
+    // token count was explicitly rejected ("没有预期，不要做") -- the agent decides whether
+    // and when to compact. The subscription is one-shot: consume it before notifying so a
+    // still-climbing context cannot re-notify on every reconcile tick.
     await this.store.updateIdleReminder(reminder.id, { status: 'deleted', crossedCount: 0 });
-    if (cw.mode === 'auto') {
-      // Fire-and-forget: waiting for idle-stability can take minutes (worst case 15), and
-      // this is called from inside reconcileOnce()/reconcileFast() -- awaiting it here would
-      // block ALL other reconciliation (watchdog, messages, other agents' reminders) for that
-      // entire window. Same pattern as runCompactWake()/the legacy observeCompact().
-      const controller = new AbortController();
-      this.observers.add(controller);
-      void this.runAutoCompact(reminder, observed, controller.signal).finally(() => this.observers.delete(controller));
-    } else {
-      await this.notifyCompactTrigger(reminder, observed, now); // fast: a single postMessage call, safe to await
-    }
+    await this.notifyCompactTrigger(reminder, observed, now); // fast: a single postMessage call, safe to await
     return this.store.findIdleReminder(reminder.id)!;
   }
 
   private async notifyCompactTrigger(reminder: IdleReminderRecord, observed: ContextUsage, now: number): Promise<void> {
     const cw = reminder.compactWake!;
     const body = [
-      `type=compact-wake id=${reminder.id} target=${reminder.agentId} event=compact-threshold-crossed criterion=contextWindowUsedTokens ${reminder.comparator ?? 'gte'} ${this.effectiveThresholdTokens(reminder, observed)} (registered as ${reminder.thresholdPercent !== undefined ? `${(reminder.thresholdPercent * 100).toFixed(1)}%` : `${reminder.thresholdTokens} tokens`}) confirmed over 2 consecutive observations, mode=notify triggeredAt=${new Date(now).toISOString()}`,
+      `type=compact-wake id=${reminder.id} target=${reminder.agentId} event=compact-threshold-crossed criterion=contextWindowUsedTokens ${reminder.comparator ?? 'gte'} ${this.effectiveThresholdTokens(reminder, observed)} (registered as ${reminder.thresholdPercent !== undefined ? `${(reminder.thresholdPercent * 100).toFixed(1)}%` : `${reminder.thresholdTokens} tokens`}) confirmed over 2 consecutive observations, action=notify-only triggeredAt=${new Date(now).toISOString()}`,
       `observed: used=${observed.usedTokens} limit=${observed.limitTokens} percent=${(observed.percent * 100).toFixed(1)}% source=${observed.source}`,
-      `Run this yourself when convenient: /compact ${cw.compact}`,
+      `Your context window is past the threshold you subscribed to. Nothing has been compacted -- this is a reminder only.`,
+      `Compact yourself when convenient: /compact ${cw.compact}`,
       cw.wake ? `After compacting, resume with: ${cw.wake}` : 'No wake steps were registered with this subscription; nothing will resume you after compacting.',
       `Unsubscribe: curl -X DELETE ${this.endpointBase()}/idle-reminders/${reminder.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`,
     ].join('\n');
     await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake' });
   }
 
-  private async waitForIdleStable(agentId: string, deadlineMs: number, signal: AbortSignal): Promise<boolean> {
+  /**
+   * Resolves true once `agentId` has been status=idle with an unchanged UpdatedAt for
+   * `stableMs`. Polling is on a 5s cadence, so the real wait rounds up to the next tick --
+   * a 10s window settles in ~10-15s. `abortIf` is checked every tick so a veto (DELETE)
+   * is observed during the wait rather than only after it.
+   */
+  private async waitForIdleStable(agentId: string, deadlineMs: number, signal: AbortSignal, stableMs = 60_000, abortIf?: () => boolean): Promise<boolean> {
     let stableSince: number | undefined;
     let previousUpdated: string | undefined;
     while (Date.now() < deadlineMs && !signal.aborted) {
+      if (abortIf?.()) return false;
       try {
         const inspect = asRecord((await this.cli.run(['inspect', agentId, '--json'], { agentId, signal, timeoutMs: 5_000 })).value);
         const status = lowerStatus(inspect.Status ?? inspect.status);
@@ -1016,67 +1014,11 @@ export class CompanionService {
         if (status === 'idle' && updated === previousUpdated) stableSince ??= now;
         else stableSince = undefined;
         previousUpdated = updated;
-        if (stableSince && now - stableSince >= 60_000) return true;
+        if (stableSince !== undefined && now - stableSince >= stableMs) return true;
       } catch { /* continue until deadline */ }
       await sleep(5_000, signal);
     }
     return false;
-  }
-
-  private async runAutoCompact(reminder: IdleReminderRecord, preUsage: ContextUsage, signal: AbortSignal): Promise<void> {
-    const cw = reminder.compactWake!;
-    const agentId = reminder.agentId;
-    // ORACLE-1 3.4-5: rate limit, the second line of defense (after 3.4-6's post-compact
-    // verification) against any compaction loop this design did not anticipate.
-    const lastAt = this.lastAutoCompactAt.get(agentId);
-    if (lastAt !== undefined && Date.now() - lastAt < 60 * 60 * 1000) {
-      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'rate-limited', minutesSinceLast: Math.round((Date.now() - lastAt) / 60_000) }));
-      return;
-    }
-    // Only ever send /compact to an agent already observed idle; a running agent would be
-    // interrupted mid-turn (ORACLE-1 3.3 C1, the single most expensive misfire).
-    const idleCheck = await this.observeAgentIdle(agentId).catch(() => undefined);
-    if (!idleCheck || idleCheck.status !== 'idle') {
-      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'not idle', observedStatus: idleCheck?.status ?? 'unknown' }));
-      return;
-    }
-    // ORACLE-1 3.4-7 (C5): a status='idle' agent can still be sitting on a plan-mode preview
-    // or an unresolved permission prompt -- Status alone does not distinguish "genuinely done"
-    // from "waiting on a human". Sending /compact there is C1 in disguise.
-    if (idleCheck.mode === 'plan' || idleCheck.pendingPermissionsCount > 0) {
-      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'plan-mode-or-pending-permission', mode: idleCheck.mode, pendingPermissionsCount: idleCheck.pendingPermissionsCount }));
-      return;
-    }
-    this.lastAutoCompactAt.set(agentId, Date.now());
-    this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
-    try {
-      try {
-        await this.cli.run(['send', agentId, `/compact ${cw.compact}`], { agentId, signal });
-      } catch (error) {
-        console.warn(JSON.stringify({ type: 'auto-compact-send-failed', agentId, reminderId: reminder.id, error: error instanceof Error ? error.message : String(error) }));
-        return;
-      }
-      const stable = await this.waitForIdleStable(agentId, Date.now() + 15 * 60 * 1000, signal);
-      if (!stable) {
-        console.warn(JSON.stringify({ type: 'auto-compact-stabilize-timeout', agentId, reminderId: reminder.id }));
-        return;
-      }
-      const postUsage = this.contextUsageObserver ? await this.contextUsageObserver.observe(agentId) : 'unknown';
-      // ORACLE-1 3.4-6: no verified shrink -> fail loud, never silently retry (that is C4, a
-      // compaction loop that quietly degrades a summary of a summary each pass).
-      const dropped = postUsage !== 'unknown' && postUsage.percent <= preUsage.percent / 2;
-      console.log(JSON.stringify({ type: 'auto-compact-verified', agentId, reminderId: reminder.id, prePercent: preUsage.percent, postPercent: postUsage === 'unknown' ? 'unknown' : postUsage.percent, dropped }));
-      if (!dropped) {
-        const warnBody = `type=compact-wake id=${reminder.id} target=${agentId} event=compact-did-not-shrink criterion="post-compact percent <= half of pre-compact percent" pre=${(preUsage.percent * 100).toFixed(1)}% post=${postUsage === 'unknown' ? 'unknown' : (postUsage.percent * 100).toFixed(1) + '%'}\nAutomatic compaction did not shrink your context window as verified. This subscription is now consumed; investigate before re-registering it.`;
-        await this.postMessage({ to: agentId, from: 'companion', body: warnBody, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake' });
-      }
-      if (cw.wake) {
-        try { await this.cli.run(['send', agentId, cw.wake], { agentId, signal }); }
-        catch (error) { console.warn(JSON.stringify({ type: 'auto-compact-wake-failed', agentId, reminderId: reminder.id, error: error instanceof Error ? error.message : String(error) })); }
-      }
-    } finally {
-      this.quietUntil.delete(agentId);
-    }
   }
 
   /** Read-only GET /context-usage. Missing/unread fields are 'unknown', never 0 (see ContextUsageEntry). */
@@ -1666,29 +1608,34 @@ export class CompanionService {
    * caller is about to run out of band (that was the pre-D-10 contract; ORACLE-1 §3.4-3's
    * "resumeSteps as a consent token" design does not apply here since `wake` is optional).
    *
-   * D-11: `delaySeconds` (default 10) is the grace window between "conditions satisfied"
-   * and the coordinator actually sending `/compact`; `DELETE /reminders/:id` during that
-   * window vetoes it. Because the default is short, this window is NOT the primary veto
-   * mechanism for the `trigger`-gated path below -- ORACLE-1 §3.5's other two layers
-   * (event-triggered DELETE, post-notify unsubscribe) still apply.
+   * D-11 / Owner 2026-08-19: `waitForIdle` (default **true**) makes the coordinator hold the
+   * `/compact` until the agent has been idle with an unchanged UpdatedAt for `delaySeconds`
+   * (default 10). Firing on a bare timer truncated a turn mid-flight, so "wait for idle,
+   * then delay" is the default and `waitForIdle:false` is the opt-out that restores the
+   * pure-timer behaviour. Either way `DELETE /reminders/:id` during the window vetoes it.
    *
    * An optional `trigger` (context-percent metric + threshold) turns this into a standing
    * subscription instead of an immediate action: it is stored as an IdleReminderRecord with
    * `metric:'context-percent'` and a `compactWake` payload, and evaluated by the same
    * reconcileIdleReminders() loop idle-reminders already use (ORACLE-1 §2.1: reuse the
-   * existing threshold-subscription concept, do not add a fifth one). `mode` (D-7, default
-   * 'notify') controls whether the coordinator sends `/compact` itself once the trigger and
-   * delay are satisfied, or only notifies the agent with the command text to run themselves.
+   * existing threshold-subscription concept, do not add a fifth one). A crossed threshold
+   * **only notifies** -- Owner 2026-08-19 explicitly rejected compacting automatically on a
+   * token count, so there is no `mode` and no auto path. `waitForIdle` is meaningless there
+   * (the notice is already `delivery:'on-idle'`) and is rejected alongside a `trigger`.
    */
-  async compactWake(body: { agentId: string; compact: string; wake?: string; delaySeconds?: number; mode?: 'notify' | 'auto'; trigger?: { metric: 'context-percent'; thresholdPercent?: number; thresholdTokens?: number; comparator?: 'gte' | 'lte' } }): Promise<unknown> {
+  async compactWake(body: { agentId: string; compact: string; wake?: string; delaySeconds?: number; waitForIdle?: boolean; trigger?: { metric: 'context-percent'; thresholdPercent?: number; thresholdTokens?: number; comparator?: 'gte' | 'lte' } }): Promise<unknown> {
     await this.store.addManager(body.agentId);
-    rejectUnknownFields(body as Record<string, unknown>, ['agentId', 'compact', 'wake', 'delaySeconds', 'mode', 'trigger']);
+    rejectUnknownFields(body as Record<string, unknown>, ['agentId', 'compact', 'wake', 'delaySeconds', 'waitForIdle', 'trigger']);
     if (!body.compact?.trim()) missingField('compact');
+    if (body.waitForIdle !== undefined && typeof body.waitForIdle !== 'boolean') invalidValue('waitForIdle must be a boolean', 'waitForIdle');
     const delaySeconds = Number.isFinite(body.delaySeconds) && (body.delaySeconds as number) >= 0 ? (body.delaySeconds as number) : 10;
-    const mode = body.mode === 'auto' ? 'auto' : 'notify';
+    const waitForIdle = body.waitForIdle ?? true;
     if (body.trigger) {
       rejectUnknownFields(body.trigger as unknown as Record<string, unknown>, ['metric', 'thresholdPercent', 'thresholdTokens', 'comparator']);
       if (body.trigger.metric !== 'context-percent') invalidValue('trigger.metric must be context-percent', 'trigger.metric');
+      // Fail loud rather than silently ignoring it: a caller who passes waitForIdle with a
+      // trigger believes the coordinator will compact for them. It will not.
+      if (body.waitForIdle !== undefined) invalidValue('waitForIdle does not apply to a trigger subscription: crossing a threshold only notifies, it never compacts', 'waitForIdle');
       const resolved = await this.resolveContextThreshold(body.agentId, body.trigger);
       const comparator = body.trigger.comparator ?? 'gte';
       const record: IdleReminderRecord = {
@@ -1697,15 +1644,15 @@ export class CompanionService {
         thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens,
         once: true, status: 'active', createdAt: new Date().toISOString(),
         metric: 'context-percent', comparator,
-        compactWake: { compact: body.compact, wake: body.wake, mode, delaySeconds },
+        compactWake: { compact: body.compact, wake: body.wake, delaySeconds },
       };
       await this.store.addIdleReminder(record);
-      return { id: record.id, status: 'active', mode, delaySeconds, compact: body.compact, wake: body.wake, trigger: { metric: 'context-percent', comparator, thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens } };
+      return { id: record.id, status: 'active', action: 'notify-only', delaySeconds, compact: body.compact, wake: body.wake, trigger: { metric: 'context-percent', comparator, thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens } };
     }
-    // No trigger: the call itself is the trigger. Grace window is an in-process timer, not a
-    // daemon heartbeat -- honest limitation: it does not survive a coordinator restart within
-    // the window. Acceptable for the 10s default; a caller who sets a large delaySeconds as a
-    // real veto window should be aware a restart during it silently drops the compact.
+    // No trigger: the call itself is the trigger. The wait (idle-gated or pure timer) runs
+    // in-process, not off a persisted heartbeat -- honest limitation: it does not survive a
+    // coordinator restart, which silently drops the compact. With waitForIdle the window is
+    // open-ended (bounded at 1h), so that exposure is larger than the old 10s timer's.
     const localId = randomUUID();
     // Built eagerly (even though it is only sent once idle-stable after the compact) so a
     // human inspecting GET /reminders can see exactly what will wake the agent, and so the
@@ -1721,20 +1668,32 @@ export class CompanionService {
     await this.store.addReminder(pending);
     const controller = new AbortController();
     this.observers.add(controller);
-    void this.runCompactWake(body.agentId, body.compact, body.wake, delaySeconds, localId, controller.signal).finally(() => this.observers.delete(controller));
-    return { id: localId, status: 'pending', delaySeconds, mode: 'immediate', compact: body.compact, wake: body.wake, willWake: Boolean(body.wake) };
+    void this.runCompactWake(body.agentId, body.compact, body.wake, delaySeconds, waitForIdle, localId, controller.signal).finally(() => this.observers.delete(controller));
+    return { id: localId, status: 'pending', delaySeconds, waitForIdle, compact: body.compact, wake: body.wake, willWake: Boolean(body.wake) };
   }
 
-  private async runCompactWake(agentId: string, compact: string, wake: string | undefined, delaySeconds: number, localId: string, signal: AbortSignal): Promise<void> {
-    // Poll in short increments rather than one long sleep so a DELETE veto during the grace
-    // window is observed promptly instead of only after the full delaySeconds has elapsed.
-    const graceDeadline = Date.now() + delaySeconds * 1000;
-    while (Date.now() < graceDeadline) {
-      if (signal.aborted || this.store.findReminder(localId)?.status === 'deleted') return;
-      await sleep(Math.min(1_000, Math.max(0, graceDeadline - Date.now())), signal).catch(() => {});
+  private async runCompactWake(agentId: string, compact: string, wake: string | undefined, delaySeconds: number, waitForIdle: boolean, localId: string, signal: AbortSignal): Promise<void> {
+    const vetoed = () => this.store.findReminder(localId)?.status === 'deleted';
+    if (waitForIdle) {
+      // Default path: delaySeconds is the *idle-stability* window, not a wall-clock delay --
+      // any activity during it restarts the wait, so the /compact cannot land mid-turn.
+      const settled = await this.waitForIdleStable(agentId, Date.now() + 60 * 60 * 1000, signal, delaySeconds * 1000, vetoed);
+      if (signal.aborted || vetoed()) return;
+      if (!settled) {
+        console.warn(JSON.stringify({ type: 'compact-wake-idle-timeout', agentId, localId, delaySeconds }));
+        await this.store.updateReminder(localId, { status: 'dead' });
+        return;
+      }
+    } else {
+      // Poll in short increments rather than one long sleep so a DELETE veto during the grace
+      // window is observed promptly instead of only after the full delaySeconds has elapsed.
+      const graceDeadline = Date.now() + delaySeconds * 1000;
+      while (Date.now() < graceDeadline) {
+        if (signal.aborted || vetoed()) return;
+        await sleep(Math.min(1_000, Math.max(0, graceDeadline - Date.now())), signal).catch(() => {});
+      }
+      if (signal.aborted || vetoed()) return; // vetoed via DELETE /reminders/:id
     }
-    if (signal.aborted) return;
-    if (this.store.findReminder(localId)?.status === 'deleted') return; // vetoed via DELETE /reminders/:id
     await this.store.updateReminder(localId, { status: 'active' });
     this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
     try {
