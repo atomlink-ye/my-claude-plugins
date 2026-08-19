@@ -905,7 +905,7 @@ export class CompanionService {
     if (notified.has(eventType)) return false;
     const body = [
       `type=watchdog id=${reminder.id} target=${managerId} event=${eventType} criterion=${criterion} triggeredAt=${new Date().toISOString()}`,
-      `snapshot: child=${snapshot.childId} status=${snapshot.status} updatedAt=${snapshot.updatedAt ?? 'unknown'} hasLivePaseoWait=${snapshot.hasLivePaseoWait ?? 'unknown'} gitDirty=${snapshot.gitDirty ?? 'unknown'} latestCommit=${snapshot.latestCommit ?? 'unknown'}`,
+      `snapshot: child=${snapshot.childId} status=${snapshot.status} updatedAt=${snapshot.updatedAt ?? 'unknown'} hasLivePaseoWait=${snapshot.hasLivePaseoWait ?? 'unknown'} hasLiveCompanionWatch=${snapshot.hasLiveCompanionWatch ?? 'unknown'} gitDirty=${snapshot.gitDirty ?? 'unknown'} latestCommit=${snapshot.latestCommit ?? 'unknown'}`,
       detail,
       ephemeral ? 'This health alert is non-acknowledgement based; the alert ID remains cancellable.' : 'Acknowledge this completion alert after review; future matching transitions remain deduplicated by this ID.',
     ].join('\n');
@@ -920,7 +920,7 @@ export class CompanionService {
     const activeChildren = new Set(snapshotResult.children.map((child) => child.id));
     for (const child of snapshotResult.children) {
       const prior = this.store.getWatchdogSnapshot(managerId, child.id);
-      const snapshot: WatchdogSnapshot = { managerId, childId: child.id, status: child.status, updatedAt: child.updatedAt, hasLivePaseoWait: child.hasLivePaseoWait, gitDirty: child.gitDirty, latestCommit: child.latestCommit, notified: [...(prior?.notified ?? [])] };
+      const snapshot: WatchdogSnapshot = { managerId, childId: child.id, status: child.status, updatedAt: child.updatedAt, hasLivePaseoWait: child.hasLivePaseoWait, hasLiveCompanionWatch: child.hasLiveCompanionWatch, gitDirty: child.gitDirty, latestCommit: child.latestCommit, notified: [...(prior?.notified ?? [])] };
       const status = lowerStatus(child.status);
       const previousStatus = lowerStatus(prior?.status);
       if (child.tracked && prior && previousStatus === 'running' && ['idle', 'closed'].includes(status)) {
@@ -931,9 +931,20 @@ export class CompanionService {
       if (waitLost && fallbackArmed) {
         await this.notifyWatchdog(managerId, child.id, 'child-wait-lost', 'running tracked child transitioned hasLivePaseoWait=true→false', `child=${child.id} paseo wait disappeared; using 300s polling fallback, latency bound immediate→5 minutes`, true, snapshot);
       } else if (child.hasLivePaseoWait === true) snapshot.notified = (snapshot.notified ?? []).filter((item) => item !== 'child-wait-lost');
-      const noWakeup = status === 'running' && child.hasLiveWakeupSource === false;
+      // hasLiveWakeupSource is the union of both sources (service.ts unionLiveSources),
+      // so in steady state (companion watch retired once a paseo wait is live) a
+      // wait-loss transition and "no live wakeup source" are the same underlying
+      // event observed through two different checks. Without deduplication both
+      // fire on the same tick, and the resulting pair is indistinguishable in the
+      // alert stream from an actual double fault. child-wait-lost already reports
+      // this gap (with the fallback-armed detail); suppress the redundant
+      // child-no-wakeup alert while that report is unresolved so only one alert
+      // survives per real coverage-loss event.
+      const wakeupMissing = status === 'running' && child.hasLiveWakeupSource === false;
+      const waitLossAlreadyReported = (snapshot.notified ?? []).includes('child-wait-lost');
+      const noWakeup = wakeupMissing && !waitLossAlreadyReported;
       if (noWakeup) await this.notifyWatchdog(managerId, child.id, 'child-no-wakeup', 'status=running and hasLiveWakeupSource=false', `child=${child.id} running without a live wakeup source, lastUpdatedAt=${child.updatedAt ?? 'unknown'}`, true, snapshot);
-      else snapshot.notified = (snapshot.notified ?? []).filter((item) => item !== 'child-no-wakeup');
+      if (!wakeupMissing) snapshot.notified = (snapshot.notified ?? []).filter((item) => item !== 'child-no-wakeup');
       const updatedMs = child.updatedAt ? Date.parse(child.updatedAt) : NaN;
       const stale = status === 'running' && Number.isFinite(updatedMs) && now - updatedMs > staleMs;
       if (stale) await this.notifyWatchdog(managerId, child.id, 'child-stale', `status=running and updatedAt older than ${Math.round(staleMs / 60000)} minutes`, `child=${child.id} running, lastUpdatedAt=${child.updatedAt}`, true, snapshot);

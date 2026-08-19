@@ -53,6 +53,7 @@ export interface WatchdogSnapshot {
   status: string;
   updatedAt?: string;
   hasLivePaseoWait?: boolean | 'unknown';
+  hasLiveCompanionWatch?: boolean | 'unknown';
   gitDirty?: boolean | 'unknown';
   latestCommit?: string;
   notified?: string[];
