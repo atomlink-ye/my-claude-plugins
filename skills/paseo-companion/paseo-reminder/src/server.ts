@@ -2,6 +2,7 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { CompanionService } from './service.js';
 import { PaseoScheduleObserver } from './schedule-observer.js';
+import { PaseoContextUsageObserver } from './context-usage-observer.js';
 import { CompanionError, invalidValue, missingField } from './errors.js';
 
 export interface CompanionServer {
@@ -35,7 +36,7 @@ const ROUTES = [
   ['POST', '/reminders', ['agentId', 'message']], ['GET', '/reminders', []], ['GET', '/reminders/:id', []], ['DELETE', '/reminders/:id', ['reason']],
   ['POST', '/idle-reminders', ['agentId', 'message', 'thresholdSeconds']], ['GET', '/idle-reminders', []],
   ['DELETE', '/idle-reminders/:id', ['reason']], ['POST', '/messages', ['to', 'from', 'body']],
-  ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'resumeSteps']],
+  ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'compact']],
   ['POST', '/ledger', ['type', 'target', 'verdict', 'reason']], ['GET', '/ledger', []],
   ['POST', '/ledger/:id/revoke', ['reason']],
   ['POST', '/corrections', ['managerId', 'auditorId', 'findings']], ['GET', '/corrections', []],
@@ -43,7 +44,7 @@ const ROUTES = [
 ] as const;
 const ERROR_STATUS: Record<string, number> = { missing_field: 400, invalid_value: 400, not_found: 404, ambiguous_id: 409, state_corrupt: 503, cli_error: 502 };
 
-export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver())): Promise<CompanionServer> {
+export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver(), undefined, { contextUsageObserver: new PaseoContextUsageObserver() })): Promise<CompanionServer> {
   await service.init();
   const server = http.createServer(async (req, res) => {
     try {
@@ -160,7 +161,7 @@ export async function createServer(service = new CompanionService(undefined, und
       }
       if (method === 'POST' && pathname === '/compact-wake') {
         const body = await readBody(req);
-        required(body.agentId, 'agentId'); required(body.resumeSteps, 'resumeSteps');
+        required(body.agentId, 'agentId'); required(body.compact, 'compact');
         send(res, 202, await service.compactWake(body)); return;
       }
       const briefingMatch = pathname.match(/^\/children\/([^/]+)\/briefing$/);

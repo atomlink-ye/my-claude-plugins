@@ -102,7 +102,7 @@ describe('HTTP integration through a paseo executable', () => {
     expect(acknowledged.body.status).toBe('acknowledged');
     const acknowledgedRows = await request(base, 'GET', '/messages?status=acknowledged');
     expect(acknowledgedRows.body).toEqual(expect.arrayContaining([expect.objectContaining({ id: ackMessage.body.id, acknowledgementReason: 'processed' })]));
-    expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', resumeSteps: 'read state; continue' })).status).toBe(202);
+    expect((await request(base, 'POST', '/compact-wake', { agentId: 'manager-1', compact: 'summarize progress', wake: 'read state; continue' })).status).toBe(202);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: 'parked', reason: 'waiting', recovery: 'resume later' })).status).toBe(201);
     expect((await request(base, 'POST', '/ledger', { type: 'park', target: childId, verdict: '', reason: '' })).status).toBe(400);
     expect(await request(base, 'POST', '/ledger', { type: 'later', target: childId, verdict: 'x', reason: 'x' })).toEqual({

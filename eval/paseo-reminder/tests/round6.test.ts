@@ -151,7 +151,7 @@ describe('round6 reminders', () => {
     const childCase = await makeService({ id: 'child-message', ParentAgentId: 'manager-1', Status: 'running', UpdatedAt: new Date().toISOString() });
     const childWatch = await childCase.service.createReminder({ agentId: 'manager-1', subjectChildId: 'child-message', kind: 'child-watch', watchKind: 'child', delaySeconds: 60, message: 'watch child' });
     expect(childWatch.prompt).toContain(`id=${childWatch.id}`); expect(childWatch.prompt).toContain(`/reminders/${childWatch.id}`); expect(childWatch.prompt).not.toContain('<port>');
-    const compact = await childCase.service.compactWake({ agentId: 'manager-1', resumeSteps: 'resume' });
+    const compact = await childCase.service.compactWake({ agentId: 'manager-1', compact: 'summarize progress', wake: 'resume' });
     const compactRecord = childCase.store.getReminders().find((item) => item.kind === 'compact-wake')!;
     expect(compactRecord.prompt).toContain('<paseo-reminder-delivery to="manager-1" kind="compact-wake">'); expect(compactRecord.prompt).toContain(`id=${compactRecord.id}`); expect(compactRecord.prompt).toContain(`/reminders/${compactRecord.id}`); expect(compactRecord.prompt).not.toContain('<port>');
     await childCase.store.addReminder({ id: 'source-recovery', daemonId: 'hb-source', agentId: 'manager-1', name: 'source-recovery', prompt: 'source', cron: '*/5 * * * *', expiresIn: '1h', status: 'active', alive: true, missedFires: 1, missedRunIds: ['run-1'], createdAt: new Date().toISOString() });
@@ -169,7 +169,7 @@ describe('round6 reminders', () => {
     await one.store.updateIdleReminder(idle.id, { idleSince: new Date(Date.now() - 5000).toISOString(), lastObservedUpdatedAt: one.cli.agents['manager-1']?.UpdatedAt });
     await one.service.listIdleReminders(); expect(one.cli.sends).toHaveLength(0);
 
-    await one.service.compactWake({ agentId: 'manager-1', resumeSteps: 'resume' });
+    await one.service.compactWake({ agentId: 'manager-1', compact: 'summarize progress', wake: 'resume' });
     const compact = one.store.getReminders().find((item) => item.kind === 'compact-wake')!;
     await one.service.deleteReminder(compact.id, 'cancelled');
     await new Promise((resolve) => setTimeout(resolve, 25));

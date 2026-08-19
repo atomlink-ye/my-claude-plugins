@@ -63,6 +63,7 @@ export interface IdleReminderRecord {
   id: string;
   agentId: string;
   message: string;
+  /** Seconds for 'idle-seconds' (default metric); a 0..1 fraction for 'context-percent'. */
   thresholdSeconds: number;
   once: boolean;
   status: 'active' | 'deleted';
@@ -70,6 +71,23 @@ export interface IdleReminderRecord {
   lastObservedUpdatedAt?: string;
   lastTriggeredAt?: string;
   createdAt: string;
+  /** Defaults to 'idle-seconds' for backward compatibility with existing records. */
+  metric?: 'idle-seconds' | 'context-percent';
+  /** Defaults to 'gte'. */
+  comparator?: 'gte' | 'lte';
+  /** context-percent only: consecutive confirming observations, reset on any non-crossing read. */
+  crossedCount?: number;
+  /** context-percent only: last observed percent (0..1), kept even while not crossed. */
+  lastObservedValue?: number;
+  /** Present only when this threshold subscription drives a coordinator-issued compact. */
+  compactWake?: {
+    compact: string;
+    wake?: string;
+    mode: 'notify' | 'auto';
+    delaySeconds: number;
+    /** Set once the 2nd consecutive crossing is confirmed; starts the delaySeconds grace. */
+    crossedAt?: string;
+  };
 }
 
 export interface LedgerRecord {

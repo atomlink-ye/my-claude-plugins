@@ -5,6 +5,7 @@ import { Store } from './store.js';
 import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
+import type { ContextUsage, ContextUsageObserver } from './context-usage-observer.js';
 import { CompanionError, invalidValue, missingField } from './errors.js';
 import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, CorrectionResolution, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
@@ -89,6 +90,9 @@ export class CompanionService {
   private readonly scheduleObserver?: ScheduleObserver;
   private readonly waitSourceDetector: WaitSourceDetector;
   private readonly watchdogStaleMs: number;
+  private readonly contextUsageObserver?: ContextUsageObserver;
+  /** Recipients whose delivery is held during an in-flight coordinator-driven compact. */
+  private readonly quietUntil = new Map<string, number>();
 
   private deliveryPrompt(to: string, items: Array<{
     id: string; from: string; at: string; urgency: MessageUrgency; mode: MessageMode;
@@ -110,9 +114,10 @@ export class CompanionService {
     return lines.join('\n');
   }
 
-  constructor(cli = new PaseoCli(), store = new Store(), scheduleObserver?: ScheduleObserver, waitSourceDetector: WaitSourceDetector = new ProcessWaitSourceDetector(), options: { watchdogStaleMs?: number } = {}) {
+  constructor(cli = new PaseoCli(), store = new Store(), scheduleObserver?: ScheduleObserver, waitSourceDetector: WaitSourceDetector = new ProcessWaitSourceDetector(), options: { watchdogStaleMs?: number; contextUsageObserver?: ContextUsageObserver } = {}) {
     this.cli = cli; this.store = store; this.scheduleObserver = scheduleObserver; this.waitSourceDetector = waitSourceDetector;
     this.watchdogStaleMs = options.watchdogStaleMs ?? Number(process.env.PASEO_WATCHDOG_STALE_MS || 45 * 60 * 1000);
+    this.contextUsageObserver = options.contextUsageObserver;
   }
   async init(): Promise<void> {
     await this.store.init();
@@ -797,13 +802,19 @@ export class CompanionService {
     return `curl -X DELETE ${this.endpointBase()}/reminders/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
   }
 
-  async createIdleReminder(body: { agentId: string; thresholdSeconds: number; message: string; once?: boolean }): Promise<IdleReminderRecord> {
+  async createIdleReminder(body: { agentId: string; thresholdSeconds: number; message: string; once?: boolean; metric?: 'idle-seconds' | 'context-percent'; comparator?: 'gte' | 'lte' }): Promise<IdleReminderRecord> {
     await this.store.addManager(body.agentId);
+    const metric = body.metric ?? 'idle-seconds';
+    if (metric !== 'idle-seconds' && metric !== 'context-percent') invalidValue('metric must be idle-seconds or context-percent', 'metric');
     if (!Number.isFinite(body.thresholdSeconds) || body.thresholdSeconds <= 0) invalidValue('thresholdSeconds must be positive', 'thresholdSeconds');
+    if (metric === 'context-percent' && body.thresholdSeconds > 1) invalidValue('thresholdSeconds must be a 0..1 fraction for context-percent', 'thresholdSeconds');
     if (!body.message?.trim()) missingField('message');
+    const comparator = body.comparator ?? 'gte';
+    if (comparator !== 'gte' && comparator !== 'lte') invalidValue('comparator must be gte or lte', 'comparator');
     const record: IdleReminderRecord = {
       id: randomUUID(), agentId: body.agentId, message: body.message, thresholdSeconds: body.thresholdSeconds,
       once: body.once === true, status: 'active', createdAt: new Date().toISOString(),
+      ...(metric !== 'idle-seconds' ? { metric } : {}), ...(comparator !== 'gte' ? { comparator } : {}),
     };
     await this.store.addIdleReminder(record);
     return record;
@@ -818,6 +829,7 @@ export class CompanionService {
 
   private async observeIdleReminder(reminder: IdleReminderRecord, now = Date.now()): Promise<IdleReminderRecord> {
     if (reminder.status !== 'active') return reminder;
+    if ((reminder.metric ?? 'idle-seconds') === 'context-percent') return this.observeContextPercentReminder(reminder, now);
     let status = '';
     let updated = '';
     try {
@@ -851,6 +863,142 @@ export class CompanionService {
       await this.store.updateIdleReminder(current.id, { idleSince: undefined, lastTriggeredAt: new Date(now).toISOString() });
     }
     return this.store.findIdleReminder(current.id)!;
+  }
+
+  private async observeContextPercentReminder(reminder: IdleReminderRecord, now = Date.now()): Promise<IdleReminderRecord> {
+    if (!this.contextUsageObserver) return reminder;
+    const observed = await this.contextUsageObserver.observe(reminder.agentId);
+    // fail-safe: an unobserved agent must never be treated as "below threshold" or "above
+    // threshold" -- it is simply not evaluated this tick. Compaction is not reversible.
+    if (observed === 'unknown') return reminder;
+    const comparator = reminder.comparator ?? 'gte';
+    const crossed = comparator === 'lte' ? observed.percent <= reminder.thresholdSeconds : observed.percent >= reminder.thresholdSeconds;
+    if (!crossed) {
+      if (reminder.crossedCount || reminder.lastObservedValue !== observed.percent) {
+        await this.store.updateIdleReminder(reminder.id, { crossedCount: 0, lastObservedValue: observed.percent, ...(reminder.compactWake ? { compactWake: { ...reminder.compactWake, crossedAt: undefined } } : {}) });
+      }
+      return this.store.findIdleReminder(reminder.id) ?? reminder;
+    }
+    // Require two consecutive crossing observations before acting; kills single-point
+    // read noise/flicker the way the watchdog dual-source fix does (ORACLE-1 step 2 gate②).
+    const crossedCount = (reminder.crossedCount ?? 0) + 1;
+    const confirmed = await this.store.updateIdleReminder(reminder.id, { crossedCount, lastObservedValue: observed.percent }) ?? reminder;
+    if (crossedCount < 2) return confirmed;
+    if (confirmed.compactWake) return this.evaluateCompactTrigger(confirmed, observed, now);
+    const body = [
+      `type=idle-reminder id=${confirmed.id} target=${confirmed.agentId} event=context-percent-crossed criterion=contextWindowUsedTokens/contextWindowMaxTokens ${comparator} ${confirmed.thresholdSeconds} confirmed over 2 consecutive observations triggeredAt=${new Date(now).toISOString()}`,
+      `observed: used=${observed.usedTokens} limit=${observed.limitTokens} percent=${(observed.percent * 100).toFixed(1)}% source=${observed.source}`,
+      confirmed.message,
+      confirmed.once ? 'This reminder is one-shot and will self-delete after delivery.' : 'This reminder repeats; it re-arms once the value crosses back and forth again.',
+    ].join('\n');
+    const actionCommand = `curl -X DELETE ${this.endpointBase()}/idle-reminders/${confirmed.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    await this.postMessage({ to: confirmed.agentId, from: 'companion', body, delivery: 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
+    if (confirmed.once) {
+      await this.store.updateIdleReminder(confirmed.id, { status: 'deleted', crossedCount: 0, lastTriggeredAt: new Date(now).toISOString() });
+    } else {
+      await this.store.updateIdleReminder(confirmed.id, { crossedCount: 0, lastTriggeredAt: new Date(now).toISOString() });
+    }
+    return this.store.findIdleReminder(confirmed.id)!;
+  }
+
+  /** compact-wake subscriptions gated on a context-percent trigger (ORACLE-1 §3.6 Phase 1/2, D-10/D-11). */
+  private async evaluateCompactTrigger(reminder: IdleReminderRecord, observed: ContextUsage, now: number): Promise<IdleReminderRecord> {
+    const cw = reminder.compactWake!;
+    if (!cw.crossedAt) {
+      // Start the delaySeconds grace/veto window now; nothing is sent yet this tick.
+      const updated = await this.store.updateIdleReminder(reminder.id, { compactWake: { ...cw, crossedAt: new Date(now).toISOString() } });
+      return updated ?? reminder;
+    }
+    const crossedAtMs = Date.parse(cw.crossedAt);
+    if (!Number.isFinite(crossedAtMs) || now - crossedAtMs < cw.delaySeconds * 1000) return reminder;
+    // The compact-wake registration is the consent token (D-10); consume it synchronously,
+    // before kicking off the (possibly long-running) compact flow in the background, so the
+    // next reconcile tick cannot re-fire this subscription while one run is still in flight.
+    await this.store.updateIdleReminder(reminder.id, { status: 'deleted', crossedCount: 0 });
+    if (cw.mode === 'auto') {
+      // Fire-and-forget: waiting for idle-stability can take minutes (worst case 15), and
+      // this is called from inside reconcileOnce()/reconcileFast() -- awaiting it here would
+      // block ALL other reconciliation (watchdog, messages, other agents' reminders) for that
+      // entire window. Same pattern as runCompactWake()/the legacy observeCompact().
+      const controller = new AbortController();
+      this.observers.add(controller);
+      void this.runAutoCompact(reminder, observed, controller.signal).finally(() => this.observers.delete(controller));
+    } else {
+      await this.notifyCompactTrigger(reminder, observed, now); // fast: a single postMessage call, safe to await
+    }
+    return this.store.findIdleReminder(reminder.id)!;
+  }
+
+  private async notifyCompactTrigger(reminder: IdleReminderRecord, observed: ContextUsage, now: number): Promise<void> {
+    const cw = reminder.compactWake!;
+    const body = [
+      `type=compact-wake id=${reminder.id} target=${reminder.agentId} event=compact-threshold-crossed criterion=contextWindowUsedTokens/contextWindowMaxTokens ${reminder.comparator ?? 'gte'} ${reminder.thresholdSeconds} confirmed over 2 consecutive observations, mode=notify triggeredAt=${new Date(now).toISOString()}`,
+      `observed: used=${observed.usedTokens} limit=${observed.limitTokens} percent=${(observed.percent * 100).toFixed(1)}% source=${observed.source}`,
+      `Run this yourself when convenient: /compact ${cw.compact}`,
+      cw.wake ? `After compacting, resume with: ${cw.wake}` : 'No wake steps were registered with this subscription; nothing will resume you after compacting.',
+      `Unsubscribe: curl -X DELETE ${this.endpointBase()}/idle-reminders/${reminder.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`,
+    ].join('\n');
+    await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake' });
+  }
+
+  private async waitForIdleStable(agentId: string, deadlineMs: number, signal: AbortSignal): Promise<boolean> {
+    let stableSince: number | undefined;
+    let previousUpdated: string | undefined;
+    while (Date.now() < deadlineMs && !signal.aborted) {
+      try {
+        const inspect = asRecord((await this.cli.run(['inspect', agentId, '--json'], { agentId, signal, timeoutMs: 5_000 })).value);
+        const status = lowerStatus(inspect.Status ?? inspect.status);
+        const updated = String(inspect.UpdatedAt ?? inspect.updatedAt ?? '');
+        const now = Date.now();
+        if (status === 'idle' && updated === previousUpdated) stableSince ??= now;
+        else stableSince = undefined;
+        previousUpdated = updated;
+        if (stableSince && now - stableSince >= 60_000) return true;
+      } catch { /* continue until deadline */ }
+      await sleep(5_000, signal);
+    }
+    return false;
+  }
+
+  private async runAutoCompact(reminder: IdleReminderRecord, preUsage: ContextUsage, signal: AbortSignal): Promise<void> {
+    const cw = reminder.compactWake!;
+    const agentId = reminder.agentId;
+    // Only ever send /compact to an agent already observed idle; a running agent would be
+    // interrupted mid-turn (ORACLE-1 3.3 C1, the single most expensive misfire).
+    const idleCheck = await this.observeAgentIdle(agentId).catch(() => undefined);
+    if (!idleCheck || idleCheck.status !== 'idle') {
+      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'not idle', observedStatus: idleCheck?.status ?? 'unknown' }));
+      return;
+    }
+    this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
+    try {
+      try {
+        await this.cli.run(['send', agentId, `/compact ${cw.compact}`], { agentId, signal });
+      } catch (error) {
+        console.warn(JSON.stringify({ type: 'auto-compact-send-failed', agentId, reminderId: reminder.id, error: error instanceof Error ? error.message : String(error) }));
+        return;
+      }
+      const stable = await this.waitForIdleStable(agentId, Date.now() + 15 * 60 * 1000, signal);
+      if (!stable) {
+        console.warn(JSON.stringify({ type: 'auto-compact-stabilize-timeout', agentId, reminderId: reminder.id }));
+        return;
+      }
+      const postUsage = this.contextUsageObserver ? await this.contextUsageObserver.observe(agentId) : 'unknown';
+      // ORACLE-1 3.4-6: no verified shrink -> fail loud, never silently retry (that is C4, a
+      // compaction loop that quietly degrades a summary of a summary each pass).
+      const dropped = postUsage !== 'unknown' && postUsage.percent <= preUsage.percent / 2;
+      console.log(JSON.stringify({ type: 'auto-compact-verified', agentId, reminderId: reminder.id, prePercent: preUsage.percent, postPercent: postUsage === 'unknown' ? 'unknown' : postUsage.percent, dropped }));
+      if (!dropped) {
+        const warnBody = `type=compact-wake id=${reminder.id} target=${agentId} event=compact-did-not-shrink criterion="post-compact percent <= half of pre-compact percent" pre=${(preUsage.percent * 100).toFixed(1)}% post=${postUsage === 'unknown' ? 'unknown' : (postUsage.percent * 100).toFixed(1) + '%'}\nAutomatic compaction did not shrink your context window as verified. This subscription is now consumed; investigate before re-registering it.`;
+        await this.postMessage({ to: agentId, from: 'companion', body: warnBody, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake' });
+      }
+      if (cw.wake) {
+        try { await this.cli.run(['send', agentId, cw.wake], { agentId, signal }); }
+        catch (error) { console.warn(JSON.stringify({ type: 'auto-compact-wake-failed', agentId, reminderId: reminder.id, error: error instanceof Error ? error.message : String(error) })); }
+      }
+    } finally {
+      this.quietUntil.delete(agentId);
+    }
   }
 
   async listIdleReminders(agentId?: string): Promise<Array<IdleReminderRecord & { idleForSeconds: number; remainingSeconds: number }>> {
@@ -1300,6 +1448,13 @@ export class CompanionService {
   }
 
   private async ensureMessageDeliveryOnce(recipient: string): Promise<void> {
+    // A coordinator-driven compact is in flight for this recipient: hold
+    // delivery (queued, not dropped -- messages stay 'pending' in the store
+    // and the next reconcile after the window closes will pick them back up)
+    // so an unrelated reminder/message cannot interrupt the compact turn
+    // (ORACLE-1 3.2/UPSTREAM "Self-compact is not atomic with respect to
+    // reminder delivery").
+    if ((this.quietUntil.get(recipient) ?? 0) > Date.now()) return;
     // Let concurrent POSTs finish their durable writes before taking the batch
     // snapshot. This keeps a burst of arrivals to one schedule generation.
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1411,62 +1566,103 @@ export class CompanionService {
     await this.reconcileIdleReminders();
   }
 
-  async compactWake(body: { agentId: string; resumeSteps: string }): Promise<unknown> {
+  /**
+   * D-10 (Owner 2026-08-19): `compact` is required and is what the coordinator actually
+   * sends (`"/compact " + compact`); `wake` is optional and, if present, is what gets sent
+   * once the compaction turn settles back to idle. No `wake` means no wake -- calling this
+   * endpoint is now itself the trigger, not a request to arm a watcher for a compact the
+   * caller is about to run out of band (that was the pre-D-10 contract; ORACLE-1 §3.4-3's
+   * "resumeSteps as a consent token" design does not apply here since `wake` is optional).
+   *
+   * D-11: `delaySeconds` (default 10) is the grace window between "conditions satisfied"
+   * and the coordinator actually sending `/compact`; `DELETE /reminders/:id` during that
+   * window vetoes it. Because the default is short, this window is NOT the primary veto
+   * mechanism for the `trigger`-gated path below -- ORACLE-1 §3.5's other two layers
+   * (event-triggered DELETE, post-notify unsubscribe) still apply.
+   *
+   * An optional `trigger` (context-percent metric + threshold) turns this into a standing
+   * subscription instead of an immediate action: it is stored as an IdleReminderRecord with
+   * `metric:'context-percent'` and a `compactWake` payload, and evaluated by the same
+   * reconcileIdleReminders() loop idle-reminders already use (ORACLE-1 §2.1: reuse the
+   * existing threshold-subscription concept, do not add a fifth one). `mode` (D-7, default
+   * 'notify') controls whether the coordinator sends `/compact` itself once the trigger and
+   * delay are satisfied, or only notifies the agent with the command text to run themselves.
+   */
+  async compactWake(body: { agentId: string; compact: string; wake?: string; delaySeconds?: number; mode?: 'notify' | 'auto'; trigger?: { metric: 'context-percent'; threshold: number; comparator?: 'gte' | 'lte' } }): Promise<unknown> {
     await this.store.addManager(body.agentId);
-    const cron = '*/5 * * * *';
-    const localId = randomUUID();
-    const createdAt = new Date().toISOString();
-    const compactBody = `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=compaction completed and manager has not resumed triggeredAt=${createdAt}\n${body.resumeSteps}\nThis is a compact recovery reminder; resume all listed steps.\nHealth check: curl -sf ${this.endpointBase()}/health || echo "COMPANION DOWN"`;
-    const prompt = this.deliveryPrompt(body.agentId, [{ id: localId, from: 'paseo-reminder', at: createdAt, urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: compactBody, actionCommand: this.cancelCommand(localId) }]);
-    const name = `compact-wake-${randomUUID().slice(0, 8)}`;
-    const pending: ReminderRecord = { id: localId, agentId: body.agentId, name, prompt, cron, expiresIn: '30m', status: 'pending', schedulingKind: 'cron', kind: 'compact-wake', createdAt: new Date().toISOString() };
-    await this.store.addReminder(pending);
-    try {
-      const value = asRecord((await this.cli.run(['heartbeat', 'create', prompt, '--cron', cron, '--expires-in', '30m', '--name', name, '--timezone', 'UTC', '--json'], { agentId: body.agentId })).value);
-      const daemonId = String(value.id ?? '');
-      await this.store.updateReminder(localId, { daemonId, status: 'active', nextRunAt: value.nextRunAt, lastRunAt: value.lastRunAt });
-      const controller = new AbortController();
-      this.observers.add(controller);
-      void this.observeCompact(body.agentId, body.resumeSteps, daemonId, localId, controller.signal).finally(() => this.observers.delete(controller));
-      return { id: daemonId, status: value.status ?? 'active', nextRunAt: value.nextRunAt };
-    } catch (error) {
-      await this.store.updateReminder(localId, { status: 'dead' });
-      throw error;
+    if (!body.compact?.trim()) missingField('compact');
+    const delaySeconds = Number.isFinite(body.delaySeconds) && (body.delaySeconds as number) >= 0 ? (body.delaySeconds as number) : 10;
+    const mode = body.mode === 'auto' ? 'auto' : 'notify';
+    if (body.trigger) {
+      if (body.trigger.metric !== 'context-percent') invalidValue('trigger.metric must be context-percent', 'trigger.metric');
+      if (!Number.isFinite(body.trigger.threshold) || body.trigger.threshold <= 0 || body.trigger.threshold > 1) invalidValue('trigger.threshold must be a 0..1 fraction', 'trigger.threshold');
+      const record: IdleReminderRecord = {
+        id: randomUUID(), agentId: body.agentId, message: `coordinator-driven compact at context-percent ${body.trigger.threshold}`,
+        thresholdSeconds: body.trigger.threshold, once: true, status: 'active', createdAt: new Date().toISOString(),
+        metric: 'context-percent', comparator: body.trigger.comparator ?? 'gte',
+        compactWake: { compact: body.compact, wake: body.wake, mode, delaySeconds },
+      };
+      await this.store.addIdleReminder(record);
+      return { id: record.id, status: 'active', mode, delaySeconds, trigger: body.trigger };
     }
+    // No trigger: the call itself is the trigger. Grace window is an in-process timer, not a
+    // daemon heartbeat -- honest limitation: it does not survive a coordinator restart within
+    // the window. Acceptable for the 10s default; a caller who sets a large delaySeconds as a
+    // real veto window should be aware a restart during it silently drops the compact.
+    const localId = randomUUID();
+    // Built eagerly (even though it is only sent once idle-stable after the compact) so a
+    // human inspecting GET /reminders can see exactly what will wake the agent, and so the
+    // eventual send reuses one fixed rendering rather than silently drifting.
+    const wakePrompt = body.wake
+      ? this.deliveryPrompt(body.agentId, [{ id: localId, from: 'paseo-reminder', at: new Date().toISOString(), urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=status=idle and updatedAt unchanged for 60s after coordinator-issued /compact\n${body.wake}`, actionCommand: this.cancelCommand(localId) }])
+      : '';
+    const pending: ReminderRecord = {
+      id: localId, agentId: body.agentId, name: `compact-wake-${localId.slice(0, 8)}`, prompt: wakePrompt,
+      cron: '', expiresIn: `${Math.max(1, Math.ceil((delaySeconds + 900) / 60))}m`,
+      status: 'pending', schedulingKind: 'cron', kind: 'compact-wake', createdAt: new Date().toISOString(),
+    };
+    await this.store.addReminder(pending);
+    const controller = new AbortController();
+    this.observers.add(controller);
+    void this.runCompactWake(body.agentId, body.compact, body.wake, delaySeconds, localId, controller.signal).finally(() => this.observers.delete(controller));
+    return { id: localId, status: 'pending', delaySeconds, willWake: Boolean(body.wake) };
   }
 
-  private async observeCompact(agentId: string, resumeSteps: string, heartbeatId: string, localId: string, signal: AbortSignal): Promise<void> {
-    const deadline = Date.now() + 15 * 60 * 1000;
+  private async runCompactWake(agentId: string, compact: string, wake: string | undefined, delaySeconds: number, localId: string, signal: AbortSignal): Promise<void> {
+    // Poll in short increments rather than one long sleep so a DELETE veto during the grace
+    // window is observed promptly instead of only after the full delaySeconds has elapsed.
+    const graceDeadline = Date.now() + delaySeconds * 1000;
+    while (Date.now() < graceDeadline) {
+      if (signal.aborted || this.store.findReminder(localId)?.status === 'deleted') return;
+      await sleep(Math.min(1_000, Math.max(0, graceDeadline - Date.now())), signal).catch(() => {});
+    }
+    if (signal.aborted) return;
+    if (this.store.findReminder(localId)?.status === 'deleted') return; // vetoed via DELETE /reminders/:id
+    await this.store.updateReminder(localId, { status: 'active' });
+    this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
     try {
-      await this.cli.run(['wait', agentId, '--timeout', '900', '--json'], { agentId, timeoutMs: 15 * 60 * 1000 + 5_000, signal });
-      let stableSince: number | undefined;
-      let previousUpdated: string | undefined;
-      while (Date.now() < deadline && !signal.aborted) {
-        try {
-          const inspect = asRecord((await this.cli.run(['inspect', agentId, '--json'], { agentId, signal, timeoutMs: 5_000 })).value);
-          const status = lowerStatus(inspect.Status ?? inspect.status);
-          const updated = String(inspect.UpdatedAt ?? inspect.updatedAt ?? '');
-          const now = Date.now();
-          console.log(JSON.stringify({ type: 'compact-observation', at: new Date(now).toISOString(), agentId, status, updatedAt: updated }));
-          if (status === 'idle' && updated === previousUpdated) stableSince ??= now;
-          else stableSince = undefined;
-          previousUpdated = updated;
-          if (stableSince && now - stableSince >= 60_000) {
-            if (this.store.findReminder(localId)?.status === 'deleted') return;
-            const compactBody = [
-              `type=compact-wake id=${localId} target=${agentId} event=compact-recovery criterion=status=idle and updatedAt unchanged for 60s triggeredAt=${new Date(now).toISOString()}`,
-              resumeSteps,
-            ].join('\n');
-            const prompt = this.deliveryPrompt(agentId, [{ id: localId, from: 'paseo-reminder', at: new Date(now).toISOString(), urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: compactBody, actionCommand: this.cancelCommand(localId) }]);
-            await this.cli.run(['send', agentId, prompt], { agentId, signal });
-            await this.cli.run(['heartbeat', 'delete', heartbeatId, '--json'], { agentId, signal });
-            await this.store.updateReminder(localId, { status: 'deleted' });
-            return;
-          }
-        } catch { /* continue until deadline */ }
-        await sleep(5_000, signal);
+      try {
+        await this.cli.run(['send', agentId, `/compact ${compact}`], { agentId, signal });
+      } catch (error) {
+        await this.store.updateReminder(localId, { status: 'dead' });
+        console.warn(JSON.stringify({ type: 'compact-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) }));
+        return;
       }
-    } catch { /* fallback heartbeat remains active */ }
+      if (!wake) { await this.store.updateReminder(localId, { status: 'deleted' }); return; }
+      const stable = await this.waitForIdleStable(agentId, Date.now() + 15 * 60 * 1000, signal);
+      if (!stable) {
+        console.warn(JSON.stringify({ type: 'compact-wake-stabilize-timeout', agentId, localId }));
+        await this.store.updateReminder(localId, { status: 'dead' });
+        return;
+      }
+      const armed = this.store.findReminder(localId);
+      if (!armed || armed.status === 'deleted') return;
+      try { await this.cli.run(['send', agentId, armed.prompt], { agentId, signal }); }
+      catch (error) { console.warn(JSON.stringify({ type: 'compact-wake-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) })); }
+      await this.store.updateReminder(localId, { status: 'deleted' });
+    } finally {
+      this.quietUntil.delete(agentId);
+    }
   }
 
   async briefing(id: string, since?: string): Promise<{ commits: string[]; uncommittedChanges: boolean; diffStat: string }> {
