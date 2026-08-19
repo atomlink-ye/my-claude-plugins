@@ -37,6 +37,7 @@ const ROUTES = [
   ['POST', '/idle-reminders', ['agentId', 'message', 'thresholdSeconds']], ['GET', '/idle-reminders', []],
   ['DELETE', '/idle-reminders/:id', ['reason']], ['POST', '/messages', ['to', 'from', 'body']],
   ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'compact']],
+  ['GET', '/context-usage', []],
   ['POST', '/ledger', ['type', 'target', 'verdict', 'reason']], ['GET', '/ledger', []],
   ['POST', '/ledger/:id/revoke', ['reason']],
   ['POST', '/corrections', ['managerId', 'auditorId', 'findings']], ['GET', '/corrections', []],
@@ -108,6 +109,9 @@ export async function createServer(service = new CompanionService(undefined, und
       }
       if (method === 'GET' && pathname === '/idle-reminders') {
         send(res, 200, await service.listIdleReminders(url.searchParams.get('agentId') || undefined)); return;
+      }
+      if (method === 'GET' && pathname === '/context-usage') {
+        send(res, 200, await service.listContextUsage(url.searchParams.get('agentId') || undefined)); return;
       }
       const idleReminderMatch = pathname.match(/^\/idle-reminders\/([^/]+)$/);
       if (method === 'DELETE' && idleReminderMatch) {

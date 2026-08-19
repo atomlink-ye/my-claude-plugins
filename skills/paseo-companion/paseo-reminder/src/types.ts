@@ -63,8 +63,17 @@ export interface IdleReminderRecord {
   id: string;
   agentId: string;
   message: string;
-  /** Seconds for 'idle-seconds' (default metric); a 0..1 fraction for 'context-percent'. */
-  thresholdSeconds: number;
+  /** idle-seconds metric only. */
+  thresholdSeconds?: number;
+  /** context-percent metric only: the 0..1 fraction the caller registered, stored as given
+   * (never pre-converted to tokens -- max varies per agent and may not be known yet at
+   * registration time, e.g. a codex lane capped at 258400 vs a claude [1m] lane at 1000000). */
+  thresholdPercent?: number;
+  /** context-percent metric only: the absolute token count the caller registered, stored as
+   * given. Exactly one of thresholdPercent/thresholdTokens is set for a context-percent
+   * record; comparison always normalizes to tokens at evaluation time using that tick's
+   * observed limitTokens, never a value baked in at registration time. */
+  thresholdTokens?: number;
   once: boolean;
   status: 'active' | 'deleted';
   idleSince?: string;
@@ -77,7 +86,7 @@ export interface IdleReminderRecord {
   comparator?: 'gte' | 'lte';
   /** context-percent only: consecutive confirming observations, reset on any non-crossing read. */
   crossedCount?: number;
-  /** context-percent only: last observed percent (0..1), kept even while not crossed. */
+  /** context-percent only: last observed absolute token count, kept even while not crossed. */
   lastObservedValue?: number;
   /** Present only when this threshold subscription drives a coordinator-issued compact. */
   compactWake?: {

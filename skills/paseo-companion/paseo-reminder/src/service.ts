@@ -5,8 +5,8 @@ import { Store } from './store.js';
 import type { ScheduleObserver } from './schedule-observer.js';
 import { ProcessWaitSourceDetector } from './wait-source.js';
 import type { WaitSourceDetector } from './wait-source.js';
-import type { ContextUsage, ContextUsageObserver } from './context-usage-observer.js';
-import { CompanionError, invalidValue, missingField } from './errors.js';
+import type { ContextUsage, ContextUsageEntry, ContextUsageObserver } from './context-usage-observer.js';
+import { CompanionError, invalidValue, missingField, rejectUnknownFields } from './errors.js';
 import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, CorrectionResolution, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
 const REMINDER_TTL = '30m';
@@ -93,6 +93,11 @@ export class CompanionService {
   private readonly contextUsageObserver?: ContextUsageObserver;
   /** Recipients whose delivery is held during an in-flight coordinator-driven compact. */
   private readonly quietUntil = new Map<string, number>();
+  /** ORACLE-1 §3.4-5: at most one coordinator-driven auto-compact per agent per hour, the
+   * second line of defense (after §3.4-6's post-compact verification) against any compaction
+   * loop this design did not anticipate. Not persisted -- a coordinator restart resets it,
+   * which is acceptable since a restart is already a rare, human-visible event. */
+  private readonly lastAutoCompactAt = new Map<string, number>();
 
   private deliveryPrompt(to: string, items: Array<{
     id: string; from: string; at: string; urgency: MessageUrgency; mode: MessageMode;
@@ -802,29 +807,78 @@ export class CompanionService {
     return `curl -X DELETE ${this.endpointBase()}/reminders/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
   }
 
-  async createIdleReminder(body: { agentId: string; thresholdSeconds: number; message: string; once?: boolean; metric?: 'idle-seconds' | 'context-percent'; comparator?: 'gte' | 'lte' }): Promise<IdleReminderRecord> {
+  /** context-percent's threshold is never pre-converted to tokens at registration time: max
+   * varies per agent (1000000 for claude [1m], 200000 for claude, 258400 for gpt-5.6-terra
+   * observed live) and may not even be known yet for a brand-new agent. Baking a percent into
+   * a token count up front would make a threshold registered against the wrong assumed max
+   * permanently unreachable for lanes with a smaller real max, with no error anywhere. */
+  /**
+   * Resolves a context-percent threshold to an absolute token count AT REGISTRATION TIME.
+   * Owner's call (overriding an earlier "normalize at evaluation time" draft): whoever is
+   * registering this already has the agentId, and connecting to that agent already implies
+   * knowing its max -- there is no meaningful "register now, learn the max later" case to
+   * design around.
+   *
+   * Both input forms are accepted and normalized to the same stored shape (thresholdPercent
+   * AND thresholdTokens both end up set on the record); every later comparison reads only
+   * thresholdTokens.
+   *
+   * If this agent's max cannot currently be read (only 20/68 agents carry contextWindow
+   * fields in a live listAll() -- an agent that has never run a turn has none), this throws
+   * rather than guessing a default max. Guessing would silently produce an unreachable
+   * threshold for a smaller-window lane (e.g. registering 70% against an assumed 1,000,000
+   * max computes 700,000 tokens -- unreachable for a gpt-5.6-terra lane capped at 258,400 --
+   * and the subscription would just never fire, with no error anywhere).
+   */
+  private async resolveContextThreshold(agentId: string, input: { thresholdPercent?: number; thresholdTokens?: number }): Promise<{ thresholdPercent: number; thresholdTokens: number }> {
+    const hasPercent = input.thresholdPercent !== undefined;
+    const hasTokens = input.thresholdTokens !== undefined;
+    if (hasPercent === hasTokens) invalidValue('exactly one of thresholdPercent or thresholdTokens is required for metric=context-percent', hasPercent ? 'thresholdTokens' : 'thresholdPercent');
+    if (hasPercent && (!Number.isFinite(input.thresholdPercent) || (input.thresholdPercent as number) <= 0 || (input.thresholdPercent as number) > 1)) invalidValue('thresholdPercent must be a 0..1 fraction', 'thresholdPercent');
+    if (hasTokens && (!Number.isFinite(input.thresholdTokens) || (input.thresholdTokens as number) <= 0)) invalidValue('thresholdTokens must be positive', 'thresholdTokens');
+    const observed = this.contextUsageObserver ? await this.contextUsageObserver.observe(agentId) : 'unknown';
+    if (observed === 'unknown') invalidValue(`cannot resolve a context-percent threshold for agent=${agentId}: its context-window max is not readable yet (it may not have run a turn since the coordinator can observe usage). Wait for it to run once, then register.`, hasPercent ? 'thresholdPercent' : 'thresholdTokens');
+    if (hasPercent) return { thresholdPercent: input.thresholdPercent as number, thresholdTokens: Math.round((input.thresholdPercent as number) * observed.limitTokens) };
+    return { thresholdPercent: (input.thresholdTokens as number) / observed.limitTokens, thresholdTokens: input.thresholdTokens as number };
+  }
+
+  async createIdleReminder(body: { agentId: string; thresholdSeconds?: number; thresholdPercent?: number; thresholdTokens?: number; message: string; once?: boolean; metric?: 'idle-seconds' | 'context-percent'; comparator?: 'gte' | 'lte' }): Promise<IdleReminderRecord> {
     await this.store.addManager(body.agentId);
+    rejectUnknownFields(body as Record<string, unknown>, ['agentId', 'message', 'thresholdSeconds', 'thresholdPercent', 'thresholdTokens', 'once', 'metric', 'comparator']);
     const metric = body.metric ?? 'idle-seconds';
     if (metric !== 'idle-seconds' && metric !== 'context-percent') invalidValue('metric must be idle-seconds or context-percent', 'metric');
-    if (!Number.isFinite(body.thresholdSeconds) || body.thresholdSeconds <= 0) invalidValue('thresholdSeconds must be positive', 'thresholdSeconds');
-    if (metric === 'context-percent' && body.thresholdSeconds > 1) invalidValue('thresholdSeconds must be a 0..1 fraction for context-percent', 'thresholdSeconds');
     if (!body.message?.trim()) missingField('message');
     const comparator = body.comparator ?? 'gte';
     if (comparator !== 'gte' && comparator !== 'lte') invalidValue('comparator must be gte or lte', 'comparator');
-    const record: IdleReminderRecord = {
-      id: randomUUID(), agentId: body.agentId, message: body.message, thresholdSeconds: body.thresholdSeconds,
-      once: body.once === true, status: 'active', createdAt: new Date().toISOString(),
-      ...(metric !== 'idle-seconds' ? { metric } : {}), ...(comparator !== 'gte' ? { comparator } : {}),
-    };
+    let record: IdleReminderRecord;
+    if (metric === 'context-percent') {
+      if (body.thresholdSeconds !== undefined) invalidValue('thresholdSeconds is only valid for metric=idle-seconds; use thresholdPercent or thresholdTokens', 'thresholdSeconds');
+      const resolved = await this.resolveContextThreshold(body.agentId, body);
+      record = {
+        id: randomUUID(), agentId: body.agentId, message: body.message,
+        thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens,
+        once: body.once === true, status: 'active', createdAt: new Date().toISOString(), metric, comparator,
+      };
+    } else {
+      if (body.thresholdPercent !== undefined || body.thresholdTokens !== undefined) invalidValue('thresholdPercent/thresholdTokens are only valid for metric=context-percent; use thresholdSeconds', body.thresholdPercent !== undefined ? 'thresholdPercent' : 'thresholdTokens');
+      if (!Number.isFinite(body.thresholdSeconds) || (body.thresholdSeconds as number) <= 0) invalidValue('thresholdSeconds must be positive', 'thresholdSeconds');
+      record = {
+        id: randomUUID(), agentId: body.agentId, message: body.message, thresholdSeconds: body.thresholdSeconds,
+        once: body.once === true, status: 'active', createdAt: new Date().toISOString(), metric, comparator,
+      };
+    }
     await this.store.addIdleReminder(record);
     return record;
   }
 
-  private async observeAgentIdle(agentId: string): Promise<{ status: string; updatedAt: string; available: boolean }> {
+  private async observeAgentIdle(agentId: string): Promise<{ status: string; updatedAt: string; available: boolean; mode: string; pendingPermissionsCount: number }> {
     const inspected = await this.inspectWithRetry(agentId, agentId);
     const status = lowerStatus(inspected.Status ?? inspected.status);
     const updatedAt = String(inspected.UpdatedAt ?? inspected.updatedAt ?? '');
-    return { status, updatedAt, available: ['idle', 'waiting'].includes(status) && Boolean(updatedAt) };
+    const mode = lowerStatus(inspected.Mode ?? inspected.mode);
+    const pendingPermissions = inspected.PendingPermissions ?? inspected.pendingPermissions;
+    const pendingPermissionsCount = Array.isArray(pendingPermissions) ? pendingPermissions.length : 0;
+    return { status, updatedAt, available: ['idle', 'waiting'].includes(status) && Boolean(updatedAt), mode, pendingPermissionsCount };
   }
 
   private async observeIdleReminder(reminder: IdleReminderRecord, now = Date.now()): Promise<IdleReminderRecord> {
@@ -849,7 +903,7 @@ export class CompanionService {
       current = await this.store.updateIdleReminder(reminder.id, { idleSince: new Date(now).toISOString(), lastObservedUpdatedAt: updated }) ?? reminder;
     }
     const since = current.idleSince ? Date.parse(current.idleSince) : NaN;
-    if (!Number.isFinite(since) || now - since < current.thresholdSeconds * 1000) return current;
+    if (!Number.isFinite(since) || now - since < (current.thresholdSeconds ?? 0) * 1000) return current;
     const body = [
       `type=idle-reminder id=${current.id} target=${current.agentId} event=manager-idle criterion=status=idle and updatedAt unchanged for ${current.thresholdSeconds}s triggeredAt=${new Date(now).toISOString()}`,
       current.message,
@@ -865,6 +919,14 @@ export class CompanionService {
     return this.store.findIdleReminder(current.id)!;
   }
 
+  /** thresholdTokens is resolved once at registration time (resolveContextThreshold) and
+   * always stored on the record; comparison always reads it directly, in token space. The
+   * observed.limitTokens fallback only covers a hypothetical pre-migration record that
+   * predates this field. */
+  private effectiveThresholdTokens(reminder: IdleReminderRecord, observed: ContextUsage): number {
+    return reminder.thresholdTokens ?? Math.round((reminder.thresholdPercent ?? 0) * observed.limitTokens);
+  }
+
   private async observeContextPercentReminder(reminder: IdleReminderRecord, now = Date.now()): Promise<IdleReminderRecord> {
     if (!this.contextUsageObserver) return reminder;
     const observed = await this.contextUsageObserver.observe(reminder.agentId);
@@ -872,21 +934,22 @@ export class CompanionService {
     // threshold" -- it is simply not evaluated this tick. Compaction is not reversible.
     if (observed === 'unknown') return reminder;
     const comparator = reminder.comparator ?? 'gte';
-    const crossed = comparator === 'lte' ? observed.percent <= reminder.thresholdSeconds : observed.percent >= reminder.thresholdSeconds;
+    const thresholdTokens = this.effectiveThresholdTokens(reminder, observed);
+    const crossed = comparator === 'lte' ? observed.usedTokens <= thresholdTokens : observed.usedTokens >= thresholdTokens;
     if (!crossed) {
-      if (reminder.crossedCount || reminder.lastObservedValue !== observed.percent) {
-        await this.store.updateIdleReminder(reminder.id, { crossedCount: 0, lastObservedValue: observed.percent, ...(reminder.compactWake ? { compactWake: { ...reminder.compactWake, crossedAt: undefined } } : {}) });
+      if (reminder.crossedCount || reminder.lastObservedValue !== observed.usedTokens) {
+        await this.store.updateIdleReminder(reminder.id, { crossedCount: 0, lastObservedValue: observed.usedTokens, ...(reminder.compactWake ? { compactWake: { ...reminder.compactWake, crossedAt: undefined } } : {}) });
       }
       return this.store.findIdleReminder(reminder.id) ?? reminder;
     }
     // Require two consecutive crossing observations before acting; kills single-point
     // read noise/flicker the way the watchdog dual-source fix does (ORACLE-1 step 2 gate②).
     const crossedCount = (reminder.crossedCount ?? 0) + 1;
-    const confirmed = await this.store.updateIdleReminder(reminder.id, { crossedCount, lastObservedValue: observed.percent }) ?? reminder;
+    const confirmed = await this.store.updateIdleReminder(reminder.id, { crossedCount, lastObservedValue: observed.usedTokens }) ?? reminder;
     if (crossedCount < 2) return confirmed;
     if (confirmed.compactWake) return this.evaluateCompactTrigger(confirmed, observed, now);
     const body = [
-      `type=idle-reminder id=${confirmed.id} target=${confirmed.agentId} event=context-percent-crossed criterion=contextWindowUsedTokens/contextWindowMaxTokens ${comparator} ${confirmed.thresholdSeconds} confirmed over 2 consecutive observations triggeredAt=${new Date(now).toISOString()}`,
+      `type=idle-reminder id=${confirmed.id} target=${confirmed.agentId} event=context-percent-crossed criterion=contextWindowUsedTokens ${comparator} ${thresholdTokens} (registered as ${confirmed.thresholdPercent !== undefined ? `${(confirmed.thresholdPercent * 100).toFixed(1)}%` : `${confirmed.thresholdTokens} tokens`}) confirmed over 2 consecutive observations triggeredAt=${new Date(now).toISOString()}`,
       `observed: used=${observed.usedTokens} limit=${observed.limitTokens} percent=${(observed.percent * 100).toFixed(1)}% source=${observed.source}`,
       confirmed.message,
       confirmed.once ? 'This reminder is one-shot and will self-delete after delivery.' : 'This reminder repeats; it re-arms once the value crosses back and forth again.',
@@ -932,7 +995,7 @@ export class CompanionService {
   private async notifyCompactTrigger(reminder: IdleReminderRecord, observed: ContextUsage, now: number): Promise<void> {
     const cw = reminder.compactWake!;
     const body = [
-      `type=compact-wake id=${reminder.id} target=${reminder.agentId} event=compact-threshold-crossed criterion=contextWindowUsedTokens/contextWindowMaxTokens ${reminder.comparator ?? 'gte'} ${reminder.thresholdSeconds} confirmed over 2 consecutive observations, mode=notify triggeredAt=${new Date(now).toISOString()}`,
+      `type=compact-wake id=${reminder.id} target=${reminder.agentId} event=compact-threshold-crossed criterion=contextWindowUsedTokens ${reminder.comparator ?? 'gte'} ${this.effectiveThresholdTokens(reminder, observed)} (registered as ${reminder.thresholdPercent !== undefined ? `${(reminder.thresholdPercent * 100).toFixed(1)}%` : `${reminder.thresholdTokens} tokens`}) confirmed over 2 consecutive observations, mode=notify triggeredAt=${new Date(now).toISOString()}`,
       `observed: used=${observed.usedTokens} limit=${observed.limitTokens} percent=${(observed.percent * 100).toFixed(1)}% source=${observed.source}`,
       `Run this yourself when convenient: /compact ${cw.compact}`,
       cw.wake ? `After compacting, resume with: ${cw.wake}` : 'No wake steps were registered with this subscription; nothing will resume you after compacting.',
@@ -963,6 +1026,13 @@ export class CompanionService {
   private async runAutoCompact(reminder: IdleReminderRecord, preUsage: ContextUsage, signal: AbortSignal): Promise<void> {
     const cw = reminder.compactWake!;
     const agentId = reminder.agentId;
+    // ORACLE-1 3.4-5: rate limit, the second line of defense (after 3.4-6's post-compact
+    // verification) against any compaction loop this design did not anticipate.
+    const lastAt = this.lastAutoCompactAt.get(agentId);
+    if (lastAt !== undefined && Date.now() - lastAt < 60 * 60 * 1000) {
+      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'rate-limited', minutesSinceLast: Math.round((Date.now() - lastAt) / 60_000) }));
+      return;
+    }
     // Only ever send /compact to an agent already observed idle; a running agent would be
     // interrupted mid-turn (ORACLE-1 3.3 C1, the single most expensive misfire).
     const idleCheck = await this.observeAgentIdle(agentId).catch(() => undefined);
@@ -970,6 +1040,14 @@ export class CompanionService {
       console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'not idle', observedStatus: idleCheck?.status ?? 'unknown' }));
       return;
     }
+    // ORACLE-1 3.4-7 (C5): a status='idle' agent can still be sitting on a plan-mode preview
+    // or an unresolved permission prompt -- Status alone does not distinguish "genuinely done"
+    // from "waiting on a human". Sending /compact there is C1 in disguise.
+    if (idleCheck.mode === 'plan' || idleCheck.pendingPermissionsCount > 0) {
+      console.warn(JSON.stringify({ type: 'auto-compact-deferred', agentId, reminderId: reminder.id, reason: 'plan-mode-or-pending-permission', mode: idleCheck.mode, pendingPermissionsCount: idleCheck.pendingPermissionsCount }));
+      return;
+    }
+    this.lastAutoCompactAt.set(agentId, Date.now());
     this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
     try {
       try {
@@ -1001,15 +1079,29 @@ export class CompanionService {
     }
   }
 
+  /** Read-only GET /context-usage. Missing/unread fields are 'unknown', never 0 (see ContextUsageEntry). */
+  async listContextUsage(agentId?: string): Promise<ContextUsageEntry[]> {
+    if (!this.contextUsageObserver) return [];
+    const entries = await this.contextUsageObserver.listAll();
+    return agentId ? entries.filter((entry) => entry.agentId === agentId) : entries;
+  }
+
   async listIdleReminders(agentId?: string): Promise<Array<IdleReminderRecord & { idleForSeconds: number; remainingSeconds: number }>> {
     const records = this.store.getIdleReminders().filter((item) => !agentId || item.agentId === agentId);
     const now = Date.now();
     const output: Array<IdleReminderRecord & { idleForSeconds: number; remainingSeconds: number }> = [];
     for (const record of records) {
       const observed = record.status === 'active' ? await this.observeIdleReminder(record, now) : record;
+      if ((observed.metric ?? 'idle-seconds') === 'context-percent') {
+        // idle-seconds' idleForSeconds/remainingSeconds concept does not apply here.
+        // thresholdPercent/thresholdTokens are both already on the stored record (resolved
+        // once, at registration time -- see resolveContextThreshold's comment).
+        output.push({ ...observed, idleForSeconds: 0, remainingSeconds: 0 });
+        continue;
+      }
       const since = observed.idleSince ? Date.parse(observed.idleSince) : NaN;
       const idleForSeconds = Number.isFinite(since) ? Math.max(0, Math.floor((now - since) / 1000)) : 0;
-      output.push({ ...observed, idleForSeconds, remainingSeconds: Math.max(0, observed.thresholdSeconds - idleForSeconds) });
+      output.push({ ...observed, idleForSeconds, remainingSeconds: Math.max(0, (observed.thresholdSeconds ?? 0) - idleForSeconds) });
     }
     return output;
   }
@@ -1588,22 +1680,27 @@ export class CompanionService {
    * 'notify') controls whether the coordinator sends `/compact` itself once the trigger and
    * delay are satisfied, or only notifies the agent with the command text to run themselves.
    */
-  async compactWake(body: { agentId: string; compact: string; wake?: string; delaySeconds?: number; mode?: 'notify' | 'auto'; trigger?: { metric: 'context-percent'; threshold: number; comparator?: 'gte' | 'lte' } }): Promise<unknown> {
+  async compactWake(body: { agentId: string; compact: string; wake?: string; delaySeconds?: number; mode?: 'notify' | 'auto'; trigger?: { metric: 'context-percent'; thresholdPercent?: number; thresholdTokens?: number; comparator?: 'gte' | 'lte' } }): Promise<unknown> {
     await this.store.addManager(body.agentId);
+    rejectUnknownFields(body as Record<string, unknown>, ['agentId', 'compact', 'wake', 'delaySeconds', 'mode', 'trigger']);
     if (!body.compact?.trim()) missingField('compact');
     const delaySeconds = Number.isFinite(body.delaySeconds) && (body.delaySeconds as number) >= 0 ? (body.delaySeconds as number) : 10;
     const mode = body.mode === 'auto' ? 'auto' : 'notify';
     if (body.trigger) {
+      rejectUnknownFields(body.trigger as unknown as Record<string, unknown>, ['metric', 'thresholdPercent', 'thresholdTokens', 'comparator']);
       if (body.trigger.metric !== 'context-percent') invalidValue('trigger.metric must be context-percent', 'trigger.metric');
-      if (!Number.isFinite(body.trigger.threshold) || body.trigger.threshold <= 0 || body.trigger.threshold > 1) invalidValue('trigger.threshold must be a 0..1 fraction', 'trigger.threshold');
+      const resolved = await this.resolveContextThreshold(body.agentId, body.trigger);
+      const comparator = body.trigger.comparator ?? 'gte';
       const record: IdleReminderRecord = {
-        id: randomUUID(), agentId: body.agentId, message: `coordinator-driven compact at context-percent ${body.trigger.threshold}`,
-        thresholdSeconds: body.trigger.threshold, once: true, status: 'active', createdAt: new Date().toISOString(),
-        metric: 'context-percent', comparator: body.trigger.comparator ?? 'gte',
+        id: randomUUID(), agentId: body.agentId,
+        message: `coordinator-driven compact at context-percent ${(resolved.thresholdPercent * 100).toFixed(1)}% (${resolved.thresholdTokens} tokens)`,
+        thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens,
+        once: true, status: 'active', createdAt: new Date().toISOString(),
+        metric: 'context-percent', comparator,
         compactWake: { compact: body.compact, wake: body.wake, mode, delaySeconds },
       };
       await this.store.addIdleReminder(record);
-      return { id: record.id, status: 'active', mode, delaySeconds, trigger: body.trigger };
+      return { id: record.id, status: 'active', mode, delaySeconds, compact: body.compact, wake: body.wake, trigger: { metric: 'context-percent', comparator, thresholdPercent: resolved.thresholdPercent, thresholdTokens: resolved.thresholdTokens } };
     }
     // No trigger: the call itself is the trigger. Grace window is an in-process timer, not a
     // daemon heartbeat -- honest limitation: it does not survive a coordinator restart within
@@ -1625,7 +1722,7 @@ export class CompanionService {
     const controller = new AbortController();
     this.observers.add(controller);
     void this.runCompactWake(body.agentId, body.compact, body.wake, delaySeconds, localId, controller.signal).finally(() => this.observers.delete(controller));
-    return { id: localId, status: 'pending', delaySeconds, willWake: Boolean(body.wake) };
+    return { id: localId, status: 'pending', delaySeconds, mode: 'immediate', compact: body.compact, wake: body.wake, willWake: Boolean(body.wake) };
   }
 
   private async runCompactWake(agentId: string, compact: string, wake: string | undefined, delaySeconds: number, localId: string, signal: AbortSignal): Promise<void> {

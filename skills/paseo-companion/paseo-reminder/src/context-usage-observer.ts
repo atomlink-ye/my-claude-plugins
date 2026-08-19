@@ -11,6 +11,16 @@ export interface ContextUsage {
   source: string;
 }
 
+/** One row of the GET /context-usage listing. Same never-fabricate-a-0 rule as ContextUsage. */
+export interface ContextUsageEntry {
+  agentId: string;
+  status: string;
+  model: string | 'unknown';
+  usedTokens: number | 'unknown';
+  maxTokens: number | 'unknown';
+  percent: number | 'unknown';
+}
+
 /**
  * Reads a running agent's context-window occupancy. Missing data returns
  * 'unknown' rather than 0 -- 0 is a truthy "not yet at threshold" answer and
@@ -19,6 +29,8 @@ export interface ContextUsage {
  */
 export interface ContextUsageObserver {
   observe(agentId: string): Promise<ContextUsage | 'unknown'>;
+  /** All agents in one daemon round-trip, for the read-only listing endpoint. */
+  listAll(): Promise<ContextUsageEntry[]>;
   close?(): Promise<void> | void;
 }
 
@@ -68,5 +80,31 @@ export class PaseoContextUsageObserver implements ContextUsageObserver {
       await client.close();
     }
   }
-  async close(): Promise<void> { /* per-call clients are closed by observe() */ }
+  async listAll(): Promise<ContextUsageEntry[]> {
+    const client = this.clientFactory();
+    await client.connect();
+    try {
+      const result = await client.fetchAgents({});
+      return result.entries.map((item: any) => {
+        const agent = item.agent ?? item;
+        const usage = agent.lastUsage;
+        const used = usage?.contextWindowUsedTokens;
+        const limit = usage?.contextWindowMaxTokens;
+        const known = typeof used === 'number' && typeof limit === 'number' && limit > 0;
+        return {
+          agentId: String(agent.id),
+          status: String(agent.status ?? 'unknown'),
+          model: agent.model ? String(agent.model) : 'unknown',
+          usedTokens: known ? used : 'unknown',
+          maxTokens: known ? limit : 'unknown',
+          percent: known ? used / limit : 'unknown',
+        };
+      });
+    } catch {
+      return [];
+    } finally {
+      await client.close();
+    }
+  }
+  async close(): Promise<void> { /* per-call clients are closed by observe()/listAll() */ }
 }
