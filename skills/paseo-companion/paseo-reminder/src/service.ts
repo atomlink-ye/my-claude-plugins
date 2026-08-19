@@ -10,6 +10,8 @@ import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, 
 
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
+// Heartbeat schedules carry '--expires-in 30m'; 5m margin covers reconcile jitter.
+const MESSAGE_SCHEDULE_ABSORPTION_TIMEOUT_MS = 35 * 60 * 1000;
 type MessageScheduleInspection = {
   state: 'live' | 'running' | 'success' | 'failed' | 'missing' | 'unknown';
   hasRun: boolean;
@@ -59,6 +61,14 @@ function deterministicName(prefix: string, value: string): string {
 function unwrapPayload(value: unknown): Record<string, any> {
   const record = asRecord(value);
   return record.payload && typeof record.payload === 'object' ? asRecord(record.payload) : record;
+}
+// CLI/daemon error shapes vary between a bare string and {code,message}; String(object)
+// collapses to "[object Object]" and silently defeats not-found/missing matching.
+function errorText(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  const record = asRecord(value);
+  return String(record.message ?? record.code ?? JSON.stringify(value));
 }
 
 export class CompanionService {
@@ -1086,7 +1096,7 @@ export class CompanionService {
         ? await this.scheduleObserver.scheduleInspect(schedule.daemonId)
         : (await this.cli.run(['schedule', 'inspect', schedule.daemonId, '--json'], { agentId: schedule.recipient, timeoutMs: 5_000 })).value;
       const inspectedEnvelope = unwrapPayload(inspectValue);
-      if (inspectedEnvelope.schedule === null && /not found|missing/i.test(String(inspectedEnvelope.error ?? ''))) return { state: 'missing', hasRun: false };
+      if (inspectedEnvelope.schedule == null && /not found|missing/i.test(errorText(inspectedEnvelope.error))) return { state: 'missing', hasRun: false };
       if (inspectedEnvelope.error && inspectedEnvelope.schedule === undefined) return { state: 'unknown', hasRun: false };
       const inspected = asRecord(inspectedEnvelope.schedule && typeof inspectedEnvelope.schedule === 'object' ? inspectedEnvelope.schedule : inspectedEnvelope);
       if (!Object.keys(inspected).length) return { state: 'unknown', hasRun: false };
@@ -1152,6 +1162,17 @@ export class CompanionService {
       } else if (observed.state === 'missing') {
         await this.store.updateMessageSchedule(schedule.id, { status: 'failed' });
         console.warn(JSON.stringify({ type: 'message-delivery-terminal', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'heartbeat', reason: observed.state }));
+      } else {
+        // 'unknown' and 'live' are not terminal observations, but they must not be an
+        // absorbing state either: an unresolvable schedule otherwise blocks re-delivery
+        // (ensureMessageDeliveryOnce treats 'active' as accepted) forever once the
+        // underlying heartbeat itself expires ('--expires-in 30m').
+        const createdAtMs = Date.parse(schedule.createdAt);
+        const ageMs = Number.isFinite(createdAtMs) ? Date.now() - createdAtMs : undefined;
+        if (ageMs !== undefined && ageMs > MESSAGE_SCHEDULE_ABSORPTION_TIMEOUT_MS) {
+          await this.store.updateMessageSchedule(schedule.id, { status: 'failed' });
+          console.warn(JSON.stringify({ type: 'message-delivery-terminal', recipient: schedule.recipient, generation: schedule.generation, batchIds: schedule.batchIds, transport: 'heartbeat', reason: 'absorption-timeout', observedState: observed.state, ageMs }));
+        }
       }
     }
   }
