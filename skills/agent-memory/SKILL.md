@@ -53,9 +53,17 @@ When durable knowledge changes:
 ---
 title: Agent Team UI Decisions
 brief: Durable decisions for the Agent Teams timeline and playback UX.
-tags: [agent-server, frontend, decisions]
+tags: [agent-server:frontend, knowledge:decisions]
 ---
 ```
+
+Hierarchical tags use `:` between segments. They may be arbitrarily deep, for example
+`agent-server:operations:deploy`. Tag filters match complete hierarchy segments or
+subpaths: `--tag operations`, `--tag deploy`, and `--tag agent-server:operations` all
+match that tag. Results always display the full canonical tag
+`agent-server:operations:deploy`; `operations` is not stored as a second flat tag.
+Multiple `--tag` filters are ANDed. Hierarchical tags classify knowledge only; project
+visibility still comes from settings scopes.
 
 3. Link related memory with ordinary Markdown links such as
    `[Shared review workflow](../../shared/workflows/review.md)`; `[[relative-note]]`
@@ -76,6 +84,7 @@ Top-level binding paths must be absolute (or `~`-based). Nested `projects[].path
 may be relative to their parent. Each `memory` entry can be a path or `{path,tags}`. Child
 project memory does **not** inherit parent memory unless `inherit_memory: true` is
 explicitly set. Binding tags inherit down the tree; root/frontmatter tags are additive.
+All three tag sources support the same `parent:child[:leaf]` hierarchy.
 
-See `docs/agent-memory.md` for the complete settings example, data model, link behavior,
-and MVE boundaries.
+See `docs/agent-memory.md` for the complete settings example, data model, hierarchical tag
+behavior, link behavior, and MVE boundaries.
