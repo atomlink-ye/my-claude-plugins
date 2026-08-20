@@ -24,6 +24,12 @@ creates an empty settings file only when one does not already exist:
 Then use the installed command; pass the actual worktree with `--path` rather than relying
 on CWD:
 
+Agent Memory emits deterministic, stdlib-only YAML by default. Use exactly one of the
+global output flags when another representation is needed: `--json` for scripts and
+backward-compatible machine output, `--table` for compact collection/health tables, or
+`--text` for the legacy human-readable view. The flags are mutually exclusive and apply
+to every subcommand, including `init` and `doctor`.
+
 ```sh
 agent-memory --json status
 agent-memory --json doctor --path "$PWD"
