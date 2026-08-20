@@ -1,6 +1,6 @@
 ---
 name: agent-memory
-description: "Use when durable local knowledge may exist outside the current CWD or across multiple projects. Resolve the active project from ~/.agent-memory/settings.json, search the file-first SQLite index, open/edit the returned Markdown source, and inspect Markdown links/backlinks without copying memory into the current repo."
+description: "Use when durable local knowledge may exist outside the current CWD or across multiple projects. Resolve the active project from ~/.agent-memory/settings.json, search the file-first SQLite index, capture durable learnings, open/edit returned Markdown sources, and inspect links/backlinks without copying memory into the current repo."
 ---
 
 # Agent Memory
@@ -19,7 +19,8 @@ Use the bundled script directly so the workflow does not depend on the current C
 ```sh
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json status
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json resolve --path "$PWD"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "query" --path "$PWD"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "learnings agent server" --path "$PWD"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json capture learning "Reusable lesson" --path "$PWD"
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json links /abs/path/to/note.md
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json sync
 ```
@@ -32,22 +33,43 @@ For project work, resolve the actual work path before searching. `--path` uses t
 nearest/longest nested binding from `~/.agent-memory/settings.json`; sibling projects do
 not share their project memory by default.
 
-1. Run `resolve --path <actual project/worktree path>` when project identity is not
-   already explicit.
-2. Search with `--path <path>` or `--project <name>`. Project searches include configured
-   shared memory unless `--no-shared` is passed.
-3. Use unscoped/global search only when the task explicitly needs cross-project knowledge
-   or the correct project is genuinely unknown.
+1. Run `resolve --path <actual project/worktree path>` when project identity is not already explicit.
+2. Search with `--path <path>` or `--project <name>`. Project searches include configured shared memory unless `--no-shared` is passed.
+3. Use unscoped/global search only when the task explicitly needs cross-project knowledge or the correct project is genuinely unknown.
 4. Prefer a returned `brief` to decide relevance, then read the returned absolute `path`.
 
 Do not infer project identity from the process CWD when the actual target path is known.
 
+## Hierarchical tags and symmetric recall
+
+Use `:` to keep a canonical classification path such as:
+
+```text
+agent-server:learnings
+agent-server:operations:deploy
+workflow:review
+```
+
+Storage/display remains canonical, but recall does not require hierarchy order:
+
+- `--tag operations` matches `agent-server:operations:deploy`;
+- `--tag agent-server:operations` matches it;
+- `--tag deploy:agent-server` also matches it because every requested complete segment is present;
+- partial strings such as `ops` do not match `operations`.
+
+Normal `search` is tag-aware too. Tag aliases are added only to the disposable FTS index,
+not to Markdown metadata. Therefore a document tagged `agent-server:learnings` can be
+recalled with either `search "agent server learnings"` or `search "learnings agent server"`.
+Hyphenated tag segments also contribute word aliases (`agent-server` -> `agent`, `server`).
+Results still show only the full canonical tag.
+
+Multiple explicit `--tag` filters are ANDed. Tags classify knowledge; project visibility
+still comes only from settings scopes.
+
 ## Write/update loop
 
-When durable knowledge changes:
-
-1. Edit the real Markdown source at the path returned by search/list.
-2. Keep optional metadata in the small frontmatter subset:
+When durable knowledge changes, edit the real Markdown source returned by search/list and
+keep optional metadata in the small frontmatter subset:
 
 ```md
 ---
@@ -57,22 +79,40 @@ tags: [agent-server:frontend, knowledge:decisions]
 ---
 ```
 
-Hierarchical tags use `:` between segments. They may be arbitrarily deep, for example
-`agent-server:operations:deploy`. Tag filters match complete hierarchy segments or
-subpaths: `--tag operations`, `--tag deploy`, and `--tag agent-server:operations` all
-match that tag. Results always display the full canonical tag
-`agent-server:operations:deploy`; `operations` is not stored as a second flat tag.
-Multiple `--tag` filters are ANDed. Hierarchical tags classify knowledge only; project
-visibility still comes from settings scopes.
+Link related memory with ordinary Markdown links such as
+`[Shared review workflow](../../shared/workflows/review.md)`; `[[relative-note]]`
+wikilinks are also indexed. Run `sync` after manually creating, moving, deleting, or
+materially editing files, and use `links <file>` when backlinks or cross-project
+dependencies matter.
 
-3. Link related memory with ordinary Markdown links such as
-   `[Shared review workflow](../../shared/workflows/review.md)`; `[[relative-note]]`
-   wikilinks are also indexed.
-4. Run `sync` after creating, moving, deleting, or materially editing memory files.
-5. Use `links <file>` when backlinks or cross-project dependencies matter.
+## Structured self-improvement capture
 
-The MVE does not auto-extract memories from conversations and does not silently write or
-rewrite notes. Capture only when the task/user actually calls for durable memory.
+`capture` is the write path used by the bundled `self-improvement` skill:
+
+```sh
+agent-memory --json capture drawback \
+  "Preview routing is coupled to the host configuration" \
+  --path /abs/path/to/project \
+  --details "The application can be healthy while the preview hostname is unreachable." \
+  --action "Validate the host route before changing application code." \
+  --tag sandbox:preview \
+  --related /abs/path/to/project/docs/sandbox.md
+```
+
+Supported kinds are `learning`, `drawback`, `error`, and `feature-request`. Each capture:
+
+- resolves the project from the actual `--path`;
+- writes one standalone Markdown file under `learnings/`, `drawbacks/`, `errors/`, or `feature-requests/` inside the project's memory root;
+- adds canonical tags such as `<project>:learnings` and `self-improvement:learning`;
+- accepts extra tags and related-file Markdown links;
+- runs `sync` immediately so the memory is searchable and backlinkable.
+
+If the resolved project has multiple memory roots, `capture` refuses to guess and requires
+`--root` to name one of the configured roots.
+
+The capture policy itself lives in `skills/self-improvement/SKILL.md`. Agent Memory owns
+storage, routing, indexing, and references; Self Improvement owns the trigger/curation
+policy.
 
 ## Settings contract
 
@@ -86,5 +126,5 @@ project memory does **not** inherit parent memory unless `inherit_memory: true` 
 explicitly set. Binding tags inherit down the tree; root/frontmatter tags are additive.
 All three tag sources support the same `parent:child[:leaf]` hierarchy.
 
-See `docs/agent-memory.md` for the complete settings example, data model, hierarchical tag
-behavior, link behavior, and MVE boundaries.
+See `docs/agent-memory.md` for the complete settings example, data model, tag behavior,
+link behavior, capture workflow, and MVE boundaries.
