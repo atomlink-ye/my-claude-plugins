@@ -112,12 +112,28 @@ def _derive_metadata(path: Path, text: str, root_tags: Iterable[str]) -> tuple[s
     return title, brief, tags, body
 
 
+def _tag_search_text(tags: Iterable[str]) -> str:
+    """Produce hidden FTS aliases while preserving canonical stored/display tags.
+
+    ``agent-server:learnings`` contributes ``agent-server``, ``agent``, ``server``, and
+    ``learnings``. This lets a normal free-text query such as ``learnings agent server``
+    recall the note without requiring the user to remember hierarchy order or hyphens.
+    """
+    aliases: list[str] = []
+    for tag in tags:
+        canonical = _normalize_tag(tag)
+        aliases.append(canonical)
+        for segment in canonical.split(":"):
+            aliases.append(segment)
+            aliases.extend(part for part in re.split(r"[-_\s]+", segment) if part)
+    return " ".join(_dedupe(aliases))
+
+
 def _resolve_link_target(source: Path, href: str) -> tuple[Path | None, str | None]:
     href = href.strip().strip("<>")
     if not href or href.startswith("#"):
         return None, href[1:] if href.startswith("#") else None
     if " " in href and not href.startswith("file://"):
-        # Markdown permits optional titles after the URL: (file.md "title")
         href = href.split(maxsplit=1)[0]
     parsed = urlparse(href)
     if parsed.scheme and parsed.scheme != "file":
@@ -149,7 +165,6 @@ def _extract_links(source: Path, body: str) -> list[dict[str, str | None]]:
             continue
         href = raw_target + (f"#{anchor}" if anchor else "")
         found.append({"target_path": str(target), "href": href, "label": (alias or Path(raw_target).stem).strip(), "anchor": anchor})
-    # Preserve order while removing duplicate parser hits.
     unique: dict[tuple[str, str], dict[str, str | None]] = {}
     for item in found:
         unique[(str(item["href"]), str(item["label"]))] = item
@@ -198,7 +213,8 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
                 )
                 doc_id = int(cur.lastrowid)
 
-            conn.execute("INSERT INTO document_fts(rowid,title,brief,content) VALUES(?,?,?,?)", (doc_id, title, brief, body))
+            indexed_content = body + "\n\n" + _tag_search_text(tags)
+            conn.execute("INSERT INTO document_fts(rowid,title,brief,content) VALUES(?,?,?,?)", (doc_id, title, brief, indexed_content))
             conn.execute("DELETE FROM document_scopes WHERE document_id=?", (doc_id,))
             conn.executemany(
                 "INSERT INTO document_scopes(document_id,scope) VALUES(?,?)",
@@ -237,19 +253,20 @@ def _fts_query(text: str) -> str:
 
 
 def _append_tag_filter(sql: str, params: list[Any], tag: str) -> str:
-    """Match a canonical hierarchical tag or any complete colon-delimited subpath.
+    """Match hierarchy segments without requiring the stored hierarchy order.
 
-    Stored tags stay canonical (for example ``project:operations:deploy``). A filter such
-    as ``operations`` or ``project:operations`` matches by complete hierarchy segments,
-    never by an arbitrary substring such as ``ops``.
+    ``agent-server:learnings`` can therefore be filtered by ``learnings``,
+    ``agent-server:learnings``, or ``learnings:agent-server``. Stored/displayed tags stay
+    canonical, and every requested segment must match a complete colon-delimited segment.
     """
     canonical = _normalize_tag(tag)
-    sql += """ AND EXISTS (
-        SELECT 1 FROM document_tags t
-        WHERE t.document_id=d.id
-          AND instr(':' || lower(t.tag) || ':', ':' || lower(?) || ':') > 0
-    )"""
-    params.append(canonical)
+    segments = canonical.split(":")
+    conditions = [
+        "instr(':' || lower(t.tag) || ':', ':' || lower(?) || ':') > 0"
+        for _ in segments
+    ]
+    sql += " AND EXISTS (SELECT 1 FROM document_tags t WHERE t.document_id=d.id AND " + " AND ".join(conditions) + ")"
+    params.extend(segments)
     return sql
 
 
