@@ -16,8 +16,7 @@ sys.modules[spec.name] = am
 assert spec.loader is not None
 spec.loader.exec_module(am)
 
-from memory_admin import doctor
-from memory_snapshot import restore_snapshot, snapshot_registry
+from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 
 
 class AgentMemorySnapshotTests(unittest.TestCase):
@@ -121,10 +120,10 @@ class AgentMemorySnapshotTests(unittest.TestCase):
         self.assertTrue(Path(result["path"]).is_file())
         self.assertEqual(Path(result["path"]).parent, self.root / "requested")
 
-    def test_restore_recreates_original_paths_without_staling_index(self):
+    def test_snapshot_search_and_inspect_use_archive_not_live_registry(self):
         note = self.memory_a / "nested" / "lesson.md"
         note.parent.mkdir()
-        note.write_text("# Lesson\n\nRestore the original timestamp.\n", encoding="utf-8")
+        note.write_text("# Snapshot lesson\n\nArchive-only durable detail.\n", encoding="utf-8")
         self.sync()
         snapshot = snapshot_registry(
             self.settings,
@@ -133,23 +132,41 @@ class AgentMemorySnapshotTests(unittest.TestCase):
             am.collect_memory_roots(self.settings, self.settings_path),
             self.root / "archives",
         )
-        self.conn.close()
-        note.unlink()
-        self.settings_path.unlink()
-        self.db_path.unlink()
-        for suffix in ("-wal", "-shm"):
-            Path(f"{self.db_path}{suffix}").unlink(missing_ok=True)
+        note.write_text("# Live replacement\n\nDifferent live content.\n", encoding="utf-8")
 
-        restored = restore_snapshot(Path(snapshot["path"]))
+        searched = search_snapshot(Path(snapshot["path"]), "archive-only durable")
+        inspected = inspect_snapshot(Path(snapshot["path"]))
 
-        self.assertEqual(restored["markdown_files"], 1)
-        self.assertTrue(note.is_file())
-        self.assertTrue(self.settings_path.is_file())
-        self.assertTrue(self.db_path.is_file())
-        self.settings = am.load_settings(self.settings_path)
-        self.conn = am.connect_db(self.db_path)
-        health = doctor(self.conn, self.settings, self.settings_path, self.db_path)
-        self.assertEqual(health["status"], "ok")
+        self.assertEqual(len(searched["documents"]), 1)
+        self.assertEqual(searched["documents"][0]["title"], "Snapshot lesson")
+        self.assertEqual({item["project"] for item in inspected["projects"]}, {"_shared", "a", "b"})
+        memory_roots = {root["path"] for root in inspected["roots"]}
+        self.assertIn(str(self.memory_a), memory_roots)
+
+    def test_cli_snapshot_search_and_inspect(self):
+        (self.memory_a / "note.md").write_text("# Archived note\n\nFind this only in snapshot.\n", encoding="utf-8")
+        self.sync()
+        snapshot = snapshot_registry(
+            self.settings,
+            self.settings_path,
+            self.db_path,
+            am.collect_memory_roots(self.settings, self.settings_path),
+            self.root / "archives",
+        )
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = am.main(["--json", "snapshot", "search", snapshot["path"], "only snapshot"])
+        search_result = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(search_result["documents"][0]["title"], "Archived note")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = am.main(["--json", "snapshot", "inspect", snapshot["path"]])
+        inspect_result = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(inspect_result["markdown_files"], 1)
 
 
 if __name__ == "__main__":

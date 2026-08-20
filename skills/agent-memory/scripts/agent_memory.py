@@ -21,7 +21,7 @@ from memory_config import (
     shared_roots,
 )
 from memory_format import table_dump, yaml_dump
-from memory_snapshot import restore_snapshot, snapshot_registry
+from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store import connect_db, link_graph, list_documents, search_documents, status, sync_index
 
 
@@ -181,10 +181,18 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = sub.add_parser("snapshot", help="archive configured Markdown sources, settings, and SQLite index")
     _add_output_options(snapshot)
     snapshot.add_argument("--output", type=Path, help="directory for the generated .tar.gz (default: settings sibling snapshots/)")
-    restore = sub.add_parser("restore", help="restore one snapshot archive to its recorded original paths")
-    _add_output_options(restore)
-    restore.add_argument("archive", type=Path)
-    restore.add_argument("--force", action="store_true", help="allow overwriting existing restored files")
+    snapshot_actions = snapshot.add_subparsers(dest="snapshot_action")
+    snapshot_inspect = snapshot_actions.add_parser("inspect", help="show project/root inventory recorded in a snapshot")
+    _add_output_options(snapshot_inspect)
+    snapshot_inspect.add_argument("archive", type=Path)
+    snapshot_search = snapshot_actions.add_parser("search", help="search a snapshot's SQLite index without restoring it")
+    _add_output_options(snapshot_search)
+    snapshot_search.add_argument("archive", type=Path)
+    snapshot_search.add_argument("query")
+    snapshot_search.add_argument("--project")
+    snapshot_search.add_argument("--tag", action="append", default=[])
+    snapshot_search.add_argument("--limit", type=int, default=10)
+    snapshot_search.add_argument("--no-shared", action="store_true")
 
     resolve = sub.add_parser("resolve", help="resolve a working path to its nearest project binding")
     _add_output_options(resolve)
@@ -286,25 +294,28 @@ def main(argv: list[str] | None = None) -> int:
     # which may create a missing database or alter connection pragmas.
     if args.command == "snapshot":
         try:
-            settings = load_settings(settings_path)
-            db_path = database_path(settings, settings_path)
-            result = snapshot_registry(
-                settings,
-                settings_path,
-                db_path,
-                collect_memory_roots(settings, settings_path),
-                args.output,
-            )
+            if args.snapshot_action == "inspect":
+                result = inspect_snapshot(args.archive)
+            elif args.snapshot_action == "search":
+                result = search_snapshot(
+                    args.archive,
+                    args.query,
+                    project=args.project,
+                    tags=tuple(args.tag),
+                    limit=args.limit,
+                    include_shared=not args.no_shared,
+                )
+            else:
+                settings = load_settings(settings_path)
+                db_path = database_path(settings, settings_path)
+                result = snapshot_registry(
+                    settings,
+                    settings_path,
+                    db_path,
+                    collect_memory_roots(settings, settings_path),
+                    args.output,
+                )
             _emit(result, "snapshot", args.output_format)
-            return 0
-        except (MemoryError, OSError, sqlite3.Error) as exc:
-            print(f"agent-memory: {exc}", file=sys.stderr)
-            return 2
-
-    if args.command == "restore":
-        try:
-            result = restore_snapshot(args.archive, force=args.force)
-            _emit(result, "restore", args.output_format)
             return 0
         except (MemoryError, OSError, sqlite3.Error) as exc:
             print(f"agent-memory: {exc}", file=sys.stderr)

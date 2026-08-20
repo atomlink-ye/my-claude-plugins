@@ -41,7 +41,7 @@ agent-memory --json capture learning "Reusable lesson" --path "$PWD"
 agent-memory --json links /abs/path/to/note.md
 agent-memory --json sync
 agent-memory --json snapshot
-agent-memory --json restore /abs/path/to/agent-memory-20260820T120000Z.tar.gz
+agent-memory --json snapshot inspect /abs/path/to/agent-memory-20260820T120000Z.tar.gz
 ```
 
 Before setup, the direct Python script remains an emergency fallback only.
@@ -90,6 +90,8 @@ read-only archive of the configured memory sources and index:
 ```sh
 agent-memory --json snapshot
 agent-memory --json snapshot --output /abs/path/to/backup-directory
+agent-memory --json snapshot search /abs/path/to/agent-memory-20260820T120000Z.tar.gz "sandbox ownership"
+agent-memory --json snapshot inspect /abs/path/to/agent-memory-20260820T120000Z.tar.gz
 ```
 
 The default destination is `snapshots/` beside the active settings file. The archive keeps
@@ -99,10 +101,14 @@ its original absolute path and scope, so unrelated roots are never flattened tog
 Missing or unreadable roots are skipped and returned in the result; sources and settings
 are never changed and snapshot does not run `sync`.
 
-`restore ARCHIVE` recreates the original paths recorded in the archive manifest and restores
-the consistent index copy. It refuses to overwrite existing files unless `--force` is
-explicit. It also restores source mtimes exactly, so a restored index does not falsely look
-stale to `doctor`.
+`snapshot search ARCHIVE QUERY` opens only the archived SQLite index in a temporary
+directory and returns matching memories without touching the live registry. `snapshot
+inspect ARCHIVE` reads only the manifest and reports the archived projects and memory roots.
+Temporary extraction is removed at command exit.
+
+Agent Memory deliberately provides no automatic restore command. To recover, manually
+extract the archive, inspect `manifest.json`, and decide yourself how to handle existing
+files before copying any source back.
 
 Use an external cron/launchd scheduler when periodic snapshots are wanted. Agent Memory
 only performs one archive operation per invocation.

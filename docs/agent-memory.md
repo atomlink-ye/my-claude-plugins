@@ -331,7 +331,8 @@ agent-memory --json links ~/memory/agent-server/ui-decisions.md
 # one source-read-only archive; default: <settings-dir>/snapshots/
 agent-memory --json snapshot
 agent-memory --json snapshot --output ~/backups/agent-memory
-agent-memory --json restore ~/backups/agent-memory/agent-memory-20260820T120000Z.tar.gz
+agent-memory --json snapshot search ~/backups/agent-memory/agent-memory-20260820T120000Z.tar.gz "sandbox ownership"
+agent-memory --json snapshot inspect ~/backups/agent-memory/agent-memory-20260820T120000Z.tar.gz
 ```
 
 The global `--settings PATH` option supports alternate registries and tests. The
@@ -364,17 +365,21 @@ directory structure below that root. A reused physical root is stored once and m
 every relevant scope. Missing or unreadable roots, and files that cannot be read, do not
 abort the archive; they are listed in both the result and manifest.
 
-`agent-memory restore ARCHIVE` is the safe normal recovery path: it reads the manifest,
-recreates each source at its recorded original path, restores `settings.json` and the
-consistent `database/index.sqlite3`, and reapplies source nanosecond mtimes so Doctor does
-not falsely report the restored index as stale. It refuses to overwrite any restored file
-unless `--force` is explicit. The original WAL/SHM sidecars are preserved in the archive for
-inspection; the consistent database backup is the restore payload.
+Use `agent-memory snapshot search ARCHIVE QUERY` to query the archived SQLite index without
+restoring it. The command expands only `database/index.sqlite3` to a system temporary
+directory, opens it read-only through the ordinary search logic, then removes the temporary
+directory. It does not read or modify the active settings file, active SQLite database, or
+Markdown sources. Project and tag filters (`--project`, repeated `--tag`, `--no-shared`, and
+`--limit`) have the same meaning as live search.
 
-Standard extraction remains viable for inspection or a custom migration: extract to an
-empty staging directory, inspect `manifest.json`, copy each `roots/<id>/` tree to its
-recorded root path with timestamp preservation, then restore `settings.json` and
-`database/index.sqlite3` to their recorded paths.
+Use `agent-memory snapshot inspect ARCHIVE` when the question is what the archive covers.
+It reads `manifest.json` only and reports archived project scopes, memory roots, skipped
+roots/files, and the number of Markdown files; it does not extract the database.
+
+Agent Memory intentionally provides no automated restore command. Recovery is a human
+decision: manually extract the archive, inspect `manifest.json`, compare its contents with
+the current filesystem, and choose which files to copy. The original WAL/SHM sidecars are
+preserved for inspection; `database/index.sqlite3` is the consistent database backup.
 
 ## Agent workflow
 

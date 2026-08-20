@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import tarfile
 import tempfile
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from memory_config import MemoryError, MemoryRoot
+from memory_store import search_documents
 
 
 def default_snapshot_directory(settings_path: Path) -> Path:
@@ -187,89 +187,90 @@ def _safe_archive_name(name: str) -> str:
     return str(path)
 
 
-def restore_snapshot(archive_path: Path, *, force: bool = False) -> dict[str, object]:
-    """Restore a snapshot to the original paths recorded in its manifest.
-
-    This is intentionally explicit and refuses to overwrite existing files unless the
-    caller supplies ``force``. It restores the consistent database backup, not its
-    diagnostic sidecar copies, and reapplies nanosecond source mtimes for doctor/index
-    consistency.
-    """
+def _open_snapshot(archive_path: Path) -> tuple[Path, tarfile.TarFile, dict[str, Any]]:
     archive_path = archive_path.expanduser().resolve(strict=False)
     try:
         archive = tarfile.open(archive_path, "r:gz")
     except (OSError, tarfile.TarError) as exc:
         raise MemoryError(f"cannot open snapshot archive: {archive_path}: {exc}") from exc
-    with archive:
+    try:
+        manifest_stream = archive.extractfile("manifest.json")
+        if manifest_stream is None:
+            raise MemoryError("snapshot archive has no manifest.json")
+        manifest = json.load(manifest_stream)
+    except (json.JSONDecodeError, tarfile.TarError) as exc:
+        archive.close()
+        raise MemoryError(f"invalid snapshot manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != 1:
+        archive.close()
+        raise MemoryError(f"unsupported snapshot format: {manifest.get('format') if isinstance(manifest, dict) else None!r}")
+    return archive_path, archive, manifest
+
+
+def inspect_snapshot(archive_path: Path) -> dict[str, object]:
+    """Return the root/project inventory recorded in a snapshot manifest."""
+    path, archive, manifest = _open_snapshot(archive_path)
+    try:
+        roots = manifest.get("roots", [])
+        if not isinstance(roots, list):
+            raise MemoryError("snapshot manifest roots must be an array")
+        projects: dict[str, list[str]] = {}
+        for root in roots:
+            if not isinstance(root, dict) or not isinstance(root.get("scope"), str) or not isinstance(root.get("path"), str):
+                raise MemoryError("snapshot manifest contains an invalid root entry")
+            projects.setdefault(root["scope"], []).append(root["path"])
+        return {
+            "archive": str(path),
+            "created_at": manifest.get("created_at"),
+            "markdown_files": manifest.get("markdown_files", 0),
+            "database_included": bool(isinstance(manifest.get("database"), dict) and manifest["database"].get("included")),
+            "projects": [{"project": project, "memory_roots": paths} for project, paths in sorted(projects.items())],
+            "roots": roots,
+            "missing_roots": manifest.get("missing_roots", []),
+            "unreadable_roots": manifest.get("unreadable_roots", []),
+            "skipped_files": manifest.get("skipped_files", []),
+        }
+    finally:
+        archive.close()
+
+
+def search_snapshot(
+    archive_path: Path,
+    query: str,
+    *,
+    project: str | None = None,
+    tags: tuple[str, ...] = (),
+    limit: int = 10,
+    include_shared: bool = True,
+) -> dict[str, object]:
+    """Search the snapshot's SQLite index without touching the live registry."""
+    path, archive, manifest = _open_snapshot(archive_path)
+    try:
+        database = manifest.get("database", {})
+        member_name = database.get("archive_path") if isinstance(database, dict) and database.get("included") else None
+        if not isinstance(member_name, str):
+            raise MemoryError("snapshot has no SQLite index; inspect it or rebuild after manual recovery")
         try:
-            manifest_stream = archive.extractfile("manifest.json")
-            if manifest_stream is None:
-                raise MemoryError("snapshot archive has no manifest.json")
-            manifest = json.load(manifest_stream)
-        except (json.JSONDecodeError, tarfile.TarError) as exc:
-            raise MemoryError(f"invalid snapshot manifest: {exc}") from exc
-        if manifest.get("format") != 1:
-            raise MemoryError(f"unsupported snapshot format: {manifest.get('format')!r}")
-
-        settings_path = Path(manifest["settings_path"])
-        database_path = Path(manifest["database_path"])
-        database_meta = manifest.get("database", {})
-        database_member = database_meta.get("archive_path") if isinstance(database_meta, dict) and database_meta.get("included") else None
-        files = manifest.get("files", [])
-        if not isinstance(files, list):
-            raise MemoryError("snapshot manifest files must be an array")
-
-        targets = [settings_path]
-        if database_member:
-            targets.append(database_path)
-            targets.extend(Path(f"{database_path}{suffix}") for suffix in ("-wal", "-shm"))
-        for item in files:
-            if not isinstance(item, dict) or not isinstance(item.get("source_path"), str) or not isinstance(item.get("archive_path"), str):
-                raise MemoryError("snapshot manifest contains an invalid file entry")
-            _safe_archive_name(item["archive_path"])
-            targets.append(Path(item["source_path"]))
-        existing = [path for path in targets if path.exists()]
-        if existing and not force:
-            raise MemoryError("restore would overwrite existing files; pass --force: " + ", ".join(str(path) for path in existing[:5]))
-
-        member_names = ["settings.json"] + ([database_member] if database_member else []) + [item["archive_path"] for item in files]
-        try:
-            for member_name in member_names:
-                member = archive.getmember(_safe_archive_name(member_name))
-                if not member.isfile():
-                    raise MemoryError(f"snapshot member is not a regular file: {member_name}")
-        except KeyError as exc:
-            raise MemoryError(f"snapshot archive is missing required member: {exc}") from exc
-
-        def write_member(member_name: str, destination: Path) -> None:
             member = archive.getmember(_safe_archive_name(member_name))
-            if not member.isfile():
-                raise MemoryError(f"snapshot member is not a regular file: {member_name}")
-            source = archive.extractfile(member)
-            if source is None:
-                raise MemoryError(f"cannot read snapshot member: {member_name}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with source, destination.open("wb") as target:
-                shutil.copyfileobj(source, target)
-            os.chmod(destination, member.mode)
-
-        write_member("settings.json", settings_path)
-        if database_member:
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(f"{database_path}{suffix}")
-                if sidecar.exists():
-                    sidecar.unlink()
-            write_member(database_member, database_path)
-        for item in files:
-            destination = Path(item["source_path"])
-            write_member(item["archive_path"], destination)
-            if isinstance(item.get("mtime_ns"), int):
-                os.utime(destination, ns=(item["mtime_ns"], item["mtime_ns"]))
-
-    return {
-        "archive": str(archive_path),
-        "settings": str(settings_path),
-        "database": str(database_path) if database_member else None,
-        "markdown_files": len(files),
-        "force": force,
-    }
+        except KeyError as exc:
+            raise MemoryError(f"snapshot archive is missing SQLite index: {member_name}") from exc
+        if not member.isfile():
+            raise MemoryError(f"snapshot SQLite member is not a regular file: {member_name}")
+        source = archive.extractfile(member)
+        if source is None:
+            raise MemoryError(f"cannot read snapshot SQLite index: {member_name}")
+        with tempfile.TemporaryDirectory(prefix="agent-memory-snapshot-search-") as temp_dir:
+            database_path = Path(temp_dir) / "index.sqlite3"
+            with source, database_path.open("wb") as target:
+                target.write(source.read())
+            # ``immutable=1`` keeps SQLite from probing or creating journal side files
+            # beside the disposable extracted copy; the archive stores a coherent backup.
+            conn = sqlite3.connect(f"file:{database_path}?mode=ro&immutable=1", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                documents = search_documents(conn, query, project, tags, limit, include_shared)
+            finally:
+                conn.close()
+        return {"archive": str(path), "query": query, "documents": documents}
+    finally:
+        archive.close()
