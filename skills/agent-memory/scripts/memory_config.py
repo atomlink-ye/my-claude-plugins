@@ -96,6 +96,16 @@ def database_path(settings: dict[str, Any], settings_path: Path) -> Path:
     return _expand_path(value, settings_path.parent)
 
 
+def _normalize_tag(value: Any) -> str:
+    tag = str(value).strip()
+    if not tag:
+        raise MemoryError("tag must not be empty")
+    parts = [part.strip() for part in tag.split(":")]
+    if any(not part for part in parts):
+        raise MemoryError(f"tag hierarchy contains an empty segment: {tag!r}")
+    return ":".join(parts)
+
+
 def _normalize_tags(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -103,7 +113,7 @@ def _normalize_tags(value: Any) -> tuple[str, ...]:
         value = [part.strip() for part in value.split(",")]
     if not isinstance(value, list):
         raise MemoryError("tags must be a string or array")
-    return _dedupe(str(item).strip() for item in value)
+    return _dedupe(_normalize_tag(item) for item in value if str(item).strip())
 
 
 def _merge_locations(items: Iterable[MemoryLocation]) -> tuple[MemoryLocation, ...]:
