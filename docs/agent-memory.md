@@ -327,10 +327,54 @@ agent-memory --json search "review workflow"
 
 # graph inspection
 agent-memory --json links ~/memory/agent-server/ui-decisions.md
+
+# one source-read-only archive; default: <settings-dir>/snapshots/
+agent-memory --json snapshot
+agent-memory --json snapshot --output ~/backups/agent-memory
+agent-memory --json restore ~/backups/agent-memory/agent-memory-20260820T120000Z.tar.gz
 ```
 
 The global `--settings PATH` option supports alternate registries and tests. The
 `AGENT_MEMORY_SETTINGS` environment variable can set the same default.
+
+## Snapshots
+
+`agent-memory snapshot` creates one timestamped `.tar.gz` archive without modifying
+Markdown sources, `settings.json`, or the index. It does not run `sync` and has no
+background scheduler; cron or launchd can invoke the command periodically when desired.
+
+The default output directory is `snapshots/` beside the active settings file. Override it
+per invocation with `--output DIRECTORY`. Repeated invocations create distinct timestamped
+archives (with a numeric suffix for a same-second collision) rather than overwriting an
+existing recovery point.
+
+Each archive contains:
+
+```text
+settings.json
+database/index.sqlite3             # consistent SQLite backup
+database/sidecars/index.sqlite3-*  # original WAL/SHM sidecars when present
+roots/<id>/...                     # Markdown, preserving its path below each root
+manifest.json                      # original root paths, scopes, tags, and archive mapping
+```
+
+Configured roots can be unrelated physical paths. `manifest.json` records every configured
+root's original absolute path and project/shared scope, while `roots/<id>/` keeps the
+directory structure below that root. A reused physical root is stored once and mapped to
+every relevant scope. Missing or unreadable roots, and files that cannot be read, do not
+abort the archive; they are listed in both the result and manifest.
+
+`agent-memory restore ARCHIVE` is the safe normal recovery path: it reads the manifest,
+recreates each source at its recorded original path, restores `settings.json` and the
+consistent `database/index.sqlite3`, and reapplies source nanosecond mtimes so Doctor does
+not falsely report the restored index as stale. It refuses to overwrite any restored file
+unless `--force` is explicit. The original WAL/SHM sidecars are preserved in the archive for
+inspection; the consistent database backup is the restore payload.
+
+Standard extraction remains viable for inspection or a custom migration: extract to an
+empty staging directory, inspect `manifest.json`, copy each `roots/<id>/` tree to its
+recorded root path with timestamp preservation, then restore `settings.json` and
+`database/index.sqlite3` to their recorded paths.
 
 ## Agent workflow
 

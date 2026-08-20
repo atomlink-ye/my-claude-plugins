@@ -40,6 +40,8 @@ agent-memory --json search "learnings agent server" --path "$PWD"
 agent-memory --json capture learning "Reusable lesson" --path "$PWD"
 agent-memory --json links /abs/path/to/note.md
 agent-memory --json sync
+agent-memory --json snapshot
+agent-memory --json restore /abs/path/to/agent-memory-20260820T120000Z.tar.gz
 ```
 
 Before setup, the direct Python script remains an emergency fallback only.
@@ -79,6 +81,31 @@ agent-memory tags --path /abs/path/to/project
 `projects` reports configured project paths, roots, capture roots, and indexed document
 counts. `tags` reports canonical tags and usage counts and can be scoped with `--path` or
 `--project`.
+
+## Snapshot before destructive bulk work
+
+Before a bulk Markdown edit without another rollback mechanism, create one portable,
+read-only archive of the configured memory sources and index:
+
+```sh
+agent-memory --json snapshot
+agent-memory --json snapshot --output /abs/path/to/backup-directory
+```
+
+The default destination is `snapshots/` beside the active settings file. The archive keeps
+`settings.json`, a consistent SQLite copy, any present SQLite WAL/SHM sidecars, and every
+Markdown file under each configured root. `manifest.json` maps each archive root back to
+its original absolute path and scope, so unrelated roots are never flattened together.
+Missing or unreadable roots are skipped and returned in the result; sources and settings
+are never changed and snapshot does not run `sync`.
+
+`restore ARCHIVE` recreates the original paths recorded in the archive manifest and restores
+the consistent index copy. It refuses to overwrite existing files unless `--force` is
+explicit. It also restores source mtimes exactly, so a restored index does not falsely look
+stale to `doctor`.
+
+Use an external cron/launchd scheduler when periodic snapshots are wanted. Agent Memory
+only performs one archive operation per invocation.
 
 ## Scope before recall
 

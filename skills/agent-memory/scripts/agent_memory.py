@@ -21,6 +21,7 @@ from memory_config import (
     shared_roots,
 )
 from memory_format import table_dump, yaml_dump
+from memory_snapshot import restore_snapshot, snapshot_registry
 from memory_store import connect_db, link_graph, list_documents, search_documents, status, sync_index
 
 
@@ -177,6 +178,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_options(status_parser)
     sync_parser = sub.add_parser("sync", help="re-index all configured Markdown roots")
     _add_output_options(sync_parser)
+    snapshot = sub.add_parser("snapshot", help="archive configured Markdown sources, settings, and SQLite index")
+    _add_output_options(snapshot)
+    snapshot.add_argument("--output", type=Path, help="directory for the generated .tar.gz (default: settings sibling snapshots/)")
+    restore = sub.add_parser("restore", help="restore one snapshot archive to its recorded original paths")
+    _add_output_options(restore)
+    restore.add_argument("archive", type=Path)
+    restore.add_argument("--force", action="store_true", help="allow overwriting existing restored files")
 
     resolve = sub.add_parser("resolve", help="resolve a working path to its nearest project binding")
     _add_output_options(resolve)
@@ -273,6 +281,34 @@ def main(argv: list[str] | None = None) -> int:
             return _emit_doctor(result, args.output_format)
         except (MemoryError, OSError, sqlite3.Error) as exc:
             return _emit_doctor(_doctor_failure("doctor_failed", str(exc), db_path), args.output_format)
+
+    # Snapshot is source-read-only: do not open the registry through connect_db(),
+    # which may create a missing database or alter connection pragmas.
+    if args.command == "snapshot":
+        try:
+            settings = load_settings(settings_path)
+            db_path = database_path(settings, settings_path)
+            result = snapshot_registry(
+                settings,
+                settings_path,
+                db_path,
+                collect_memory_roots(settings, settings_path),
+                args.output,
+            )
+            _emit(result, "snapshot", args.output_format)
+            return 0
+        except (MemoryError, OSError, sqlite3.Error) as exc:
+            print(f"agent-memory: {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "restore":
+        try:
+            result = restore_snapshot(args.archive, force=args.force)
+            _emit(result, "restore", args.output_format)
+            return 0
+        except (MemoryError, OSError, sqlite3.Error) as exc:
+            print(f"agent-memory: {exc}", file=sys.stderr)
+            return 2
 
     try:
         settings = load_settings(settings_path)
