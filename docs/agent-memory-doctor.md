@@ -1,139 +1,86 @@
-# Agent Memory Doctor
+# Agent Memory Doctor and Durable Memory Lifecycle
 
-`agent-memory doctor` is the read-only health check for the local Agent Memory registry.
-It is intended for both humans and Agents that need to answer: is routing safe, is capture
-configured, is the derived index current, and are local references healthy?
+`agent-memory doctor` is the read-only health check for the local registry. YAML remains the default output; `--json`, `--table`, and `--text` are available. Exit codes are `0=healthy`, `1=warnings`, `2=errors`.
 
-## Commands
+## Core diagnostics
 
-```sh
-agent-memory doctor                 # deterministic YAML (default)
-agent-memory --json doctor          # JSON for scripts
-agent-memory --table doctor         # summary and findings tables
-agent-memory --text doctor          # legacy human-readable output
-agent-memory doctor --path /abs/path/to/project
-```
+Doctor checks routing/binding ambiguity, capture-root configuration, filesystem health, SQLite integrity, stale/unindexed Markdown, dangling local links, tag collisions, and accidental physical-root reuse across project scopes.
 
-`--json`, `--table`, and `--text` are mutually exclusive global output options. They
-apply to every subcommand; YAML is the default when no option is provided.
+The completed roadmap also adds stable-memory diagnostics:
 
-`--path` additionally resolves the actual worktree and reports its project, binding,
-memory roots, and default capture root.
+- captured memories receive an opaque `mem_<uuid>` frontmatter `id`;
+- duplicate or malformed IDs are errors;
+- legacy documents without IDs remain valid and are reported as migration info;
+- `memory://mem_xxx` references are checked for missing targets;
+- lifecycle values are checked against `raw`, `validated`, `promoted`, `superseded`;
+- `promoted` should point to `promoted_to` and `superseded` to `superseded_by`;
+- missing lifecycle targets are errors.
 
-Exit codes:
-
-```text
-0  healthy
-1  warnings only
-2  errors / unsafe configuration
-```
-
-The first implementation is deliberately read-only; there is no `--fix`.
-
-## Checks
-
-Doctor currently checks:
-
-- duplicate resolved binding paths and reused project names;
-- projects with no memory roots;
-- multiple roots without a `capture: true` default;
-- multiple roots incorrectly marked `capture: true`;
-- missing, non-directory, or unreadable memory roots;
-- writability of capture roots and the SQLite parent directory;
-- physical memory roots visible in multiple project scopes;
-- SQLite `PRAGMA quick_check`;
-- indexed files that disappeared;
-- indexed files whose mtime/size changed since the last sync;
-- Markdown files under configured roots that are not indexed;
-- local links whose targets are missing (including targets deleted after the last sync),
-  distinguishing them from existing local files outside the indexed memory graph;
-- deterministic tag case and hyphen/underscore collisions.
-
-Warnings about stale/unindexed files recommend `agent-memory sync`; Doctor does not run it
-automatically.
+Doctor remains read-only and never rewrites Markdown.
 
 ## Capture root
 
-When a project has several memory roots, configure one preferred write location:
+A project with several roots can mark exactly one preferred write location:
 
 ```json
-{
-  "path": "~/workspace/agent-server",
-  "project": "agent-server",
-  "memory": [
-    {
-      "path": "~/memory/agent-server",
-      "capture": true,
-      "tags": ["agent-server:knowledge"]
-    },
-    {
-      "path": "~/memory/research",
-      "tags": ["research"]
-    }
-  ]
-}
+{"path":"~/workspace/agent-server","project":"agent-server","memory":[{"path":"~/memory/agent-server","capture":true},{"path":"~/memory/research"}]}
 ```
 
-A single memory root remains an implicit capture root. With multiple roots and no marked
-default, capture refuses to guess and Doctor reports `capture_root_ambiguous`. `--root`
-remains an explicit override.
+`--root` remains an explicit override.
 
-## JSON contract
+## Stable IDs and links
 
-Example:
+New captures include:
 
-```json
-{
-  "status": "warn",
-  "summary": {
-    "errors": 0,
-    "warnings": 2,
-    "info": 1,
-    "bindings": 4,
-    "documents": 83,
-    "dangling_links": 1,
-    "unindexed_markdown": 1,
-    "stale_documents": 0
-  },
-  "resolved": {
-    "path": "/workspace/agent-server",
-    "project": "agent-server",
-    "binding": "/workspace/agent-server",
-    "memory_roots": ["/memory/agent-server"],
-    "capture_root": "/memory/agent-server"
-  },
-  "checks": [
-    {
-      "code": "link_target_missing",
-      "severity": "warning",
-      "message": "local Markdown link target does not exist",
-      "paths": ["/memory/shared/old-workflow.md"]
-    }
-  ]
-}
+```yaml
+---
+id: mem_012345...
+type: learning
+status: raw
+tags: [agent-server:learnings]
+---
 ```
 
-Finding `code` values are stable machine-readable identifiers; Agents should prefer them
-over parsing the prose message.
+The ID is logical identity; the Markdown path remains physical location. Stable cross-project references can therefore use:
+
+```md
+[Canonical workflow](memory://mem_012345...)
+```
+
+`agent-memory links mem_012345...` resolves stable outbound references and backlinks alongside ordinary Markdown links.
+
+## Lifecycle
+
+```sh
+agent-memory lifecycle mem_abc validated
+agent-memory lifecycle mem_abc promoted --target mem_canonical
+agent-memory lifecycle mem_old superseded --target mem_new
+```
+
+Promotion writes `promoted_to: memory://...`; superseding writes `superseded_by: memory://...`. The original Markdown remains as provenance.
+
+## Duplicate-before-capture
+
+Capture performs a lightweight local similarity preflight against existing project Markdown titles/briefs. A likely duplicate is returned without writing a new file:
+
+```sh
+agent-memory capture learning "Resolve the actual worktree before recall"
+```
+
+The result contains `duplicate_blocked: true` and `possible_duplicates`. If the caller has intentionally decided that separate evidence is warranted, it may explicitly override:
+
+```sh
+agent-memory capture learning "..." --allow-duplicate
+```
+
+This keeps the decision with the Agent/human instead of silently merging memories.
 
 ## Discovery
 
-Two companion discovery commands make the registry observable before search:
-
 ```sh
 agent-memory projects
-agent-memory tags
 agent-memory tags --path /abs/path/to/project
-agent-memory tags --project agent-server
+agent-memory search "learnings agent server" --path /abs/path/to/project
 ```
 
-`projects` reports binding paths, memory roots, default capture roots, binding tags, and
-indexed document counts. `tags` reports canonical tags and document counts; project-scoped
-tag discovery includes shared memory by default and accepts `--no-shared`.
-
-## Follow-up checks
-
-Stable memory IDs and `memory://` references are intentionally deferred. Once those land,
-Doctor should add duplicate/missing ID checks and broken stable-reference checks. Promotion
-lifecycle checks (`promoted_to`, `superseded_by`) should be added at the same time rather
-than inventing a second identity mechanism now.
+Search/list payloads are enriched with stable ID, type, lifecycle state, and promotion/supersession targets when available.
