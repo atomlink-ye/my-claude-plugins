@@ -1,4 +1,5 @@
 """SQLite index, Markdown metadata, and link graph for Agent Memory."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +9,15 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
-from memory_config import MemoryError, MemoryRoot, SHARED_SCOPE, _dedupe, _expand_path, _normalize_tag, _normalize_tags
+from memory_config import (
+    MemoryError,
+    MemoryRoot,
+    SHARED_SCOPE,
+    _dedupe,
+    _expand_path,
+    _normalize_tag,
+    _normalize_tags,
+)
 
 MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]")
@@ -56,7 +65,9 @@ def connect_db(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_links_target_path ON links(target_path);
         """
     )
-    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(title, brief, content)")
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(title, brief, content)"
+    )
     return conn
 
 
@@ -75,7 +86,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         if not stripped or stripped.startswith("#"):
             continue
         if current_list and stripped.startswith("-"):
-            meta.setdefault(current_list, []).append(stripped[1:].strip().strip('"\''))
+            meta.setdefault(current_list, []).append(stripped[1:].strip().strip("\"'"))
             continue
         current_list = None
         if ":" not in line:
@@ -87,24 +98,36 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
             current_list = key
         elif value.startswith("[") and value.endswith("]"):
             inner = value[1:-1].strip()
-            meta[key] = [part.strip().strip('"\'') for part in inner.split(",") if part.strip()]
+            meta[key] = [
+                part.strip().strip("\"'") for part in inner.split(",") if part.strip()
+            ]
         else:
-            meta[key] = value.strip('"\'')
+            meta[key] = value.strip("\"'")
     return meta, body
 
 
-def _derive_metadata(path: Path, text: str, root_tags: Iterable[str]) -> tuple[str, str, tuple[str, ...], str]:
+def _derive_metadata(
+    path: Path, text: str, root_tags: Iterable[str]
+) -> tuple[str, str, tuple[str, ...], str]:
     meta, body = _parse_frontmatter(text)
     title = str(meta.get("title") or "").strip()
     if not title:
         heading = re.search(r"^#\s+(.+?)\s*$", body, flags=re.MULTILINE)
-        title = heading.group(1).strip() if heading else path.stem.replace("-", " ").replace("_", " ")
+        title = (
+            heading.group(1).strip()
+            if heading
+            else path.stem.replace("-", " ").replace("_", " ")
+        )
 
     brief = str(meta.get("brief") or "").strip()
     if not brief:
         paragraphs = re.split(r"\n\s*\n", body)
         for paragraph in paragraphs:
-            cleaned = " ".join(line.strip() for line in paragraph.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+            cleaned = " ".join(
+                line.strip()
+                for line in paragraph.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
             if cleaned:
                 brief = cleaned[:280]
                 break
@@ -139,7 +162,9 @@ def _resolve_link_target(source: Path, href: str) -> tuple[Path | None, str | No
     if parsed.scheme and parsed.scheme != "file":
         return None, parsed.fragment or None
     anchor = parsed.fragment or None
-    raw_path = unquote(parsed.path if parsed.scheme == "file" else href.split("#", 1)[0])
+    raw_path = unquote(
+        parsed.path if parsed.scheme == "file" else href.split("#", 1)[0]
+    )
     if not raw_path:
         return None, anchor
     target = Path(raw_path)
@@ -155,16 +180,34 @@ def _extract_links(source: Path, body: str) -> list[dict[str, str | None]]:
         target, anchor = _resolve_link_target(source, href)
         if target is None:
             continue
-        found.append({"target_path": str(target), "href": href, "label": label or target.name, "anchor": anchor})
+        found.append(
+            {
+                "target_path": str(target),
+                "href": href,
+                "label": label or target.name,
+                "anchor": anchor,
+            }
+        )
     for match in WIKI_LINK_RE.finditer(body):
-        raw_target, anchor, alias = match.group(1).strip(), match.group(2), match.group(3)
+        raw_target, anchor, alias = (
+            match.group(1).strip(),
+            match.group(2),
+            match.group(3),
+        )
         if not Path(raw_target).suffix:
             raw_target += ".md"
         target, _ = _resolve_link_target(source, raw_target)
         if target is None:
             continue
         href = raw_target + (f"#{anchor}" if anchor else "")
-        found.append({"target_path": str(target), "href": href, "label": (alias or Path(raw_target).stem).strip(), "anchor": anchor})
+        found.append(
+            {
+                "target_path": str(target),
+                "href": href,
+                "label": (alias or Path(raw_target).stem).strip(),
+                "anchor": anchor,
+            }
+        )
     unique: dict[tuple[str, str], dict[str, str | None]] = {}
     for item in found:
         unique[(str(item["href"]), str(item["label"]))] = item
@@ -198,7 +241,9 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
             title, brief, tags, body = _derive_metadata(path, text, visibility["tags"])
             seen_paths.add(str(path))
 
-            existing = conn.execute("SELECT id FROM documents WHERE path=?", (str(path),)).fetchone()
+            existing = conn.execute(
+                "SELECT id FROM documents WHERE path=?", (str(path),)
+            ).fetchone()
             if existing:
                 doc_id = int(existing["id"])
                 conn.execute(
@@ -214,7 +259,10 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
                 doc_id = int(cur.lastrowid)
 
             indexed_content = body + "\n\n" + _tag_search_text(tags)
-            conn.execute("INSERT INTO document_fts(rowid,title,brief,content) VALUES(?,?,?,?)", (doc_id, title, brief, indexed_content))
+            conn.execute(
+                "INSERT INTO document_fts(rowid,title,brief,content) VALUES(?,?,?,?)",
+                (doc_id, title, brief, indexed_content),
+            )
             conn.execute("DELETE FROM document_scopes WHERE document_id=?", (doc_id,))
             conn.executemany(
                 "INSERT INTO document_scopes(document_id,scope) VALUES(?,?)",
@@ -229,11 +277,21 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
             for link in _extract_links(path, body):
                 conn.execute(
                     "INSERT OR IGNORE INTO links(source_document_id,target_path,href,label,anchor) VALUES(?,?,?,?,?)",
-                    (doc_id, link["target_path"], link["href"], link["label"], link["anchor"]),
+                    (
+                        doc_id,
+                        link["target_path"],
+                        link["href"],
+                        link["label"],
+                        link["anchor"],
+                    ),
                 )
             indexed += 1
 
-        stale = [row["id"] for row in conn.execute("SELECT id,path FROM documents") if row["path"] not in seen_paths]
+        stale = [
+            row["id"]
+            for row in conn.execute("SELECT id,path FROM documents")
+            if row["path"] not in seen_paths
+        ]
         for doc_id in stale:
             conn.execute("DELETE FROM document_fts WHERE rowid=?", (doc_id,))
             conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
@@ -242,7 +300,12 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
             "UPDATE links SET target_document_id=(SELECT id FROM documents d WHERE d.path=links.target_path)"
         )
 
-    return {"indexed": indexed, "removed": len(stale), "missing_roots": missing_roots, "roots": len(roots)}
+    return {
+        "indexed": indexed,
+        "removed": len(stale),
+        "missing_roots": missing_roots,
+        "roots": len(roots),
+    }
 
 
 def _fts_terms(text: str) -> list[str]:
@@ -272,20 +335,38 @@ def _append_tag_filter(sql: str, params: list[Any], tag: str) -> str:
         "instr(':' || lower(t.tag) || ':', ':' || lower(?) || ':') > 0"
         for _ in segments
     ]
-    sql += " AND EXISTS (SELECT 1 FROM document_tags t WHERE t.document_id=d.id AND " + " AND ".join(conditions) + ")"
+    sql += (
+        " AND EXISTS (SELECT 1 FROM document_tags t WHERE t.document_id=d.id AND "
+        + " AND ".join(conditions)
+        + ")"
+    )
     params.extend(segments)
     return sql
 
 
-def _doc_payload(conn: sqlite3.Connection, row: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
+def _doc_payload(
+    conn: sqlite3.Connection, row: sqlite3.Row, score: float | None = None
+) -> dict[str, Any]:
     doc_id = int(row["id"])
     payload: dict[str, Any] = {
         "id": doc_id,
         "title": row["title"],
         "brief": row["brief"],
         "path": row["path"],
-        "projects": [r[0] for r in conn.execute("SELECT scope FROM document_scopes WHERE document_id=? ORDER BY scope", (doc_id,))],
-        "tags": [r[0] for r in conn.execute("SELECT tag FROM document_tags WHERE document_id=? ORDER BY tag", (doc_id,))],
+        "projects": [
+            r[0]
+            for r in conn.execute(
+                "SELECT scope FROM document_scopes WHERE document_id=? ORDER BY scope",
+                (doc_id,),
+            )
+        ],
+        "tags": [
+            r[0]
+            for r in conn.execute(
+                "SELECT tag FROM document_tags WHERE document_id=? ORDER BY tag",
+                (doc_id,),
+            )
+        ],
     }
     if score is not None:
         payload["score"] = score
@@ -338,7 +419,9 @@ def search_documents(
             float(row["score"]),
         )
     )
-    return [_doc_payload(conn, row, float(row["score"])) for row in fallback_hits[:limit]]
+    return [
+        _doc_payload(conn, row, float(row["score"])) for row in fallback_hits[:limit]
+    ]
 
 
 def list_documents(
@@ -364,15 +447,22 @@ def list_documents(
 
 def resolve_document(conn: sqlite3.Connection, ref: str) -> sqlite3.Row:
     if ref.isdigit():
-        row = conn.execute("SELECT id,path,title,brief FROM documents WHERE id=?", (int(ref),)).fetchone()
+        row = conn.execute(
+            "SELECT id,path,title,brief FROM documents WHERE id=?", (int(ref),)
+        ).fetchone()
         if row:
             return row
     candidate = _expand_path(ref)
-    row = conn.execute("SELECT id,path,title,brief FROM documents WHERE path=?", (str(candidate),)).fetchone()
+    row = conn.execute(
+        "SELECT id,path,title,brief FROM documents WHERE path=?", (str(candidate),)
+    ).fetchone()
     if row:
         return row
     suffix = ref.replace("\\", "/").lstrip("./")
-    matches = conn.execute("SELECT id,path,title,brief FROM documents WHERE replace(path,'\\','/') LIKE ?", (f"%/{suffix}",)).fetchall()
+    matches = conn.execute(
+        "SELECT id,path,title,brief FROM documents WHERE replace(path,'\\','/') LIKE ?",
+        (f"%/{suffix}",),
+    ).fetchall()
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -417,14 +507,22 @@ def link_graph(conn: sqlite3.Connection, ref: str) -> dict[str, Any]:
                 "anchor": row["anchor"],
             }
         )
-    return {"document": _doc_payload(conn, doc), "outbound": outbound, "inbound": inbound}
+    return {
+        "document": _doc_payload(conn, doc),
+        "outbound": outbound,
+        "inbound": inbound,
+    }
 
 
-def status(conn: sqlite3.Connection, settings_path: Path, db_path: Path) -> dict[str, Any]:
+def status(
+    conn: sqlite3.Connection, settings_path: Path, db_path: Path
+) -> dict[str, Any]:
     return {
         "settings": str(settings_path),
         "database": str(db_path),
         "documents": conn.execute("SELECT count(*) FROM documents").fetchone()[0],
         "links": conn.execute("SELECT count(*) FROM links").fetchone()[0],
-        "resolved_links": conn.execute("SELECT count(*) FROM links WHERE target_document_id IS NOT NULL").fetchone()[0],
+        "resolved_links": conn.execute(
+            "SELECT count(*) FROM links WHERE target_document_id IS NOT NULL"
+        ).fetchone()[0],
     }

@@ -1,4 +1,5 @@
 """Read-only, point-in-time archives for a file-first Agent Memory registry."""
+
 from __future__ import annotations
 
 import hashlib
@@ -64,7 +65,11 @@ def snapshot_registry(
     reported in the manifest/result while the rest of the archive remains usable.
     """
     now = datetime.now(timezone.utc)
-    output_dir = (output_dir or default_snapshot_directory(settings_path)).expanduser().resolve(strict=False)
+    output_dir = (
+        (output_dir or default_snapshot_directory(settings_path))
+        .expanduser()
+        .resolve(strict=False)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = _archive_name(output_dir, now)
 
@@ -93,7 +98,9 @@ def snapshot_registry(
     index_included = False
     index_sidecars: list[str] = []
 
-    with tempfile.TemporaryDirectory(dir=output_dir, prefix=".agent-memory-snapshot-") as temp_dir:
+    with tempfile.TemporaryDirectory(
+        dir=output_dir, prefix=".agent-memory-snapshot-"
+    ) as temp_dir:
         temp = Path(temp_dir)
         backup_path = temp / "index.sqlite3"
         if database.exists() and database.is_file():
@@ -115,7 +122,11 @@ def snapshot_registry(
             "unreadable_roots": unreadable_roots,
             "skipped_files": skipped_files,
             "files": files,
-            "database": {"archive_path": "database/index.sqlite3", "included": index_included, "sidecars": index_sidecars},
+            "database": {
+                "archive_path": "database/index.sqlite3",
+                "included": index_included,
+                "sidecars": index_sidecars,
+            },
         }
 
         with tarfile.open(archive_path, "w:gz") as archive:
@@ -140,7 +151,10 @@ def snapshot_registry(
                     unreadable_roots.append(str(root_path))
                     continue
                 try:
-                    markdown_paths = sorted((path for path in root_path.rglob("*.md") if path.is_file()), key=str)
+                    markdown_paths = sorted(
+                        (path for path in root_path.rglob("*.md") if path.is_file()),
+                        key=str,
+                    )
                 except OSError:
                     unreadable_roots.append(str(root_path))
                     continue
@@ -150,13 +164,22 @@ def snapshot_registry(
                         archive_name = f"{root_id}/{relative}"
                         _add_file(archive, path, archive_name)
                         stat = path.stat()
-                        files.append({"archive_path": archive_name, "source_path": str(path), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+                        files.append(
+                            {
+                                "archive_path": archive_name,
+                                "source_path": str(path),
+                                "mtime_ns": stat.st_mtime_ns,
+                                "size": stat.st_size,
+                            }
+                        )
                         markdown_files += 1
                     except OSError:
                         skipped_files.append(str(path))
 
             manifest["markdown_files"] = markdown_files
-            manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+            manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode(
+                "utf-8"
+            )
             manifest_info = tarfile.TarInfo("manifest.json")
             manifest_info.size = len(manifest_bytes)
             archive.addfile(manifest_info, _bytes_reader(manifest_bytes))
@@ -165,7 +188,11 @@ def snapshot_registry(
         "path": str(archive_path),
         "created_at": now.isoformat(),
         "settings": str(settings_path),
-        "database": {"path": str(database), "included": index_included, "sidecars": index_sidecars},
+        "database": {
+            "path": str(database),
+            "included": index_included,
+            "sidecars": index_sidecars,
+        },
         "roots": root_entries,
         "markdown_files": markdown_files,
         "missing_roots": missing_roots,
@@ -192,7 +219,9 @@ def _open_snapshot(archive_path: Path) -> tuple[Path, tarfile.TarFile, dict[str,
     try:
         archive = tarfile.open(archive_path, "r:gz")
     except (OSError, tarfile.TarError) as exc:
-        raise MemoryError(f"cannot open snapshot archive: {archive_path}: {exc}") from exc
+        raise MemoryError(
+            f"cannot open snapshot archive: {archive_path}: {exc}"
+        ) from exc
     try:
         manifest_stream = archive.extractfile("manifest.json")
         if manifest_stream is None:
@@ -203,7 +232,9 @@ def _open_snapshot(archive_path: Path) -> tuple[Path, tarfile.TarFile, dict[str,
         raise MemoryError(f"invalid snapshot manifest: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("format") != 1:
         archive.close()
-        raise MemoryError(f"unsupported snapshot format: {manifest.get('format') if isinstance(manifest, dict) else None!r}")
+        raise MemoryError(
+            f"unsupported snapshot format: {manifest.get('format') if isinstance(manifest, dict) else None!r}"
+        )
     return archive_path, archive, manifest
 
 
@@ -216,15 +247,25 @@ def inspect_snapshot(archive_path: Path) -> dict[str, object]:
             raise MemoryError("snapshot manifest roots must be an array")
         projects: dict[str, list[str]] = {}
         for root in roots:
-            if not isinstance(root, dict) or not isinstance(root.get("scope"), str) or not isinstance(root.get("path"), str):
+            if (
+                not isinstance(root, dict)
+                or not isinstance(root.get("scope"), str)
+                or not isinstance(root.get("path"), str)
+            ):
                 raise MemoryError("snapshot manifest contains an invalid root entry")
             projects.setdefault(root["scope"], []).append(root["path"])
         return {
             "archive": str(path),
             "created_at": manifest.get("created_at"),
             "markdown_files": manifest.get("markdown_files", 0),
-            "database_included": bool(isinstance(manifest.get("database"), dict) and manifest["database"].get("included")),
-            "projects": [{"project": project, "memory_roots": paths} for project, paths in sorted(projects.items())],
+            "database_included": bool(
+                isinstance(manifest.get("database"), dict)
+                and manifest["database"].get("included")
+            ),
+            "projects": [
+                {"project": project, "memory_roots": paths}
+                for project, paths in sorted(projects.items())
+            ],
             "roots": roots,
             "missing_roots": manifest.get("missing_roots", []),
             "unreadable_roots": manifest.get("unreadable_roots", []),
@@ -247,28 +288,44 @@ def search_snapshot(
     path, archive, manifest = _open_snapshot(archive_path)
     try:
         database = manifest.get("database", {})
-        member_name = database.get("archive_path") if isinstance(database, dict) and database.get("included") else None
+        member_name = (
+            database.get("archive_path")
+            if isinstance(database, dict) and database.get("included")
+            else None
+        )
         if not isinstance(member_name, str):
-            raise MemoryError("snapshot has no SQLite index; inspect it or rebuild after manual recovery")
+            raise MemoryError(
+                "snapshot has no SQLite index; inspect it or rebuild after manual recovery"
+            )
         try:
             member = archive.getmember(_safe_archive_name(member_name))
         except KeyError as exc:
-            raise MemoryError(f"snapshot archive is missing SQLite index: {member_name}") from exc
+            raise MemoryError(
+                f"snapshot archive is missing SQLite index: {member_name}"
+            ) from exc
         if not member.isfile():
-            raise MemoryError(f"snapshot SQLite member is not a regular file: {member_name}")
+            raise MemoryError(
+                f"snapshot SQLite member is not a regular file: {member_name}"
+            )
         source = archive.extractfile(member)
         if source is None:
             raise MemoryError(f"cannot read snapshot SQLite index: {member_name}")
-        with tempfile.TemporaryDirectory(prefix="agent-memory-snapshot-search-") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-memory-snapshot-search-"
+        ) as temp_dir:
             database_path = Path(temp_dir) / "index.sqlite3"
             with source, database_path.open("wb") as target:
                 target.write(source.read())
             # ``immutable=1`` keeps SQLite from probing or creating journal side files
             # beside the disposable extracted copy; the archive stores a coherent backup.
-            conn = sqlite3.connect(f"file:{database_path}?mode=ro&immutable=1", uri=True)
+            conn = sqlite3.connect(
+                f"file:{database_path}?mode=ro&immutable=1", uri=True
+            )
             conn.row_factory = sqlite3.Row
             try:
-                documents = search_documents(conn, query, project, tags, limit, include_shared)
+                documents = search_documents(
+                    conn, query, project, tags, limit, include_shared
+                )
             finally:
                 conn.close()
         return {"archive": str(path), "query": query, "documents": documents}

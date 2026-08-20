@@ -1,4 +1,5 @@
 """Settings and project-scope resolution for Agent Memory."""
+
 from __future__ import annotations
 
 import json
@@ -81,12 +82,16 @@ def load_settings(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise MemoryError(f"settings not found: {path}; run `agent-memory init` first") from exc
+        raise MemoryError(
+            f"settings not found: {path}; run `agent-memory init` first"
+        ) from exc
     except json.JSONDecodeError as exc:
         raise MemoryError(f"invalid JSON in {path}: {exc}") from exc
     if data.get("version") != SCHEMA_VERSION:
         raise MemoryError(f"unsupported settings version: {data.get('version')!r}")
-    if not isinstance(data.get("bindings", []), list) or not isinstance(data.get("shared", []), list):
+    if not isinstance(data.get("bindings", []), list) or not isinstance(
+        data.get("shared", []), list
+    ):
         raise MemoryError("settings `bindings` and `shared` must be arrays")
     return data
 
@@ -144,14 +149,21 @@ def _memory_locations(value: Any, binding_path: Path) -> tuple[MemoryLocation, .
                 )
             )
         else:
-            raise MemoryError("each binding `memory` entry must be a path string or {path,tags} object")
+            raise MemoryError(
+                "each binding `memory` entry must be a path string or {path,tags} object"
+            )
     return _merge_locations(locations)
 
 
 def flatten_bindings(settings: dict[str, Any]) -> list[Binding]:
     flattened: list[Binding] = []
 
-    def visit(node: dict[str, Any], parent: Path | None, inherited_memory: tuple[MemoryLocation, ...], inherited_tags: tuple[str, ...]) -> None:
+    def visit(
+        node: dict[str, Any],
+        parent: Path | None,
+        inherited_memory: tuple[MemoryLocation, ...],
+        inherited_tags: tuple[str, ...],
+    ) -> None:
         raw_path = node.get("path")
         project = node.get("project")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -161,11 +173,15 @@ def flatten_bindings(settings: dict[str, Any]) -> list[Binding]:
 
         expanded_raw = Path(os.path.expandvars(os.path.expanduser(raw_path)))
         if parent is None and not expanded_raw.is_absolute():
-            raise MemoryError(f"top-level binding path must be absolute (or use ~): {raw_path}")
+            raise MemoryError(
+                f"top-level binding path must be absolute (or use ~): {raw_path}"
+            )
         binding_path = _expand_path(raw_path, parent)
         own_memory = _memory_locations(node.get("memory"), binding_path)
         inherit_memory = bool(node.get("inherit_memory", False))
-        memory_locations = _merge_locations((inherited_memory if inherit_memory else ()) + own_memory)
+        memory_locations = _merge_locations(
+            (inherited_memory if inherit_memory else ()) + own_memory
+        )
 
         tags = _dedupe((*inherited_tags, *_normalize_tags(node.get("tags"))))
         flattened.append(
@@ -211,7 +227,9 @@ def shared_roots(settings: dict[str, Any], settings_path: Path) -> list[MemoryRo
     return roots
 
 
-def collect_memory_roots(settings: dict[str, Any], settings_path: Path) -> list[MemoryRoot]:
+def collect_memory_roots(
+    settings: dict[str, Any], settings_path: Path
+) -> list[MemoryRoot]:
     roots = shared_roots(settings, settings_path)
     for binding in flatten_bindings(settings):
         roots.extend(
@@ -236,7 +254,11 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 def resolve_binding(settings: dict[str, Any], target: Path) -> Binding:
     target = target.resolve(strict=False)
-    matches = [binding for binding in flatten_bindings(settings) if _is_within(target, binding.path)]
+    matches = [
+        binding
+        for binding in flatten_bindings(settings)
+        if _is_within(target, binding.path)
+    ]
     if not matches:
         raise MemoryError(f"no project binding matches path: {target}")
     max_depth = max(binding.depth for binding in matches)
