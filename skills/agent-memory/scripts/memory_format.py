@@ -12,7 +12,6 @@ import math
 import re
 from typing import Any, Iterable
 
-
 _PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 _YAML_BOOL_OR_NULL = {"null", "true", "false", "yes", "no", "on", "off", "y", "n", "~"}
 _YAML_NUMBER_RE = re.compile(

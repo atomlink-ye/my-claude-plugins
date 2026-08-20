@@ -29,8 +29,7 @@ def connect_db(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL UNIQUE,
@@ -63,8 +62,7 @@ def connect_db(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_scopes_scope ON document_scopes(scope);
         CREATE INDEX IF NOT EXISTS idx_tags_tag ON document_tags(tag);
         CREATE INDEX IF NOT EXISTS idx_links_target_path ON links(target_path);
-        """
-    )
+        """)
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(title, brief, content)"
     )
