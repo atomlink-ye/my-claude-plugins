@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).parents[3] / "skills" / "agent-memory" / "scripts" / "agent_memory.py"
@@ -59,7 +61,6 @@ class AgentMemoryAdminTests(unittest.TestCase):
     def test_explicit_capture_root_is_selected(self):
         binding = am.resolve_binding(self.settings, self.project)
         self.assertEqual(preferred_capture_root(self.settings, binding), self.memory)
-
         captured = am.capture_memory(binding, "learning", "Capture root preference", root=str(preferred_capture_root(self.settings, binding)))
         self.assertEqual(Path(captured["path"]).parent, self.memory / "learnings")
 
@@ -69,12 +70,10 @@ class AgentMemoryAdminTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.sync()
-
         projects = project_inventory(self.conn, self.settings)
         self.assertEqual(projects[0]["project"], "a")
         self.assertEqual(projects[0]["documents"], 1)
         self.assertEqual(Path(projects[0]["capture_root"]), self.memory)
-
         tags = {item["tag"]: item["count"] for item in tag_inventory(self.conn, "a")}
         self.assertEqual(tags["a:operations"], 1)
         self.assertEqual(tags["a:knowledge"], 1)
@@ -117,6 +116,30 @@ class AgentMemoryAdminTests(unittest.TestCase):
         result = doctor(self.conn, self.settings, self.settings_path, self.db_path)
         self.assertIn("markdown_unindexed", [item["code"] for item in result["checks"]])
         self.assertEqual(result["summary"]["unindexed_markdown"], 1)
+
+    def test_cli_doctor_does_not_create_missing_database(self):
+        home = self.root / "fresh"
+        home.mkdir()
+        settings = home / "settings.json"
+        settings.write_text(json.dumps({"version": 1, "database": "index.sqlite3", "shared": [], "bindings": []}), encoding="utf-8")
+        database = home / "index.sqlite3"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = am.main(["--settings", str(settings), "--json", "doctor"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["checks"][0]["code"], "database_missing")
+        self.assertFalse(database.exists())
+
+    def test_cli_doctor_returns_structured_invalid_settings_error(self):
+        settings = self.root / "broken-settings.json"
+        settings.write_text("{not-json", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = am.main(["--settings", str(settings), "--json", "doctor"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["checks"][0]["code"], "settings_invalid")
 
 
 if __name__ == "__main__":
