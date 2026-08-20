@@ -45,7 +45,10 @@ python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --js
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json capture learning "Reusable learning" --path "$WORK_DIR"
 ```
 
-The Agent Memory design and settings contract are documented in [docs/agent-memory.md](docs/agent-memory.md).
+Agent Memory documentation:
+
+- [docs/agent-memory.md](docs/agent-memory.md) — core design and settings contract.
+- [docs/agent-memory-self-improvement.md](docs/agent-memory-self-improvement.md) — Self Improvement integration, symmetric tag recall, and capture layout.
 
 ## Installation
 
