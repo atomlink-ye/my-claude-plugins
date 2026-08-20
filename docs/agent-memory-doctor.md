@@ -7,10 +7,15 @@ configured, is the derived index current, and are local references healthy?
 ## Commands
 
 ```sh
-agent-memory doctor
-agent-memory --json doctor
+agent-memory doctor                 # deterministic YAML (default)
+agent-memory --json doctor          # JSON for scripts
+agent-memory --table doctor         # summary and findings tables
+agent-memory --text doctor          # legacy human-readable output
 agent-memory doctor --path /abs/path/to/project
 ```
+
+`--json`, `--table`, and `--text` are mutually exclusive global output options. They
+apply to every subcommand; YAML is the default when no option is provided.
 
 `--path` additionally resolves the actual worktree and reports its project, binding,
 memory roots, and default capture root.

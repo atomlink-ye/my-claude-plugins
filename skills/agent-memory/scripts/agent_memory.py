@@ -20,6 +20,7 @@ from memory_config import (
     resolve_binding,
     shared_roots,
 )
+from memory_format import table_dump, yaml_dump
 from memory_store import connect_db, link_graph, list_documents, search_documents, status, sync_index
 
 
@@ -50,6 +51,24 @@ def _human_projects(items: list[dict[str, object]]) -> None:
 def _human_tags(items: list[dict[str, object]]) -> None:
     for item in items:
         print(f"{item['tag']}  {item['count']}")
+
+
+def _human_links(result: dict[str, object]) -> None:
+    document = result.get("document")
+    if isinstance(document, dict):
+        print(f"{document['title']}\n  {document['path']}")
+    for direction in ("outbound", "inbound"):
+        print(f"{direction}:")
+        links = result.get(direction, [])
+        if not links:
+            print("  - (none)")
+            continue
+        for link in links:
+            if direction == "outbound":
+                marker = "ok" if link.get("resolved") else "dangling"
+                print(f"  - [{marker}] {link['label']} -> {link['path']}")
+            else:
+                print(f"  - {link['title']} <- {link['path']}")
 
 
 def _human_doctor(result: dict[str, object]) -> None:
@@ -101,29 +120,70 @@ def _doctor_failure(code: str, message: str, path: Path | None = None) -> dict[s
     }
 
 
-def _emit_doctor(result: dict[str, object], as_json: bool) -> int:
-    if as_json:
+def _emit(result: object, command: str, output_format: str) -> None:
+    if output_format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif output_format == "table":
+        print(table_dump(command, result))
+    elif output_format == "text":
+        if command in {"search", "list"} and isinstance(result, list):
+            _human_documents(result)
+        elif command == "projects" and isinstance(result, list):
+            _human_projects(result)
+        elif command == "tags" and isinstance(result, list):
+            _human_tags(result)
+        elif command == "links" and isinstance(result, dict):
+            _human_links(result)
+        elif command == "doctor" and isinstance(result, dict):
+            _human_doctor(result)
+        elif command == "init" and isinstance(result, dict):
+            print(f"created {result['settings']}")
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
-        _human_doctor(result)
+        print(yaml_dump(result))
+
+
+def _emit_doctor(result: dict[str, object], output_format: str) -> int:
+    _emit(result, "doctor", output_format)
     return 2 if result["status"] == "error" else 1 if result["status"] == "warn" else 0
+
+
+def _add_output_options(parser: argparse.ArgumentParser) -> None:
+    """Add output switches to a parser without overriding a global selection.
+
+    Registering the switches on both the root parser and each subparser means common
+    forms such as ``agent-memory tags --table`` work alongside the established
+    ``agent-memory --table tags`` spelling.  ``SUPPRESS`` matters here: a subparser
+    with no output switch must leave a root-level choice intact.
+    """
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument("--json", dest="output_format", action="store_const", const="json", default=argparse.SUPPRESS, help="emit JSON")
+    formats.add_argument("--table", dest="output_format", action="store_const", const="table", default=argparse.SUPPRESS, help="emit a box-drawing table")
+    formats.add_argument("--text", dest="output_format", action="store_const", const="text", default=argparse.SUPPRESS, help="emit legacy human-readable text")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-memory", description="Local file-first memory registry")
     parser.add_argument("--settings", type=Path, default=default_settings_path(), help="settings.json path")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    _add_output_options(parser)
+    parser.set_defaults(output_format="yaml")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create an empty settings.json")
     init.add_argument("--force", action="store_true")
-    sub.add_parser("status", help="show registry status")
-    sub.add_parser("sync", help="re-index all configured Markdown roots")
+    _add_output_options(init)
+    status_parser = sub.add_parser("status", help="show registry status")
+    _add_output_options(status_parser)
+    sync_parser = sub.add_parser("sync", help="re-index all configured Markdown roots")
+    _add_output_options(sync_parser)
 
     resolve = sub.add_parser("resolve", help="resolve a working path to its nearest project binding")
+    _add_output_options(resolve)
     resolve.add_argument("--path", type=Path, default=Path.cwd())
 
     search = sub.add_parser("search", help="full-text and tag-aware search indexed memory")
+    _add_output_options(search)
     search.add_argument("query")
     search.add_argument("--project")
     search.add_argument("--path", type=Path)
@@ -132,6 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--no-shared", action="store_true")
 
     ls = sub.add_parser("list", help="list indexed memory documents")
+    _add_output_options(ls)
     ls.add_argument("--project")
     ls.add_argument("--path", type=Path)
     ls.add_argument("--tag", action="append", default=[])
@@ -139,9 +200,11 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--no-shared", action="store_true")
 
     links = sub.add_parser("links", help="show outbound references and inbound backlinks")
+    _add_output_options(links)
     links.add_argument("document", help="document id, absolute path, or unique indexed path suffix")
 
     capture = sub.add_parser("capture", help="write a structured self-improvement memory and index it")
+    _add_output_options(capture)
     capture.add_argument("kind", choices=sorted(KINDS))
     capture.add_argument("summary")
     capture.add_argument("--path", type=Path, default=Path.cwd(), help="actual project/worktree path used for scope resolution")
@@ -151,28 +214,35 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--related", action="append", default=[], help="related local file path; repeatable")
     capture.add_argument("--root", help="configured memory root override")
 
-    sub.add_parser("projects", help="list configured projects, roots, and indexed document counts")
+    projects = sub.add_parser("projects", help="list configured projects, roots, and indexed document counts")
+    _add_output_options(projects)
 
     tags = sub.add_parser("tags", help="list canonical indexed tags and usage counts")
+    _add_output_options(tags)
     tags.add_argument("--project")
     tags.add_argument("--path", type=Path)
     tags.add_argument("--no-shared", action="store_true")
 
     check = sub.add_parser("doctor", help="diagnose settings, routing, filesystem, index, links, and capture health")
+    _add_output_options(check)
     check.add_argument("--path", type=Path, help="also resolve and diagnose one actual project/worktree path")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    selected_formats = {argument for argument in raw_argv if argument in {"--json", "--table", "--text"}}
+    if len(selected_formats) > 1:
+        parser.error("--json, --table, and --text are mutually exclusive")
+    args = parser.parse_args(raw_argv)
     settings_path = args.settings.expanduser().resolve(strict=False)
 
     if args.command == "init":
         try:
             init_settings(settings_path, args.force)
             result = {"settings": str(settings_path)}
-            print(json.dumps(result, indent=2) if args.json else f"created {settings_path}")
+            _emit(result, "init", args.output_format)
             return 0
         except (MemoryError, OSError) as exc:
             print(f"agent-memory: {exc}", file=sys.stderr)
@@ -183,15 +253,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             settings = load_settings(settings_path)
         except (MemoryError, OSError) as exc:
-            return _emit_doctor(_doctor_failure("settings_invalid", str(exc), settings_path), args.json)
+            return _emit_doctor(_doctor_failure("settings_invalid", str(exc), settings_path), args.output_format)
         try:
             db_path = database_path(settings, settings_path)
         except MemoryError as exc:
-            return _emit_doctor(_doctor_failure("database_path_invalid", str(exc), settings_path), args.json)
+            return _emit_doctor(_doctor_failure("database_path_invalid", str(exc), settings_path), args.output_format)
         if not db_path.exists():
             return _emit_doctor(
                 _doctor_failure("database_missing", "SQLite index does not exist; run agent-memory sync first", db_path),
-                args.json,
+                args.output_format,
             )
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -200,9 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                 result = doctor(conn, settings, settings_path, db_path, args.path)
             finally:
                 conn.close()
-            return _emit_doctor(result, args.json)
+            return _emit_doctor(result, args.output_format)
         except (MemoryError, OSError, sqlite3.Error) as exc:
-            return _emit_doctor(_doctor_failure("doctor_failed", str(exc), db_path), args.json)
+            return _emit_doctor(_doctor_failure("doctor_failed", str(exc), db_path), args.output_format)
 
     try:
         settings = load_settings(settings_path)
@@ -263,25 +333,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("unknown command")
                 return 2
 
-            if args.json:
-                print(json.dumps(result, indent=2, ensure_ascii=False))
-            elif args.command in {"search", "list"}:
-                _human_documents(result)
-            elif args.command == "links":
-                print(f"{result['document']['title']}\n  {result['document']['path']}")
-                print("outbound:")
-                for link in result["outbound"]:
-                    marker = "ok" if link["resolved"] else "dangling"
-                    print(f"  - [{marker}] {link['label']} -> {link['path']}")
-                print("inbound:")
-                for link in result["inbound"]:
-                    print(f"  - {link['title']} <- {link['path']}")
-            elif args.command == "projects":
-                _human_projects(result)
-            elif args.command == "tags":
-                _human_tags(result)
-            else:
-                print(json.dumps(result, indent=2, ensure_ascii=False))
+            _emit(result, args.command, args.output_format)
             return 0
         finally:
             conn.close()

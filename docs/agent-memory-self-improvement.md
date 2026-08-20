@@ -56,4 +56,8 @@ agent-memory --json capture learning \
   --related /abs/path/to/agent-server/AGENTS.md
 ```
 
+The example requests JSON explicitly for scripting. Omit `--json` for the default
+deterministic YAML output; `--table` and `--text` are also available as mutually
+exclusive global output options.
+
 If the project has several configured memory roots, the command requires `--root` instead of guessing.

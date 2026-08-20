@@ -293,6 +293,18 @@ file.
 
 The implementation is stdlib-only Python 3 plus SQLite/FTS5.
 
+Every subcommand emits deterministic YAML by default, including `init` and `doctor`.
+Choose one mutually exclusive global flag when needed: `--json` keeps the previous
+machine-readable JSON contract, `--table` renders compact tables for humans, and
+`--text` selects the legacy human-readable output. For example:
+
+```sh
+agent-memory status                 # YAML (default)
+agent-memory --json status          # JSON for scripts
+agent-memory --table projects       # compact table
+agent-memory --text doctor          # legacy human-readable view
+```
+
 ```sh
 # bootstrap
 agent-memory init
