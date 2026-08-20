@@ -118,6 +118,29 @@ class AgentMemoryTests(unittest.TestCase):
         binding = am.resolve_binding(settings, self.project_a)
         self.assertEqual(tuple(location.path for location in binding.memory_roots), (self.memory_a,))
 
+    def test_hierarchical_tags_match_subtags_but_display_canonical_tag(self):
+        note = self.memory_a / "operations.md"
+        note.write_text(
+            "---\ntitle: Deployment Operations\ntags: [project : operations : deploy]\n---\n\nDeployment operations runbook.\n",
+            encoding="utf-8",
+        )
+        self.sync()
+
+        by_subtag = am.list_documents(self.conn, project="a", tags=["operations"])
+        self.assertEqual(len(by_subtag), 1)
+        self.assertIn("project:operations:deploy", by_subtag[0]["tags"])
+        self.assertNotIn("operations", by_subtag[0]["tags"])
+
+        by_parent_path = am.list_documents(self.conn, project="a", tags=["project:operations"])
+        self.assertEqual(len(by_parent_path), 1)
+
+        by_leaf = am.search_documents(self.conn, "runbook", project="a", tags=["DEPLOY"])
+        self.assertEqual(len(by_leaf), 1)
+        self.assertIn("project:operations:deploy", by_leaf[0]["tags"])
+
+        partial = am.list_documents(self.conn, project="a", tags=["ops"])
+        self.assertEqual(partial, [])
+
 
 if __name__ == "__main__":
     unittest.main()
