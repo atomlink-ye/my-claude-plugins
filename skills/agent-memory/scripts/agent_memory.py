@@ -2,75 +2,66 @@
 from __future__ import annotations
 import argparse,json,sqlite3,sys
 from pathlib import Path
-from memory_admin import doctor,preferred_capture_root,project_inventory,tag_inventory
+from memory_admin import preferred_capture_root,project_inventory,tag_inventory
+from memory_doctor_ext import doctor
 from memory_capture import KINDS,LIFECYCLE_STATES,capture_memory
 from memory_config import MemoryError,collect_memory_roots,database_path,default_settings_path,init_settings,load_settings,resolve_binding,shared_roots
 from memory_format import table_dump,yaml_dump
 from memory_lifecycle import update_lifecycle
 from memory_store_ext import connect_db,link_graph,list_documents,search_documents,status,sync_index
 
-def _emit(result,command,fmt):
- if fmt=="json":print(json.dumps(result,indent=2,ensure_ascii=False));return
- if fmt=="table":print(table_dump(command,result));return
- if fmt=="yaml":print(yaml_dump(result));return
- if command in {"search","list"}:
-  for x in result:
-   ident=x.get("memory_id") or x["id"];mode=f" {x.get('match_mode','')}" if x.get("match_mode") else "";print(f"[{ident}]{mode} {x['title']}\n  {x.get('brief','')}\n  path: {x['path']}\n  tags: {','.join(x.get('tags',[])) or '-'}")
- elif command=="tags":
-  for x in result:print(f"{x['tag']}  {x['count']}")
- elif command=="projects":
-  for x in result:print(f"{x['project']} documents={x['documents']}\n  path: {x['path']}\n  capture: {x.get('capture_root') or '-'}")
- else:print(json.dumps(result,indent=2,ensure_ascii=False))
+def _emit(r,cmd,fmt):
+ if fmt=="json":print(json.dumps(r,indent=2,ensure_ascii=False));return
+ if fmt=="table":print(table_dump(cmd,r));return
+ if fmt=="yaml":print(yaml_dump(r));return
+ if cmd in {"search","list"}:
+  for x in r:print(f"[{x.get('memory_id') or x['id']}] {x['title']}\n  {x.get('brief','')}\n  path: {x['path']}\n  tags: {','.join(x.get('tags',[])) or '-'}")
+ elif cmd=="tags":
+  for x in r:print(f"{x['tag']}  {x['count']}")
+ elif cmd=="projects":
+  for x in r:print(f"{x['project']} documents={x['documents']}\n  path: {x['path']}\n  capture: {x.get('capture_root') or '-'}")
+ else:print(json.dumps(r,indent=2,ensure_ascii=False))
 def _opts(p):
  g=p.add_mutually_exclusive_group();g.add_argument("--json",dest="output_format",action="store_const",const="json",default=argparse.SUPPRESS);g.add_argument("--table",dest="output_format",action="store_const",const="table",default=argparse.SUPPRESS);g.add_argument("--text",dest="output_format",action="store_const",const="text",default=argparse.SUPPRESS)
 def build_parser():
  p=argparse.ArgumentParser(prog="agent-memory");p.add_argument("--settings",type=Path,default=default_settings_path());_opts(p);p.set_defaults(output_format="yaml");s=p.add_subparsers(dest="command",required=True)
- def sub(name,help):q=s.add_parser(name,help=help);_opts(q);return q
- q=sub("init","create settings");q.add_argument("--force",action="store_true");sub("status","registry status");sub("sync","re-index Markdown")
- q=sub("resolve","resolve path");q.add_argument("--path",type=Path,default=Path.cwd())
- for name in ("search","list"):
-  q=sub(name,name+" memory");
-  if name=="search":q.add_argument("query")
-  q.add_argument("--project");q.add_argument("--path",type=Path);q.add_argument("--tag",action="append",default=[]);q.add_argument("--limit",type=int,default=10 if name=="search" else 100);q.add_argument("--no-shared",action="store_true")
- q=sub("links","show links/backlinks");q.add_argument("document")
- q=sub("capture","capture durable learning");q.add_argument("kind",choices=sorted(KINDS));q.add_argument("summary");q.add_argument("--path",type=Path,default=Path.cwd());q.add_argument("--details",default="");q.add_argument("--action",default="");q.add_argument("--tag",action="append",default=[]);q.add_argument("--related",action="append",default=[]);q.add_argument("--root");q.add_argument("--status",choices=sorted(LIFECYCLE_STATES),default="raw");q.add_argument("--allow-duplicate",action="store_true")
- q=sub("lifecycle","change memory lifecycle");q.add_argument("document");q.add_argument("status",choices=sorted(LIFECYCLE_STATES));q.add_argument("--target")
- sub("projects","list projects");q=sub("tags","list tags");q.add_argument("--project");q.add_argument("--path",type=Path);q.add_argument("--no-shared",action="store_true")
- q=sub("doctor","health diagnostics");q.add_argument("--path",type=Path);return p
-def _failure(code,msg,path=None):return {"status":"error","summary":{"errors":1,"warnings":0,"info":0,"bindings":0,"documents":0,"dangling_links":0,"unindexed_markdown":0,"stale_documents":0},"resolved":None,"checks":[{"code":code,"severity":"error","message":msg,**({"paths":[str(path)]} if path else {})}]}
+ def sub(n,h):q=s.add_parser(n,help=h);_opts(q);return q
+ q=sub("init","create settings");q.add_argument("--force",action="store_true");sub("status","registry status");sub("sync","re-index Markdown");q=sub("resolve","resolve path");q.add_argument("--path",type=Path,default=Path.cwd())
+ for n in ("search","list"):
+  q=sub(n,n+" memory");
+  if n=="search":q.add_argument("query")
+  q.add_argument("--project");q.add_argument("--path",type=Path);q.add_argument("--tag",action="append",default=[]);q.add_argument("--limit",type=int,default=10 if n=="search" else 100);q.add_argument("--no-shared",action="store_true")
+ q=sub("links","show links/backlinks");q.add_argument("document");q=sub("capture","capture durable learning");q.add_argument("kind",choices=sorted(KINDS));q.add_argument("summary");q.add_argument("--path",type=Path,default=Path.cwd());q.add_argument("--details",default="");q.add_argument("--action",default="");q.add_argument("--tag",action="append",default=[]);q.add_argument("--related",action="append",default=[]);q.add_argument("--root");q.add_argument("--status",choices=sorted(LIFECYCLE_STATES),default="raw");q.add_argument("--allow-duplicate",action="store_true")
+ q=sub("lifecycle","change lifecycle");q.add_argument("document");q.add_argument("status",choices=sorted(LIFECYCLE_STATES));q.add_argument("--target");sub("projects","list projects");q=sub("tags","list tags");q.add_argument("--project");q.add_argument("--path",type=Path);q.add_argument("--no-shared",action="store_true");q=sub("doctor","health diagnostics");q.add_argument("--path",type=Path);return p
+def _fail(code,msg,path=None):return {"status":"error","summary":{"errors":1,"warnings":0,"info":0,"bindings":0,"documents":0,"dangling_links":0,"unindexed_markdown":0,"stale_documents":0},"resolved":None,"checks":[{"code":code,"severity":"error","message":msg,**({"paths":[str(path)]} if path else {})}]}
 def main(argv=None):
  p=build_parser();raw=sys.argv[1:] if argv is None else argv
- if len({x for x in raw if x in {"--json","--table","--text"}})>1:p.error("--json, --table, and --text are mutually exclusive")
+ if len({x for x in raw if x in {"--json","--table","--text"}})>1:p.error("output options are mutually exclusive")
  a=p.parse_args(raw);sp=a.settings.expanduser().resolve(strict=False)
  if a.command=="init":
   try:init_settings(sp,a.force);r={"settings":str(sp)};_emit(r,"init",a.output_format);return 0
   except (MemoryError,OSError) as e:print(f"agent-memory: {e}",file=sys.stderr);return 2
  if a.command=="doctor":
   try:settings=load_settings(sp);db=database_path(settings,sp)
-  except (MemoryError,OSError) as e:r=_failure("settings_invalid",str(e),sp);_emit(r,"doctor",a.output_format);return 2
-  if not db.exists():r=_failure("database_missing","SQLite index does not exist; run agent-memory sync first",db);_emit(r,"doctor",a.output_format);return 2
-  try:
-   c=sqlite3.connect(f"file:{db}?mode=ro",uri=True);c.row_factory=sqlite3.Row;r=doctor(c,settings,sp,db,a.path);c.close();_emit(r,"doctor",a.output_format);return 2 if r["status"]=="error" else 1 if r["status"]=="warn" else 0
-  except Exception as e:r=_failure("doctor_failed",str(e),db);_emit(r,"doctor",a.output_format);return 2
+  except (MemoryError,OSError) as e:r=_fail("settings_invalid",str(e),sp);_emit(r,"doctor",a.output_format);return 2
+  if not db.exists():r=_fail("database_missing","SQLite index does not exist; run agent-memory sync first",db);_emit(r,"doctor",a.output_format);return 2
+  try:c=sqlite3.connect(f"file:{db}?mode=ro",uri=True);c.row_factory=sqlite3.Row;r=doctor(c,settings,sp,db,a.path);c.close();_emit(r,"doctor",a.output_format);return 2 if r["status"]=="error" else 1 if r["status"]=="warn" else 0
+  except Exception as e:r=_fail("doctor_failed",str(e),db);_emit(r,"doctor",a.output_format);return 2
  try:
   settings=load_settings(sp);db=database_path(settings,sp);c=connect_db(db)
   if a.command=="status":r=status(c,sp,db)
   elif a.command=="sync":r=sync_index(c,collect_memory_roots(settings,sp))
-  elif a.command=="resolve":
-   b=resolve_binding(settings,a.path);pref=preferred_capture_root(settings,b);r={"path":str(a.path.resolve(strict=False)),"project":b.project,"binding":str(b.path),"memory":[{"path":str(x.path),"tags":list(x.tags)} for x in b.memory_roots],"capture_root":str(pref) if pref else (str(b.memory_roots[0].path) if len(b.memory_roots)==1 else None),"shared":[str(x.path) for x in shared_roots(settings,sp)],"tags":list(b.tags)}
+  elif a.command=="resolve":b=resolve_binding(settings,a.path);pref=preferred_capture_root(settings,b);r={"path":str(a.path.resolve(strict=False)),"project":b.project,"binding":str(b.path),"memory":[{"path":str(x.path),"tags":list(x.tags)} for x in b.memory_roots],"capture_root":str(pref) if pref else (str(b.memory_roots[0].path) if len(b.memory_roots)==1 else None),"shared":[str(x.path) for x in shared_roots(settings,sp)],"tags":list(b.tags)}
   elif a.command in {"search","list"}:
    if a.project and a.path:raise MemoryError("use either --project or --path, not both")
-   project=a.project or (resolve_binding(settings,a.path).project if a.path else None);shared=not a.no_shared;r=search_documents(c,a.query,project,a.tag,a.limit,shared) if a.command=="search" else list_documents(c,project,a.tag,a.limit,shared)
+   project=a.project or (resolve_binding(settings,a.path).project if a.path else None);r=search_documents(c,a.query,project,a.tag,a.limit,not a.no_shared) if a.command=="search" else list_documents(c,project,a.tag,a.limit,not a.no_shared)
   elif a.command=="links":r=link_graph(c,a.document)
-  elif a.command=="capture":
-   b=resolve_binding(settings,a.path);pref=preferred_capture_root(settings,b);r=capture_memory(b,a.kind,a.summary,details=a.details,suggested_action=a.action,tags=a.tag,related=a.related,root=a.root or (str(pref) if pref else None),status=a.status,allow_duplicate=a.allow_duplicate)
-   if r.get("created"):r["sync"]=sync_index(c,collect_memory_roots(settings,sp))
+  elif a.command=="capture":b=resolve_binding(settings,a.path);pref=preferred_capture_root(settings,b);r=capture_memory(b,a.kind,a.summary,details=a.details,suggested_action=a.action,tags=a.tag,related=a.related,root=a.root or (str(pref) if pref else None),status=a.status,allow_duplicate=a.allow_duplicate);r.update({"sync":sync_index(c,collect_memory_roots(settings,sp))} if r.get("created") else {})
   elif a.command=="lifecycle":r=update_lifecycle(c,a.document,a.status,target=a.target);r["sync"]=sync_index(c,collect_memory_roots(settings,sp))
   elif a.command=="projects":r=project_inventory(c,settings)
   elif a.command=="tags":
    if a.project and a.path:raise MemoryError("use either --project or --path, not both")
    project=a.project or (resolve_binding(settings,a.path).project if a.path else None);r=tag_inventory(c,project,not a.no_shared)
-  else:raise MemoryError("unknown command")
   _emit(r,a.command,a.output_format);c.close();return 0
  except (MemoryError,OSError,sqlite3.Error) as e:print(f"agent-memory: {e}",file=sys.stderr);return 2
 if __name__=="__main__":raise SystemExit(main())
