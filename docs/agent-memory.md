@@ -258,6 +258,42 @@ Because identity is the normalized source file path, a project-specific note can
 shared domain note, or one project can explicitly reference another project's durable
 knowledge, without globally merging their search scopes.
 
+## Stable IDs and lifecycle
+
+Captured memories receive an opaque frontmatter `id: mem_<uuid>` and default to
+`status: raw`; the capture result also returns that ID as `memory_id`. IDs are logical
+identity while the Markdown path remains the physical source location, so a stable
+cross-project reference can survive a file move:
+
+```md
+[Canonical workflow](memory://mem_012345...)
+```
+
+`agent-memory links mem_012345...` resolves these references alongside ordinary Markdown
+links. Existing Markdown without an ID remains valid. Doctor reports it as migration info;
+use `skills/agent-memory/scripts/migrate_ids.py` only when stable references are needed.
+
+Lifecycle records a reuse decision, not routine editing. The valid statuses are:
+
+- `raw` — captured evidence not yet independently confirmed;
+- `validated` — guidance confirmed through another check or use;
+- `promoted` — retained evidence that points to a canonical reusable memory;
+- `superseded` — retained provenance replaced by a newer canonical memory.
+
+The common progression is `raw` → `validated`; once repeated evidence is consolidated, use
+the canonical memory ID as the target for promoted evidence and superseded duplicates:
+
+```sh
+agent-memory lifecycle mem_evidence validated
+agent-memory lifecycle mem_evidence promoted --target mem_canonical
+agent-memory lifecycle mem_old superseded --target memory://mem_canonical
+```
+
+`promoted` writes `promoted_to: memory://…`; `superseded` writes
+`superseded_by: memory://…`. Both require `--target`; each lifecycle command re-indexes the
+registry. Doctor checks ID validity/duplication, lifecycle values, and missing lifecycle or
+`memory://` targets.
+
 ## SQLite model
 
 SQLite is rebuildable derived state:
@@ -419,9 +455,8 @@ stdlib + SQLite + Markdown + one CLI/Skill contract.
 1. `project add/remove` commands that edit `settings.json` safely instead of requiring
    manual JSON edits.
 2. Incremental sync using stored hashes/mtimes and an optional watcher.
-3. Stable `memory://...` identifiers/aliases for links that should survive file moves.
-4. Heading/chunk-level indexing and line-range citations.
-5. Optional semantic/hybrid search behind a local-only extra.
-6. Optional MCP adapter exposing the same `resolve/search/list/links/sync` contract.
-7. A conservative capture/consolidation workflow once manual file-first memory proves
+3. Heading/chunk-level indexing and line-range citations.
+4. Optional semantic/hybrid search behind a local-only extra.
+5. Optional MCP adapter exposing the same `resolve/search/list/links/sync` contract.
+6. A conservative capture/consolidation workflow once manual file-first memory proves
    useful in daily multi-agent work.

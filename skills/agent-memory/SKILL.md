@@ -38,6 +38,7 @@ agent-memory --json projects
 agent-memory --json tags --path "$PWD"
 agent-memory --json search "learnings agent server" --path "$PWD"
 agent-memory --json capture learning "Reusable lesson" --path "$PWD"
+agent-memory --json lifecycle mem_abc validated
 agent-memory --json links /abs/path/to/note.md
 agent-memory --json sync
 agent-memory --json snapshot
@@ -231,6 +232,40 @@ location:
 If only one root exists it remains the implicit default. `--root` is an explicit override.
 If multiple roots exist without `capture: true`, capture refuses to guess and `doctor`
 reports `capture_root_ambiguous`.
+
+## Lifecycle and stable memory identity
+
+Every successful capture writes an opaque `mem_<uuid>` frontmatter `id` and returns it as
+`memory_id`; its default lifecycle status is `raw`. Keep that ID when the same durable
+knowledge must be referenced across project roots or after the Markdown file moves. A
+Markdown link such as `[canonical rule](memory://mem_abc)` is a stable reference, and
+`agent-memory links mem_abc` resolves its outbound links and backlinks.
+
+Use lifecycle only when the knowledge's reuse status materially changes, not for ordinary
+edits, tag changes, or one-off notes. The states are:
+
+- `raw`: newly captured evidence that has not yet been independently confirmed;
+- `validated`: evidence whose guidance has worked or been checked again;
+- `promoted`: evidence retained as provenance but pointing at a canonical reusable memory;
+- `superseded`: an older or duplicate memory retained as provenance but replaced by a newer
+  canonical memory.
+
+The usual path is `raw` → `validated`; after repeated related evidence has been consolidated,
+create or identify the canonical memory, promote the evidence to it, and supersede the other
+duplicates to that same target. The command makes an explicit source edit and re-indexes:
+
+```sh
+# The capture result supplies mem_evidence and mem_canonical.
+agent-memory lifecycle mem_evidence validated
+agent-memory lifecycle mem_evidence promoted --target mem_canonical
+agent-memory lifecycle mem_old superseded --target memory://mem_canonical
+```
+
+`promoted` requires `--target` and writes `promoted_to: memory://…`; `superseded` likewise
+requires `--target` and writes `superseded_by: memory://…`. Doctor checks duplicate or
+malformed IDs, invalid lifecycle values, and unresolved lifecycle or `memory://` targets.
+Legacy Markdown without an ID remains valid; Doctor reports it as migration information,
+not a reason to manufacture lifecycle transitions.
 
 ## Recall before repeating work
 
