@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.8.0"
+    "version": "0.9.0"
   },
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, local file-first agent memory, team-lead orchestration, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
-      "version": "0.8.0",
+      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, local file-first agent memory with self-improvement capture, team-lead orchestration, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
+      "version": "0.9.0",
       "author": {
         "name": "atomlink-ye"
       },
@@ -28,6 +28,7 @@
         "./skills/paseo-companion",
         "./skills/team-lead-orchestration",
         "./skills/agent-memory",
+        "./skills/self-improvement",
         "./skills/figma-console",
         "./skills/workspace-org-prac"
       ]
