@@ -118,7 +118,7 @@ class AgentMemoryTests(unittest.TestCase):
         binding = am.resolve_binding(settings, self.project_a)
         self.assertEqual(tuple(location.path for location in binding.memory_roots), (self.memory_a,))
 
-    def test_hierarchical_tags_match_subtags_but_display_canonical_tag(self):
+    def test_hierarchical_tags_match_subtags_reverse_order_and_display_canonical_tag(self):
         note = self.memory_a / "operations.md"
         note.write_text(
             "---\ntitle: Deployment Operations\ntags: [project : operations : deploy]\n---\n\nDeployment operations runbook.\n",
@@ -134,12 +134,53 @@ class AgentMemoryTests(unittest.TestCase):
         by_parent_path = am.list_documents(self.conn, project="a", tags=["project:operations"])
         self.assertEqual(len(by_parent_path), 1)
 
+        by_reverse_path = am.list_documents(self.conn, project="a", tags=["deploy:project"])
+        self.assertEqual(len(by_reverse_path), 1)
+        self.assertIn("project:operations:deploy", by_reverse_path[0]["tags"])
+
         by_leaf = am.search_documents(self.conn, "runbook", project="a", tags=["DEPLOY"])
         self.assertEqual(len(by_leaf), 1)
         self.assertIn("project:operations:deploy", by_leaf[0]["tags"])
 
         partial = am.list_documents(self.conn, project="a", tags=["ops"])
         self.assertEqual(partial, [])
+
+    def test_normal_search_can_recall_hierarchical_tags_in_any_word_order(self):
+        note = self.memory_a / "learning.md"
+        note.write_text(
+            "---\ntitle: Durable Lesson\ntags: [agent-server:learnings]\n---\n\nPrefer the verified route before changing runtime code.\n",
+            encoding="utf-8",
+        )
+        self.sync()
+
+        hits = am.search_documents(self.conn, "learnings agent server", project="a")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("agent-server:learnings", hits[0]["tags"])
+
+        reversed_hits = am.search_documents(self.conn, "server learnings agent", project="a")
+        self.assertEqual(len(reversed_hits), 1)
+
+    def test_self_improvement_capture_writes_markdown_and_becomes_searchable(self):
+        binding = am.resolve_binding(self.settings, self.project_a)
+        captured = am.capture_memory(
+            binding,
+            "learning",
+            "Resolve the real project path before memory recall",
+            details="An orchestration CWD can own several sibling projects.",
+            suggested_action="Pass the target worktree through --path.",
+            tags=["memory:routing"],
+        )
+        captured_path = Path(captured["path"])
+        self.assertTrue(captured_path.is_file())
+        self.assertEqual(captured_path.parent, self.memory_a / "learnings")
+        self.assertIn("a:learnings", captured["tags"])
+        self.assertIn("self-improvement:learning", captured["tags"])
+
+        self.sync()
+        hits = am.search_documents(self.conn, "learnings", project="a")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(Path(hits[0]["path"]), captured_path)
+        self.assertIn("a:learnings", hits[0]["tags"])
 
 
 if __name__ == "__main__":
