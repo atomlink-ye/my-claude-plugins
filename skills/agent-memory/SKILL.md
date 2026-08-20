@@ -1,6 +1,6 @@
 ---
 name: agent-memory
-description: "TRIGGER — before non-trivial work or ‘have we seen this?’ questions, recall; before reporting a durable event, capture user corrections (‘no’, ‘actually’, ‘其实’), reusable bug fixes, drawbacks, proven better practices, or feature requests. SKIP only typos/transient failures, secrets, raw transcripts, or expiring trivia."
+description: "TRIGGER — before non-trivial work or ‘have we seen this?’ questions, recall; before reporting a durable event, capture user corrections (‘no’, ‘actually’, ‘其实’), reusable bug fixes, drawbacks, proven better practices, or feature requests. Use doctor when memory routing/index/link health is uncertain. SKIP only typos/transient failures, secrets, raw transcripts, or expiring trivia."
 ---
 
 # Agent Memory
@@ -26,7 +26,10 @@ on CWD:
 
 ```sh
 agent-memory --json status
+agent-memory --json doctor --path "$PWD"
 agent-memory --json resolve --path "$PWD"
+agent-memory --json projects
+agent-memory --json tags --path "$PWD"
 agent-memory --json search "learnings agent server" --path "$PWD"
 agent-memory --json capture learning "Reusable lesson" --path "$PWD"
 agent-memory --json links /abs/path/to/note.md
@@ -38,6 +41,37 @@ Before setup, the direct Python script remains an emergency fallback only.
 Search first requires every query term. When that has no result, it automatically retries
 with OR semantics so a natural-language symptom containing one absent word can still
 recall a relevant concise memory. Completely unrelated terms still return no result.
+
+## Health and discovery before recall
+
+Use `doctor` when setup may be stale, a link looks broken, capture routing is unclear, or
+an Agent has inherited an unfamiliar machine/workspace. It is read-only.
+
+`doctor` checks:
+
+- project binding duplication/ambiguity and reused project names;
+- missing/unreadable memory roots and writable capture/database locations;
+- ambiguous or duplicate `capture: true` roots;
+- SQLite `PRAGMA quick_check`;
+- indexed files that disappeared or changed since the last sync;
+- Markdown under configured roots that is not indexed yet;
+- dangling local Markdown links versus existing local files outside the memory graph;
+- deterministic tag case/separator collisions;
+- physical memory roots reused by multiple project scopes.
+
+`doctor --path <actual-worktree>` also reports the resolved project, binding, memory roots,
+and default capture root. Exit codes are `0=ok`, `1=warnings`, `2=errors`.
+
+Use discovery before guessing taxonomy:
+
+```sh
+agent-memory projects
+agent-memory tags --path /abs/path/to/project
+```
+
+`projects` reports configured project paths, roots, capture roots, and indexed document
+counts. `tags` reports canonical tags and usage counts and can be scoped with `--path` or
+`--project`.
 
 ## Scope before recall
 
@@ -142,8 +176,21 @@ Kinds are `learning`, `drawback`, `error`, and `feature-request`. Each capture:
 - accepts extra tags and related-file Markdown links;
 - runs `sync` immediately so the memory is searchable and backlinkable.
 
-Additional `--tag` values are additive. If the project has multiple memory roots, pass
-`--root` explicitly rather than guessing.
+When a project has multiple memory roots, mark exactly one root as the default capture
+location:
+
+```json
+{
+  "memory": [
+    {"path": "~/memory/agent-server", "capture": true, "tags": ["agent-server:knowledge"]},
+    {"path": "~/memory/shared-research", "tags": ["research"]}
+  ]
+}
+```
+
+If only one root exists it remains the implicit default. `--root` is an explicit override.
+If multiple roots exist without `capture: true`, capture refuses to guess and `doctor`
+reports `capture_root_ambiguous`.
 
 ## Recall before repeating work
 
@@ -175,13 +222,13 @@ memory scopes.
 
 ## Settings contract
 
-Default settings are `~/.agent-memory/settings.json`; the SQLite index defaults to
-`~/.agent-memory/index.sqlite3`. Override the settings file with `--settings` or
+Default settings are `~/.agent-memory/settings.json`; the SQLite index defaults beside the
+settings file as `index.sqlite3`. Override the settings file with `--settings` or
 `AGENT_MEMORY_SETTINGS`.
 
 Top-level binding paths must be absolute (or `~`-based). Nested `projects[].path` values
-may be relative to their parent. Each `memory` entry can be a path or `{path,tags}`. Child
-project memory does **not** inherit parent memory unless `inherit_memory: true` is
+may be relative to their parent. Each `memory` entry can be a path or `{path,tags,capture}`.
+Child project memory does **not** inherit parent memory unless `inherit_memory: true` is
 explicitly set. Binding tags inherit down the tree; root/frontmatter tags are additive.
 All three tag sources support the same `parent:child[:leaf]` hierarchy.
 
