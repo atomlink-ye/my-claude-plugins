@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).parents[3] / "skills" / "agent-memory" / "scripts" / "agent_memory.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 spec = importlib.util.spec_from_file_location("agent_memory", MODULE_PATH)
 am = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = am
