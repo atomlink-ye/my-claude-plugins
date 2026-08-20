@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
-from memory_config import MemoryError, MemoryRoot, SHARED_SCOPE, _dedupe, _expand_path, _normalize_tags
+from memory_config import MemoryError, MemoryRoot, SHARED_SCOPE, _dedupe, _expand_path, _normalize_tag, _normalize_tags
 
 MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]")
+
 
 def connect_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +236,23 @@ def _fts_query(text: str) -> str:
     return " AND ".join('"' + term.replace('"', '""') + '"' for term in terms)
 
 
+def _append_tag_filter(sql: str, params: list[Any], tag: str) -> str:
+    """Match a canonical hierarchical tag or any complete colon-delimited subpath.
+
+    Stored tags stay canonical (for example ``project:operations:deploy``). A filter such
+    as ``operations`` or ``project:operations`` matches by complete hierarchy segments,
+    never by an arbitrary substring such as ``ops``.
+    """
+    canonical = _normalize_tag(tag)
+    sql += """ AND EXISTS (
+        SELECT 1 FROM document_tags t
+        WHERE t.document_id=d.id
+          AND instr(':' || lower(t.tag) || ':', ':' || lower(?) || ':') > 0
+    )"""
+    params.append(canonical)
+    return sql
+
+
 def _doc_payload(conn: sqlite3.Connection, row: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
     doc_id = int(row["id"])
     payload: dict[str, Any] = {
@@ -270,8 +288,7 @@ def search_documents(
         sql += f" AND EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
         params.extend(scopes)
     for tag in tags:
-        sql += " AND EXISTS (SELECT 1 FROM document_tags t WHERE t.document_id=d.id AND t.tag=?)"
-        params.append(tag)
+        sql = _append_tag_filter(sql, params, tag)
     sql += " ORDER BY score LIMIT ?"
     params.append(limit)
     return [_doc_payload(conn, row, float(row["score"])) for row in conn.execute(sql, params)]
@@ -292,8 +309,7 @@ def list_documents(
         sql += f" AND EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
         params.extend(scopes)
     for tag in tags:
-        sql += " AND EXISTS (SELECT 1 FROM document_tags t WHERE t.document_id=d.id AND t.tag=?)"
-        params.append(tag)
+        sql = _append_tag_filter(sql, params, tag)
     sql += " ORDER BY d.mtime_ns DESC,d.path LIMIT ?"
     params.append(limit)
     return [_doc_payload(conn, row) for row in conn.execute(sql, params)]
