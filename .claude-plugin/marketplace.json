@@ -1,49 +1,18 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "my-claude-plugins",
-  "owner": {
-    "name": "atomlink-ye"
-  },
-  "metadata": {
-    "description": "Personal Claude Code plugin marketplace.",
-    "version": "0.9.0"
-  },
+  "owner": {"name": "atomlink-ye"},
+  "metadata": {"description": "Personal Claude Code plugin marketplace.", "version": "0.9.0"},
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, local file-first agent memory with built-in curated capture, team-lead orchestration, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
+      "description": "Bundle of skills including local file-first Agent Memory, MVE-first delivery routing, runtime companions, workspace organization, helpers, and Figma Desktop Bridge.",
       "version": "0.9.0",
-      "author": {
-        "name": "atomlink-ye"
-      },
+      "author": {"name": "atomlink-ye"},
       "source": "./",
       "strict": false,
-      "skills": [
-        "./skills/daytona-companion",
-        "./skills/sandbox-ctl",
-        "./skills/google-workspace",
-        "./skills/mcp-skill",
-        "./skills/mve-first-development",
-        "./skills/opencode-companion",
-        "./skills/paseo-companion",
-        "./skills/team-lead-orchestration",
-        "./skills/agent-memory",
-        "./skills/figma-console",
-        "./skills/workspace-org-prac"
-      ]
+      "skills": ["./skills/sandbox-ctl","./skills/google-workspace","./skills/mcp-skill","./skills/mve-first-development","./skills/opencode-companion","./skills/paseo-companion","./skills/agent-memory","./skills/figma-console","./skills/workspace-org-prac"]
     },
-    {
-      "name": "skill-creator",
-      "description": "Optional standalone skill for creating, evaluating, packaging, and improving Claude Code skills.",
-      "version": "0.3.0",
-      "author": {
-        "name": "atomlink-ye"
-      },
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/skill-creator"
-      ]
-    }
+    {"name":"skill-creator","description":"Optional standalone skill for creating, evaluating, packaging, and improving Claude Code skills.","version":"0.3.0","author":{"name":"atomlink-ye"},"source":"./","strict":false,"skills":["./skills/skill-creator"]}
   ]
 }
