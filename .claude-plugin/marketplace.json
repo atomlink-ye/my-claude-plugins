@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "my-skills",
-      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, team-lead orchestration, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
+      "description": "Bundle of skills in this marketplace: MVE-first delivery routing, local runtime companions, workspace organization practice, helpers, and the schema-first Figma Desktop Bridge adapter.",
       "version": "0.7.0",
       "author": {
         "name": "atomlink-ye"
@@ -19,14 +19,12 @@
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/daytona-companion",
         "./skills/sandbox-ctl",
         "./skills/google-workspace",
         "./skills/mcp-skill",
         "./skills/mve-first-development",
         "./skills/opencode-companion",
         "./skills/paseo-companion",
-        "./skills/team-lead-orchestration",
         "./skills/figma-console",
         "./skills/workspace-org-prac"
       ]
