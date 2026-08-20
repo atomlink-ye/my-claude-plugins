@@ -10,6 +10,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 |-------|-------------|
 | [mve-first-development](skills/mve-first-development/) | Shape/Probe/Prove/Protect/Harden stage router for early product delivery; defaults to a real minimum verifiable E2E slice before contract freezing or production hardening |
 | [team-lead-orchestration](skills/team-lead-orchestration/) | Runtime-neutral principles for the team-lead role: lead/lane split, bounded execution lanes, and acceptance gates |
+| [agent-memory](skills/agent-memory/) | Local file-first Agent Memory registry: nested project routing, Markdown source files, SQLite FTS5 search, tags, and links/backlinks across projects |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
@@ -39,7 +40,10 @@ Companion skills expose direct script entrypoints:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new --directory "$WORK_DIR" -- "<prompt>"
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" status --directory "$WORK_DIR"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "query" --path "$WORK_DIR"
 ```
+
+The Agent Memory design and settings contract are documented in [docs/agent-memory.md](docs/agent-memory.md).
 
 ## Installation
 
@@ -108,10 +112,11 @@ Per-skill triggers, outcomes, smoke and unit tests live under [`eval/<skill>/`](
 # Trigger eval for one skill (default runner: `claude`)
 eval/_shared/run-trigger-eval.sh opencode-companion
 
-# Smoke tests (offline-safe)
+# Smoke/unit tests (offline-safe)
 eval/opencode-companion/tests/smoke.sh
 eval/daytona-companion/tests/smoke.sh
 eval/paseo-companion/tests/smoke.sh
+python3 -m unittest discover -s eval/agent-memory/tests -p 'test_*.py'
 ```
 
 If you want eval runs to use a different Anthropic-compatible endpoint (e.g. an overflow-quota wrapper), point `EVAL_RUNNER` at your own wrapper executable. See [`eval/_shared/README.md`](eval/_shared/README.md) for the layout, the runner contract, and the coverage plan across skills.
