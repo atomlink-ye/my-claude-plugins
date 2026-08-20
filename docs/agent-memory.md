@@ -27,6 +27,8 @@ answers: *which durable files are relevant, where are they, and how are they rel
 - Child projects do not inherit parent memory unless `inherit_memory: true` is explicit.
 - Shared/domain memory can be visible to every project without merging project-specific
   scopes.
+- Tags can be hierarchical (`parent:child[:leaf]`) while remaining searchable by any
+  complete subtag/segment such as `child`; results preserve the full canonical tag.
 - Standard Markdown links create a local graph; outbound links and inbound backlinks can
   cross project boundaries.
 - The CLI returns compact briefs and absolute file paths first; agents open the actual file
@@ -77,7 +79,7 @@ Default path: `~/.agent-memory/settings.json`.
   "shared": [
     {
       "path": "~/memory/shared",
-      "tags": ["shared", "domain"]
+      "tags": ["shared:domain"]
     }
   ],
   "bindings": [
@@ -93,7 +95,7 @@ Default path: `~/.agent-memory/settings.json`.
           "memory": [
             {
               "path": "~/memory/agent-server",
-              "tags": ["project-memory", "decisions"]
+              "tags": ["agent-server:knowledge", "knowledge:decisions"]
             }
           ],
           "tags": ["agent-server"]
@@ -102,13 +104,13 @@ Default path: `~/.agent-memory/settings.json`.
           "path": "experiments/ui-a",
           "project": "ui-a",
           "memory": ["~/memory/ui-a"],
-          "tags": ["prototype"]
+          "tags": ["prototype:ui"]
         },
         {
           "path": "experiments/ui-b",
           "project": "ui-b",
           "memory": ["~/memory/ui-b"],
-          "tags": ["prototype"]
+          "tags": ["prototype:ui"]
         }
       ]
     }
@@ -142,6 +144,55 @@ This makes the common multi-project workspace safe by default:
 Project A and B do not see each other's project memory simply because the agent was
 launched from `~/workspace`.
 
+## Hierarchical tags
+
+Tags from bindings, memory roots, and Markdown frontmatter all support a colon-delimited
+hierarchy:
+
+```text
+agent-server:operations
+agent-server:architecture
+agent-server:operations:deploy
+workflow:review
+```
+
+The stored value is always the full canonical tag. Whitespace around hierarchy separators
+is normalized, so `agent-server : operations` becomes `agent-server:operations` during
+indexing/config resolution. Empty hierarchy segments such as `agent-server::operations`
+are rejected.
+
+Tag filtering works on complete colon-delimited segments/subpaths, case-insensitively:
+
+```text
+stored tag: agent-server:operations:deploy
+
+--tag operations                 -> match
+--tag deploy                     -> match
+--tag agent-server:operations    -> match
+--tag OPERATIONS                 -> match
+--tag ops                        -> no match
+```
+
+The important display rule is that a subtag is a **lookup alias, not a second stored tag**.
+A query by `--tag operations` still returns:
+
+```json
+{
+  "tags": ["agent-server:operations:deploy"]
+}
+```
+
+It does not return or persist an extra flat `operations` tag. This preserves the context
+that the operations knowledge belongs under `agent-server`.
+
+When several `--tag` arguments are supplied, they are ANDed. For example,
+`--tag operations --tag runbook` requires a document to have a canonical tag containing
+`operations` and another (or the same hierarchical tag) containing `runbook` as complete
+segments.
+
+Hierarchical tags are classification only. They do not change project scope, shared
+visibility, or the longest-prefix binding rules.
+
 ## Markdown memory format
 
 Any `.md` file under a configured memory root is indexed. Frontmatter is optional. The MVE
@@ -149,18 +200,19 @@ supports `title`, `brief`, and `tags` in a deliberately small YAML-like subset:
 
 ```md
 ---
-title: Agent Team Playback Decisions
-brief: Durable decisions about timeline, swimlane, and historical replay UX.
-tags: [frontend, agent-teams, decisions]
+title: Agent Team Operations
+brief: Durable operating knowledge for Agent Teams deployment and maintenance.
+tags: [agent-server:operations, knowledge:runbook]
 ---
 
-# Agent Team Playback Decisions
+# Agent Team Operations
 
 ...
 ```
 
 If `title` is absent, the first H1 (or filename) is used. If `brief` is absent, the first
-non-heading paragraph is used. Tags from settings and frontmatter are merged.
+non-heading paragraph is used. Tags from settings and frontmatter are merged and kept in
+canonical hierarchical form.
 
 Project scope is controlled by settings rather than file frontmatter. A note cannot place
 itself into another project's search scope by declaring a metadata field.
@@ -213,7 +265,7 @@ document_scopes
   document_id, scope
 
 document_tags
-  document_id, tag
+  document_id, tag          # full canonical hierarchy only
 
 document_fts (FTS5)
   rowid -> title, brief, content
@@ -224,6 +276,9 @@ links
   target_document_id?   # null when dangling/not indexed
   href, label, anchor
 ```
+
+Subtag lookup does not need duplicate rows or a second alias table in the MVE. Filtering
+matches complete `:`-delimited segments against the canonical value in `document_tags`.
 
 The same physical document can have multiple scopes when a memory root is intentionally
 reused or inherited. This is represented in `document_scopes` rather than duplicating the
@@ -246,8 +301,9 @@ agent-memory --json sync
 
 # project-safe recall; shared memory is included
 agent-memory --json search "sandbox filesystem" --path ~/workspace/agent-server
-agent-memory --json search "timeline replay" --project agent-server --tag frontend
-agent-memory --json list --path ~/workspace/agent-server --tag decisions
+agent-memory --json search "deployment" --project agent-server --tag operations
+agent-memory --json search "deployment" --project agent-server --tag agent-server:operations
+agent-memory --json list --path ~/workspace/agent-server --tag architecture
 
 # deliberately global/cross-project recall
 agent-memory --json search "review workflow"
@@ -266,8 +322,8 @@ The intended progressive-disclosure loop is:
 ```text
 actual work path
   -> resolve project
-  -> scoped search/list
-  -> brief + absolute source path
+  -> scoped search/list (+ optional hierarchical tag filters)
+  -> brief + absolute source path + canonical full tags
   -> open/read the Markdown file
   -> act
   -> edit/create/delete Markdown only when durable knowledge changes
