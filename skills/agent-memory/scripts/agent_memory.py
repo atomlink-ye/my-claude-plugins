@@ -20,14 +20,7 @@ from memory_config import (
     resolve_binding,
     shared_roots,
 )
-from memory_store import (
-    connect_db,
-    link_graph,
-    list_documents,
-    search_documents,
-    status,
-    sync_index,
-)
+from memory_store import connect_db, link_graph, list_documents, search_documents, status, sync_index
 
 
 def _human_documents(items: list[dict[str, object]]) -> None:
@@ -46,13 +39,11 @@ def _human_projects(items: list[dict[str, object]]) -> None:
     for item in items:
         print(f"{item['project']}  documents={item['documents']}")
         print(f"  path: {item['path']}")
-        capture = item.get("capture_root")
-        if capture:
-            print(f"  capture: {capture}")
-        roots = item.get("memory_roots", [])
-        if roots:
+        if item.get("capture_root"):
+            print(f"  capture: {item['capture_root']}")
+        if item.get("memory_roots"):
             print("  memory:")
-            for root in roots:
+            for root in item["memory_roots"]:
                 print(f"    - {root}")
 
 
@@ -89,6 +80,35 @@ def _human_doctor(result: dict[str, object]) -> None:
         print("\nNo problems found.")
 
 
+def _doctor_failure(code: str, message: str, path: Path | None = None) -> dict[str, object]:
+    finding: dict[str, object] = {"code": code, "severity": "error", "message": message}
+    if path is not None:
+        finding["paths"] = [str(path)]
+    return {
+        "status": "error",
+        "summary": {
+            "errors": 1,
+            "warnings": 0,
+            "info": 0,
+            "bindings": 0,
+            "documents": 0,
+            "dangling_links": 0,
+            "unindexed_markdown": 0,
+            "stale_documents": 0,
+        },
+        "resolved": None,
+        "checks": [finding],
+    }
+
+
+def _emit_doctor(result: dict[str, object], as_json: bool) -> int:
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        _human_doctor(result)
+    return 2 if result["status"] == "error" else 1 if result["status"] == "warn" else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-memory", description="Local file-first memory registry")
     parser.add_argument("--settings", type=Path, default=default_settings_path(), help="settings.json path")
@@ -97,7 +117,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="create an empty settings.json")
     init.add_argument("--force", action="store_true")
-
     sub.add_parser("status", help="show registry status")
     sub.add_parser("sync", help="re-index all configured Markdown roots")
 
@@ -149,13 +168,43 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings_path = args.settings.expanduser().resolve(strict=False)
 
-    try:
-        if args.command == "init":
+    if args.command == "init":
+        try:
             init_settings(settings_path, args.force)
             result = {"settings": str(settings_path)}
             print(json.dumps(result, indent=2) if args.json else f"created {settings_path}")
             return 0
+        except (MemoryError, OSError) as exc:
+            print(f"agent-memory: {exc}", file=sys.stderr)
+            return 2
 
+    # Doctor must diagnose bad/missing setup without creating or mutating the index.
+    if args.command == "doctor":
+        try:
+            settings = load_settings(settings_path)
+        except (MemoryError, OSError) as exc:
+            return _emit_doctor(_doctor_failure("settings_invalid", str(exc), settings_path), args.json)
+        try:
+            db_path = database_path(settings, settings_path)
+        except MemoryError as exc:
+            return _emit_doctor(_doctor_failure("database_path_invalid", str(exc), settings_path), args.json)
+        if not db_path.exists():
+            return _emit_doctor(
+                _doctor_failure("database_missing", "SQLite index does not exist; run agent-memory sync first", db_path),
+                args.json,
+            )
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                result = doctor(conn, settings, settings_path, db_path, args.path)
+            finally:
+                conn.close()
+            return _emit_doctor(result, args.json)
+        except (MemoryError, OSError, sqlite3.Error) as exc:
+            return _emit_doctor(_doctor_failure("doctor_failed", str(exc), db_path), args.json)
+
+    try:
         settings = load_settings(settings_path)
         db_path = database_path(settings, settings_path)
         conn = connect_db(db_path)
@@ -171,10 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                     "path": str(args.path.resolve(strict=False)),
                     "project": binding.project,
                     "binding": str(binding.path),
-                    "memory": [
-                        {"path": str(location.path), "tags": list(location.tags)}
-                        for location in binding.memory_roots
-                    ],
+                    "memory": [{"path": str(location.path), "tags": list(location.tags)} for location in binding.memory_roots],
                     "capture_root": str(preferred) if preferred else (str(binding.memory_roots[0].path) if len(binding.memory_roots) == 1 else None),
                     "shared": [str(root.path) for root in shared_roots(settings, settings_path)],
                     "tags": list(binding.tags),
@@ -186,10 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.path:
                     project = resolve_binding(settings, args.path).project
                 include_shared = not args.no_shared
-                if args.command == "search":
-                    result = search_documents(conn, args.query, project, args.tag, args.limit, include_shared)
-                else:
-                    result = list_documents(conn, project, args.tag, args.limit, include_shared)
+                result = search_documents(conn, args.query, project, args.tag, args.limit, include_shared) if args.command == "search" else list_documents(conn, project, args.tag, args.limit, include_shared)
             elif args.command == "links":
                 result = link_graph(conn, args.document)
             elif args.command == "capture":
@@ -216,8 +259,6 @@ def main(argv: list[str] | None = None) -> int:
                 if args.path:
                     project = resolve_binding(settings, args.path).project
                 result = tag_inventory(conn, project, not args.no_shared)
-            elif args.command == "doctor":
-                result = doctor(conn, settings, settings_path, db_path, args.path)
             else:
                 parser.error("unknown command")
                 return 2
@@ -239,13 +280,8 @@ def main(argv: list[str] | None = None) -> int:
                 _human_projects(result)
             elif args.command == "tags":
                 _human_tags(result)
-            elif args.command == "doctor":
-                _human_doctor(result)
             else:
                 print(json.dumps(result, indent=2, ensure_ascii=False))
-
-            if args.command == "doctor":
-                return 2 if result["status"] == "error" else 1 if result["status"] == "warn" else 0
             return 0
         finally:
             conn.close()
