@@ -8,6 +8,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from memory_admin import doctor, preferred_capture_root, project_inventory, tag_inventory
 from memory_capture import KINDS, capture_memory
 from memory_config import (
     MemoryError,
@@ -39,6 +40,53 @@ def _human_documents(items: list[dict[str, object]]) -> None:
             print(f"  {item['brief']}")
         print(f"  path: {item['path']}")
         print(f"  projects: {scopes or '-'}  tags: {tags or '-'}")
+
+
+def _human_projects(items: list[dict[str, object]]) -> None:
+    for item in items:
+        print(f"{item['project']}  documents={item['documents']}")
+        print(f"  path: {item['path']}")
+        capture = item.get("capture_root")
+        if capture:
+            print(f"  capture: {capture}")
+        roots = item.get("memory_roots", [])
+        if roots:
+            print("  memory:")
+            for root in roots:
+                print(f"    - {root}")
+
+
+def _human_tags(items: list[dict[str, object]]) -> None:
+    for item in items:
+        print(f"{item['tag']}  {item['count']}")
+
+
+def _human_doctor(result: dict[str, object]) -> None:
+    print("Agent Memory Doctor")
+    resolved = result.get("resolved")
+    if isinstance(resolved, dict):
+        print(f"\nResolved project: {resolved['project']}")
+        print(f"  binding: {resolved['binding']}")
+        print(f"  capture: {resolved.get('capture_root') or '-'}")
+    summary = result["summary"]
+    print("\nSummary")
+    print(
+        f"  status={result['status']} errors={summary['errors']} warnings={summary['warnings']} "
+        f"info={summary['info']} documents={summary['documents']} bindings={summary['bindings']}"
+    )
+    checks = result.get("checks", [])
+    if checks:
+        print("\nFindings")
+        marker = {"error": "ERROR", "warning": "WARN", "info": "INFO"}
+        for item in checks:
+            scope = f" project={item['project']}" if item.get("project") else ""
+            print(f"  {marker[item['severity']]} {item['code']}{scope}: {item['message']}")
+            for path in item.get("paths", []):
+                print(f"    {path}")
+            if item.get("suggested_action"):
+                print(f"    action: {item['suggested_action']}")
+    else:
+        print("\nNo problems found.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,7 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--action", default="", help="suggested follow-up action")
     capture.add_argument("--tag", action="append", default=[])
     capture.add_argument("--related", action="append", default=[], help="related local file path; repeatable")
-    capture.add_argument("--root", help="configured memory root to use when the project has multiple roots")
+    capture.add_argument("--root", help="configured memory root override")
+
+    sub.add_parser("projects", help="list configured projects, roots, and indexed document counts")
+
+    tags = sub.add_parser("tags", help="list canonical indexed tags and usage counts")
+    tags.add_argument("--project")
+    tags.add_argument("--path", type=Path)
+    tags.add_argument("--no-shared", action="store_true")
+
+    check = sub.add_parser("doctor", help="diagnose settings, routing, filesystem, index, links, and capture health")
+    check.add_argument("--path", type=Path, help="also resolve and diagnose one actual project/worktree path")
     return parser
 
 
@@ -108,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = sync_index(conn, collect_memory_roots(settings, settings_path))
             elif args.command == "resolve":
                 binding = resolve_binding(settings, args.path)
+                preferred = preferred_capture_root(settings, binding)
                 result = {
                     "path": str(args.path.resolve(strict=False)),
                     "project": binding.project,
@@ -116,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                         {"path": str(location.path), "tags": list(location.tags)}
                         for location in binding.memory_roots
                     ],
+                    "capture_root": str(preferred) if preferred else (str(binding.memory_roots[0].path) if len(binding.memory_roots) == 1 else None),
                     "shared": [str(root.path) for root in shared_roots(settings, settings_path)],
                     "tags": list(binding.tags),
                 }
@@ -134,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = link_graph(conn, args.document)
             elif args.command == "capture":
                 binding = resolve_binding(settings, args.path)
+                preferred = preferred_capture_root(settings, binding)
+                root = args.root or (str(preferred) if preferred else None)
                 result = capture_memory(
                     binding,
                     args.kind,
@@ -142,9 +204,20 @@ def main(argv: list[str] | None = None) -> int:
                     suggested_action=args.action,
                     tags=args.tag,
                     related=args.related,
-                    root=args.root,
+                    root=root,
                 )
                 result["sync"] = sync_index(conn, collect_memory_roots(settings, settings_path))
+            elif args.command == "projects":
+                result = project_inventory(conn, settings)
+            elif args.command == "tags":
+                if args.project and args.path:
+                    raise MemoryError("use either --project or --path, not both")
+                project = args.project
+                if args.path:
+                    project = resolve_binding(settings, args.path).project
+                result = tag_inventory(conn, project, not args.no_shared)
+            elif args.command == "doctor":
+                result = doctor(conn, settings, settings_path, db_path, args.path)
             else:
                 parser.error("unknown command")
                 return 2
@@ -162,8 +235,17 @@ def main(argv: list[str] | None = None) -> int:
                 print("inbound:")
                 for link in result["inbound"]:
                     print(f"  - {link['title']} <- {link['path']}")
+            elif args.command == "projects":
+                _human_projects(result)
+            elif args.command == "tags":
+                _human_tags(result)
+            elif args.command == "doctor":
+                _human_doctor(result)
             else:
                 print(json.dumps(result, indent=2, ensure_ascii=False))
+
+            if args.command == "doctor":
+                return 2 if result["status"] == "error" else 1 if result["status"] == "warn" else 0
             return 0
         finally:
             conn.close()
