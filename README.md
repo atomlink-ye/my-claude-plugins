@@ -10,7 +10,8 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 |-------|-------------|
 | [mve-first-development](skills/mve-first-development/) | Shape/Probe/Prove/Protect/Harden stage router for early product delivery; defaults to a real minimum verifiable E2E slice before contract freezing or production hardening |
 | [team-lead-orchestration](skills/team-lead-orchestration/) | Runtime-neutral principles for the team-lead role: lead/lane split, bounded execution lanes, and acceptance gates |
-| [agent-memory](skills/agent-memory/) | Local file-first Agent Memory registry: nested project routing, Markdown source files, SQLite FTS5 search, tags, and links/backlinks across projects |
+| [agent-memory](skills/agent-memory/) | Local file-first Agent Memory registry: nested project routing, Markdown source files, SQLite FTS5/tag-aware search, hierarchical tags, capture, and links/backlinks across projects |
+| [self-improvement](skills/self-improvement/) | Capture policy for learnings, drawbacks, errors, corrections, and feature requests; persists them through Agent Memory instead of a CWD-local `.learnings/` silo |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
@@ -40,7 +41,8 @@ Companion skills expose direct script entrypoints:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new --directory "$WORK_DIR" -- "<prompt>"
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" status --directory "$WORK_DIR"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "query" --path "$WORK_DIR"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "learnings agent server" --path "$WORK_DIR"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json capture learning "Reusable learning" --path "$WORK_DIR"
 ```
 
 The Agent Memory design and settings contract are documented in [docs/agent-memory.md](docs/agent-memory.md).
