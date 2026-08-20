@@ -4,12 +4,13 @@
   "description": "Personal Claude Code plugin marketplace.",
   "type": "module",
   "bin": {
+    "agent-memory": "./skills/agent-memory/scripts/agent_memory.py",
     "sandbox-ctl": "./skills/sandbox-ctl/scripts/sandbox-ctl.mjs"
   },
   "scripts": {
     "test": "pnpm run test:js && pnpm run test:python",
     "test:js": "vitest run",
-    "test:python": "python3 -m unittest discover -s eval/skill-creator/tests -p 'test_*.py'",
+    "test:python": "python3 -m unittest discover -s eval/skill-creator/tests -p 'test_*.py' && python3 -m unittest discover -s eval/agent-memory/tests -p 'test_*.py'",
     "test:watch": "vitest",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
