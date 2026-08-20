@@ -55,7 +55,8 @@ an Agent has inherited an unfamiliar machine/workspace. It is read-only.
 - SQLite `PRAGMA quick_check`;
 - indexed files that disappeared or changed since the last sync;
 - Markdown under configured roots that is not indexed yet;
-- dangling local Markdown links versus existing local files outside the memory graph;
+- dangling local Markdown links (including targets deleted after sync) versus existing local
+  files outside the memory graph;
 - deterministic tag case/separator collisions;
 - physical memory roots reused by multiple project scopes.
 

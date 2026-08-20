@@ -102,6 +102,23 @@ class AgentMemoryAdminTests(unittest.TestCase):
         self.assertIn("links_external_local", codes)
         self.assertEqual(result["summary"]["dangling_links"], 1)
 
+    def test_doctor_reports_link_target_deleted_after_sync(self):
+        target = self.memory / "target.md"
+        target.write_text("# Target\n", encoding="utf-8")
+        (self.memory / "source.md").write_text(
+            "# Source\n\n[target](target.md)\n",
+            encoding="utf-8",
+        )
+        self.sync()
+        target.unlink()
+
+        result = doctor(self.conn, self.settings, self.settings_path, self.db_path)
+
+        missing = [item for item in result["checks"] if item["code"] == "link_target_missing"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(Path(missing[0]["paths"][0]), target)
+        self.assertEqual(result["summary"]["dangling_links"], 1)
+
     def test_doctor_reports_multiple_capture_roots_as_error(self):
         data = json.loads(self.settings_path.read_text(encoding="utf-8"))
         data["bindings"][0]["memory"][1]["capture"] = True

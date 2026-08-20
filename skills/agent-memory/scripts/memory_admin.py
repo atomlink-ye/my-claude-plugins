@@ -184,13 +184,16 @@ def doctor(conn: sqlite3.Connection, settings: dict[str, Any], settings_path: Pa
 
     dangling = 0
     external_local = 0
-    for row in conn.execute("SELECT target_path FROM links WHERE target_document_id IS NULL"):
+    # Check the filesystem for every local link, not only links that were unresolved
+    # when the last sync ran. A previously indexed target can be deleted afterwards;
+    # its stored target_document_id remains non-null until sync removes that document.
+    for row in conn.execute("SELECT target_path,target_document_id FROM links"):
         target = Path(row["target_path"])
-        if target.exists():
-            external_local += 1
-        else:
+        if not target.exists():
             dangling += 1
             findings.append(_finding("link_target_missing", "warning", "local Markdown link target does not exist", paths=[target]))
+        elif row["target_document_id"] is None:
+            external_local += 1
     if external_local:
         findings.append(_finding("links_external_local", "info", f"{external_local} local link(s) point to existing files outside the indexed memory graph"))
 

@@ -40,8 +40,8 @@ Doctor currently checks:
 - indexed files that disappeared;
 - indexed files whose mtime/size changed since the last sync;
 - Markdown files under configured roots that are not indexed;
-- unresolved local links, distinguishing missing targets from existing local files outside
-  the indexed memory graph;
+- local links whose targets are missing (including targets deleted after the last sync),
+  distinguishing them from existing local files outside the indexed memory graph;
 - deterministic tag case and hyphen/underscore collisions.
 
 Warnings about stale/unindexed files recommend `agent-memory sync`; Doctor does not run it
