@@ -123,6 +123,20 @@ class AgentMemoryOutputTests(unittest.TestCase):
     def test_output_flags_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
             am.build_parser().parse_args(["--json", "--table", "status"])
+        with self.assertRaises(SystemExit):
+            self.run_cli("--table", "tags", "--json")
+
+    def test_output_flags_work_before_or_after_the_subcommand(self):
+        cases = [
+            ("tags", "--table"),
+            ("search", "Source", "--table"),
+            ("--table", "tags"),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                code, output = self.run_cli(*args)
+                self.assertEqual(code, 0)
+                self.assertIn("┌", output)
 
     def test_yaml_round_trip_when_pyyaml_is_available(self):
         try:
