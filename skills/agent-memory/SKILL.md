@@ -1,6 +1,6 @@
 ---
 name: agent-memory
-description: "Use when durable local knowledge may exist outside the current CWD or across multiple projects. Resolve the active project from ~/.agent-memory/settings.json, search the file-first SQLite index, capture durable learnings, open/edit returned Markdown sources, and inspect links/backlinks without copying memory into the current repo."
+description: "TRIGGER — before non-trivial work or ‘have we seen this?’ questions, recall; before reporting a durable event, capture user corrections (‘no’, ‘actually’, ‘其实’), reusable bug fixes, drawbacks, proven better practices, or feature requests. SKIP only typos/transient failures, secrets, raw transcripts, or expiring trivia."
 ---
 
 # Agent Memory
@@ -98,9 +98,30 @@ wikilinks are also indexed. Run `sync` after manually creating, moving, deleting
 materially editing files, and use `links <file>` when backlinks or cross-project
 dependencies matter.
 
-## Structured self-improvement capture
+## Capture policy
 
-`capture` is the write path used by the bundled `self-improvement` skill:
+Agent Memory owns both recall and the judgment to capture durable, curated knowledge. Do
+not create a separate project-local `.learnings/` database or assume the current CWD owns
+the learning. Agent Memory resolves the actual project, writes Markdown into that
+project's configured memory root, and indexes it for later cross-CWD recall and linking.
+
+### Capture when the signal is durable
+
+Capture one concise memory when any of these materially changes how future work should be
+done:
+
+- the user corrects an incorrect assumption or result → `learning`
+- a better recurring approach is discovered → `learning`
+- an architectural/tool/workflow drawback becomes clear → `drawback`
+- a command, integration, API, or runtime fails in a reusable way → `error`
+- the user requests a missing reusable capability → `feature-request`
+
+Do not capture routine transient failures, secrets, raw transcripts, noisy debugging
+output, or facts that will obviously expire immediately.
+
+### Write through `agent-memory capture`
+
+Pass the actual project/worktree path rather than trusting the process CWD:
 
 ```sh
 agent-memory --json capture drawback \
@@ -112,7 +133,7 @@ agent-memory --json capture drawback \
   --related /abs/path/to/project/docs/sandbox.md
 ```
 
-Supported kinds are `learning`, `drawback`, `error`, and `feature-request`. Each capture:
+Kinds are `learning`, `drawback`, `error`, and `feature-request`. Each capture:
 
 - resolves the project from the actual `--path`;
 - writes one standalone Markdown file under `learnings/`, `drawbacks/`, `errors/`, or `feature-requests/` inside the project's memory root;
@@ -121,12 +142,36 @@ Supported kinds are `learning`, `drawback`, `error`, and `feature-request`. Each
 - accepts extra tags and related-file Markdown links;
 - runs `sync` immediately so the memory is searchable and backlinkable.
 
-If the resolved project has multiple memory roots, `capture` refuses to guess and requires
-`--root` to name one of the configured roots.
+Additional `--tag` values are additive. If the project has multiple memory roots, pass
+`--root` explicitly rather than guessing.
 
-The capture policy itself lives in `skills/self-improvement/SKILL.md`. Agent Memory owns
-storage, routing, indexing, and references; Self Improvement owns the trigger/curation
-policy.
+## Recall before repeating work
+
+Normal Agent Memory search is tag-aware. These all intentionally converge on the same
+canonical project learning:
+
+```sh
+agent-memory search "learnings agent server" --path /abs/path/to/agent-server
+agent-memory list --path /abs/path/to/agent-server --tag learnings
+agent-memory list --path /abs/path/to/agent-server --tag learnings:agent-server
+```
+
+A stored tag such as `agent-server:learnings` is displayed in full even when the query is
+reversed or uses only the `learnings` segment. Tag order is a classification convention,
+not a recall requirement.
+
+## Promote instead of duplicating
+
+A captured learning starts as evidence, not automatically as a global rule. When it is
+repeatedly useful:
+
+1. keep the original learning Markdown as provenance;
+2. update the canonical workflow/domain/architecture document that should own the rule;
+3. link the learning to that document with a normal Markdown link;
+4. use `agent-memory links` to retain the backlink trail.
+
+This lets multiple projects cite shared domain knowledge without flattening their project
+memory scopes.
 
 ## Settings contract
 

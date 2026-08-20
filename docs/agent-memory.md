@@ -5,7 +5,7 @@
 Coding agents are often launched from a workspace, task bundle, or orchestration root
 that is not the repository they are currently working on. A single launch directory may
 control several unrelated projects. CWD-scoped memory (`CLAUDE.md`, `.memory/`, or a
-project-local self-improvement skill) therefore creates two failure modes:
+project-local capture workflow) therefore creates two failure modes:
 
 1. **missed memory** — useful durable knowledge lives in another project or domain folder;
 2. **cross-project leakage** — an agent launched above projects A and B accidentally uses
@@ -44,7 +44,7 @@ answers: *which durable files are relevant, where are they, and how are they rel
 - Background filesystem watchers.
 - Conflict resolution or multi-device sync.
 - A graph database or transitive graph reasoning.
-- Automatic consolidation, decay, scoring, or self-improvement policies.
+- Automatic consolidation, decay, or scoring policies.
 - MCP as the primary transport. The CLI is the stable core; MCP can be an adapter later.
 
 ## Local layout

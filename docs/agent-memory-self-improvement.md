@@ -1,10 +1,11 @@
-# Agent Memory + Self Improvement
+# Agent Memory Curation and Capture Design
 
-The Self Improvement workflow is implemented as a policy layer over Agent Memory rather than a second local memory store.
+Agent Memory includes curation and capture policy rather than delegating it to a second
+local memory store or a separate skill.
 
 ## Responsibilities
 
-- `self-improvement` decides when a failure, correction, drawback, knowledge gap, better recurring approach, or feature request is durable enough to capture.
+- `agent-memory` decides when a failure, correction, drawback, knowledge gap, better recurring approach, or feature request is durable enough to capture.
 - `agent-memory capture` resolves the actual project/worktree path, chooses the configured project memory root, writes Markdown, adds canonical tags, links related files, and immediately refreshes the SQLite index.
 - Agent Memory search and backlinks make those captures reusable from other CWDs and referenceable from shared/domain knowledge.
 

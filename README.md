@@ -10,8 +10,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 |-------|-------------|
 | [mve-first-development](skills/mve-first-development/) | Shape/Probe/Prove/Protect/Harden stage router for early product delivery; defaults to a real minimum verifiable E2E slice before contract freezing or production hardening |
 | [team-lead-orchestration](skills/team-lead-orchestration/) | Runtime-neutral principles for the team-lead role: lead/lane split, bounded execution lanes, and acceptance gates |
-| [agent-memory](skills/agent-memory/) | Local file-first Agent Memory registry: nested project routing, Markdown source files, SQLite FTS5/tag-aware search, hierarchical tags, capture, and links/backlinks across projects |
-| [self-improvement](skills/self-improvement/) | Capture policy for learnings, drawbacks, errors, corrections, and feature requests; persists them through Agent Memory instead of a CWD-local `.learnings/` silo |
+| [agent-memory](skills/agent-memory/) | Local file-first Agent Memory: project routing, curated capture policy, Markdown sources, SQLite FTS5/tag-aware search, hierarchical tags, and links/backlinks across projects |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [daytona-companion](skills/daytona-companion/) | Daytona sandbox lifecycle, global project-scoped state, and artifact workflows |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
@@ -49,7 +48,7 @@ agent-memory --json capture learning "Reusable learning" --path "$WORK_DIR"
 Agent Memory documentation:
 
 - [docs/agent-memory.md](docs/agent-memory.md) — core design and settings contract.
-- [docs/agent-memory-self-improvement.md](docs/agent-memory-self-improvement.md) — Self Improvement integration, symmetric tag recall, and capture layout.
+- [docs/agent-memory-self-improvement.md](docs/agent-memory-self-improvement.md) — Agent Memory curation, symmetric tag recall, and capture layout design.
 
 ## Installation
 
