@@ -196,12 +196,13 @@ visibility, or the longest-prefix binding rules.
 ## Markdown memory format
 
 Any `.md` file under a configured memory root is indexed. Frontmatter is optional. The MVE
-supports `title`, `brief`, and `tags` in a deliberately small YAML-like subset:
+supports `title`, `brief`, `type`, and `tags` in a deliberately small YAML-like subset:
 
 ```md
 ---
 title: Agent Team Operations
 brief: Durable operating knowledge for Agent Teams deployment and maintenance.
+type: reference
 tags: [agent-server:operations, knowledge:runbook]
 ---
 
@@ -213,6 +214,10 @@ tags: [agent-server:operations, knowledge:runbook]
 If `title` is absent, the first H1 (or filename) is used. If `brief` is absent, the first
 non-heading paragraph is used. Tags from settings and frontmatter are merged and kept in
 canonical hierarchical form.
+
+`type` is an explicit source-level classification (for example `learning`, `error`,
+`feedback`, or `reference`). It remains deliberately separate from project scope and tags;
+the MVE preserves it in Markdown rather than adding another filter surface prematurely.
 
 Project scope is controlled by settings rather than file frontmatter. A note cannot place
 itself into another project's search scope by declaring a metadata field.

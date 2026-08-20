@@ -245,11 +245,18 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
     return {"indexed": indexed, "removed": len(stale), "missing_roots": missing_roots, "roots": len(roots)}
 
 
-def _fts_query(text: str) -> str:
+def _fts_terms(text: str) -> list[str]:
     terms = re.findall(r"[\w-]+", text, flags=re.UNICODE)
     if not terms:
         raise MemoryError("search query has no searchable terms")
-    return " AND ".join('"' + term.replace('"', '""') + '"' for term in terms)
+    return terms
+
+
+def _fts_query(text: str, operator: str = "AND") -> str:
+    terms = _fts_terms(text)
+    if operator not in {"AND", "OR"}:
+        raise ValueError(f"unsupported FTS operator: {operator}")
+    return f" {operator} ".join('"' + term.replace('"', '""') + '"' for term in terms)
 
 
 def _append_tag_filter(sql: str, params: list[Any], tag: str) -> str:
@@ -293,22 +300,45 @@ def search_documents(
     limit: int = 10,
     include_shared: bool = True,
 ) -> list[dict[str, Any]]:
-    sql = """
-        SELECT d.id,d.path,d.title,d.brief,bm25(document_fts) AS score
-        FROM document_fts JOIN documents d ON d.id=document_fts.rowid
-        WHERE document_fts MATCH ?
-    """
-    params: list[Any] = [_fts_query(query)]
-    if project:
-        scopes = [project] + ([SHARED_SCOPE] if include_shared else [])
-        placeholders = ",".join("?" for _ in scopes)
-        sql += f" AND EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
-        params.extend(scopes)
-    for tag in tags:
-        sql = _append_tag_filter(sql, params, tag)
-    sql += " ORDER BY score LIMIT ?"
-    params.append(limit)
-    return [_doc_payload(conn, row, float(row["score"])) for row in conn.execute(sql, params)]
+    tags = tuple(tags)
+
+    def execute(match_query: str, result_limit: int) -> list[sqlite3.Row]:
+        sql = """
+            SELECT d.id,d.path,d.title,d.brief,document_fts.content AS indexed_content,
+                   bm25(document_fts) AS score
+            FROM document_fts JOIN documents d ON d.id=document_fts.rowid
+            WHERE document_fts MATCH ?
+        """
+        params: list[Any] = [match_query]
+        if project:
+            scopes = [project] + ([SHARED_SCOPE] if include_shared else [])
+            placeholders = ",".join("?" for _ in scopes)
+            sql += f" AND EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
+            params.extend(scopes)
+        for tag in tags:
+            sql = _append_tag_filter(sql, params, tag)
+        sql += " ORDER BY score LIMIT ?"
+        params.append(result_limit)
+        return list(conn.execute(sql, params))
+
+    strict_hits = execute(_fts_query(query), limit)
+    if strict_hits:
+        return [_doc_payload(conn, row, float(row["score"])) for row in strict_hits]
+
+    # Natural-language recall often contains an extra symptom or synonym that is
+    # absent from a concise memory. Preserve precise AND results when they exist,
+    # but make a no-result query useful by recalling documents that match any term.
+    # A concise memory matching several symptoms should rank above a large general
+    # workflow that happens to repeat one common word, then BM25 breaks ties.
+    terms = [term.casefold() for term in _fts_terms(query)]
+    fallback_hits = execute(_fts_query(query, "OR"), max(limit * 20, 100))
+    fallback_hits.sort(
+        key=lambda row: (
+            -sum(term in row["indexed_content"].casefold() for term in terms),
+            float(row["score"]),
+        )
+    )
+    return [_doc_payload(conn, row, float(row["score"])) for row in fallback_hits[:limit]]
 
 
 def list_documents(

@@ -38,6 +38,10 @@ Each durable event is a standalone Markdown file rather than an ever-growing `.l
 ```
 
 Standalone files give each event its own brief, tags, related-file links, backlinks, and lifecycle. A learning can later link to a canonical workflow/domain document while retaining the original evidence trail.
+Capture also writes an explicit frontmatter `type` and uses a concise conclusion plus
+`Why` / `How to apply` sections when details and action are supplied. This mirrors the
+useful source-document structure of curated memories without requiring a second manual
+index file: Agent Memory already supplies scoped FTS, tags, and list/search commands.
 
 ## Example
 

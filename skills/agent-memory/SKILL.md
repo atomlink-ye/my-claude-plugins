@@ -14,18 +14,30 @@ row as the canonical memory when the source Markdown is available.
 
 ## CLI
 
-Use the bundled script directly so the workflow does not depend on the current CWD:
+Run setup once from the plugin checkout. It links the repository's `agent-memory` bin and
+creates an empty settings file only when one does not already exist:
 
 ```sh
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json status
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json resolve --path "$PWD"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "learnings agent server" --path "$PWD"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json capture learning "Reusable lesson" --path "$PWD"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json links /abs/path/to/note.md
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json sync
+"${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/setup.sh"
 ```
 
-If the package bin is on `PATH`, `agent-memory ...` is equivalent.
+Then use the installed command; pass the actual worktree with `--path` rather than relying
+on CWD:
+
+```sh
+agent-memory --json status
+agent-memory --json resolve --path "$PWD"
+agent-memory --json search "learnings agent server" --path "$PWD"
+agent-memory --json capture learning "Reusable lesson" --path "$PWD"
+agent-memory --json links /abs/path/to/note.md
+agent-memory --json sync
+```
+
+Before setup, the direct Python script remains an emergency fallback only.
+
+Search first requires every query term. When that has no result, it automatically retries
+with OR semantics so a natural-language symptom containing one absent word can still
+recall a relevant concise memory. Completely unrelated terms still return no result.
 
 ## Scope before recall
 
@@ -75,6 +87,7 @@ keep optional metadata in the small frontmatter subset:
 ---
 title: Agent Team UI Decisions
 brief: Durable decisions for the Agent Teams timeline and playback UX.
+type: decision
 tags: [agent-server:frontend, knowledge:decisions]
 ---
 ```
@@ -103,6 +116,7 @@ Supported kinds are `learning`, `drawback`, `error`, and `feature-request`. Each
 
 - resolves the project from the actual `--path`;
 - writes one standalone Markdown file under `learnings/`, `drawbacks/`, `errors/`, or `feature-requests/` inside the project's memory root;
+- writes an explicit `type` equal to the capture kind and uses `Why` / `How to apply` sections when details/action are provided;
 - adds canonical tags such as `<project>:learnings` and `self-improvement:learning`;
 - accepts extra tags and related-file Markdown links;
 - runs `sync` immediately so the memory is searchable and backlinkable.

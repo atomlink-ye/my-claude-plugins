@@ -98,6 +98,7 @@ def capture_memory(
         "---",
         f'title: "{title}"',
         f'brief: "{brief}"',
+        f"type: {kind}",
         "tags: [" + ", ".join(canonical_tags) + "]",
         "---",
         "",
@@ -108,9 +109,9 @@ def capture_memory(
         f"**Project**: {binding.project}",
     ]
     if details.strip():
-        lines.extend(["", "## Details", "", details.strip()])
+        lines.extend(["", "## Why", "", details.strip()])
     if suggested_action.strip():
-        lines.extend(["", "## Suggested Action", "", suggested_action.strip()])
+        lines.extend(["", "## How to apply", "", suggested_action.strip()])
     related_links = _related_links(note_path, related)
     if related_links:
         lines.extend(["", "## Related Files", "", *related_links])

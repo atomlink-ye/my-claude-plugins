@@ -12,12 +12,15 @@ am = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = am
 assert spec.loader is not None
 spec.loader.exec_module(am)
+import memory_config as mc
 
 
 class AgentMemoryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        # Production paths are canonicalized with Path.resolve(); do the same for
+        # macOS /tmp -> /private/tmp fixtures before comparing returned paths.
+        self.root = Path(self.tmp.name).resolve()
         self.workspace = self.root / "workspace"
         self.project_a = self.workspace / "project-a"
         self.project_b = self.workspace / "project-b"
@@ -77,7 +80,7 @@ class AgentMemoryTests(unittest.TestCase):
         self.sync()
         hits = am.search_documents(self.conn, "bounded review", project="a", tags=["reusable"])
         self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0]["projects"], [am.SHARED_SCOPE])
+        self.assertEqual(hits[0]["projects"], ["_shared"])
         self.assertIn("domain", hits[0]["tags"])
         self.assertIn("review", hits[0]["tags"])
 
@@ -117,6 +120,9 @@ class AgentMemoryTests(unittest.TestCase):
         settings = am.load_settings(self.settings_path)
         binding = am.resolve_binding(settings, self.project_a)
         self.assertEqual(tuple(location.path for location in binding.memory_roots), (self.memory_a,))
+
+    def test_default_settings_keep_database_beside_settings_file(self):
+        self.assertEqual(mc.default_settings()["database"], "index.sqlite3")
 
     def test_hierarchical_tags_match_subtags_reverse_order_and_display_canonical_tag(self):
         note = self.memory_a / "operations.md"
@@ -160,6 +166,31 @@ class AgentMemoryTests(unittest.TestCase):
         reversed_hits = am.search_documents(self.conn, "server learnings agent", project="a")
         self.assertEqual(len(reversed_hits), 1)
 
+    def test_search_falls_back_to_or_when_one_natural_language_term_is_absent(self):
+        note = self.memory_a / "sandbox.md"
+        note.write_text(
+            "# Sandbox Workspace Ownership\n\nRepair sandbox push ownership with chown.\n",
+            encoding="utf-8",
+        )
+        (self.memory_a / "workflow.md").write_text(
+            "# Generic Sandbox Workflow\n\nRun the sandbox before work.\n",
+            encoding="utf-8",
+        )
+        self.sync()
+
+        hits = am.search_documents(self.conn, "sandbox push pull permission", project="a")
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(Path(hits[0]["path"]), note)
+
+    def test_search_fallback_does_not_recall_completely_unrelated_terms(self):
+        (self.memory_a / "sandbox.md").write_text(
+            "# Sandbox Workspace Ownership\n\nRepair sandbox push ownership with chown.\n",
+            encoding="utf-8",
+        )
+        self.sync()
+
+        self.assertEqual(am.search_documents(self.conn, "orchard nebula", project="a"), [])
+
     def test_self_improvement_capture_writes_markdown_and_becomes_searchable(self):
         binding = am.resolve_binding(self.settings, self.project_a)
         captured = am.capture_memory(
@@ -173,6 +204,9 @@ class AgentMemoryTests(unittest.TestCase):
         captured_path = Path(captured["path"])
         self.assertTrue(captured_path.is_file())
         self.assertEqual(captured_path.parent, self.memory_a / "learnings")
+        self.assertIn("type: learning", captured_path.read_text(encoding="utf-8"))
+        self.assertIn("## Why", captured_path.read_text(encoding="utf-8"))
+        self.assertIn("## How to apply", captured_path.read_text(encoding="utf-8"))
         self.assertIn("a:learnings", captured["tags"])
         self.assertIn("self-improvement:learning", captured["tags"])
 

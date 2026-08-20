@@ -41,8 +41,9 @@ Companion skills expose direct script entrypoints:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/skills/opencode-companion/scripts/opencode-companion.mjs" session new --directory "$WORK_DIR" -- "<prompt>"
 node "${CLAUDE_PLUGIN_ROOT}/skills/daytona-companion/scripts/daytona-manager.mjs" status --directory "$WORK_DIR"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json search "learnings agent server" --path "$WORK_DIR"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/agent_memory.py" --json capture learning "Reusable learning" --path "$WORK_DIR"
+"${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/setup.sh"
+agent-memory --json search "learnings agent server" --path "$WORK_DIR"
+agent-memory --json capture learning "Reusable learning" --path "$WORK_DIR"
 ```
 
 Agent Memory documentation:

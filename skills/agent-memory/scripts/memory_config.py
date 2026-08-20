@@ -62,7 +62,9 @@ def default_settings_path() -> Path:
 def default_settings() -> dict[str, Any]:
     return {
         "version": 1,
-        "database": "~/.agent-memory/index.sqlite3",
+        # Keep the database beside its settings file so AGENT_MEMORY_HOME produces
+        # a self-contained registry rather than silently writing to ~/.agent-memory.
+        "database": "index.sqlite3",
         "shared": [],
         "bindings": [],
     }
