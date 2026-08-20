@@ -10,7 +10,7 @@ def doctor(conn,settings,settings_path,db_path,target_path=None):
  except Exception:return r
  ids=defaultdict(list)
  for path,mid,status,promoted,superseded in rows:
-  if not mid:checks.append({"code":"memory_id_missing","severity":"warning","message":"indexed memory has no stable id","paths":[path]})
+  if not mid:checks.append({"code":"memory_id_missing","severity":"info","message":"legacy indexed memory has no stable id","paths":[path]})
   elif not MEMORY_ID_RE.fullmatch(mid):checks.append({"code":"memory_id_invalid","severity":"error","message":f"invalid stable memory id: {mid}","paths":[path]})
   else:ids[mid].append(path)
   if status and status not in LIFECYCLE_STATES:checks.append({"code":"lifecycle_status_invalid","severity":"error","message":f"invalid lifecycle status: {status}","paths":[path]})
