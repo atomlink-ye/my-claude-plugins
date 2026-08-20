@@ -8,9 +8,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from memory_capture import KINDS, capture_memory
 from memory_config import (
     MemoryError,
-    SHARED_SCOPE,
     collect_memory_roots,
     database_path,
     default_settings_path,
@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = sub.add_parser("resolve", help="resolve a working path to its nearest project binding")
     resolve.add_argument("--path", type=Path, default=Path.cwd())
 
-    search = sub.add_parser("search", help="full-text search indexed memory")
+    search = sub.add_parser("search", help="full-text and tag-aware search indexed memory")
     search.add_argument("query")
     search.add_argument("--project")
     search.add_argument("--path", type=Path)
@@ -73,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     links = sub.add_parser("links", help="show outbound references and inbound backlinks")
     links.add_argument("document", help="document id, absolute path, or unique indexed path suffix")
+
+    capture = sub.add_parser("capture", help="write a structured self-improvement memory and index it")
+    capture.add_argument("kind", choices=sorted(KINDS))
+    capture.add_argument("summary")
+    capture.add_argument("--path", type=Path, default=Path.cwd(), help="actual project/worktree path used for scope resolution")
+    capture.add_argument("--details", default="")
+    capture.add_argument("--action", default="", help="suggested follow-up action")
+    capture.add_argument("--tag", action="append", default=[])
+    capture.add_argument("--related", action="append", default=[], help="related local file path; repeatable")
+    capture.add_argument("--root", help="configured memory root to use when the project has multiple roots")
     return parser
 
 
@@ -122,6 +132,19 @@ def main(argv: list[str] | None = None) -> int:
                     result = list_documents(conn, project, args.tag, args.limit, include_shared)
             elif args.command == "links":
                 result = link_graph(conn, args.document)
+            elif args.command == "capture":
+                binding = resolve_binding(settings, args.path)
+                result = capture_memory(
+                    binding,
+                    args.kind,
+                    args.summary,
+                    details=args.details,
+                    suggested_action=args.action,
+                    tags=args.tag,
+                    related=args.related,
+                    root=args.root,
+                )
+                result["sync"] = sync_index(conn, collect_memory_roots(settings, settings_path))
             else:
                 parser.error("unknown command")
                 return 2
