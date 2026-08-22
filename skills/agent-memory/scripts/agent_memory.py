@@ -7,9 +7,11 @@ from memory_doctor_ext import doctor
 from memory_capture import KINDS, LIFECYCLE_STATES, capture_memory
 from memory_config import (
     MemoryError,
+    UnboundPathError,
     collect_memory_roots,
     database_path,
     default_settings_path,
+    flatten_bindings,
     init_settings,
     load_settings,
     resolve_binding,
@@ -201,6 +203,20 @@ def _fail(code, msg, path=None):
     }
 
 
+def _query_project(settings, project=None, path=None):
+    """Resolve the optional project scope used by read-only queries."""
+    if project and path:
+        raise MemoryError("use either --project or --path, not both")
+    if project:
+        return project
+    if path is None:
+        return None
+    try:
+        return resolve_binding(settings, path).project
+    except UnboundPathError:
+        return None
+
+
 def main(argv=None):
     p = build_parser()
     raw = sys.argv[1:] if argv is None else argv
@@ -275,6 +291,10 @@ def main(argv=None):
     try:
         settings = load_settings(sp)
         db = database_path(settings, sp)
+        if a.command in {"search", "list", "tags"}:
+            # Validate all routing config before a query opens/initializes SQLite.
+            flatten_bindings(settings)
+            shared_roots(settings, sp)
         c = connect_db(db)
         if a.command == "status":
             r = status(c, sp, db)
@@ -303,11 +323,7 @@ def main(argv=None):
                 "tags": list(b.tags),
             }
         elif a.command in {"search", "list"}:
-            if a.project and a.path:
-                raise MemoryError("use either --project or --path, not both")
-            project = a.project or (
-                resolve_binding(settings, a.path).project if a.path else None
-            )
+            project = _query_project(settings, a.project, a.path)
             r = (
                 search_documents(c, a.query, project, a.tag, a.limit, not a.no_shared)
                 if a.command == "search"
@@ -341,11 +357,7 @@ def main(argv=None):
         elif a.command == "projects":
             r = project_inventory(c, settings)
         elif a.command == "tags":
-            if a.project and a.path:
-                raise MemoryError("use either --project or --path, not both")
-            project = a.project or (
-                resolve_binding(settings, a.path).project if a.path else None
-            )
+            project = _query_project(settings, a.project, a.path)
             r = tag_inventory(c, project, not a.no_shared)
         _emit(r, a.command, a.output_format)
         c.close()

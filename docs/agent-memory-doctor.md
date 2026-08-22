@@ -83,4 +83,8 @@ agent-memory tags --path /abs/path/to/project
 agent-memory search "learnings agent server" --path /abs/path/to/project
 ```
 
+`search`, `list`, and `tags` accept either `--project` or `--path`. If the supplied path
+is not covered by a binding, these read-only queries use global scope; `resolve`, `capture`,
+and `doctor --path` remain strict and report the unbound path as an error.
+
 Search/list payloads are enriched with stable ID, type, lifecycle state, and promotion/supersession targets when available.

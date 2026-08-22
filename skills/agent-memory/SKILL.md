@@ -116,13 +116,13 @@ only performs one archive operation per invocation.
 
 ## Scope before recall
 
-For project work, resolve the actual work path before searching. `--path` uses the
+For project work, pass the actual work path when searching. `--path` uses the
 nearest/longest nested binding from `~/.agent-memory/settings.json`; sibling projects do
-not share their project memory by default.
+not share their project memory by default. `--project` and `--path` are mutually exclusive.
 
-1. Run `resolve --path <actual project/worktree path>` when project identity is not already explicit.
-2. Search with `--path <path>` or `--project <name>`. Project searches include configured shared memory unless `--no-shared` is passed.
-3. Use unscoped/global search only when the task explicitly needs cross-project knowledge or the correct project is genuinely unknown.
+1. Search/list/tags with `--path <path>` or `--project <name>`. Project-scoped queries include configured shared memory unless `--no-shared` is passed.
+2. If a query path has no binding, search/list/tags fall back to the same global scope as omitting both options. Ambiguous bindings and invalid settings still fail.
+3. Use `resolve --path <actual project/worktree path>` when strict project resolution is needed. `resolve`, `capture`, and `doctor --path` fail when the path is unbound; they never guess a write root.
 4. Prefer a returned `brief` to decide relevance, then read the returned absolute `path`.
 
 Do not infer project identity from the process CWD when the actual target path is known.

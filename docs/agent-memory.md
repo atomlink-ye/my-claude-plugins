@@ -134,6 +134,11 @@ Default path: `~/.agent-memory/settings.json`.
 - `shared` roots are indexed under the reserved `_shared` scope. A project-scoped query
   includes `_shared` unless `--no-shared` is requested.
 
+For the read-only `search`, `list`, and `tags` commands, `--project` and `--path` are
+mutually exclusive. An unbound `--path` falls back to global scope; ambiguous bindings and
+invalid settings still fail. `resolve`, `capture`, and `doctor --path` remain strict and
+fail for an unbound path rather than guessing a project or capture root.
+
 This makes the common multi-project workspace safe by default:
 
 ```text
@@ -423,8 +428,8 @@ The intended progressive-disclosure loop is:
 
 ```text
 actual work path
-  -> resolve project
-  -> scoped search/list (+ optional hierarchical tag filters)
+  -> resolve project (or global fallback for an unbound read-only query path)
+  -> scoped search/list/tags (+ optional hierarchical tag filters)
   -> brief + absolute source path + canonical full tags
   -> open/read the Markdown file
   -> act

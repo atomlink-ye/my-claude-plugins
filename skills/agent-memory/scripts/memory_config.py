@@ -16,6 +16,10 @@ class MemoryError(RuntimeError):
     pass
 
 
+class UnboundPathError(MemoryError):
+    """Raised when a path is not covered by any configured project binding."""
+
+
 @dataclass(frozen=True)
 class MemoryLocation:
     path: Path
@@ -260,7 +264,7 @@ def resolve_binding(settings: dict[str, Any], target: Path) -> Binding:
         if _is_within(target, binding.path)
     ]
     if not matches:
-        raise MemoryError(f"no project binding matches path: {target}")
+        raise UnboundPathError(f"no project binding matches path: {target}")
     max_depth = max(binding.depth for binding in matches)
     winners = [binding for binding in matches if binding.depth == max_depth]
     if len(winners) != 1:
