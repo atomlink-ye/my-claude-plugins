@@ -77,8 +77,12 @@ def _emit(r, cmd, fmt):
         _human_links(r)
     elif cmd == "browse":
         for group in r["groups"]:
-            label = "shared" if group["project"] == "_shared" else f"project: {group['project']}"
-            print(f"{label}:")
+            label = (
+                "[shared]"
+                if group["project"] == "_shared"
+                else f"[project: {group['project']}]"
+            )
+            print(label)
             documents = group["documents"]
             if not documents:
                 print("  - (none)")

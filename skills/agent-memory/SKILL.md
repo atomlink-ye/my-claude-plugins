@@ -83,8 +83,8 @@ agent-memory tags --path /abs/path/to/project
 ```
 
 `projects` reports configured project paths, roots, capture roots, and indexed document
-counts. `browse` is the human-first inventory: it groups memories by shared/project and
-shows each title, brief, and absolute source path. It accepts `--project`, `--path`,
+counts. `browse` is the human-first inventory: it groups memories under `[shared]` and
+`[project: <name>]`, showing each title, brief, and absolute source path. It accepts `--project`, `--path`,
 repeated `--tag`, `--limit`, and `--no-shared`; use `--json`, `--table`, or `--yaml` when
 text is not wanted. `tags` reports canonical tags and usage counts and can be scoped with
 `--path` or `--project`.

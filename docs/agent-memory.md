@@ -351,7 +351,7 @@ agent-memory --json status          # JSON for scripts
 agent-memory --table projects       # compact table
 agent-memory --text doctor          # legacy human-readable view
 agent-memory --yaml browse          # explicit YAML instead of browse's text default
-agent-memory browse                 # shared/project groups with title, brief, and path
+agent-memory browse                 # [shared] / [project: <name>] groups with title, brief, and path
 agent-memory --json browse --project agent-server
 ```
 
