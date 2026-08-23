@@ -6,6 +6,7 @@ from memory_admin import preferred_capture_root, project_inventory, tag_inventor
 from memory_doctor_ext import doctor
 from memory_capture import KINDS, LIFECYCLE_STATES, capture_memory
 from memory_config import (
+    AmbiguousDescendantBindingError,
     MemoryError,
     UnboundPathError,
     collect_memory_roots,
@@ -15,6 +16,7 @@ from memory_config import (
     init_settings,
     load_settings,
     resolve_binding,
+    resolve_project_binding,
     shared_roots,
 )
 from memory_format import table_dump, yaml_dump
@@ -73,6 +75,20 @@ def _emit(r, cmd, fmt):
             )
     elif cmd == "links":
         _human_links(r)
+    elif cmd == "browse":
+        for group in r["groups"]:
+            label = "shared" if group["project"] == "_shared" else f"project: {group['project']}"
+            print(f"{label}:")
+            documents = group["documents"]
+            if not documents:
+                print("  - (none)")
+                continue
+            for document in documents:
+                print(
+                    f"  - {document['title']}\n"
+                    f"    {document.get('brief', '')}\n"
+                    f"    path: {document['path']}"
+                )
     else:
         print(json.dumps(r, indent=2, ensure_ascii=False))
 
@@ -100,13 +116,20 @@ def _opts(p):
         const="text",
         default=argparse.SUPPRESS,
     )
+    g.add_argument(
+        "--yaml",
+        dest="output_format",
+        action="store_const",
+        const="yaml",
+        default=argparse.SUPPRESS,
+    )
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog="agent-memory")
     p.add_argument("--settings", type=Path, default=default_settings_path())
     _opts(p)
-    p.set_defaults(output_format="yaml")
+    p.set_defaults(output_format=None)
     s = p.add_subparsers(dest="command", required=True)
 
     def sub(n, h):
@@ -156,7 +179,9 @@ def build_parser():
     q = sub("capture", "capture durable learning")
     q.add_argument("kind", choices=sorted(KINDS))
     q.add_argument("summary")
-    q.add_argument("--path", type=Path, default=Path.cwd())
+    target = q.add_mutually_exclusive_group()
+    target.add_argument("--path", type=Path)
+    target.add_argument("--project")
     q.add_argument("--details", default="")
     q.add_argument("--action", default="")
     q.add_argument("--tag", action="append", default=[])
@@ -172,6 +197,12 @@ def build_parser():
     q = sub("tags", "list tags")
     q.add_argument("--project")
     q.add_argument("--path", type=Path)
+    q.add_argument("--no-shared", action="store_true")
+    q = sub("browse", "browse memories grouped by shared/project")
+    q.add_argument("--project")
+    q.add_argument("--path", type=Path)
+    q.add_argument("--tag", action="append", default=[])
+    q.add_argument("--limit", type=int, default=100)
     q.add_argument("--no-shared", action="store_true")
     q = sub("doctor", "health diagnostics")
     q.add_argument("--path", type=Path)
@@ -213,16 +244,38 @@ def _query_project(settings, project=None, path=None):
         return None
     try:
         return resolve_binding(settings, path).project
-    except UnboundPathError:
+    except (UnboundPathError, AmbiguousDescendantBindingError):
         return None
+
+
+def _browse_documents(conn, project=None, tags=(), limit=100, include_shared=True):
+    """Return visible documents grouped by their configured scope for people."""
+    documents = list_documents(conn, project, tags, limit, include_shared)
+    groups: dict[str, list[dict]] = {}
+    for document in documents:
+        for scope in document.get("projects", []):
+            if scope == "_shared" and not include_shared:
+                continue
+            if project is not None and scope not in {project, "_shared"}:
+                continue
+            groups.setdefault(scope, []).append(document)
+    ordered = ["_shared"] + sorted(scope for scope in groups if scope != "_shared")
+    return {
+        "groups": [
+            {"project": scope, "documents": groups[scope]}
+            for scope in ordered
+            if scope in groups
+        ]
+    }
 
 
 def main(argv=None):
     p = build_parser()
     raw = sys.argv[1:] if argv is None else argv
-    if len({x for x in raw if x in {"--json", "--table", "--text"}}) > 1:
+    if len({x for x in raw if x in {"--json", "--table", "--text", "--yaml"}}) > 1:
         p.error("output options are mutually exclusive")
     a = p.parse_args(raw)
+    a.output_format = a.output_format or ("text" if a.command == "browse" else "yaml")
     sp = a.settings.expanduser().resolve(strict=False)
     if a.command == "init":
         try:
@@ -291,7 +344,7 @@ def main(argv=None):
     try:
         settings = load_settings(sp)
         db = database_path(settings, sp)
-        if a.command in {"search", "list", "tags"}:
+        if a.command in {"search", "list", "tags", "browse"}:
             # Validate all routing config before a query opens/initializes SQLite.
             flatten_bindings(settings)
             shared_roots(settings, sp)
@@ -332,7 +385,11 @@ def main(argv=None):
         elif a.command == "links":
             r = link_graph(c, a.document)
         elif a.command == "capture":
-            b = resolve_binding(settings, a.path)
+            b = (
+                resolve_project_binding(settings, a.project)
+                if a.project
+                else resolve_binding(settings, a.path or Path.cwd())
+            )
             pref = preferred_capture_root(settings, b)
             r = capture_memory(
                 b,
@@ -359,6 +416,9 @@ def main(argv=None):
         elif a.command == "tags":
             project = _query_project(settings, a.project, a.path)
             r = tag_inventory(c, project, not a.no_shared)
+        elif a.command == "browse":
+            project = _query_project(settings, a.project, a.path)
+            r = _browse_documents(c, project, a.tag, a.limit, not a.no_shared)
         _emit(r, a.command, a.output_format)
         c.close()
         return 0

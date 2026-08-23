@@ -24,10 +24,11 @@ creates an empty settings file only when one does not already exist:
 Then use the installed command; pass the actual worktree with `--path` rather than relying
 on CWD:
 
-Agent Memory emits deterministic, stdlib-only YAML by default. Use exactly one of the
-global output flags when another representation is needed: `--json` for scripts and
-backward-compatible machine output, `--table` for compact collection/health tables, or
-`--text` for the legacy human-readable view. The flags are mutually exclusive and apply
+Agent Memory emits deterministic, stdlib-only YAML by default, except `browse`, whose
+default is human-readable text. Use exactly one of the global output flags when another
+representation is needed: `--json` for scripts and backward-compatible machine output,
+`--table` for compact collection/health tables, `--text` for the legacy human-readable
+view, or `--yaml` for explicit YAML. The flags are mutually exclusive and apply
 to every subcommand, including `init` and `doctor`.
 
 ```sh
@@ -35,6 +36,7 @@ agent-memory --json status
 agent-memory --json doctor --path "$PWD"
 agent-memory --json resolve --path "$PWD"
 agent-memory --json projects
+agent-memory browse
 agent-memory --json tags --path "$PWD"
 agent-memory --json search "learnings agent server" --path "$PWD"
 agent-memory --json capture learning "Reusable lesson" --path "$PWD"
@@ -76,12 +78,16 @@ Use discovery before guessing taxonomy:
 
 ```sh
 agent-memory projects
+agent-memory browse --path /abs/path/to/workspace
 agent-memory tags --path /abs/path/to/project
 ```
 
 `projects` reports configured project paths, roots, capture roots, and indexed document
-counts. `tags` reports canonical tags and usage counts and can be scoped with `--path` or
-`--project`.
+counts. `browse` is the human-first inventory: it groups memories by shared/project and
+shows each title, brief, and absolute source path. It accepts `--project`, `--path`,
+repeated `--tag`, `--limit`, and `--no-shared`; use `--json`, `--table`, or `--yaml` when
+text is not wanted. `tags` reports canonical tags and usage counts and can be scoped with
+`--path` or `--project`.
 
 ## Snapshot before destructive bulk work
 
@@ -118,11 +124,13 @@ only performs one archive operation per invocation.
 
 For project work, pass the actual work path when searching. `--path` uses the
 nearest/longest nested binding from `~/.agent-memory/settings.json`; sibling projects do
-not share their project memory by default. `--project` and `--path` are mutually exclusive.
+not share their project memory by default. If an orchestration workspace is above exactly
+one binding, it resolves to that project. If it is above multiple bindings, strict commands
+refuse to guess and name the candidates. `--project` and `--path` are mutually exclusive.
 
-1. Search/list/tags with `--path <path>` or `--project <name>`. Project-scoped queries include configured shared memory unless `--no-shared` is passed.
-2. If a query path has no binding, search/list/tags fall back to the same global scope as omitting both options. Ambiguous bindings and invalid settings still fail.
-3. Use `resolve --path <actual project/worktree path>` when strict project resolution is needed. `resolve`, `capture`, and `doctor --path` fail when the path is unbound; they never guess a write root.
+1. Search/list/tags/browse with `--path <path>` or `--project <name>`. Project-scoped queries include configured shared memory unless `--no-shared` is passed.
+2. A unique descendant binding is used for every command. For read-only search/list/tags/browse, an unbound path or a path above multiple candidates falls back to the same global scope as omitting both options. Invalid settings and equally specific containing bindings still fail.
+3. Use `resolve --path <actual project/worktree path>` when strict project resolution is needed. `resolve`, `capture`, and `doctor --path` reject unbound or multiply-descendant paths; they never guess a write root. Their errors point to `projects`, `browse`, and `--project`.
 4. Prefer a returned `brief` to decide relevance, then read the returned absolute `path`.
 
 Do not infer project identity from the process CWD when the actual target path is known.
@@ -196,7 +204,8 @@ output, or facts that will obviously expire immediately.
 
 ### Write through `agent-memory capture`
 
-Pass the actual project/worktree path rather than trusting the process CWD:
+Pass the actual project/worktree path rather than trusting the process CWD. From a unique
+project name, `--project` is an equivalent explicit target (duplicate names are rejected):
 
 ```sh
 agent-memory --json capture drawback \
@@ -210,7 +219,7 @@ agent-memory --json capture drawback \
 
 Kinds are `learning`, `drawback`, `error`, and `feature-request`. Each capture:
 
-- resolves the project from the actual `--path`;
+- resolves the project from `--path` or a unique `--project`;
 - writes one standalone Markdown file under `learnings/`, `drawbacks/`, `errors/`, or `feature-requests/` inside the project's memory root;
 - writes an explicit `type` equal to the capture kind and uses `Why` / `How to apply` sections when details/action are provided;
 - adds canonical tags such as `<project>:learnings` and `self-improvement:learning`;

@@ -20,6 +20,10 @@ class UnboundPathError(MemoryError):
     """Raised when a path is not covered by any configured project binding."""
 
 
+class AmbiguousDescendantBindingError(MemoryError):
+    """Raised when an ancestor path would require guessing between projects."""
+
+
 @dataclass(frozen=True)
 class MemoryLocation:
     path: Path
@@ -257,17 +261,62 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 
 def resolve_binding(settings: dict[str, Any], target: Path) -> Binding:
+    """Resolve a write-safe project context for ``target``.
+
+    Paths inside a binding retain the established longest-prefix behavior.  When
+    an orchestration workspace sits above a single configured project, resolving
+    that ancestor is also safe.  More than one descendant is deliberately never
+    guessed: callers that write must stop, while read-only callers can elect to
+    use their existing global fallback.
+    """
     target = target.resolve(strict=False)
+    bindings = flatten_bindings(settings)
     matches = [
         binding
-        for binding in flatten_bindings(settings)
+        for binding in bindings
         if _is_within(target, binding.path)
     ]
+    if matches:
+        max_depth = max(binding.depth for binding in matches)
+        winners = [binding for binding in matches if binding.depth == max_depth]
+        if len(winners) != 1:
+            projects = ", ".join(sorted(binding.project for binding in winners))
+            raise MemoryError(
+                f"ambiguous project binding for {target}: {projects}; "
+                "run `agent-memory projects` or `agent-memory browse`, then pass --project <name>"
+            )
+        return winners[0]
+
+    descendants = [binding for binding in bindings if _is_within(binding.path, target)]
+    if len(descendants) == 1:
+        return descendants[0]
+    if descendants:
+        candidates = ", ".join(
+            f"{binding.project} ({binding.path})"
+            for binding in sorted(descendants, key=lambda item: (item.project, str(item.path)))
+        )
+        raise AmbiguousDescendantBindingError(
+            f"path {target} is an ancestor of multiple project bindings: {candidates}; "
+            "run `agent-memory projects` or `agent-memory browse`, then pass --project <name>"
+        )
+    raise UnboundPathError(
+        f"no project binding matches path: {target}; "
+        "run `agent-memory projects` or `agent-memory browse`, then pass --project <name>"
+    )
+
+
+def resolve_project_binding(settings: dict[str, Any], project: str) -> Binding:
+    """Resolve a project name only when it identifies exactly one binding."""
+    matches = [binding for binding in flatten_bindings(settings) if binding.project == project]
+    if len(matches) == 1:
+        return matches[0]
     if not matches:
-        raise UnboundPathError(f"no project binding matches path: {target}")
-    max_depth = max(binding.depth for binding in matches)
-    winners = [binding for binding in matches if binding.depth == max_depth]
-    if len(winners) != 1:
-        projects = ", ".join(sorted(binding.project for binding in winners))
-        raise MemoryError(f"ambiguous project binding for {target}: {projects}")
-    return winners[0]
+        raise MemoryError(
+            f"unknown project {project!r}; run `agent-memory projects` or "
+            "`agent-memory browse` to choose a project"
+        )
+    paths = ", ".join(str(binding.path) for binding in sorted(matches, key=lambda item: str(item.path)))
+    raise MemoryError(
+        f"project name {project!r} matches multiple bindings: {paths}; "
+        "use --path for one binding (see `agent-memory projects` or `agent-memory browse`)"
+    )

@@ -298,6 +298,27 @@ def table_dump(command: str, result: object) -> str:
                 if isinstance(item, dict)
             ),
         )
+    if command == "browse" and isinstance(result, dict):
+        rows = []
+        for group in result.get("groups", []):
+            if not isinstance(group, dict):
+                continue
+            scope = group.get("project", "")
+            label = "shared" if scope == "_shared" else scope
+            for document in group.get("documents", []):
+                if isinstance(document, dict):
+                    rows.append(
+                        [
+                            label,
+                            document.get("title", ""),
+                            document.get("brief", ""),
+                            document.get("path", ""),
+                        ]
+                    )
+        return render_table(
+            ["scope", "title", "brief", "path"],
+            rows or [["", "(none)", "", ""]],
+        )
     if command == "doctor" and isinstance(result, dict):
         return _doctor_table(result)
     if isinstance(result, dict):

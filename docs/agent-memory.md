@@ -127,6 +127,9 @@ Default path: `~/.agent-memory/settings.json`.
 - A `memory` entry may be a path string or `{ "path": "...", "tags": [...] }`; root tags are merged with binding and Markdown tags.
 - When several bindings contain the target path, the longest/more-specific path wins.
 - Two equally specific bindings are an error instead of an arbitrary choice.
+- If a target is an ancestor of exactly one binding, it resolves to that binding. If it is
+  an ancestor of multiple bindings, strict resolution refuses to guess and lists the
+  candidates with `projects` / `browse` / `--project` guidance.
 - `memory` roots from the parent are **not** inherited by a child by default. Set
   `"inherit_memory": true` on the child to opt in.
 - Binding tags are inherited by children. Tags classify documents; they do not grant
@@ -134,10 +137,12 @@ Default path: `~/.agent-memory/settings.json`.
 - `shared` roots are indexed under the reserved `_shared` scope. A project-scoped query
   includes `_shared` unless `--no-shared` is requested.
 
-For the read-only `search`, `list`, and `tags` commands, `--project` and `--path` are
-mutually exclusive. An unbound `--path` falls back to global scope; ambiguous bindings and
-invalid settings still fail. `resolve`, `capture`, and `doctor --path` remain strict and
-fail for an unbound path rather than guessing a project or capture root.
+For the read-only `search`, `list`, `tags`, and `browse` commands, `--project` and `--path`
+are mutually exclusive. An unbound `--path`, or one above multiple descendant bindings,
+falls back to global scope; invalid settings and equally-specific containing bindings still
+fail. `resolve`, `capture`, and `doctor --path` remain strict and fail rather than guessing
+a project or capture root. `capture --project <name>` is an explicit alternative to
+`--path`, only when that name identifies exactly one binding; duplicate names are rejected.
 
 This makes the common multi-project workspace safe by default:
 
@@ -334,16 +339,20 @@ file.
 
 The implementation is stdlib-only Python 3 plus SQLite/FTS5.
 
-Every subcommand emits deterministic YAML by default, including `init` and `doctor`.
+Every subcommand except `browse` emits deterministic YAML by default, including `init` and
+`doctor`. `browse` defaults to human-readable grouped text.
 Choose one mutually exclusive global flag when needed: `--json` keeps the previous
 machine-readable JSON contract, `--table` renders compact tables for humans, and
-`--text` selects the legacy human-readable output. For example:
+`--text` selects the legacy human-readable output; `--yaml` explicitly selects YAML. For example:
 
 ```sh
 agent-memory status                 # YAML (default)
 agent-memory --json status          # JSON for scripts
 agent-memory --table projects       # compact table
 agent-memory --text doctor          # legacy human-readable view
+agent-memory --yaml browse          # explicit YAML instead of browse's text default
+agent-memory browse                 # shared/project groups with title, brief, and path
+agent-memory --json browse --project agent-server
 ```
 
 ```sh
@@ -365,6 +374,7 @@ agent-memory --json list --path ~/workspace/agent-server --tag architecture
 
 # deliberately global/cross-project recall
 agent-memory --json search "review workflow"
+agent-memory browse --path ~/workspace/agent-server --tag operations
 
 # graph inspection
 agent-memory --json links ~/memory/agent-server/ui-decisions.md
@@ -428,8 +438,8 @@ The intended progressive-disclosure loop is:
 
 ```text
 actual work path
-  -> resolve project (or global fallback for an unbound read-only query path)
-  -> scoped search/list/tags (+ optional hierarchical tag filters)
+  -> resolve project (or global fallback for an unbound/ambiguous read-only query path)
+  -> scoped search/list/tags/browse (+ optional hierarchical tag filters)
   -> brief + absolute source path + canonical full tags
   -> open/read the Markdown file
   -> act
