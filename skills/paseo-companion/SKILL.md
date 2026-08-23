@@ -39,6 +39,13 @@ accepted delivery; use `mode:"ack"` for DELETE acknowledgement, or `mode:"reply"
 with `replyTo` to answer and resolve a parent. Acceptance is daemon receipt, not
 proof the recipient processed the prompt.
 
+**Manager-safe default:** if the recipient is a Claude Manager, or may currently
+be running subagents, ordinary updates from Owner Deputy or Workers MUST use
+`POST /messages` with `delivery:"on-idle"`. A direct `paseo send` interrupts the
+Manager's active turn and can cancel its in-flight subagents. Use
+`delivery:"interrupt"` only for a correction that must change what the Manager
+is doing right now and whose avoided rework is worth that cancellation risk.
+
 Delivery controls both timing and the Paseo transport. `interrupt` genuinely
 interrupts a busy recipient and its complete prompt is visible in `paseo logs`.
 `on-idle` uses a heartbeat that runs only once the recipient is idle; its prompt
@@ -140,6 +147,49 @@ paseo <command> [options]
 
 ## Typical workflows
 
+### Reuse and name the workspace before starting related agents
+
+Paseo groups sessions by **workspace**, not merely by identical `--cwd`. If every
+`paseo run` omits `--workspace`, the daemon may create multiple same-named
+workspaces for the same directory. In the UI those become duplicate sidebar
+entries instead of tabs, which makes Owner/Manager auditing unnecessarily hard.
+
+For one task or round, create or choose one named workspace, then reuse its ID
+for every related Manager, Worker, Oracle, and Auditor session:
+
+```bash
+ws=$(paseo workspace create \
+  --isolation local \
+  --path /absolute/task/root \
+  --title "Owner Deputy · <round name>" \
+  --json | jq -r '.workspaceId')
+
+paseo run -d --workspace "$ws" \
+  --provider codex --model gpt-5.6-terra --thinking medium \
+  --title "Audit A · manager decisions" "<prompt>"
+
+paseo run -d --workspace "$ws" \
+  --provider codex --model gpt-5.6-terra --thinking medium \
+  --title "Audit B · quota and topology" "<prompt>"
+```
+
+Operational rules:
+
+- **Same task/round + same execution directory → same workspace ID.** Related
+  sessions then appear as tabs inside one visible workspace.
+- Give the workspace a task-level title; give each agent a lane-level `--title`.
+- `--cwd` chooses process location; `--workspace` chooses UI/ownership grouping.
+  Pass both when the distinction matters, and verify with `paseo inspect` plus
+  `paseo workspace ls --json`.
+- Rename an existing workspace with
+  `paseo workspace rename <workspace-id> "<title>"`.
+- The current CLI cannot move an existing agent to another workspace. If a run
+  accidentally created a duplicate workspace, let/cause its agent to reach a
+  safe terminal state, preserve its result, then archive that extra workspace;
+  use the canonical workspace ID for all subsequent runs.
+- A shared, well-named workspace is part of the audit surface: the Owner can see
+  Worker state, tool calls, and progress without asking the Manager to relay it.
+
 ### Run a single task and wait for completion
 
 ```bash
@@ -155,6 +205,10 @@ Reuse before relaunch — if an agent already exists for related work, continue 
 ```bash
 paseo send <id> "now add tests for the new endpoint"
 ```
+
+This direct form is for an idle agent or deliberate interruption. For a Manager
+or any agent that may have active subagents, queue the follow-up through
+`POST /messages` with `delivery:"on-idle"` instead.
 
 `<id>` accepts a unique prefix or the agent name, not just the full UUID.
 
@@ -320,6 +374,7 @@ Treat this as a local runtime/dependency problem (Node/Homebrew dylib mismatch),
 ## Non-negotiables
 
 - **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one. Reuse when it's the same task and the same context (a direct continuation, not a topic change) and that context hasn't gone stale or noisy; otherwise start fresh rather than let a long-lived session keep absorbing unrelated work.
+- **Do not directly send ordinary updates to a busy Manager.** Queue Owner Deputy / Worker / subagent updates through paseo-reminder `/messages` with `delivery:on-idle`; direct `paseo send` may cancel the Manager's active subagents.
 - **Wait, don't poll.** Never loop on `paseo ls` / `paseo inspect`. Use `paseo wait <id>` (blocks efficiently) or `paseo logs <id> -f` (streams).
 - **One armed wait per agent.** A single `paseo wait <id>` already returns on either completion or timeout — that covers both "it finished" and "check on it again." Don't re-arm a new wait after every interim `paseo logs`/`paseo inspect` peek; the peek is free and doesn't consume the pending wait. Stacking waits produces duplicate wake-ups on the same event.
 - **Detach follow-ups too.** Plain `paseo send <id> "..."` blocks until that turn finishes, just like `run` without `-d`. If you're driving your own check-in cadence with `paseo wait`, use `paseo send --no-wait <id> "..."` — otherwise the blocking send quietly becomes your polling interval.
