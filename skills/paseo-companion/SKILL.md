@@ -147,15 +147,59 @@ paseo <command> [options]
 
 ## Typical workflows
 
-### Reuse and name the workspace before starting related agents
+### Reuse the Project; choose Workspace by checkout
+
+Paseo's visible hierarchy is:
+
+```text
+Project = one repository/product identity
+  → Workspace = one exact checkout/worktree and its supervised state
+    → Tab = one Agent session in that Workspace
+```
 
 Paseo groups sessions by **workspace**, not merely by identical `--cwd`. If every
 `paseo run` omits `--workspace`, the daemon may create multiple same-named
-workspaces for the same directory. In the UI those become duplicate sidebar
-entries instead of tabs, which makes Owner/Manager auditing unnecessarily hard.
+workspaces for the same directory. Worse, creating workspaces from pre-created
+external git-worktree paths without `--project` can register each worktree as a
+separate Project even when all have the same `mainRepoRoot`.
 
-For one task or round, create or choose one named workspace, then reuse its ID
-for every related Manager, Worker, Oracle, and Auditor session:
+For one task or round:
+
+- same repo + same exact checkout → same Workspace, different Agent tabs;
+- same repo + different writer worktrees → same Project, different worktree Workspaces;
+- do **not** put different worktree paths into one Workspace: its cwd/scripts/terminals/archive lifecycle represent one checkout, and `--cwd` may normalize back to the Workspace root.
+
+The canonical parallel-writer flow is to register/select the repository Project
+once, then let Paseo create each branch Workspace under that Project:
+
+```bash
+project=$(paseo project ls --json | jq -r \
+  '.[] | select(.path == "/absolute/repo/root") | .projectId')
+
+ws=$(paseo workspace create --json \
+  --project "$project" \
+  --isolation worktree \
+  --path /absolute/repo/root \
+  --mode branch-off \
+  --new-branch fix/lane-a \
+  --base main \
+  --worktree-slug lane-a \
+  --title "<round> · lane-a" | jq -r '.workspaceId')
+
+paseo run -d --workspace "$ws" \
+  --provider codex --model gpt-5.6-terra --thinking high \
+  --mode full-access --title "Worker · lane-a" "<goal>"
+```
+
+For an already-existing branch, use `--mode checkout-branch --branch <name>`.
+This creates a Paseo-managed worktree. If an external worktree already exists,
+do not create a second checkout of the same branch; either keep its existing
+Workspace for that round or recreate it safely through the canonical Project
+before dispatch. Existing Agents cannot be moved between Workspaces.
+
+For several agents that intentionally share the **same exact checkout** (for
+example a read-only Oracle and Auditor), create or choose one named Workspace
+and reuse its ID so they appear as tabs:
 
 ```bash
 ws=$(paseo workspace create \
