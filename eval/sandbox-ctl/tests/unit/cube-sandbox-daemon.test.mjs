@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, lstatSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { createDaemonServer, createDaemonClient, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, daemonStatus, ensureRuntimeDir, runtimePaths, startDaemon } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon.mjs";
+import { createDaemonServer, createDaemonClient, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, daemonStatus, ensureRuntimeDir, readExecutions, runtimePaths, startDaemon, writeExecutions, writeState } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon.mjs";
 import { daemonPathsFromEnvironment } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-daemon-process.mjs";
 import { createCubeDirectProxy } from "../../../../skills/sandbox-ctl/scripts/lib/cube-sandbox-proxy.mjs";
 import net from "node:net";
@@ -22,6 +22,8 @@ function testPaths(runtimeDir) {
     lockPath: path.join(runtimeDir, "cube-sandbox.lock"),
   });
 }
+
+function pathsFor(server) { return testPaths(server.runtimeDir); }
 
 async function withDaemon(options, callback) {
   const runtimeDir = testRuntimeDir();
@@ -173,8 +175,8 @@ describe("Cube Sandbox daemon protocol", () => {
     }
   });
 
-  it("gives exec requests a deadline after the requested remote timeout", () => {
-    expect(daemonRequestDeadline({ op: "exec", timeoutMs: 900000 })).toBe(930000);
+  it("gives exec requests a deadline after the requested local wait", () => {
+    expect(daemonRequestDeadline({ op: "exec", localWaitTimeoutMs: 900000 })).toBe(900000);
     expect(daemonRequestDeadline({ op: "ping" })).toBe(1500);
   });
 
@@ -202,6 +204,186 @@ describe("Cube Sandbox daemon protocol", () => {
       expect(second.exitCode).toBe(7);
       expect(calls).toEqual({ clients: 1, connects: 1, homes: 1, runs: 2 });
     });
+  });
+
+  it("inspects a live daemon when project and user config are malformed", async () => {
+    const configDir = testRuntimeDir();
+    const configPath = path.join(configDir, "config.json");
+    writeFileSync(configPath, "{ definitely not json");
+    const previous = process.env.SANDBOX_CTL_USER_CONFIG;
+    process.env.SANDBOX_CTL_USER_CONFIG = configPath;
+    try {
+      await withDaemon({}, async (server) => {
+        const paths = testPaths(server.runtimeDir);
+        writeState(paths.statePath, { version: 1, pid: process.pid, uid: process.getuid?.(), socketPath: paths.socketPath, fingerprint: connectionFingerprint({ CUBE_API_URL: "https://cube.example", CUBE_API_KEY: "fake" }, { materialize: false }) });
+        const status = await daemonStatus(paths);
+        expect(status).toMatchObject({ running: true, config: { valid: false }, identity: { matched: true } });
+        expect(JSON.stringify(status)).not.toContain("definitely not json");
+      });
+    } finally {
+      if (previous === undefined) delete process.env.SANDBOX_CTL_USER_CONFIG; else process.env.SANDBOX_CTL_USER_CONFIG = previous;
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates a stale per-sandbox connection without replaying the command", async () => {
+    let connects = 0;
+    let runs = 0;
+    await withDaemon({
+      client: {
+        connect: async () => {
+          connects += 1;
+          const generation = connects;
+          return { disconnect: async () => {}, commands: { run: async () => {
+            runs += 1;
+            if (generation === 1) throw new Error("stale connection");
+            return { exitCode: 0, stdout: "reconnected\n", stderr: "" };
+          } } };
+        },
+      },
+    }, async (server) => {
+      const first = await createDaemonClient({ socketPath: server.socketPath }).exec({ sandboxId: "sbx-stale", command: "echo one" });
+      expect(first).toMatchObject({ exitCode: 125, failure: { kind: "sandbox_stale_connection" } });
+      const second = await createDaemonClient({ socketPath: server.socketPath }).exec({ sandboxId: "sbx-stale", command: "echo two" });
+      expect(second).toMatchObject({ exitCode: 0, stdout: "reconnected\n" });
+      expect({ connects, runs }).toEqual({ connects: 2, runs: 2 });
+    });
+  });
+
+  it("classifies an SDK TimeoutError as proxy transport instead of stale cache", async () => {
+    await withDaemon({
+      client: { connect: async () => ({ commands: { run: async () => { throw Object.assign(new Error("SDK command timeout"), { name: "TimeoutError" }); } } }) },
+    }, async (server) => {
+      const result = await createDaemonClient({ socketPath: server.socketPath }).exec({ sandboxId: "sbx-timeout-error", command: "sleep 3" });
+      expect(result).toMatchObject({ exitCode: 125, failure: { kind: "proxy_transport" } });
+    });
+  });
+
+  it("persists streamed output and terminal control failure after an accepted transport error", async () => {
+    await withDaemon({
+      client: { connect: async () => ({ disconnect: async () => {}, commands: { run: async (_command, options) => {
+        options.onStdout("partial-out\n");
+        options.onStderr("partial-err\n");
+        throw new Error("transport reset after acceptance");
+      } } }) },
+    }, async (server) => {
+      const executionId = "exec-accepted-transport";
+      const result = await createDaemonClient({ socketPath: server.socketPath }).exec({ executionId, sandboxId: "sbx-transport", command: "echo accepted" });
+      expect(result).toMatchObject({ executionId, exitCode: 125, failure: { kind: "sandbox_stale_connection" }, stdout: "partial-out\n", stderr: "partial-err\n" });
+      const record = await createDaemonClient({ socketPath: server.socketPath }).execResult(executionId);
+      expect(record).toMatchObject({ executionId, status: "failed", exitCode: 125, failure: { kind: "sandbox_stale_connection" }, stdout: "partial-out\n", stderr: "partial-err\n", completedAt: expect.any(String) });
+    });
+  });
+
+  it("retains an execution record after the client times out and disconnects", async () => {
+    let release;
+    await withDaemon({
+      client: {
+        connect: async () => ({
+          commands: {
+            run: async () => new Promise((resolve) => {
+              release = () => resolve({ exitCode: 23, stdout: "late\n", stderr: "remote-error\n" });
+            }),
+          },
+        }),
+      },
+    }, async (server) => {
+      const client = createDaemonClient({ socketPath: server.socketPath, requestGraceMs: 0 });
+      const executionId = "exec-test-durable";
+      await expect(client.exec({ executionId, sandboxId: "sbx-late", command: "sleep 1", timeoutMs: 1 })).rejects.toMatchObject({ executionId, failure: { kind: "local_timeout_remote_unknown" } });
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const record = await client.execResult(executionId);
+      expect(record).toMatchObject({ executionId, status: "completed", exitCode: 23, stdout: "late\n", stderr: "remote-error\n" });
+      expect(readdirSync(pathsFor(server).executionsDir)).toContain("exec-test-durable.json");
+    });
+  });
+
+  it("returns a local timeout without passing it to the SDK or cancelling the remote command", async () => {
+    let release;
+    let runOptions;
+    let runs = 0;
+    await withDaemon({
+      client: {
+        connect: async () => ({
+          commands: {
+            run: async (_command, options) => {
+              runs += 1;
+              runOptions = options;
+              return new Promise((resolve) => { release = () => resolve({ exitCode: 9, stdout: "late-out\n", stderr: "late-err\n" }); });
+            },
+          },
+        }),
+      },
+    }, async (server) => {
+      const client = createDaemonClient({ socketPath: server.socketPath, requestGraceMs: 0 });
+      const executionId = "exec-local-wait-only";
+      const startedAt = Date.now();
+      await expect(client.exec({ executionId, sandboxId: "sbx-local-wait", command: "sleep 3", localWaitTimeoutMs: 25 }))
+        .rejects.toMatchObject({ executionId, exitCode: 125, failure: { kind: "local_timeout_remote_unknown" } });
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      expect(runOptions).toBeTruthy();
+      expect(runOptions).not.toHaveProperty("timeoutMs");
+      expect(runs).toBe(1);
+      expect(typeof release).toBe("function");
+
+      release();
+      let result;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        result = await client.execResult(executionId);
+        if (result.status === "completed") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(result).toMatchObject({ executionId, status: "completed", exitCode: 9, stdout: "late-out\n", stderr: "late-err\n" });
+      expect(runs).toBe(1);
+    });
+  });
+
+  it("writes execution state atomically and refuses to overwrite corrupt records", () => {
+    const runtimeDir = testRuntimeDir();
+    const executionsPath = path.join(runtimeDir, "executions.json");
+    try {
+      writeExecutions(executionsPath, { one: { executionId: "one", sandboxId: "sbx", status: "completed", exitCode: 0, stdout: "ok", stderr: "" } });
+      expect(readExecutions(executionsPath)).toMatchObject({ one: { exitCode: 0 } });
+      expect(lstatSync(executionsPath).mode & 0o077).toBe(0);
+      expect(readdirSync(runtimeDir).filter((name) => name.includes(".tmp"))).toEqual([]);
+      writeFileSync(executionsPath, "not-json");
+      expect(() => writeExecutions(executionsPath, {})).toThrow(/unreadable|corrupt/i);
+      expect(readFileSync(executionsPath, "utf8")).toBe("not-json");
+    } finally { rmSync(runtimeDir, { recursive: true, force: true }); }
+  });
+
+  it("stores exact multibyte logs over 1MiB in an isolated record across daemon reload", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const stdout = "🙂".repeat(300_000);
+    const stderr = "é".repeat(600_000);
+    const client = { connect: async () => ({ commands: { run: async (_command, options) => {
+      options.onStdout(stdout);
+      options.onStderr(stderr);
+      return { exitCode: 0 };
+    } } }) };
+    const firstServer = createDaemonServer({ ...paths, client });
+    let secondServer;
+    try {
+      await firstServer.listen();
+      const executionId = "exec-large-exact";
+      await expect(createDaemonClient({ socketPath: firstServer.socketPath }).exec({ executionId, sandboxId: "sbx-large", command: "emit" })).resolves.toMatchObject({ executionId, exitCode: 0 });
+      expect(readdirSync(paths.executionsDir)).toEqual(["exec-large-exact.json"]);
+      const firstBytes = readFileSync(path.join(paths.executionsDir, "exec-large-exact.json"));
+      await expect(createDaemonClient({ socketPath: firstServer.socketPath }).exec({ executionId: "exec-small-isolated", sandboxId: "sbx-small", command: "emit" })).resolves.toMatchObject({ executionId: "exec-small-isolated", exitCode: 0 });
+      expect(readdirSync(paths.executionsDir).sort()).toEqual(["exec-large-exact.json", "exec-small-isolated.json"]);
+      expect(readFileSync(path.join(paths.executionsDir, "exec-large-exact.json"))).toEqual(firstBytes);
+      await firstServer.close();
+      secondServer = createDaemonServer({ ...paths, client });
+      await secondServer.listen();
+      const record = await createDaemonClient({ socketPath: secondServer.socketPath }).execResult(executionId);
+      expect(record).toMatchObject({ executionId, status: "completed", exitCode: 0, stdout, stderr });
+    } finally {
+      if (!firstServer.closed) await firstServer.close();
+      if (secondServer && !secondServer.closed) await secondServer.close();
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
   });
 
   it("exposes the daemon-owned loopback proxy through ping/status", async () => {

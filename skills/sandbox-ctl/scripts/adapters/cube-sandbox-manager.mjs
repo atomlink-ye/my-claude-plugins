@@ -72,7 +72,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 import { parseArgs as parseArgsGeneric, sanitizeTaskId, shellQuote } from "../lib/cli-shared.mjs";
@@ -89,7 +89,7 @@ import {
   validateTarEntries,
 } from "../lib/transfer.mjs";
 import { createGitBundle, fetchGitBundleIntoBranch, remoteEnsureGitCommand, validateGitBranch } from "../lib/git-sync.mjs";
-import { createDaemonClient, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
+import { classifyFailure, createDaemonClient, FAILURE_KINDS, readExecutionRecord, readExecutions, runtimePaths, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
@@ -266,7 +266,29 @@ function addConnectionOptions(method, args, connection) {
   return result;
 }
 
-function wrapCubeSandboxClient(Sandbox, connection) {
+const REQUIRED_SANDBOX_STATIC_METHODS = ["create", "connect", "list", "getInfo", "kill"];
+
+function hasSandboxLifecycleMethods(value) {
+  return typeof value === "function"
+    && REQUIRED_SANDBOX_STATIC_METHODS.every((method) => typeof value[method] === "function");
+}
+
+/**
+ * Dynamic ESM imports of the CommonJS-compatible e2b package have appeared in
+ * three shapes: a named Sandbox export, a default namespace containing
+ * Sandbox, and a default Sandbox class. Resolve those shapes to the actual
+ * static lifecycle owner and reject namespace objects or partial exports
+ * before any handler can make a real request.
+ */
+function resolveSandboxLifecycleClass(sdk) {
+  const candidates = [sdk?.Sandbox, sdk?.default?.Sandbox, sdk?.default, typeof sdk === "function" ? sdk : undefined];
+  const Sandbox = candidates.find((candidate) => hasSandboxLifecycleMethods(candidate));
+  if (Sandbox) return Sandbox;
+  throw new Error(`Could not resolve the e2b Sandbox lifecycle facade: expected a callable Sandbox class with static ${REQUIRED_SANDBOX_STATIC_METHODS.join(", ")} methods (supported shapes: sdk.Sandbox, sdk.default.Sandbox, or sdk.default).`);
+}
+
+function wrapCubeSandboxClient(sdk, connection) {
+  const Sandbox = resolveSandboxLifecycleClass(sdk);
   if (!connection || !Object.values(connection).some((value) => value !== undefined && value !== "")) return Sandbox;
   const methods = new Set(["create", "connect", "list", "getInfo", "kill", "pause"]);
   return new Proxy(Sandbox, { get(target, property, receiver) {
@@ -286,8 +308,8 @@ function wrapCubeSandboxClient(Sandbox, connection) {
  * SDK export, which also makes it trivial to inject a fake object with the
  * same shape via `options.client` in tests.
  */
-async function createClient() {
-  const connection = resolveCubeSandboxEnv();
+async function createClient(options = {}) {
+  const connection = resolveCubeSandboxEnv(options.env ?? process.env);
   const { apiKey, apiUrl } = connection;
   let proxy = connection.proxy;
   // In direct-dial mode the loopback proxy belongs to the shared daemon. CLI
@@ -300,13 +322,11 @@ async function createClient() {
   }
   if (!apiKey) throw new Error("Cube Sandbox API key is required. Set CUBE_API_KEY or E2B_API_KEY.");
   if (!apiUrl) throw new Error("Cube Sandbox API URL is required. Set CUBE_API_URL or E2B_API_URL to a network-reachable operator endpoint; do not rely on the SDK's public e2b.dev default.");
-  const sdk = await loadCubeSandboxSdk();
-  const Sandbox = sdk.Sandbox ?? sdk.default;
-  if (!Sandbox) throw new Error("Could not find Sandbox client export in e2b.");
+  const sdk = options.sdk ?? await loadCubeSandboxSdk();
   // Pass every connection setting explicitly to every static SDK lifecycle
   // call.  This prevents unrelated E2B_* environment values from silently
   // selecting a different account or cluster when CUBE_* is configured.
-  return wrapCubeSandboxClient(Sandbox, { apiKey, apiUrl, proxy });
+  return wrapCubeSandboxClient(sdk, { apiKey, apiUrl, proxy });
 }
 
 function buildUserConfigFromEnvironment(options = {}) {
@@ -498,7 +518,7 @@ async function invalidateDaemonConnection(sandboxId, options = {}) {
   const nonzeroExit = Number.isInteger(result?.exitCode) && result.exitCode !== 0;
   if (nonzeroExit || result?.error || result?.ok === false) {
     const detail = result?.error ? `: ${result.error}` : nonzeroExit ? ` (exit code ${result.exitCode})` : "";
-    throw new Error(`Could not invalidate the local Cube Sandbox daemon connection for ${sandboxId}${detail}; restart the local sandbox-ctl daemon (daemon stop, then daemon start) and retry`);
+    throw new Error(`Could not invalidate the local Cube Sandbox daemon connection for ${sandboxId}${detail}; inspect daemon status and probe another binding before optionally restarting the local daemon`);
   }
   return result;
 }
@@ -540,7 +560,7 @@ function redactExecFailure(error) {
 
 function daemonUnavailableDiagnostic(error) {
   const detail = redactExecFailure(error);
-  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Run sandbox-ctl daemon stop && sandbox-ctl daemon start, then retry.`;
+  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Inspect daemon status and probe another binding before considering a restart.`;
 }
 
 function assertWorkspaceOwnership(result, action = "workspace ownership validation") {
@@ -839,11 +859,15 @@ async function handleExec(options, command) {
     const daemonResult = await handleExecViaDaemon(options, command);
     if (daemonResult) return daemonResult;
   }
+  if (options.timeoutMs !== undefined) {
+    const error = "Direct Cube Sandbox diagnostic mode cannot provide durable local timeout recovery; omit --timeout or enable the daemon-backed exec path";
+    return { exitCode: 125, stdout: "", stderr: "", error, failure: { kind: FAILURE_KINDS.PROXY_TRANSPORT, message: error } };
+  }
   let sandboxInfo;
   try {
     sandboxInfo = await requireSandbox(options);
   } catch (error) {
-    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error) };
+    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error), failure: classifyFailure(error, FAILURE_KINDS.SANDBOX_CONNECT) };
   }
   const { paths, sandbox, remoteHome } = sandboxInfo;
   const cwd = toRemoteAbsolute(options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath, remoteHome);
@@ -857,18 +881,18 @@ async function handleExec(options, command) {
     (kind === "stderr" ? stderr : stdout).push(text);
     if (shouldStream) (kind === "stderr" ? process.stderr : process.stdout).write(text);
   };
-  const timeoutMs = options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const runOptions = {
+    background: false,
+    cwd,
+    onStdout: (chunk) => emit("stdout", chunk),
+    onStderr: (chunk) => emit("stderr", chunk),
+  };
+  if (options.remoteTimeoutMs !== undefined) runOptions.timeoutMs = options.remoteTimeoutMs;
+  const commandPromise = Promise.resolve().then(() => sandbox.commands.run(cmd, runOptions));
+  const outcome = await commandPromise.then((result) => ({ kind: "result", result }), (error) => ({ kind: "error", error }));
   let exitCode;
-  try {
-    const result = await sandbox.commands.run(cmd, {
-      background: false,
-      cwd,
-      timeoutMs,
-      onStdout: (chunk) => emit("stdout", chunk),
-      onStderr: (chunk) => emit("stderr", chunk),
-    });
-    exitCode = remoteExitCode(result?.exitCode) ?? 0;
-  } catch (error) {
+  if (outcome.kind === "error") {
+    const { error } = outcome;
     // Duck-typed CommandExitError (see cubeSandboxExec's header note): stdout/stderr
     // were already streamed via onStdout/onStderr by the time wait() rejects,
     // so we only need the exit code here — re-appending error.stdout/stderr
@@ -876,10 +900,12 @@ async function handleExec(options, command) {
     if (typeof error?.exitCode === "number" && typeof error?.stdout === "string" && typeof error?.stderr === "string") {
       exitCode = remoteExitCode(error.exitCode) ?? 125;
     } else {
-      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error) };
+      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error), failure: classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT) };
     }
+  } else {
+    exitCode = remoteExitCode(outcome.result?.exitCode) ?? 0;
   }
-  const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join("") };
+  const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), ...(exitCode !== 0 ? { failure: { kind: FAILURE_KINDS.REMOTE_COMMAND, remoteExitCode: exitCode } } : {}) };
   if (options.artifacts) {
     try { result.artifactPath = writeExecArtifacts(options.artifacts, { ...result, command, cwd }); }
     catch (error) { return { ...result, exitCode: 125, error: redactExecFailure(error) }; }
@@ -891,6 +917,7 @@ async function handleExecViaDaemon(options, command) {
   let paths;
   const stdout = [];
   const stderr = [];
+  const executionId = randomUUID();
   try {
     paths = resolveProjectPaths(options);
     if (!paths.binding?.sandboxId) return null;
@@ -900,16 +927,18 @@ async function handleExecViaDaemon(options, command) {
     if (!options.daemonClient) await (options.startDaemon ?? startDaemon)(options.daemon ?? {});
     const cwd = options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath;
     const result = await daemon.exec({
+      executionId,
       sandboxId: paths.binding.sandboxId,
       command: command.map(shellQuote).join(" "),
       cwd,
       remoteHome: paths.binding.remoteHome,
       sandboxTimeoutMs: paths.binding.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS,
-      timeoutMs: options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
+      localWaitTimeoutMs: options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
+      ...(options.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: options.remoteTimeoutMs } : {}),
       onStdout: (chunk) => { const text = String(chunk ?? ""); stdout.push(text); if (!options.json && !options.bufferOutput) process.stdout.write(text); },
       onStderr: (chunk) => { const text = String(chunk ?? ""); stderr.push(text); if (!options.json && !options.bufferOutput) process.stderr.write(text); },
     });
-    const normalized = { exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 125, stdout: result.stdout ?? stdout.join(""), stderr: result.stderr ?? stderr.join(""), ...(result.remoteHome ? { remoteHome: result.remoteHome } : {}) };
+    const normalized = { executionId: result.executionId ?? executionId, exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 125, stdout: result.stdout ?? stdout.join(""), stderr: result.stderr ?? stderr.join(""), ...(result.remoteHome ? { remoteHome: result.remoteHome } : {}), ...(result.failure ? { failure: result.failure } : {}) };
     if (result.remoteHome && !paths.binding.remoteHome) {
       try { upsertBinding(paths.directory, paths.binding.name, { remoteHome: result.remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* preserve command result; next direct run can retry */ }
     }
@@ -917,6 +946,7 @@ async function handleExecViaDaemon(options, command) {
       const diagnostic = daemonUnavailableDiagnostic(result.error);
       normalized.exitCode = 125;
       normalized.error = diagnostic;
+      normalized.failure = result.failure ?? classifyFailure(result, FAILURE_KINDS.PROXY_TRANSPORT);
       normalized.stderr = normalized.stderr ? `${normalized.stderr}${normalized.stderr.endsWith("\n") ? "" : "\n"}${diagnostic}\n` : `${diagnostic}\n`;
     }
     if (options.artifacts && !normalized.error) {
@@ -927,8 +957,28 @@ async function handleExecViaDaemon(options, command) {
   } catch (error) {
     const diagnostic = daemonUnavailableDiagnostic(error);
     const priorStderr = stderr.join("");
-    return { exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic };
+    const classified = error.failure ?? classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT);
+    return { executionId: error.executionId ?? executionId, exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic, failure: classified, ...(classified.kind === FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN ? { remoteStatus: "unknown" } : {}) };
   }
+}
+
+async function handleExecRecord(options = {}) {
+  const executionId = String(options.executionId ?? options["execution-id"] ?? "");
+  if (!executionId) throw new Error("exec status/result requires an execution ID");
+  const daemon = options.daemonClient
+    ? (typeof options.daemonClient === "function" ? await options.daemonClient() : options.daemonClient)
+    : createDaemonClient(options.daemon ?? {});
+  const operation = options.execCommand === "status" ? "execStatus" : "execResult";
+  if (typeof daemon[operation] === "function") {
+    try {
+      const result = await daemon[operation](executionId);
+      if (result?.status !== "not-found") return result;
+    } catch { /* read the durable local record below when the daemon is stopped */ }
+  }
+  const paths = runtimePaths(options.daemon ?? {});
+  const local = readExecutionRecord(paths.executionsDir, executionId) ?? readExecutions(paths.executionsPath)[executionId];
+  if (local) return { ok: true, ...local };
+  return { ok: false, executionId, status: "not-found", failure: { kind: FAILURE_KINDS.PROXY_TRANSPORT, message: "Execution record was not found" } };
 }
 
 async function handlePush(options) {
@@ -1303,6 +1353,7 @@ export {
   assertManagedSandboxInfo,
   assertSafeDestructiveRemoteWorkspace,
   createClient,
+  resolveSandboxLifecycleClass,
   wrapCubeSandboxClient,
   resolveCubeSandboxEnv,
   cubeSandboxExec,
@@ -1315,6 +1366,7 @@ export {
   handlePause,
   handleResume,
   handleExec,
+  handleExecRecord,
   handleList,
   handlePreview,
   handlePull,

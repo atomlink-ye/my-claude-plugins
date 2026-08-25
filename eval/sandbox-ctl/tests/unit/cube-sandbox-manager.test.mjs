@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -11,16 +12,22 @@ import {
   cubeExec,
   handleDoctor,
   handleDown,
+  handleAdopt,
   handleExec,
+  handleExecRecord,
   handleList,
+  handlePause,
   handlePreview,
   handlePull,
   handlePush,
+  handleResume,
+  handleStatus,
   handleUp,
   isNotFoundError,
   parseArgs,
   parsePort,
   projectIdentity,
+  resolveSandboxLifecycleClass,
   requireSandbox,
   resolveProjectPaths,
   redactExecFailure,
@@ -99,6 +106,17 @@ function missingUserConfig(prefix) {
 }
 
 describe("cube-sandbox-manager argument parsing", () => {
+  it("rejects an invalid SDK export with a nonsecret lifecycle error", () => {
+    let error;
+    try { resolveSandboxLifecycleClass({ default: { Sandbox: { apiKey: "super-secret" } } }); }
+    catch (cause) { error = cause; }
+    expect(error?.message).toMatch(/static create, connect, list, getInfo, kill methods/i);
+    expect(error?.message).not.toContain("super-secret");
+
+    const namespaceLike = { create() {}, connect() {}, list() {}, getInfo() {}, kill() {} };
+    expect(() => resolveSandboxLifecycleClass({ default: { Sandbox: namespaceLike } })).toThrow(/callable|class|export/i);
+  });
+
   it("removes URL credentials, query, and fragment from diagnostics", () => {
     const error = redactExecFailure(new Error("request failed https://user:pass@cube.example/api?token=secret#fragment"));
     expect(error).toContain("https://cube.example/api");
@@ -106,7 +124,7 @@ describe("cube-sandbox-manager argument parsing", () => {
   });
   it("injects the resolved proxy into all Cube lifecycle static calls", async () => {
     const calls = [];
-    const fake = {};
+    const fake = class StaticSandboxFake {};
     for (const method of ["create", "connect", "getInfo", "kill", "list"]) fake[method] = (...args) => { calls.push([method, args]); return method === "list" ? {} : {}; };
     const wrapped = wrapCubeSandboxClient(fake, { proxy: "http://127.0.0.1:43123" });
     await wrapped.create({ template: "base" });
@@ -123,9 +141,82 @@ describe("cube-sandbox-manager argument parsing", () => {
     ]);
   });
 
+  it("normalizes a CJS-wrapped Sandbox namespace before real lifecycle handlers use it", async () => {
+    const calls = [];
+    const sandbox = fakeSandbox({ sandboxId: "facade-sbx" });
+    sandbox.setTimeout = async () => {};
+    let state = "running";
+    const staticFake = class StaticSandboxFake {};
+    staticFake.create = async (...args) => { calls.push(["create", args]); return sandbox; };
+    staticFake.connect = async (...args) => { calls.push(["connect", args]); state = "running"; return sandbox; };
+    staticFake.list = (...args) => {
+      calls.push(["list", args]);
+      let hasNext = true;
+      return { get hasNext() { return hasNext; }, nextItems: async () => { hasNext = false; return [{ sandboxId: "facade-sbx", name: "facade", state: "running", templateId: "base" }]; } };
+    };
+    staticFake.getInfo = async (...args) => { calls.push(["getInfo", args]); return { state, templateId: "base", metadata: {} }; };
+    staticFake.kill = async (...args) => { calls.push(["kill", args]); return true; };
+    staticFake.pause = async (...args) => { calls.push(["pause", args]); state = "paused"; return true; };
+    const userConfig = missingUserConfig("cube-facade-client");
+    const facade = await createClient({
+      sdk: { default: { Sandbox: staticFake } },
+      env: {
+        SANDBOX_CTL_USER_CONFIG: userConfig.path,
+        CUBE_API_KEY: "cube-key",
+        CUBE_API_URL: "https://cube.example/api",
+        CUBE_PROXY_URL: "http://127.0.0.1:43123",
+      },
+    });
+    expect(typeof facade).toBe("function");
+    expect(typeof facade.create).toBe("function");
+    expect(typeof facade.connect).toBe("function");
+    expect(typeof facade.list).toBe("function");
+    expect(typeof facade.getInfo).toBe("function");
+    expect(typeof facade.kill).toBe("function");
+
+    const originalLog = console.log;
+    console.log = () => {};
+    const roots = [];
+    try {
+      const upRoot = mkdtempSync(path.join(tmpdir(), "cube-facade-up-"));
+      roots.push(upRoot);
+      await handleUp({ directory: upRoot, template: "base", client: facade, json: true });
+
+      const adoptRoot = mkdtempSync(path.join(tmpdir(), "cube-facade-adopt-"));
+      roots.push(adoptRoot);
+      await handleAdopt({ directory: adoptRoot, sandboxId: "facade-sbx", "remote-path": "workspace/adopt", client: facade, remoteHome: "/home/user" });
+
+      await handleStatus({ directory: adoptRoot, client: facade });
+      await handleList({ client: facade });
+      await handleDown({ directory: adoptRoot, client: facade, "keep-state": true });
+      const daemonClient = { invalidate: async () => ({ ok: true }) };
+      await handlePause({ directory: adoptRoot, client: facade, daemonClient });
+      await handleResume({ directory: adoptRoot, client: facade, daemonClient });
+    } finally {
+      console.log = originalLog;
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+      rmSync(userConfig.directory, { recursive: true, force: true });
+    }
+
+    expect(calls.map(([method]) => method)).toEqual([
+      "create", "getInfo", "connect", "getInfo", "list", "getInfo", "kill",
+      "getInfo", "pause", "getInfo", "connect",
+    ]);
+    for (const [, args] of calls) expect(args.at(-1)).toMatchObject({
+      apiKey: "cube-key",
+      apiUrl: "https://cube.example/api",
+      proxy: "http://127.0.0.1:43123",
+    });
+    expect(calls.find(([method]) => method === "create")[1][0]).toMatchObject({ template: "base", timeoutMs: expect.any(Number) });
+    expect(calls.find(([method]) => method === "connect")[1][0]).toBe("facade-sbx");
+    expect(calls.find(([method]) => method === "getInfo")[1][0]).toBe("facade-sbx");
+    expect(calls.find(([method]) => method === "kill")[1][0]).toBe("facade-sbx");
+    expect(calls.find(([method]) => method === "pause")[1][0]).toBe("facade-sbx");
+  });
+
   it("passes explicit Cube connection settings to every SDK lifecycle call", async () => {
     const calls = [];
-    const fake = {};
+    const fake = class StaticSandboxFake {};
     for (const method of ["create", "connect", "getInfo", "kill", "list"]) fake[method] = (...args) => { calls.push([method, args]); return method === "list" ? {} : {}; };
     const wrapped = wrapCubeSandboxClient(fake, { apiKey: "cube-key", apiUrl: "https://cube.example/api", proxy: "http://127.0.0.1:43123" });
     await wrapped.create({ apiKey: "e2b-key", apiUrl: "https://e2b.example", proxy: "http://e2b-proxy" });
@@ -240,8 +331,74 @@ describe("cube-sandbox-manager exec", () => {
     } finally { delete process.env.CUBE_TEST_TOKEN; rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("classifies malformed project config as config_invalid", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-config-invalid-"));
+    try {
+      mkdirSync(path.join(root, ".sandbox-ctl"), { recursive: true });
+      writeFileSync(path.join(root, ".sandbox-ctl", "config.json"), "{bad");
+      const result = await handleExec({ directory: root, daemonClient: { exec: async () => ({ exitCode: 0 }) } }, ["true"]);
+      expect(result).toMatchObject({ exitCode: 125, failure: { kind: "config_invalid" } });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("requires a command after --", async () => {
     await expect(handleExec({}, [])).rejects.toThrow(/requires a command/i);
+  });
+
+  it("exposes durable execution status/result records without reading credentials", async () => {
+    const daemon = {
+      execStatus: async (executionId) => ({ ok: true, executionId, status: "running", sandboxId: "sbx-1" }),
+      execResult: async (executionId) => ({ ok: true, executionId, status: "completed", exitCode: 7, stdout: "out\n", stderr: "err\n" }),
+    };
+    await expect(handleExecRecord({ execCommand: "status", executionId: "exec-1", daemonClient: daemon })).resolves.toMatchObject({ status: "running", executionId: "exec-1" });
+    await expect(handleExecRecord({ execCommand: "result", executionId: "exec-1", daemonClient: daemon })).resolves.toMatchObject({ status: "completed", exitCode: 7, stdout: "out\n" });
+  });
+
+  it("returns a stable unknown-remote-status timeout with the execution ID and never retries", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-timeout-"));
+    try {
+      bindConfig(root);
+      let calls = 0;
+      const client = {
+        exec: async () => {
+          calls += 1;
+          const error = new Error("local wait timed out");
+          error.executionId = "exec-timeout-1";
+          error.failure = { kind: "local_timeout_remote_unknown" };
+          throw error;
+        },
+      };
+      const result = await handleExec({ directory: root, daemonClient: client }, ["sleep", "60"]);
+      expect(result).toMatchObject({ exitCode: 125, executionId: "exec-timeout-1", remoteStatus: "unknown", failure: { kind: "local_timeout_remote_unknown" } });
+      expect(calls).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects direct SDK local timeout recovery before command acceptance", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-direct-exec-timeout-"));
+    const previousDisableDaemon = process.env.SANDBOX_CTL_DISABLE_DAEMON;
+    process.env.SANDBOX_CTL_DISABLE_DAEMON = "1";
+    let connects = 0;
+    try {
+      bindConfig(root, { remoteHome: "/home/user" });
+      const sandbox = {
+        commands: {
+          run: async () => ({ exitCode: 9, stdout: "late-out\n", stderr: "late-err\n" }),
+        },
+      };
+      const client = { connect: async () => { connects += 1; return sandbox; } };
+      const startedAt = Date.now();
+      const result = await handleExec({ directory: root, client, timeoutMs: 5, json: true }, ["sleep", "3"]);
+      expect(result).toMatchObject({ exitCode: 125, failure: { kind: "proxy_transport" } });
+      expect(result).not.toHaveProperty("executionId");
+      expect(result.error).toMatch(/direct.*local timeout|daemon.*local timeout/i);
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      expect(connects).toBe(0);
+    } finally {
+      if (previousDisableDaemon === undefined) delete process.env.SANDBOX_CTL_DISABLE_DAEMON;
+      else process.env.SANDBOX_CTL_DISABLE_DAEMON = previousDisableDaemon;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -507,6 +664,56 @@ describe("cube-sandbox-manager createClient env resolution", () => {
 });
 
 describe("cube-sandbox-manager up binding shape", () => {
+  it("connects the node-created sandbox through the normalized static facade", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-up-node-facade-"));
+    const userConfig = missingUserConfig("cube-up-node-facade-config");
+    const calls = [];
+    const sandbox = fakeSandbox({ sandboxId: "442401a76bcb418aabbd2e4c100a4f81" });
+    const staticFake = class StaticSandboxFake {};
+    staticFake.create = async () => { throw new Error("node mode should not call create"); };
+    staticFake.connect = async (...args) => { calls.push(["connect", args]); return sandbox; };
+    staticFake.list = () => ({ hasNext: false, nextItems: async () => [] });
+    staticFake.getInfo = async (...args) => { calls.push(["getInfo", args]); return { state: "running" }; };
+    staticFake.kill = async (...args) => { calls.push(["kill", args]); return true; };
+    const facade = wrapCubeSandboxClient({ default: { Sandbox: staticFake } }, { proxy: "http://127.0.0.1:43123" });
+    expect(typeof facade).toBe("function");
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { end: () => queueMicrotask(() => {
+        child.stdout.emit("data", "code:200 totalRunSuccCnt:1 totalRunErr:0 sandBoxId:442401a76bcb418aabbd2e4c100a4f81\n");
+        child.emit("close", 0, null);
+      }) };
+      return child;
+    };
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      await handleUp({
+        directory: root,
+        template: "base",
+        node: "10.0.0.9",
+        env: {
+          SANDBOX_CTL_USER_CONFIG: userConfig.path,
+          CUBE_SCHEDULER_SSH_HOST: "operator",
+          CUBE_SCHEDULER_CLI_PATH: "/usr/bin/cube",
+        },
+        spawnImpl,
+        client: facade,
+        json: true,
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toBe("connect");
+      expect(calls[0][1][0]).toBe("442401a76bcb418aabbd2e4c100a4f81");
+      expect(calls[0][1][1]).toMatchObject({ timeoutMs: expect.any(Number), proxy: "http://127.0.0.1:43123" });
+    } finally {
+      console.log = originalLog;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(userConfig.directory, { recursive: true, force: true });
+    }
+  });
+
   it("requires a template before creating an unbound sandbox", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-up-template-required-"));
     const create = vi.fn(async () => { throw new Error("client.create should not be called"); });

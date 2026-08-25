@@ -1,11 +1,11 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, connect as connectSocket } from "node:net";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { materializeCubeSandboxEnv } from "./cube-sandbox-user-config.mjs";
+import { configuredPath, materializeCubeSandboxEnv, resolveCubeSandboxValues } from "./cube-sandbox-user-config.mjs";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_SANDBOX_TIMEOUT_MS = 1_800_000;
@@ -16,6 +16,7 @@ const DEFAULT_SANDBOX_TIMEOUT_MS = 1_800_000;
 const DEFAULT_RUNTIME_DIR = path.join("/tmp", `sandbox-ctl-${process.getuid?.() ?? "user"}`);
 const DEFAULT_SOCKET_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox.sock");
 const DEFAULT_STATE_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox-state.json");
+const DEFAULT_EXECUTIONS_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox-executions.json");
 const DEFAULT_LOCK_PATH = path.join(DEFAULT_RUNTIME_DIR, "cube-sandbox.lock");
 // These are intentionally not public configuration knobs. They are set only
 // on the detached daemon child by startDaemon; the daemon entrypoint consumes
@@ -24,6 +25,8 @@ const CHILD_PATH_ENVS = {
   runtimeDir: "SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL",
   socketPath: "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL",
   statePath: "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL",
+  executionsPath: "SANDBOX_CTL_DAEMON_EXECUTIONS_PATH_INTERNAL",
+  executionsDir: "SANDBOX_CTL_DAEMON_EXECUTIONS_DIR_INTERNAL",
   lockPath: "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL",
 };
 
@@ -33,8 +36,36 @@ function runtimePaths(options = {}) {
     runtimeDir,
     socketPath: options.socketPath || path.join(runtimeDir, "cube-sandbox.sock"),
     statePath: options.statePath || path.join(runtimeDir, "cube-sandbox-state.json"),
+    executionsPath: options.executionsPath || path.join(runtimeDir, "cube-sandbox-executions.json"),
+    executionsDir: options.executionsDir || path.join(runtimeDir, "cube-sandbox-executions"),
     lockPath: options.lockPath || path.join(runtimeDir, "cube-sandbox.lock"),
   };
+}
+
+export const FAILURE_KINDS = Object.freeze({
+  CONFIG_INVALID: "config_invalid",
+  DAEMON_UNREACHABLE: "daemon_unreachable",
+  DAEMON_IDENTITY_MISMATCH: "daemon_identity_mismatch",
+  PROXY_TRANSPORT: "proxy_transport",
+  SANDBOX_CONNECT: "sandbox_connect",
+  SANDBOX_STALE_CONNECTION: "sandbox_stale_connection",
+  LOCAL_TIMEOUT_REMOTE_UNKNOWN: "local_timeout_remote_unknown",
+  REMOTE_COMMAND: "remote_command",
+});
+
+function failure(kind, message, extra = {}) {
+  return { kind, ...(message ? { message: String(message) } : {}), ...extra };
+}
+
+export function classifyFailure(error, fallback = FAILURE_KINDS.PROXY_TRANSPORT) {
+  if (error?.failure?.kind) return error.failure;
+  if (error?.kind && Object.values(FAILURE_KINDS).includes(error.kind)) return failure(error.kind, error.message, error.details);
+  const message = String(error?.message ?? error ?? "");
+  if (/malformed .*config|user config.*(invalid|schema|json)|config.*(invalid|malformed)|invalid .*config/i.test(message)) return failure(FAILURE_KINDS.CONFIG_INVALID);
+  if (/identity.*(indeterminate|mismatch|unavailable)|connection settings changed/i.test(message)) return failure(FAILURE_KINDS.DAEMON_IDENTITY_MISMATCH);
+  if (/unreachable|connect econn|enoent|econnrefused|socket/i.test(message)) return failure(FAILURE_KINDS.DAEMON_UNREACHABLE);
+  if (/sandbox.*(connect|not found|unavailable)/i.test(message)) return failure(FAILURE_KINDS.SANDBOX_CONNECT);
+  return failure(fallback);
 }
 
 function sanitizeUrl(value) {
@@ -73,22 +104,22 @@ function urlSensitiveDigest(value) {
   return sensitive.replaceAll("\u0000", "") ? `sha256:${createHash("sha256").update(sensitive).digest("hex")}` : "";
 }
 
-function connectionFingerprint(env = process.env) {
-  materializeCubeSandboxEnv(env);
-  const endpoint = env.CUBE_API_URL || env.E2B_API_URL || "";
-  const proxy = env.CUBE_PROXY_URL || env.E2B_PROXY_URL || "";
-  const caPath = env.CUBE_CA_PATH || env.E2B_CA_PATH || env.NODE_EXTRA_CA_CERTS || "";
-  const apiKey = env.CUBE_API_KEY || env.E2B_API_KEY || "";
+function connectionFingerprint(env = process.env, { materialize = true, resolveConfig = true } = {}) {
+  const resolved = materialize ? (materializeCubeSandboxEnv(env), null) : (resolveConfig ? resolveCubeSandboxValues({ env }) : null);
+  const endpoint = env.CUBE_API_URL || env.E2B_API_URL || resolved?.api?.url || "";
+  const proxy = env.CUBE_PROXY_URL || env.E2B_PROXY_URL || resolved?.network?.proxyUrl || "";
+  const caPath = env.CUBE_CA_PATH || env.E2B_CA_PATH || env.NODE_EXTRA_CA_CERTS || resolved?.network?.caPath || "";
+  const apiKey = env.CUBE_API_KEY || env.E2B_API_KEY || resolved?.api?.key || "";
   return {
     apiUrl: sanitizeUrl(endpoint), proxy: sanitizeUrl(proxy),
     apiUrlSensitiveDigest: urlSensitiveDigest(endpoint),
     proxySensitiveDigest: urlSensitiveDigest(proxy),
     apiKeyDigest: apiKey ? `sha256:${createHash("sha256").update(String(apiKey)).digest("hex")}` : "",
     caPath: String(caPath),
-    proxyNodeIp: String(env.CUBE_PROXY_NODE_IP || ""),
-    apiNodeIp: String(env.CUBE_API_NODE_IP || env.CUBE_PROXY_NODE_IP || ""),
-    sandboxDomain: String(env.CUBE_API_SANDBOX_DOMAIN || "cube.app"),
-    proxyPortHttps: String(env.CUBE_PROXY_PORT_HTTPS || "443"),
+    proxyNodeIp: String(env.CUBE_PROXY_NODE_IP || resolved?.network?.proxyNodeIp || ""),
+    apiNodeIp: String(env.CUBE_API_NODE_IP || env.CUBE_PROXY_NODE_IP || resolved?.network?.apiNodeIp || ""),
+    sandboxDomain: String(env.CUBE_API_SANDBOX_DOMAIN || resolved?.network?.apiSandboxDomain || "cube.app"),
+    proxyPortHttps: String(env.CUBE_PROXY_PORT_HTTPS || resolved?.network?.proxyPortHttps || "443"),
   };
 }
 
@@ -162,6 +193,110 @@ function writeState(statePath, state) {
   chmodSync(statePath, 0o600);
 }
 
+function readExecutions(executionsPath) {
+  try {
+    if (lstatSync(executionsPath).isSymbolicLink()) return {};
+    const value = JSON.parse(readFileSync(executionsPath, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+
+function writeExecutions(executionsPath, executions) {
+  try { if (lstatSync(executionsPath).isSymbolicLink()) throw protocolError(`Refusing symlinked daemon executions: ${executionsPath}`); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  try {
+    const existing = readFileSync(executionsPath, "utf8");
+    const parsed = JSON.parse(existing);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("execution registry is not an object");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw protocolError(`Daemon execution registry is unreadable or corrupt: ${executionsPath}`);
+  }
+  const safe = {};
+  for (const [executionId, record] of Object.entries(executions ?? {})) {
+    if (!record || typeof record !== "object") continue;
+    safe[executionId] = {
+      executionId,
+      sandboxId: String(record.sandboxId ?? ""),
+      status: String(record.status ?? "unknown"),
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+      ...(record.completedAt ? { completedAt: record.completedAt } : {}),
+      ...(Number.isInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
+      ...(record.failure ? { failure: record.failure } : {}),
+      ...(record.stdout !== undefined ? { stdout: String(record.stdout) } : {}),
+      ...(record.stderr !== undefined ? { stderr: String(record.stderr) } : {}),
+    };
+  }
+  const temporaryPath = `${executionsPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(safe)}\n`, { mode: 0o600, flag: "wx" });
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, executionsPath);
+    chmodSync(executionsPath, 0o600);
+  } finally { try { unlinkSync(temporaryPath); } catch {} }
+}
+
+function executionFilePath(executionsDir, executionId) {
+  const safeId = String(executionId ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeId)) throw protocolError("Invalid execution ID");
+  return path.join(executionsDir, `${safeId}.json`);
+}
+
+function ensureExecutionsDir(executionsDir) {
+  try { if (lstatSync(executionsDir).isSymbolicLink()) throw protocolError(`Refusing symlinked daemon execution directory: ${executionsDir}`); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  mkdirSync(executionsDir, { recursive: true, mode: 0o700 });
+  chmodSync(executionsDir, 0o700);
+  const info = lstatSync(executionsDir);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw protocolError(`Daemon execution path is not a directory: ${executionsDir}`);
+  if (process.getuid && info.uid !== process.getuid()) throw protocolError(`Daemon execution directory is not owned by the current user: ${executionsDir}`);
+}
+
+function readExecutionRecord(executionsDir, executionId) {
+  let filePath;
+  try { filePath = executionFilePath(executionsDir, executionId); } catch { return null; }
+  try {
+    if (lstatSync(filePath).isSymbolicLink()) return null;
+    const record = JSON.parse(readFileSync(filePath, "utf8"));
+    return record && typeof record === "object" && !Array.isArray(record) ? record : null;
+  } catch { return null; }
+}
+
+function writeExecutionRecord(executionsDir, record) {
+  ensureExecutionsDir(executionsDir);
+  const filePath = executionFilePath(executionsDir, record?.executionId);
+  try {
+    const existing = readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(existing);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("record is not an object");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw protocolError(`Daemon execution record is unreadable or corrupt: ${filePath}`);
+  }
+  const safe = {
+    executionId: String(record.executionId),
+    sandboxId: String(record.sandboxId ?? ""),
+    status: String(record.status ?? "unknown"),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+    ...(record.completedAt ? { completedAt: record.completedAt } : {}),
+    ...(Number.isInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
+    ...(record.failure ? { failure: record.failure } : {}),
+    ...(record.stdout !== undefined ? { stdout: String(record.stdout) } : {}),
+    ...(record.stderr !== undefined ? { stderr: String(record.stderr) } : {}),
+  };
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(safe)}\n`, { mode: 0o600, flag: "wx" });
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, filePath);
+    chmodSync(filePath, 0o600);
+  } finally { try { unlinkSync(temporaryPath); } catch {} }
+}
+
+function executionRecord(executionsPath, executionId) {
+  return readExecutions(executionsPath)[executionId] ?? null;
+}
+
 function protocolError(message, extra = {}) {
   const error = new Error(message);
   Object.assign(error, extra);
@@ -169,7 +304,8 @@ function protocolError(message, extra = {}) {
 }
 
 function daemonRequestDeadline(payload = {}, options = {}) {
-  if (payload.op === "exec" && Number.isFinite(Number(payload.timeoutMs))) return Math.max(1000, Number(payload.timeoutMs) + (options.requestGraceMs ?? 30000));
+  const localWaitTimeoutMs = payload.localWaitTimeoutMs ?? payload.timeoutMs;
+  if (payload.op === "exec" && Number.isFinite(Number(localWaitTimeoutMs))) return Math.max(1, Number(localWaitTimeoutMs) + (options.requestGraceMs ?? 0));
   return options.pingTimeoutMs ?? options.requestTimeoutMs ?? 1500;
 }
 
@@ -182,6 +318,8 @@ function normalizeResult(result, stdout, stderr) {
     exitCode: hasExitCode ? result.exitCode : 125,
     stdout: stdout.join(""),
     stderr: stderr.join(""),
+    ...(hasExitCode && result.exitCode !== 0 ? { failure: failure(FAILURE_KINDS.REMOTE_COMMAND, "Remote command exited with a non-zero status", { remoteExitCode: result.exitCode }) } : {}),
+    ...(!hasExitCode ? { failure: failure(FAILURE_KINDS.PROXY_TRANSPORT) } : {}),
     ...(!hasExitCode ? { error: String(result?.error || "Cube Sandbox daemon/proxy returned no remote exit code") } : {}),
   };
 }
@@ -224,7 +362,7 @@ export function createDaemonServer(options = {}) {
     return entry;
   }
 
-  async function handleRequest(request, send) {
+  async function handleRequest(request, send, onAccepted = () => {}) {
     if (!request || request.version !== PROTOCOL_VERSION) throw protocolError(`Unsupported daemon protocol version: ${request?.version ?? "missing"}`);
     if (request.op === "ping") return {
       ok: true,
@@ -241,8 +379,30 @@ export function createDaemonServer(options = {}) {
       await closeResource(entry.sandbox);
       return { ok: true, invalidated: true, sandboxId: request.sandboxId };
     }
+    if (request.op === "exec-status" || request.op === "exec-result") {
+      if (!request.executionId) throw protocolError("executionId is required");
+      const record = readExecutionRecord(paths.executionsDir, request.executionId) ?? executionRecord(paths.executionsPath, request.executionId);
+      if (!record) return { ok: false, executionId: request.executionId, status: "not-found", failure: failure(FAILURE_KINDS.PROXY_TRANSPORT, "Execution record was not found") };
+      return { ok: true, ...record };
+    }
     if (request.op !== "exec") throw protocolError(`Unsupported daemon operation: ${request.op}`);
-    const { sandbox, remoteHome } = await getConnection(request.sandboxId, request.remoteHome, request.sandboxTimeoutMs);
+    const executionId = String(request.executionId || randomUUID());
+    const now = new Date().toISOString();
+    let record = { executionId, sandboxId: request.sandboxId, status: "pending", createdAt: now, updatedAt: now };
+    writeExecutionRecord(paths.executionsDir, record);
+    let entry;
+    try {
+      entry = await getConnection(request.sandboxId, request.remoteHome, request.sandboxTimeoutMs);
+    } catch (error) {
+      const classified = failure(FAILURE_KINDS.SANDBOX_CONNECT, "Sandbox connection failed");
+      record = { ...record, status: "failed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: 125, failure: classified };
+      writeExecutionRecord(paths.executionsDir, record);
+      throw protocolError(error?.message || String(error), { failure: classified, executionId });
+    }
+    const { sandbox, remoteHome } = entry;
+    onAccepted();
+    record = { ...record, status: "running", startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    writeExecutionRecord(paths.executionsDir, record);
     const stdout = [];
     const stderr = [];
     const emit = (kind, chunk) => {
@@ -254,22 +414,38 @@ export function createDaemonServer(options = {}) {
     const runOptions = {
       background: false,
       cwd: request.cwd ? (request.cwd.startsWith("/") || !remoteHome ? request.cwd : path.posix.join(remoteHome, request.cwd)) : undefined,
-      timeoutMs: request.timeoutMs,
       onStdout: (chunk) => emit("stdout", chunk),
       onStderr: (chunk) => emit("stderr", chunk),
     };
+    if (Number.isFinite(Number(request.remoteTimeoutMs)) && Number(request.remoteTimeoutMs) > 0) runOptions.timeoutMs = Number(request.remoteTimeoutMs);
     let result;
     try {
       result = await sandbox.commands.run(String(request.command || ""), runOptions);
     } catch (error) {
       if (typeof error?.exitCode === "number") result = error;
-      else throw protocolError(error?.message || String(error));
+      else {
+        connections.delete(request.sandboxId);
+        await closeResource(sandbox);
+        const kind = error?.name === "TimeoutError" || error?.code === "ETIMEDOUT"
+          ? FAILURE_KINDS.PROXY_TRANSPORT
+          : FAILURE_KINDS.SANDBOX_STALE_CONNECTION;
+        const classified = failure(kind, kind === FAILURE_KINDS.PROXY_TRANSPORT
+          ? "Cube Sandbox command transport timed out before a remote result was returned"
+          : "Cached sandbox connection failed before a remote result was returned");
+        const completedAt = new Date().toISOString();
+        record = { ...record, status: "failed", updatedAt: completedAt, completedAt, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), failure: classified };
+        writeExecutionRecord(paths.executionsDir, record);
+        throw protocolError(error?.message || String(error), { failure: classified, executionId, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join("") });
+      }
     }
     // Some fakes/SDK versions return buffered output without callbacks. Preserve it
     // while avoiding duplicate data when callbacks already streamed the same bytes.
     if (!stdout.length && result?.stdout) emit("stdout", result.stdout);
     if (!stderr.length && result?.stderr) emit("stderr", result.stderr);
-    return { ...normalizeResult(result, stdout, stderr), remoteHome };
+    const normalized = { ...normalizeResult(result, stdout, stderr), remoteHome, executionId };
+    record = { ...record, status: "completed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: normalized.exitCode, stdout: normalized.stdout, stderr: normalized.stderr, ...(normalized.failure ? { failure: normalized.failure } : {}) };
+    writeExecutionRecord(paths.executionsDir, record);
+    return normalized;
   }
 
   function accept(socket) {
@@ -290,8 +466,10 @@ export function createDaemonServer(options = {}) {
         if (!line.trim()) continue;
         let request;
         try { request = JSON.parse(line); } catch { send({ version: PROTOCOL_VERSION, type: "result", exitCode: 125, error: "Invalid daemon JSON request" }); continue; }
-        send({ version: PROTOCOL_VERSION, id: request.id, type: "accepted" });
-        Promise.resolve(handleRequest(request, send)).then((result) => send({ version: PROTOCOL_VERSION, id: request.id, type: "result", ...result })).catch((error) => send({ version: PROTOCOL_VERSION, id: request.id, type: "result", exitCode: Number.isInteger(error?.exitCode) ? error.exitCode : 125, error: String(error?.message || error) }));
+        Promise.resolve(handleRequest(request, send, () => send({ version: PROTOCOL_VERSION, id: request.id, type: "accepted", executionId: request.executionId }))).then((result) => send({ version: PROTOCOL_VERSION, id: request.id, type: "result", ...result })).catch((error) => {
+          const classified = error?.failure ?? failure(FAILURE_KINDS.PROXY_TRANSPORT);
+          send({ version: PROTOCOL_VERSION, id: request.id, type: "result", exitCode: Number.isInteger(error?.exitCode) ? error.exitCode : 125, error: `Cube Sandbox control failure (${classified.kind})`, failure: classified, ...(error?.executionId ? { executionId: error.executionId } : {}), ...(error?.stdout !== undefined ? { stdout: error.stdout } : {}), ...(error?.stderr !== undefined ? { stderr: error.stderr } : {}) });
+        });
       }
     });
   }
@@ -334,14 +512,15 @@ export function createDaemonClient(options = {}) {
     return new Promise((resolve, reject) => {
       const socket = connectSocket(socketPath);
       const id = payload.id || randomUUID();
+      const executionId = payload.op === "exec" ? String(payload.executionId || randomUUID()) : undefined;
       const stdout = []; const stderr = [];
       let buffer = ""; let settled = false; let accepted = false;
       const finish = (fn, value) => { if (settled) return; settled = true; socket.destroy(); fn(value); };
-      const timer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}`)), connectTimeoutMs);
+      const timer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}`, { executionId, failure: failure(FAILURE_KINDS.DAEMON_UNREACHABLE), accepted })), connectTimeoutMs);
       let requestTimer;
       const requestDeadlineMs = daemonRequestDeadline(payload, options);
       socket.setEncoding("utf8");
-      socket.on("connect", () => { clearTimeout(timer); requestTimer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon request timed out`)), requestDeadlineMs); socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload })}\n`); });
+      socket.on("connect", () => { clearTimeout(timer); requestTimer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon request timed out`, { accepted, executionId, exitCode: 125, remoteStatus: "unknown", failure: failure(FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN, "Remote execution status is unknown") })), requestDeadlineMs); socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload, ...(executionId ? { executionId } : {}) })}\n`); });
       socket.on("data", (chunk) => {
         buffer += chunk;
         let newline;
@@ -354,8 +533,8 @@ export function createDaemonClient(options = {}) {
           else if (frame.type === "result") { clearTimeout(timer); clearTimeout(requestTimer); finish(resolve, { ...frame, stdout: frame.stdout ?? stdout.join(""), stderr: frame.stderr ?? stderr.join("") }); }
         }
       });
-      socket.on("error", (error) => { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}: ${error.message}`, { accepted })); });
-      socket.on("close", () => { if (!settled) { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon closed before returning a result`, { accepted })); } });
+      socket.on("error", (error) => { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}: ${error.message}`, { accepted, executionId, failure: failure(FAILURE_KINDS.DAEMON_UNREACHABLE) })); });
+      socket.on("close", () => { if (!settled) { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon closed before returning a result`, { accepted, executionId, failure: accepted ? failure(FAILURE_KINDS.PROXY_TRANSPORT) : failure(FAILURE_KINDS.DAEMON_UNREACHABLE) })); } });
     });
   }
   return {
@@ -363,6 +542,8 @@ export function createDaemonClient(options = {}) {
     ping: () => request({ op: "ping" }),
     invalidate: (sandboxId) => request({ op: "invalidate", sandboxId }),
     exec: (requestOptions) => request({ op: "exec", ...requestOptions }, requestOptions),
+    execStatus: (executionId) => request({ op: "exec-status", executionId }),
+    execResult: (executionId) => request({ op: "exec-result", executionId }),
   };
 }
 
@@ -388,14 +569,25 @@ async function probeDaemon(paths) {
 
 export async function daemonStatus(options = {}) {
   const paths = runtimePaths(options);
+  const env = options.env ?? process.env;
   const state = readState(paths.statePath);
+  let currentFingerprint;
+  let configValid = true;
+  let configPath;
+  try { configPath = configuredPath(env); } catch { configPath = undefined; }
+  try { currentFingerprint = connectionFingerprint(env, { materialize: false }); }
+  catch {
+    configValid = false;
+    currentFingerprint = connectionFingerprint(env, { materialize: false, resolveConfig: false });
+  }
   const probe = await probeDaemon(paths);
-  if (!probe) return { running: false, socketPath: paths.socketPath, state };
-  const currentFingerprint = connectionFingerprint();
+  if (!probe) return { running: false, socketPath: paths.socketPath, state, blastRadius: "per-user-daemon", process: { running: false }, socket: { path: paths.socketPath, reachable: false }, config: { valid: configValid, path: configPath }, fingerprint: { matches: false, health: "unavailable" }, identity: { matched: false }, failure: failure(FAILURE_KINDS.DAEMON_UNREACHABLE) };
   const stateIdentity = Boolean(state?.pid && state?.fingerprint && Number(state.pid) === Number(probe.ping.pid)
     && (state.uid === undefined || probe.ping.uid === undefined || Number(state.uid) === Number(probe.ping.uid)));
   const fingerprintMatches = stateIdentity && sameFingerprint(state.fingerprint, currentFingerprint);
-  if (!stateIdentity || !fingerprintMatches) {
+  const identity = { matched: stateIdentity && (configValid ? fingerprintMatches : true), pid: probe.ping.pid, uid: probe.ping.uid };
+  const health = { matches: fingerprintMatches, health: configValid ? (fingerprintMatches ? "matched" : "mismatch") : "unavailable" };
+  if (!stateIdentity || (configValid && !fingerprintMatches)) {
     // A listening socket without a matching state file is a startup/stop race,
     // not proof of a healthy daemon. Report it as not running so callers fail
     // closed instead of attaching to an unknown process.
@@ -407,9 +599,16 @@ export async function daemonStatus(options = {}) {
       uid: probe.ping.uid,
       socketPath: paths.socketPath,
       state,
+      blastRadius: "per-user-daemon",
+      process: { running: true, pid: probe.ping.pid, uid: probe.ping.uid },
+      socket: { path: paths.socketPath, reachable: true },
+      config: { valid: configValid, path: configPath },
+      fingerprint: health,
+      identity,
+      failure: failure(FAILURE_KINDS.DAEMON_IDENTITY_MISMATCH),
     };
   }
-  return { running: true, ...probe.ping, socketPath: paths.socketPath, state };
+  return { running: true, ...probe.ping, socketPath: paths.socketPath, state, blastRadius: "per-user-daemon", process: { running: true, pid: probe.ping.pid, uid: probe.ping.uid }, socket: { path: paths.socketPath, reachable: true }, config: { valid: configValid, path: configPath }, fingerprint: health, identity };
 }
 
 export async function startDaemon(options = {}) {
@@ -420,7 +619,7 @@ export async function startDaemon(options = {}) {
     return status;
   }
   if (status.daemonDetected) {
-    throw protocolError(`Cube Sandbox daemon identity is indeterminate (${status.identityError}); stop it from the owning environment before starting`);
+    throw protocolError(`Cube Sandbox daemon identity is indeterminate (${status.identityError}); stop it from the owning environment before starting`, { failure: failure(FAILURE_KINDS.DAEMON_IDENTITY_MISMATCH) });
   }
   if (existsSync(paths.lockPath)) {
     try { const lock = JSON.parse(readFileSync(paths.lockPath, "utf8")); if (lock.pid) process.kill(lock.pid, 0); else throw new Error("stale"); throw protocolError("Cube Sandbox daemon start is already in progress; retry shortly"); }
@@ -438,7 +637,7 @@ export async function startDaemon(options = {}) {
       // polling through that tiny window, but never treat the socket as ready.
       await new Promise((resolve) => setTimeout(resolve, 30));
     }
-    throw protocolError(`Cube Sandbox daemon failed to start at ${paths.socketPath}; check CUBE_API_URL and credentials, then retry`);
+    throw protocolError(`Cube Sandbox daemon failed to start at ${paths.socketPath}; inspect daemon status and connection health before retrying`, { failure: failure(FAILURE_KINDS.PROXY_TRANSPORT) });
   } finally { try { unlinkSync(paths.lockPath); } catch {} }
 }
 
@@ -466,4 +665,4 @@ export async function stopDaemon(options = {}) {
   return { running: false, stopped: true, socketPath: paths.socketPath };
 }
 
-export { PROTOCOL_VERSION, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, ensureRuntimeDir, runtimePaths, readState, writeState };
+export { PROTOCOL_VERSION, connectionFingerprint, daemonChildEnvironment, daemonEnvironment, daemonRequestDeadline, ensureRuntimeDir, runtimePaths, readState, writeState, readExecutions, writeExecutions, readExecutionRecord, writeExecutionRecord };

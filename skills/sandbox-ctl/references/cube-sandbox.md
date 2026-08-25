@@ -54,6 +54,12 @@ start|status|stop` manages this process; `exec` starts it automatically.
 Changing connection settings or rotating the API key requires a daemon
 restart and is detected by a non-secret fingerprint.
 
+`daemon status --json` is a safe host inspection: it does not materialize
+credentials and remains usable with malformed project or user config. Its
+machine-readable fields include `process`, `socket`, `config`, `fingerprint`,
+and `identity`; `blastRadius` is `per-user-daemon`, shared by all bindings.
+The installed legacy `adapters.cube-sandbox` user-config wrapper is accepted.
+
 New directories default to Cube Sandbox. An existing project config remains
 authoritative; legacy configs without an adapter continue to mean Daytona.
 
@@ -65,13 +71,21 @@ node and fails with CubeMaster `130404`. **Always pass `--template`.** The node
 exposes no template-listing command; query the API's `/templates` endpoint.
 
 `up` uses a 30-minute sandbox idle timeout unless overridden with `--timeout`;
-`exec` has an independent 5-minute local wait default. `adopt` accepts the same
-`--timeout` duration, defaults to 30 minutes when omitted, and applies it via
+`exec` has an independent 5-minute local wait default. The exec wait is local
+only and is never forwarded as an E2B command timeout; if it expires, the
+remote command continues and can be inspected by execution ID. `adopt` accepts
+the same `--timeout` duration, defaults to 30 minutes when omitted, and applies
+it via
 the connected sandbox instance's `setTimeout` before persisting the binding. If
 that capability is unavailable, adoption fails instead of claiming the timeout
 was changed. Idle expiry **kills** the sandbox — unlike Daytona there is no
 separate stop/archive/delete ladder and no `--auto-delete -1` — so size the
 timeout to the work and pull artifacts before it expires.
+
+When `SANDBOX_CTL_DISABLE_DAEMON=1` selects direct diagnostic mode, an explicit
+`exec --timeout` is rejected before command submission because that path cannot
+provide durable status/result recovery. Omit the flag to remain attached until
+the direct SDK command completes, or use the daemon-backed path for local waits.
 
 Cube workspace ownership is opt-in with `--workspace-owner UID:GID` (for
 example `1000:1000`); UID and GID must be non-root positive integers. `up`
@@ -88,8 +102,28 @@ an owner contract is active; use bundle or full mode for that workspace.
 
 Streaming and JSON `exec` preserve the remote command's actual exit code. If
 the local daemon or its proxy transport is unavailable, `exec` returns control
-exit 125 and writes an actionable diagnostic to stderr. Restart only the local
-path with `sandbox-ctl daemon stop && sandbox-ctl daemon start`, then retry.
+exit 125 and writes an actionable diagnostic to stderr. JSON includes a stable
+`failure.kind` classification. Accepted executions are persisted under the
+daemon runtime directory without command text or credentials; final exact
+remote exit code and exact UTF-8 stdout/stderr remain available with:
+
+```sh
+sandbox-ctl exec status EXECUTION_ID --json
+sandbox-ctl exec result EXECUTION_ID --json
+```
+
+On `local_timeout_remote_unknown`, the ID is authoritative and the command is
+not replayed. Each execution is stored in its own private atomic record file,
+so later executions do not rewrite historical logs and records survive daemon
+restart/reload. A stale cached sandbox connection is invalidated after its
+failed attempt; only a later request reconnects, so an accepted command is
+never replayed. Before any optional daemon restart, inspect `daemon status --json`
+and probe another binding (`sandbox-ctl exec --sandbox OTHER --json -- true`) to
+determine whether the shared daemon or one sandbox is affected.
+
+Execution records have no automatic time-based retention; each record remains
+available until the daemon runtime directory is intentionally removed or
+rotated by the operator.
 
 If a local CLI client times out or disconnects during a long `exec`, a later
 daemon write can target the dead Unix socket and produce `EPIPE`/`ECONNRESET`.
@@ -131,9 +165,9 @@ also returns the API-provided lifecycle timing fields `startedAt` and `endAt`
 alongside each item's `id`, `name`, and `template`. `list.state` is
 control-plane metadata, not a data-plane liveness check; a successful `exec`
 is the liveness check for the command path.
-If lifecycle control reports an incompatible local daemon protocol, restart
-only the local daemon (`sandbox-ctl daemon stop` followed by `daemon start`)
-before retrying; this does not restart the Cube sandbox service.
+If lifecycle control reports an incompatible local daemon protocol, inspect the
+structured daemon identity/fingerprint result and then optionally restart only
+the local daemon; this does not restart the Cube sandbox service.
 
 Automatic idle pause/resume is intentionally not supported yet. e2b SDK
 2.38.2 serializes `autoPause`/`autoResume` as top-level options, while Cube

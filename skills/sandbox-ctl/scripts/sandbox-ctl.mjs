@@ -7,7 +7,7 @@ import { realpathSync } from "node:fs";
 
 import * as daytonaAdapter from "./adapters/daytona-manager.mjs";
 import * as cubeAdapter from "./adapters/cube-sandbox-manager.mjs";
-import { daemonStatus, startDaemon, stopDaemon } from "./lib/cube-sandbox-daemon.mjs";
+import { classifyFailure, daemonStatus, startDaemon, stopDaemon } from "./lib/cube-sandbox-daemon.mjs";
 import { canonicalizeAdapter, configPath, discoverConfig, getActiveBinding, readConfig, resolveBinding, selectBinding } from "./project-config.mjs";
 
 const ADAPTERS = { daytona: daytonaAdapter, "cube-sandbox": cubeAdapter };
@@ -417,7 +417,14 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
   const requestedJson = argv.some((arg) => arg === "--json" || arg.startsWith("--json="));
   try {
     const parsed = parseSandboxCtlArgs(argv);
-    const configuredSelection = resolveConfiguredAdapter(parsed);
+    // Daemon status is a host-bound inspection operation. An explicit Cube
+    // adapter must remain usable even when the selected project config is
+    // malformed; status never needs to read or materialize project/user
+    // credentials.
+    const hostInspection = (parsed.command === "daemon" || (parsed.command === "exec" && ["status", "result"].includes(parsed.positionals[0]))) && parsed.adapterExplicit && parsed.adapter === "cube-sandbox";
+    const configuredSelection = hostInspection
+      ? { name: "cube-sandbox", adapter: ADAPTERS["cube-sandbox"] }
+      : resolveConfiguredAdapter(parsed);
     parsed.adapter = configuredSelection.name;
     const selectedAdapter = adapter ?? configuredSelection.adapter;
     if (parsed.options.help || !parsed.command) {
@@ -436,6 +443,14 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
       if (parsed.json) console.log(JSON.stringify({ ok: daemonOk, command: "daemon", adapter: parsed.adapter, daemonCommand, ...result }));
       else console.log(JSON.stringify(result, null, 2));
       return result;
+    }
+    if (parsed.command === "exec" && ["status", "result"].includes(parsed.positionals[0]) && parsed.positionals[1]) {
+      if (parsed.adapter !== "cube-sandbox") throw new Error("sandbox-ctl exec status/result is only available for the cube-sandbox adapter");
+      const result = await selectedAdapter.handleExecRecord({ execCommand: parsed.positionals[0], executionId: parsed.positionals[1], daemon: { runtimeDir: process.env.SANDBOX_CTL_RUNTIME_DIR } });
+      const payload = { command: "exec", execCommand: parsed.positionals[0], adapter: parsed.adapter, ...result };
+      if (!result.ok) process.exitCode = 1;
+      if (parsed.json) console.log(JSON.stringify(payload)); else console.log(JSON.stringify(payload, null, 2));
+      return payload;
     }
     if (parsed.command === "config") {
       if (parsed.adapter !== "cube-sandbox") throw new Error("sandbox-ctl config is only available for the cube-sandbox adapter; pass --adapter cube-sandbox");
@@ -498,6 +513,9 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
         error: sanitizeError(error),
         sandboxId: error?.sandboxId ?? null,
         nextActions: error?.nextActions ?? [],
+        failure: error?.failure ?? classifyFailure(error),
+        ...(error?.executionId ? { executionId: error.executionId } : {}),
+        ...(error?.remoteStatus ? { remoteStatus: error.remoteStatus } : {}),
       };
       process.exitCode = 125;
       if (requestedJson) console.log(JSON.stringify(payload));
@@ -600,6 +618,7 @@ async function loadDirectAdapter(argv = process.argv.slice(2)) {
   if (modulePath) return import(pathToFileURL(path.resolve(modulePath)).href);
   try {
     const parsed = parseSandboxCtlArgs(argv);
+    if ((parsed.command === "daemon" || parsed.command === "exec") && parsed.adapterExplicit && parsed.adapter === "cube-sandbox") return cubeAdapter;
     return resolveConfiguredAdapter(parsed).adapter;
   } catch {
     return daytonaAdapter;
