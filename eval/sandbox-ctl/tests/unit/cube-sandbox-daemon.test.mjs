@@ -175,8 +175,8 @@ describe("Cube Sandbox daemon protocol", () => {
     }
   });
 
-  it("gives exec requests a deadline after the requested remote timeout", () => {
-    expect(daemonRequestDeadline({ op: "exec", timeoutMs: 900000 })).toBe(930000);
+  it("gives exec requests a deadline after the requested local wait", () => {
+    expect(daemonRequestDeadline({ op: "exec", localWaitTimeoutMs: 900000 })).toBe(900000);
     expect(daemonRequestDeadline({ op: "ping" })).toBe(1500);
   });
 
@@ -250,6 +250,15 @@ describe("Cube Sandbox daemon protocol", () => {
     });
   });
 
+  it("classifies an SDK TimeoutError as proxy transport instead of stale cache", async () => {
+    await withDaemon({
+      client: { connect: async () => ({ commands: { run: async () => { throw Object.assign(new Error("SDK command timeout"), { name: "TimeoutError" }); } } }) },
+    }, async (server) => {
+      const result = await createDaemonClient({ socketPath: server.socketPath }).exec({ sandboxId: "sbx-timeout-error", command: "sleep 3" });
+      expect(result).toMatchObject({ exitCode: 125, failure: { kind: "proxy_transport" } });
+    });
+  });
+
   it("persists streamed output and terminal control failure after an accepted transport error", async () => {
     await withDaemon({
       client: { connect: async () => ({ disconnect: async () => {}, commands: { run: async (_command, options) => {
@@ -287,6 +296,46 @@ describe("Cube Sandbox daemon protocol", () => {
       const record = await client.execResult(executionId);
       expect(record).toMatchObject({ executionId, status: "completed", exitCode: 23, stdout: "late\n", stderr: "remote-error\n" });
       expect(readdirSync(pathsFor(server).executionsDir)).toContain("exec-test-durable.json");
+    });
+  });
+
+  it("returns a local timeout without passing it to the SDK or cancelling the remote command", async () => {
+    let release;
+    let runOptions;
+    let runs = 0;
+    await withDaemon({
+      client: {
+        connect: async () => ({
+          commands: {
+            run: async (_command, options) => {
+              runs += 1;
+              runOptions = options;
+              return new Promise((resolve) => { release = () => resolve({ exitCode: 9, stdout: "late-out\n", stderr: "late-err\n" }); });
+            },
+          },
+        }),
+      },
+    }, async (server) => {
+      const client = createDaemonClient({ socketPath: server.socketPath, requestGraceMs: 0 });
+      const executionId = "exec-local-wait-only";
+      const startedAt = Date.now();
+      await expect(client.exec({ executionId, sandboxId: "sbx-local-wait", command: "sleep 3", localWaitTimeoutMs: 25 }))
+        .rejects.toMatchObject({ executionId, exitCode: 125, failure: { kind: "local_timeout_remote_unknown" } });
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      expect(runOptions).toBeTruthy();
+      expect(runOptions).not.toHaveProperty("timeoutMs");
+      expect(runs).toBe(1);
+      expect(typeof release).toBe("function");
+
+      release();
+      let result;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        result = await client.execResult(executionId);
+        if (result.status === "completed") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(result).toMatchObject({ executionId, status: "completed", exitCode: 9, stdout: "late-out\n", stderr: "late-err\n" });
+      expect(runs).toBe(1);
     });
   });
 

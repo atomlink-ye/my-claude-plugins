@@ -304,7 +304,8 @@ function protocolError(message, extra = {}) {
 }
 
 function daemonRequestDeadline(payload = {}, options = {}) {
-  if (payload.op === "exec" && Number.isFinite(Number(payload.timeoutMs))) return Math.max(1000, Number(payload.timeoutMs) + (options.requestGraceMs ?? 30000));
+  const localWaitTimeoutMs = payload.localWaitTimeoutMs ?? payload.timeoutMs;
+  if (payload.op === "exec" && Number.isFinite(Number(localWaitTimeoutMs))) return Math.max(1, Number(localWaitTimeoutMs) + (options.requestGraceMs ?? 0));
   return options.pingTimeoutMs ?? options.requestTimeoutMs ?? 1500;
 }
 
@@ -413,10 +414,10 @@ export function createDaemonServer(options = {}) {
     const runOptions = {
       background: false,
       cwd: request.cwd ? (request.cwd.startsWith("/") || !remoteHome ? request.cwd : path.posix.join(remoteHome, request.cwd)) : undefined,
-      timeoutMs: request.timeoutMs,
       onStdout: (chunk) => emit("stdout", chunk),
       onStderr: (chunk) => emit("stderr", chunk),
     };
+    if (Number.isFinite(Number(request.remoteTimeoutMs)) && Number(request.remoteTimeoutMs) > 0) runOptions.timeoutMs = Number(request.remoteTimeoutMs);
     let result;
     try {
       result = await sandbox.commands.run(String(request.command || ""), runOptions);
@@ -425,7 +426,12 @@ export function createDaemonServer(options = {}) {
       else {
         connections.delete(request.sandboxId);
         await closeResource(sandbox);
-        const classified = failure(FAILURE_KINDS.SANDBOX_STALE_CONNECTION, "Cached sandbox connection failed before a remote result was returned");
+        const kind = error?.name === "TimeoutError" || error?.code === "ETIMEDOUT"
+          ? FAILURE_KINDS.PROXY_TRANSPORT
+          : FAILURE_KINDS.SANDBOX_STALE_CONNECTION;
+        const classified = failure(kind, kind === FAILURE_KINDS.PROXY_TRANSPORT
+          ? "Cube Sandbox command transport timed out before a remote result was returned"
+          : "Cached sandbox connection failed before a remote result was returned");
         const completedAt = new Date().toISOString();
         record = { ...record, status: "failed", updatedAt: completedAt, completedAt, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), failure: classified };
         writeExecutionRecord(paths.executionsDir, record);
@@ -514,7 +520,7 @@ export function createDaemonClient(options = {}) {
       let requestTimer;
       const requestDeadlineMs = daemonRequestDeadline(payload, options);
       socket.setEncoding("utf8");
-      socket.on("connect", () => { clearTimeout(timer); requestTimer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon request timed out`, { accepted, executionId, failure: failure(FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN, "Remote execution status is unknown") })), requestDeadlineMs); socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload, ...(executionId ? { executionId } : {}) })}\n`); });
+      socket.on("connect", () => { clearTimeout(timer); requestTimer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon request timed out`, { accepted, executionId, exitCode: 125, remoteStatus: "unknown", failure: failure(FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN, "Remote execution status is unknown") })), requestDeadlineMs); socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload, ...(executionId ? { executionId } : {}) })}\n`); });
       socket.on("data", (chunk) => {
         buffer += chunk;
         let newline;

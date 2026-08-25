@@ -266,7 +266,29 @@ function addConnectionOptions(method, args, connection) {
   return result;
 }
 
-function wrapCubeSandboxClient(Sandbox, connection) {
+const REQUIRED_SANDBOX_STATIC_METHODS = ["create", "connect", "list", "getInfo", "kill"];
+
+function hasSandboxLifecycleMethods(value) {
+  return typeof value === "function"
+    && REQUIRED_SANDBOX_STATIC_METHODS.every((method) => typeof value[method] === "function");
+}
+
+/**
+ * Dynamic ESM imports of the CommonJS-compatible e2b package have appeared in
+ * three shapes: a named Sandbox export, a default namespace containing
+ * Sandbox, and a default Sandbox class. Resolve those shapes to the actual
+ * static lifecycle owner and reject namespace objects or partial exports
+ * before any handler can make a real request.
+ */
+function resolveSandboxLifecycleClass(sdk) {
+  const candidates = [sdk?.Sandbox, sdk?.default?.Sandbox, sdk?.default, typeof sdk === "function" ? sdk : undefined];
+  const Sandbox = candidates.find((candidate) => hasSandboxLifecycleMethods(candidate));
+  if (Sandbox) return Sandbox;
+  throw new Error(`Could not resolve the e2b Sandbox lifecycle facade: expected a callable Sandbox class with static ${REQUIRED_SANDBOX_STATIC_METHODS.join(", ")} methods (supported shapes: sdk.Sandbox, sdk.default.Sandbox, or sdk.default).`);
+}
+
+function wrapCubeSandboxClient(sdk, connection) {
+  const Sandbox = resolveSandboxLifecycleClass(sdk);
   if (!connection || !Object.values(connection).some((value) => value !== undefined && value !== "")) return Sandbox;
   const methods = new Set(["create", "connect", "list", "getInfo", "kill", "pause"]);
   return new Proxy(Sandbox, { get(target, property, receiver) {
@@ -286,8 +308,8 @@ function wrapCubeSandboxClient(Sandbox, connection) {
  * SDK export, which also makes it trivial to inject a fake object with the
  * same shape via `options.client` in tests.
  */
-async function createClient() {
-  const connection = resolveCubeSandboxEnv();
+async function createClient(options = {}) {
+  const connection = resolveCubeSandboxEnv(options.env ?? process.env);
   const { apiKey, apiUrl } = connection;
   let proxy = connection.proxy;
   // In direct-dial mode the loopback proxy belongs to the shared daemon. CLI
@@ -300,13 +322,11 @@ async function createClient() {
   }
   if (!apiKey) throw new Error("Cube Sandbox API key is required. Set CUBE_API_KEY or E2B_API_KEY.");
   if (!apiUrl) throw new Error("Cube Sandbox API URL is required. Set CUBE_API_URL or E2B_API_URL to a network-reachable operator endpoint; do not rely on the SDK's public e2b.dev default.");
-  const sdk = await loadCubeSandboxSdk();
-  const Sandbox = sdk.Sandbox ?? sdk.default;
-  if (!Sandbox) throw new Error("Could not find Sandbox client export in e2b.");
+  const sdk = options.sdk ?? await loadCubeSandboxSdk();
   // Pass every connection setting explicitly to every static SDK lifecycle
   // call.  This prevents unrelated E2B_* environment values from silently
   // selecting a different account or cluster when CUBE_* is configured.
-  return wrapCubeSandboxClient(Sandbox, { apiKey, apiUrl, proxy });
+  return wrapCubeSandboxClient(sdk, { apiKey, apiUrl, proxy });
 }
 
 function buildUserConfigFromEnvironment(options = {}) {
@@ -839,6 +859,10 @@ async function handleExec(options, command) {
     const daemonResult = await handleExecViaDaemon(options, command);
     if (daemonResult) return daemonResult;
   }
+  if (options.timeoutMs !== undefined) {
+    const error = "Direct Cube Sandbox diagnostic mode cannot provide durable local timeout recovery; omit --timeout or enable the daemon-backed exec path";
+    return { exitCode: 125, stdout: "", stderr: "", error, failure: { kind: FAILURE_KINDS.PROXY_TRANSPORT, message: error } };
+  }
   let sandboxInfo;
   try {
     sandboxInfo = await requireSandbox(options);
@@ -857,18 +881,18 @@ async function handleExec(options, command) {
     (kind === "stderr" ? stderr : stdout).push(text);
     if (shouldStream) (kind === "stderr" ? process.stderr : process.stdout).write(text);
   };
-  const timeoutMs = options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const runOptions = {
+    background: false,
+    cwd,
+    onStdout: (chunk) => emit("stdout", chunk),
+    onStderr: (chunk) => emit("stderr", chunk),
+  };
+  if (options.remoteTimeoutMs !== undefined) runOptions.timeoutMs = options.remoteTimeoutMs;
+  const commandPromise = Promise.resolve().then(() => sandbox.commands.run(cmd, runOptions));
+  const outcome = await commandPromise.then((result) => ({ kind: "result", result }), (error) => ({ kind: "error", error }));
   let exitCode;
-  try {
-    const result = await sandbox.commands.run(cmd, {
-      background: false,
-      cwd,
-      timeoutMs,
-      onStdout: (chunk) => emit("stdout", chunk),
-      onStderr: (chunk) => emit("stderr", chunk),
-    });
-    exitCode = remoteExitCode(result?.exitCode) ?? 0;
-  } catch (error) {
+  if (outcome.kind === "error") {
+    const { error } = outcome;
     // Duck-typed CommandExitError (see cubeSandboxExec's header note): stdout/stderr
     // were already streamed via onStdout/onStderr by the time wait() rejects,
     // so we only need the exit code here — re-appending error.stdout/stderr
@@ -878,6 +902,8 @@ async function handleExec(options, command) {
     } else {
       return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error), failure: classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT) };
     }
+  } else {
+    exitCode = remoteExitCode(outcome.result?.exitCode) ?? 0;
   }
   const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), ...(exitCode !== 0 ? { failure: { kind: FAILURE_KINDS.REMOTE_COMMAND, remoteExitCode: exitCode } } : {}) };
   if (options.artifacts) {
@@ -907,7 +933,8 @@ async function handleExecViaDaemon(options, command) {
       cwd,
       remoteHome: paths.binding.remoteHome,
       sandboxTimeoutMs: paths.binding.timeoutMs ?? DEFAULT_SANDBOX_TIMEOUT_MS,
-      timeoutMs: options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
+      localWaitTimeoutMs: options.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
+      ...(options.remoteTimeoutMs !== undefined ? { remoteTimeoutMs: options.remoteTimeoutMs } : {}),
       onStdout: (chunk) => { const text = String(chunk ?? ""); stdout.push(text); if (!options.json && !options.bufferOutput) process.stdout.write(text); },
       onStderr: (chunk) => { const text = String(chunk ?? ""); stderr.push(text); if (!options.json && !options.bufferOutput) process.stderr.write(text); },
     });
@@ -1326,6 +1353,7 @@ export {
   assertManagedSandboxInfo,
   assertSafeDestructiveRemoteWorkspace,
   createClient,
+  resolveSandboxLifecycleClass,
   wrapCubeSandboxClient,
   resolveCubeSandboxEnv,
   cubeSandboxExec,
