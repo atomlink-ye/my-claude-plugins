@@ -12,6 +12,7 @@ import {
   handleDoctor,
   handleDown,
   handleExec,
+  handleExecRecord,
   handleList,
   handlePreview,
   handlePull,
@@ -240,8 +241,47 @@ describe("cube-sandbox-manager exec", () => {
     } finally { delete process.env.CUBE_TEST_TOKEN; rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("classifies malformed project config as config_invalid", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-config-invalid-"));
+    try {
+      mkdirSync(path.join(root, ".sandbox-ctl"), { recursive: true });
+      writeFileSync(path.join(root, ".sandbox-ctl", "config.json"), "{bad");
+      const result = await handleExec({ directory: root, daemonClient: { exec: async () => ({ exitCode: 0 }) } }, ["true"]);
+      expect(result).toMatchObject({ exitCode: 125, failure: { kind: "config_invalid" } });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("requires a command after --", async () => {
     await expect(handleExec({}, [])).rejects.toThrow(/requires a command/i);
+  });
+
+  it("exposes durable execution status/result records without reading credentials", async () => {
+    const daemon = {
+      execStatus: async (executionId) => ({ ok: true, executionId, status: "running", sandboxId: "sbx-1" }),
+      execResult: async (executionId) => ({ ok: true, executionId, status: "completed", exitCode: 7, stdout: "out\n", stderr: "err\n" }),
+    };
+    await expect(handleExecRecord({ execCommand: "status", executionId: "exec-1", daemonClient: daemon })).resolves.toMatchObject({ status: "running", executionId: "exec-1" });
+    await expect(handleExecRecord({ execCommand: "result", executionId: "exec-1", daemonClient: daemon })).resolves.toMatchObject({ status: "completed", exitCode: 7, stdout: "out\n" });
+  });
+
+  it("returns a stable unknown-remote-status timeout with the execution ID and never retries", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-timeout-"));
+    try {
+      bindConfig(root);
+      let calls = 0;
+      const client = {
+        exec: async () => {
+          calls += 1;
+          const error = new Error("local wait timed out");
+          error.executionId = "exec-timeout-1";
+          error.failure = { kind: "local_timeout_remote_unknown" };
+          throw error;
+        },
+      };
+      const result = await handleExec({ directory: root, daemonClient: client }, ["sleep", "60"]);
+      expect(result).toMatchObject({ exitCode: 125, executionId: "exec-timeout-1", remoteStatus: "unknown", failure: { kind: "local_timeout_remote_unknown" } });
+      expect(calls).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

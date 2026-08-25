@@ -20,6 +20,8 @@ sandbox-ctl use NAME
 sandbox-ctl exec -- COMMAND...                 # stream human output
 sandbox-ctl exec --timeout 30m -- COMMAND...   # default foreground timeout: 5m
 sandbox-ctl exec --json -- COMMAND...          # buffer one JSON object
+sandbox-ctl exec status EXECUTION_ID --json   # inspect an accepted exec
+sandbox-ctl exec result EXECUTION_ID --json   # fetch final rc and exact logs
 sandbox-ctl exec --artifacts ./artifacts -- COMMAND...
 sandbox-ctl push --mode bundle
 sandbox-ctl pull --output ./artifacts
@@ -54,6 +56,10 @@ exact config, then Cube Sandbox. Use `cube-sandbox`; `cube` is deprecated.
 `exec --timeout DURATION` accepts positive integers with `ms`, `s`, `m`, or `h`
 (bare integer = seconds); streaming defaults to `5m`. Timeout ends only the
 local wait.
+Every Cube exec has a local `executionId`, generated before submission. A
+timeout returns control exit 125 with `failure.kind=local_timeout_remote_unknown`
+and that ID; it never replays the command. Use `exec status ID` or `exec result
+ID` after disconnect.
 
 `run -- COMMAND...` creates a unique disposable binding, safely bundle-pushes,
 executes, writes optional artifacts, then deletes that exact binding. Remote
@@ -93,9 +99,15 @@ pushes preserve that owner contract, while Git push is refused for owned
 workspaces. Daytona behavior is unchanged.
 
 `exec` propagates the remote command exit code in streaming and JSON modes.
-Daemon or proxy transport failures return control exit 125 and an actionable
-diagnostic on stderr; restart the local path with `sandbox-ctl daemon stop &&
-sandbox-ctl daemon start`, then retry. Workspace-owner contract failures are
+Machine-readable failures use stable `failure.kind` values: `config_invalid`,
+`daemon_unreachable`, `daemon_identity_mismatch`, `proxy_transport`,
+`sandbox_connect`, `sandbox_stale_connection`,
+`local_timeout_remote_unknown`, and `remote_command`. Remote command failures
+keep their true exit code; control failures use 125. `daemon status --json`
+reports process/socket/config/fingerprint/identity health and
+`blastRadius=per-user-daemon`. Inspect and classify first; probe another
+binding with `sandbox-ctl exec --sandbox OTHER --json -- true`. Only then
+optionally restart the local daemon. Workspace-owner contract failures are
 fail-closed and identify the ownership mismatch; no recursive ownership repair
 is attempted. Cube `list` exposes each item's API-provided `id`, `name`, `state`,
 `template`, `startedAt`, and `endAt`. Details in [Cube Sandbox](references/cube-sandbox.md).
