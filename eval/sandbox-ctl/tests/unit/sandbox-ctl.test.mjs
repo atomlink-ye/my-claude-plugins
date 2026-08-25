@@ -353,6 +353,25 @@ describe("sandbox-ctl dispatch", () => {
     expect(calls).toContainEqual(["exec", ["sh", "-lc", "echo hi"]]);
   });
 
+  it("dispatches Cube durable exec status without resolving project config", async () => {
+    const project = mkdtempSync(`${tmpdir()}/cube-status-malformed-`);
+    const originalLog = console.log;
+    const logs = [];
+    try {
+      mkdirSync(path.join(project, ".sandbox-ctl"), { recursive: true });
+      writeFileSync(path.join(project, ".sandbox-ctl", "config.json"), "{bad");
+      console.log = (...args) => logs.push(args.join(" "));
+      const adapter = {
+        handleExecRecord: async (options) => ({ ok: true, executionId: options.executionId, status: "completed", exitCode: 0 }),
+      };
+      const result = await runSandboxCtl(["--adapter", "cube-sandbox", "--json", "--directory", project, "exec", "result", "exec-1"], { adapter });
+      expect(result).toMatchObject({ command: "exec", execCommand: "result", executionId: "exec-1", status: "completed" });
+    } finally {
+      console.log = originalLog;
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
   it("dispatches task/project policy defaults and inventory diagnostics", async () => {
     const calls = [];
     const adapter = fakeAdapter(calls);
@@ -461,6 +480,44 @@ describe("sandbox-ctl hardening", () => {
     expect(child.status).toBe(7);
     expect(child.stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(child.stdout)).toMatchObject({ ok: false, command: "exec", exitCode: 7, stdout: "fixture stdout", stderr: "fixture stderr" });
+  });
+
+  it("preserves structured failure metadata from a pre-dispatch Cube exec error", async () => {
+    const originalLog = console.log;
+    const logs = [];
+    try {
+      console.log = (...args) => logs.push(args.join(" "));
+      const error = new Error("malformed project config");
+      error.failure = { kind: "config_invalid" };
+      error.executionId = "exec-pre-dispatch";
+      const adapter = {
+        parseArgs: () => ({ options: {}, positionals: [], passthrough: [] }),
+        handleExec: async () => { throw error; },
+      };
+      const result = await runSandboxCtl(["--adapter", "cube-sandbox", "--json", "exec", "--", "true"], { adapter });
+      expect(result).toMatchObject({ command: "exec", exitCode: 125, failure: { kind: "config_invalid" }, executionId: "exec-pre-dispatch" });
+      expect(JSON.parse(logs.at(-1))).toMatchObject({ failure: { kind: "config_invalid" }, executionId: "exec-pre-dispatch" });
+    } finally { console.log = originalLog; }
+  });
+
+  it("classifies a genuinely malformed project config in real Cube exec JSON", () => {
+    const project = mkdtempSync(`${tmpdir()}/cube-cli-malformed-project-`);
+    const user = mkdtempSync(`${tmpdir()}/cube-cli-malformed-user-`);
+    try {
+      mkdirSync(path.join(project, ".sandbox-ctl"), { recursive: true });
+      writeFileSync(path.join(project, ".sandbox-ctl", "config.json"), "{not-json");
+      const cli = path.join(process.cwd(), "skills/sandbox-ctl/scripts/sandbox-ctl.mjs");
+      const child = spawnSync(process.execPath, [cli, "--adapter", "cube-sandbox", "--json", "--directory", project, "exec", "--", "true"], {
+        encoding: "utf8",
+        env: { ...process.env, SANDBOX_CTL_USER_CONFIG: path.join(user, "config.json"), SANDBOX_CTL_RUNTIME_DIR: path.join(user, "runtime") },
+      });
+      expect(child.status).toBe(125);
+      expect(child.stdout.trim().split("\n")).toHaveLength(1);
+      expect(JSON.parse(child.stdout)).toMatchObject({ command: "exec", exitCode: 125, failure: { kind: "config_invalid" } });
+    } finally {
+      rmSync(project, { recursive: true, force: true });
+      rmSync(user, { recursive: true, force: true });
+    }
   });
 
   it("routes --adapter cube through the real CLI entry to the cube adapter's own handlers, not Daytona's", () => {

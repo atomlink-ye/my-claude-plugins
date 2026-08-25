@@ -72,7 +72,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
 import { parseArgs as parseArgsGeneric, sanitizeTaskId, shellQuote } from "../lib/cli-shared.mjs";
@@ -89,7 +89,7 @@ import {
   validateTarEntries,
 } from "../lib/transfer.mjs";
 import { createGitBundle, fetchGitBundleIntoBranch, remoteEnsureGitCommand, validateGitBranch } from "../lib/git-sync.mjs";
-import { createDaemonClient, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
+import { classifyFailure, createDaemonClient, FAILURE_KINDS, readExecutionRecord, readExecutions, runtimePaths, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
@@ -498,7 +498,7 @@ async function invalidateDaemonConnection(sandboxId, options = {}) {
   const nonzeroExit = Number.isInteger(result?.exitCode) && result.exitCode !== 0;
   if (nonzeroExit || result?.error || result?.ok === false) {
     const detail = result?.error ? `: ${result.error}` : nonzeroExit ? ` (exit code ${result.exitCode})` : "";
-    throw new Error(`Could not invalidate the local Cube Sandbox daemon connection for ${sandboxId}${detail}; restart the local sandbox-ctl daemon (daemon stop, then daemon start) and retry`);
+    throw new Error(`Could not invalidate the local Cube Sandbox daemon connection for ${sandboxId}${detail}; inspect daemon status and probe another binding before optionally restarting the local daemon`);
   }
   return result;
 }
@@ -540,7 +540,7 @@ function redactExecFailure(error) {
 
 function daemonUnavailableDiagnostic(error) {
   const detail = redactExecFailure(error);
-  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Run sandbox-ctl daemon stop && sandbox-ctl daemon start, then retry.`;
+  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Inspect daemon status and probe another binding before considering a restart.`;
 }
 
 function assertWorkspaceOwnership(result, action = "workspace ownership validation") {
@@ -843,7 +843,7 @@ async function handleExec(options, command) {
   try {
     sandboxInfo = await requireSandbox(options);
   } catch (error) {
-    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error) };
+    return { exitCode: 125, stdout: "", stderr: "", error: redactExecFailure(error), failure: classifyFailure(error, FAILURE_KINDS.SANDBOX_CONNECT) };
   }
   const { paths, sandbox, remoteHome } = sandboxInfo;
   const cwd = toRemoteAbsolute(options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath, remoteHome);
@@ -876,10 +876,10 @@ async function handleExec(options, command) {
     if (typeof error?.exitCode === "number" && typeof error?.stdout === "string" && typeof error?.stderr === "string") {
       exitCode = remoteExitCode(error.exitCode) ?? 125;
     } else {
-      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error) };
+      return { exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), error: redactExecFailure(error), failure: classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT) };
     }
   }
-  const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join("") };
+  const result = { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), ...(exitCode !== 0 ? { failure: { kind: FAILURE_KINDS.REMOTE_COMMAND, remoteExitCode: exitCode } } : {}) };
   if (options.artifacts) {
     try { result.artifactPath = writeExecArtifacts(options.artifacts, { ...result, command, cwd }); }
     catch (error) { return { ...result, exitCode: 125, error: redactExecFailure(error) }; }
@@ -891,6 +891,7 @@ async function handleExecViaDaemon(options, command) {
   let paths;
   const stdout = [];
   const stderr = [];
+  const executionId = randomUUID();
   try {
     paths = resolveProjectPaths(options);
     if (!paths.binding?.sandboxId) return null;
@@ -900,6 +901,7 @@ async function handleExecViaDaemon(options, command) {
     if (!options.daemonClient) await (options.startDaemon ?? startDaemon)(options.daemon ?? {});
     const cwd = options.cwd ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath;
     const result = await daemon.exec({
+      executionId,
       sandboxId: paths.binding.sandboxId,
       command: command.map(shellQuote).join(" "),
       cwd,
@@ -909,7 +911,7 @@ async function handleExecViaDaemon(options, command) {
       onStdout: (chunk) => { const text = String(chunk ?? ""); stdout.push(text); if (!options.json && !options.bufferOutput) process.stdout.write(text); },
       onStderr: (chunk) => { const text = String(chunk ?? ""); stderr.push(text); if (!options.json && !options.bufferOutput) process.stderr.write(text); },
     });
-    const normalized = { exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 125, stdout: result.stdout ?? stdout.join(""), stderr: result.stderr ?? stderr.join(""), ...(result.remoteHome ? { remoteHome: result.remoteHome } : {}) };
+    const normalized = { executionId: result.executionId ?? executionId, exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 125, stdout: result.stdout ?? stdout.join(""), stderr: result.stderr ?? stderr.join(""), ...(result.remoteHome ? { remoteHome: result.remoteHome } : {}), ...(result.failure ? { failure: result.failure } : {}) };
     if (result.remoteHome && !paths.binding.remoteHome) {
       try { upsertBinding(paths.directory, paths.binding.name, { remoteHome: result.remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* preserve command result; next direct run can retry */ }
     }
@@ -917,6 +919,7 @@ async function handleExecViaDaemon(options, command) {
       const diagnostic = daemonUnavailableDiagnostic(result.error);
       normalized.exitCode = 125;
       normalized.error = diagnostic;
+      normalized.failure = result.failure ?? classifyFailure(result, FAILURE_KINDS.PROXY_TRANSPORT);
       normalized.stderr = normalized.stderr ? `${normalized.stderr}${normalized.stderr.endsWith("\n") ? "" : "\n"}${diagnostic}\n` : `${diagnostic}\n`;
     }
     if (options.artifacts && !normalized.error) {
@@ -927,8 +930,28 @@ async function handleExecViaDaemon(options, command) {
   } catch (error) {
     const diagnostic = daemonUnavailableDiagnostic(error);
     const priorStderr = stderr.join("");
-    return { exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic };
+    const classified = error.failure ?? classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT);
+    return { executionId: error.executionId ?? executionId, exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic, failure: classified, ...(classified.kind === FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN ? { remoteStatus: "unknown" } : {}) };
   }
+}
+
+async function handleExecRecord(options = {}) {
+  const executionId = String(options.executionId ?? options["execution-id"] ?? "");
+  if (!executionId) throw new Error("exec status/result requires an execution ID");
+  const daemon = options.daemonClient
+    ? (typeof options.daemonClient === "function" ? await options.daemonClient() : options.daemonClient)
+    : createDaemonClient(options.daemon ?? {});
+  const operation = options.execCommand === "status" ? "execStatus" : "execResult";
+  if (typeof daemon[operation] === "function") {
+    try {
+      const result = await daemon[operation](executionId);
+      if (result?.status !== "not-found") return result;
+    } catch { /* read the durable local record below when the daemon is stopped */ }
+  }
+  const paths = runtimePaths(options.daemon ?? {});
+  const local = readExecutionRecord(paths.executionsDir, executionId) ?? readExecutions(paths.executionsPath)[executionId];
+  if (local) return { ok: true, ...local };
+  return { ok: false, executionId, status: "not-found", failure: { kind: FAILURE_KINDS.PROXY_TRANSPORT, message: "Execution record was not found" } };
 }
 
 async function handlePush(options) {
@@ -1315,6 +1338,7 @@ export {
   handlePause,
   handleResume,
   handleExec,
+  handleExecRecord,
   handleList,
   handlePreview,
   handlePull,

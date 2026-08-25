@@ -11,6 +11,8 @@ const CHILD_PATH_ENVS = {
   runtimeDir: "SANDBOX_CTL_DAEMON_RUNTIME_DIR_INTERNAL",
   socketPath: "SANDBOX_CTL_DAEMON_SOCKET_PATH_INTERNAL",
   statePath: "SANDBOX_CTL_DAEMON_STATE_PATH_INTERNAL",
+  executionsPath: "SANDBOX_CTL_DAEMON_EXECUTIONS_PATH_INTERNAL",
+  executionsDir: "SANDBOX_CTL_DAEMON_EXECUTIONS_DIR_INTERNAL",
   lockPath: "SANDBOX_CTL_DAEMON_LOCK_PATH_INTERNAL",
 };
 
@@ -28,7 +30,7 @@ async function runDaemon() {
   const previous = readState(paths.statePath);
   const fingerprint = connectionFingerprint();
   if (previous?.fingerprint && JSON.stringify(previous.fingerprint) !== JSON.stringify(fingerprint)) {
-    process.stderr.write("Cube Sandbox daemon connection settings changed; run sandbox-ctl daemon stop then sandbox-ctl daemon start.\n");
+    process.stderr.write("Cube Sandbox daemon connection settings changed; inspect daemon status and optionally restart the local daemon.\n");
     process.exit(1);
   }
 
