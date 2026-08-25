@@ -71,13 +71,21 @@ node and fails with CubeMaster `130404`. **Always pass `--template`.** The node
 exposes no template-listing command; query the API's `/templates` endpoint.
 
 `up` uses a 30-minute sandbox idle timeout unless overridden with `--timeout`;
-`exec` has an independent 5-minute local wait default. `adopt` accepts the same
-`--timeout` duration, defaults to 30 minutes when omitted, and applies it via
+`exec` has an independent 5-minute local wait default. The exec wait is local
+only and is never forwarded as an E2B command timeout; if it expires, the
+remote command continues and can be inspected by execution ID. `adopt` accepts
+the same `--timeout` duration, defaults to 30 minutes when omitted, and applies
+it via
 the connected sandbox instance's `setTimeout` before persisting the binding. If
 that capability is unavailable, adoption fails instead of claiming the timeout
 was changed. Idle expiry **kills** the sandbox — unlike Daytona there is no
 separate stop/archive/delete ladder and no `--auto-delete -1` — so size the
 timeout to the work and pull artifacts before it expires.
+
+When `SANDBOX_CTL_DISABLE_DAEMON=1` selects direct diagnostic mode, an explicit
+`exec --timeout` is rejected before command submission because that path cannot
+provide durable status/result recovery. Omit the flag to remain attached until
+the direct SDK command completes, or use the daemon-backed path for local waits.
 
 Cube workspace ownership is opt-in with `--workspace-owner UID:GID` (for
 example `1000:1000`); UID and GID must be non-root positive integers. `up`
