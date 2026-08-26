@@ -72,6 +72,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 
 import { getActiveBinding, readConfig, removeBinding, resolveBinding, upsertBinding } from "../project-config.mjs";
@@ -235,7 +236,16 @@ function resolveProjectPaths(options = {}) {
 
 async function loadCubeSandboxSdk() {
   try {
-    return await import("e2b");
+    // Load e2b via CJS require anchored at its realpath rather than `await import("e2b")`.
+    // Under Node >=26, dynamic ESM import of e2b (a CJS package) yields a namespace whose
+    // named binding `Sandbox` reads back undefined inside the full CLI process (the
+    // cjs->esm live getters resolve to undefined), which trips resolveSandboxLifecycleClass.
+    // A plain createRequire from this module fixes the binding but, under pnpm, requiring
+    // e2b through its symlinked node_modules path hides transitive deps (openapi-fetch).
+    // Requiring from e2b's realpath (inside .pnpm/e2b@x/node_modules) lets those siblings resolve.
+    const require = createRequire(import.meta.url);
+    const e2bRealPath = realpathSync(require.resolve("e2b"));
+    return createRequire(e2bRealPath)(e2bRealPath);
   } catch (directImportError) {
     throw new Error(`e2b SDK is required for this command. Install it with: pnpm add e2b (or install plugin dependencies). Original error: ${directImportError?.message ?? directImportError}`);
   }
