@@ -662,12 +662,23 @@ export class ArcpService {
     return delivery ? { state: delivery.state } : undefined;
   }
   async withdraw(id: string, reason = 'withdrawn', memberId?: string): Promise<Delivery> {
-    const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
+    const snapshot = this.store.snapshot();
+    const delivery = snapshot.deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (['delivered', 'running', 'processed', 'acknowledged'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivered delivery cannot be withdrawn');
     if (memberId) {
-      const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
-      if (!session || session.memberId !== memberId) throw new ArcpError('unauthorized', 'delivery withdrawal is not authorized');
+      const member = snapshot.members.find((item) => item.id === memberId);
+      const session = snapshot.sessions.find((item) => item.id === delivery.runtimeSessionId);
+      const workspace = session?.workspaceId ? snapshot.workspaces.find((item) => item.id === session.workspaceId) : undefined;
+      const sameWorkspace = Boolean(member && session?.workspaceId && member.workspaceId === session.workspaceId && workspace?.id === member.workspaceId);
+      if (!member || !session || !workspace || !sameWorkspace) throw new ArcpError('unauthorized', 'delivery withdrawal is not authorized');
+      const authorized = (
+        delivery.fromActorId === member.actorId
+        || workspace.ownerMemberId === member.id
+        || member.role === 'manager'
+        || session.memberId === member.id
+      );
+      if (!authorized) throw new ArcpError('unauthorized', 'delivery withdrawal is not authorized');
     }
     return this.store.mutate((state) => {
       const item = state.deliveries.find((value) => value.id === id)!;

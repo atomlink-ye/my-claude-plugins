@@ -378,6 +378,30 @@ describe('ARCP Slice A channel correctness', () => {
     service.close();
   });
 
+  it('authorizes non-terminal withdrawal for sender, owner, and manager members only within the workspace', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-withdraw-auth-')));
+    const { actor: ownerActor, binding } = await service.registerActor({ clientIdentity: 'withdraw-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: ownerActor.id, purpose: 'withdraw authorization' });
+    const { actor: senderActor } = await service.registerActor({ clientIdentity: 'withdraw-sender' });
+    const { actor: managerActor } = await service.registerActor({ clientIdentity: 'withdraw-manager' });
+    const { actor: unrelatedActor } = await service.registerActor({ clientIdentity: 'withdraw-unrelated' });
+    const sender = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'sender', role: 'worker', actorId: senderActor.id });
+    const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager', actorId: managerActor.id });
+    const recipient = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'recipient', role: 'worker' });
+    const unrelated = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'unrelated', role: 'worker', actorId: unrelatedActor.id });
+    const goal = await service.createGoal({ actorId: ownerActor.id, title: 'withdraw authorization', workspaceId: workspace.workspace.id });
+    await service.store.mutate((state: any) => {
+      state.sessions.push({ id: 'withdraw-recipient-runtime', actorId: recipient.member.actorId ?? 'recipient-runtime-actor', goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: recipient.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'withdraw-recipient-runtime', createdAt: new Date().toISOString() });
+      for (const id of ['withdraw-sender', 'withdraw-manager', 'withdraw-owner', 'withdraw-unrelated']) state.deliveries.push({ id, fromActorId: senderActor.id, runtimeSessionId: 'withdraw-recipient-runtime', generation: 1, body: id, command: 'normal', state: 'waiting_safe_point', createdAt: new Date().toISOString() });
+    });
+    await expect(service.withdraw('withdraw-sender', 'sender withdrew', sender.member.id)).resolves.toMatchObject({ state: 'withdrawn' });
+    await expect(service.withdraw('withdraw-manager', 'manager withdrew', manager.member.id)).resolves.toMatchObject({ state: 'withdrawn' });
+    await expect(service.withdraw('withdraw-owner', 'owner withdrew', workspace.member.id)).resolves.toMatchObject({ state: 'withdrawn' });
+    await expect(service.withdraw('withdraw-unrelated', 'unrelated attempt', unrelated.member.id)).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(service.state().deliveries.find((item) => item.id === 'withdraw-unrelated')?.state).toBe('waiting_safe_point');
+    service.close();
+  });
+
   it('does not replay an already-delivered event after service restart', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-restart-delivery-')); const first = await control(root);
     const { actor } = await first.registerActor({ clientIdentity: 'restart-owner' }); const goal = await first.createGoal({ actorId: actor.id, title: 'restart' });
