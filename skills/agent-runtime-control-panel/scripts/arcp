@@ -53,8 +53,8 @@ const helpRequested = area === 'help' || area === '--help' || area === '-h' || (
 if (helpRequested || !area) { console.log(HELP); }
 else if (area === 'db') {
   try {
-    const { SQLiteStateStore } = await import('../runtime/dist/state-store.js');
-    const dbPath = f.db || process.env.ARCP_DB || process.env.ARCP_STATE_DB || process.env.ARCP_DATA || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel');
+    const { SQLiteStateStore, resolveDatabasePath } = await import('../runtime/dist/state-store.js');
+    const dbPath = resolveDatabasePath(f.db || process.env.ARCP_DATA || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/data'));
     const store = new SQLiteStateStore(dbPath); await store.init();
     if (action === 'status') console.log(JSON.stringify(store.status(), null, 2));
     else if (action === 'check') console.log(JSON.stringify(store.check(), null, 2));

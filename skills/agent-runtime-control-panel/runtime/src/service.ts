@@ -18,8 +18,6 @@ import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, 
 export interface ArcpDeliveryPolicy {
   isRecipient(recipient: string): boolean;
   dispatch(message: MessageRecord, prompt: string): Promise<{ deliveryId: string; state: string }>;
-  /** Deliver an already-rendered body (for provider commands and envelopes). */
-  dispatchRaw?(message: MessageRecord, body: string): Promise<{ deliveryId: string; state: string }>;
   status?(deliveryId: string): Promise<{ state: string } | undefined>;
   acknowledge?(deliveryId: string, reason: string): Promise<unknown>;
   withdraw?(deliveryId: string, reason: string): Promise<unknown>;
@@ -1569,9 +1567,7 @@ export class CompanionService {
       const rawBody = pending.length === 1 && (/^\/compact\s/.test(pending[0].body) || /^<paseo-reminder-delivery\b/.test(pending[0].body))
         ? pending[0].body : undefined;
       const prompt = rawBody ?? this.messagePrompt(recipient, pending);
-      const result = rawBody && this.arcpDeliveryPolicy!.dispatchRaw
-        ? await this.arcpDeliveryPolicy!.dispatchRaw(pending[0], rawBody)
-        : await this.arcpDeliveryPolicy!.dispatch(pending[0], prompt);
+      const result = await this.arcpDeliveryPolicy!.dispatch(pending[0], prompt);
       const delivered = ['delivered', 'running', 'processed', 'acknowledged'].includes(result.state);
       for (const message of pending) {
         // The callback's ARCP delivery ID is deterministic from this durable

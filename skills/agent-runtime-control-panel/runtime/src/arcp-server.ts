@@ -105,7 +105,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'POST' && path === '/v1/reuse') { const requested = await body(req); if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); send(res, 200, publicDelivery(await service.reuse({ ...requested, fromActorId: authenticatedActor.id } as any))); return true; }
     if (method === 'GET' && path === '/v1/deliveries') { send(res, 200, service.state().deliveries.map(publicDelivery)); return true; }
     const ack = path.match(/^\/v1\/deliveries\/([^/]+)\/ack$/);
-    if (method === 'POST' && ack) { const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), String(value.reason ?? 'processed'), typeof value.generation === 'number' ? value.generation : undefined))); return true; }
+    if (method === 'POST' && ack) { const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), typeof value.generation === 'number' ? value.generation : undefined))); return true; }
     const withdraw = path.match(/^\/v1\/deliveries\/([^/]+)\/withdraw$/);
     if (method === 'POST' && withdraw) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.withdraw(decodeURIComponent(withdraw[1]), String(value.reason ?? 'withdrawn'), authenticatedMember.id))); return true; }
     const release = path.match(/^\/v1\/deliveries\/([^/]+)\/release$/);

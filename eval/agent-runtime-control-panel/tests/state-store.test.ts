@@ -12,9 +12,12 @@ const event = (id: string, summary = 'event') => ({ id, workspaceId: 'workspace-
 describe('SQLite StateStore', () => {
   it('initializes crash-safe numbered migrations with required SQLite settings', async () => {
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
-    expect(store.status()).toMatchObject({ schemaVersion: 2, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
+    expect(store.status()).toMatchObject({ schemaVersion: 1, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
     const db = new DatabaseSync(store.file);
-    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1, 2]);
+    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1]);
+    expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('corrections', 'gates', 'legacy_records')").all() as any[])).toEqual([]);
+    expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_observations'").all() as any[])).toHaveLength(1);
+    expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'runtime_observations_runtime_idx'").all() as any[])).toHaveLength(1);
     expect(store.check()).toMatchObject({ quickCheck: 'ok', integrityCheck: 'ok' }); db.close(); store.close();
   });
 
@@ -59,6 +62,7 @@ describe('SQLite StateStore', () => {
     expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true }); expect(store.export('finding').events).toHaveLength(1);
     const backup = path.join(dbDir, 'backup.sqlite'); await store.backupTo(backup); expect((await stat(backup)).mode & 0o777).toBe(0o600); const backupDb = new DatabaseSync(backup); expect((backupDb.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(1); backupDb.close();
     const raw = await readFile(store.file); expect(raw.toString()).not.toContain('credential-secret'); expect(raw.toString()).not.toContain('reminder content'); store.close();
+    const reopened = new SQLiteStateStore(dbDir); await reopened.init(); expect(reopened.export('finding').events).toHaveLength(1); expect(reopened.status().schemaVersion).toBe(1); reopened.close();
   });
 
   it('reuses one hashed content row for an imported Result and identical task candidate event', async () => {
@@ -87,5 +91,16 @@ describe('SQLite StateStore', () => {
     const source = await root(); const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
     await store.mutate((state) => state.channelEvents.push(event('existing'))); await writeFile(path.join(source, 'arcp-state.json'), '{not-json');
     await expect(store.importLegacy(source)).rejects.toThrow(); expect(store.status().tables.event_journal).toBe(1); store.close();
+  });
+
+  it('rejects an import when a normalized projection drops a record during persistence', async () => {
+    const source = await root(); const dir = await root();
+    await writeFile(path.join(source, 'arcp-state.json'), JSON.stringify({ channelEvents: [event('kept'), event('dropped')] }));
+    const store = new SQLiteStateStore(dir); await store.init();
+    const original = (store as any).persistEvents;
+    (store as any).persistEvents = function (events: unknown[]) { return original.call(this, events.slice(0, 1)); };
+    await expect(store.importLegacy(source)).rejects.toThrow(/import verification failed/);
+    expect(store.status().tables.event_journal).toBe(0);
+    store.close();
   });
 });

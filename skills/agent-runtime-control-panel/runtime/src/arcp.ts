@@ -11,6 +11,7 @@ import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
+import { contentAddress, normalizeChannelEvent } from './content.js';
 export type { StateStore } from './state-store.js';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
@@ -73,7 +74,7 @@ export class ArcpStore implements StateStore {
     await mkdir(path.dirname(this.file), { recursive: true });
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
-      const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, any>>; const channelEvents = legacyEvents.map((item) => item.content ? item as ChannelEvent : migrateLegacyChannelEvent(item));
+      const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, unknown>>; const channelEvents = legacyEvents.map(normalizeChannelEvent);
       this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
@@ -141,14 +142,6 @@ const safeJson = (value: unknown): Record<string, any> => asRecord(value);
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => execFile('git', args, { cwd, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
-function migrateLegacyChannelEvent(item: Record<string, any>): ChannelEvent {
-  const summary = String(item.summary ?? ''); const evidenceRefs = Array.isArray(item.evidenceRefs) ? item.evidenceRefs.map(String) : []; const { summary: _summary, evidenceRefs: _evidenceRefs, content: _content, transitions: _transitions, ...envelope } = item;
-  const at = item.createdAt ?? item.deliveredAt ?? item.processedAt ?? item.acknowledgedAt ?? '1970-01-01T00:00:00.000Z'; const transitions: ChannelTransition[] = [{ state: 'queued', at }];
-  for (const [state, timestamp] of [['delivered', item.deliveredAt], ['processed', item.processedAt], ['acknowledged', item.acknowledgedAt]] as const) if (typeof timestamp === 'string') transitions.push({ state, at: timestamp });
-  const final = item.deliveryState; if (final === 'transport_indeterminate' && !transitions.some((entry) => entry.state === final)) transitions.push({ state: final, at: item.transportUncertainAt ?? at });
-  const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex'); return { ...envelope, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: transitions.at(-1)!.state, transitions, createdAt: item.createdAt ?? at } as ChannelEvent;
-}
-
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
  * this adapter owns only safe Paseo transport/discovery calls and never exposes native handles. */
 type PaseoModeClient = { connect(): Promise<void>; close(): Promise<void>; providers: { listModes(provider: string): Promise<unknown> } };
@@ -244,14 +237,13 @@ export class ArcpService {
     if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) void this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId }).catch(() => undefined); });
   }
   private adapterFor(session: RuntimeSession): RuntimeAdapter { return this.adapters.get(session.adapterId || (session.runtimeKind === 'external' ? 'hermes-acp' : 'paseo')) ?? this.adapter; }
-  private channelFor(session: RuntimeSession): RuntimeAdapter { return this.adapters.get(session.adapterId || (session.runtimeKind === 'external' ? 'hermes-acp' : 'paseo')) ?? this.adapter; }
   private async prepareRuntimeClientState(sessionId: string, workspaceId: string, memberId: string, credential: string): Promise<string> {
     const root = path.join(path.dirname(this.store.file), 'runtime-members'); const file = path.join(root, `${sessionId}.json`);
     await mkdir(root, { recursive: true }); await writeFile(file, JSON.stringify({ workspaceId, memberId, runtimeMemberCredentials: { [sessionId]: credential } }) + '\n', { mode: 0o600 }); return file;
   }
   async init(): Promise<void> {
     await this.store.init();
-    if ('prune' in this.store && typeof (this.store as any).prune === 'function') await (this.store as any).prune();
+    if (this.store.prune) await this.store.prune();
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
       const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[] };
@@ -432,7 +424,7 @@ export class ArcpService {
       // Persist the opaque handle before postflight: reconcile must remain possible
       // when launch succeeded but the immediate observation timed out.
       await this.store.mutate((next) => { next.sessions.find((item) => item.id === session.id)!.externalId = externalId; });
-      const snapshot = await this.channelFor(session).snapshot(externalId); const inspected = snapshot.agent;
+      const snapshot = await this.adapterFor(session).snapshot(externalId); const inspected = snapshot.agent;
       const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.currentModeId ?? inspected.mode ?? inspected.Mode, inspected.effectiveThinkingOptionId ?? inspected.thinkingOptionId ?? inspected.thinking ?? inspected.Thinking];
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
       const matchesPlan = expected.every((expectedValue, index) => !expectedValue || (typeof observed[index] === 'string' && capabilityToken(String(observed[index])) === capabilityToken(expectedValue)));
@@ -446,7 +438,7 @@ export class ArcpService {
     if (!prior) throw new ArcpError('not_found', 'runtime session not found');
     if (!prior.externalId) return prior;
     try {
-      const snapshot = await this.channelFor(prior).snapshot(prior.externalId); const observed = snapshot.agent;
+      const snapshot = await this.adapterFor(prior).snapshot(prior.externalId); const observed = snapshot.agent;
       const updated = await this.store.mutate((state) => {
         const item = state.sessions.find((value) => value.id === id)!;
         item.observed = { ...(setting(observed.provider ?? observed.Provider) ? { provider: String(observed.provider ?? observed.Provider) } : {}), ...(setting(observed.model ?? observed.Model) ? { model: String(observed.model ?? observed.Model) } : {}), ...(setting(observed.currentModeId ?? observed.mode ?? observed.Mode) ? { mode: String(observed.currentModeId ?? observed.mode ?? observed.Mode) } : {}), ...(setting(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) ? { thinking: String(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) } : {}) };
@@ -472,7 +464,7 @@ export class ArcpService {
         const valid = adapter.reconcileExternal ? await adapter.reconcileExternal(prior.externalId ?? '') : false;
         if (!valid) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
       }
-      const agents = (await this.channelFor(prior).registry()).value;
+      const agents = (await this.adapterFor(prior).registry()).value;
       const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => String(item.id ?? item.agentId) === prior.externalId) : undefined;
       if (!match) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
       return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = sessionState(match.status ?? match.Status); item.lastObservedAt = now(); return item; });
@@ -488,7 +480,7 @@ export class ArcpService {
   }
   private async facts(session: RuntimeSession) {
     if (!session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
-    const adapter = this.channelFor(session); const snapshot = await adapter.snapshot(session.externalId); const children = await this.children(session.externalId, adapter); const turn = safeJson(snapshot.agent.activeTurn);
+    const adapter = this.adapterFor(session); const snapshot = await adapter.snapshot(session.externalId); const children = await this.children(session.externalId, adapter); const turn = safeJson(snapshot.agent.activeTurn);
     return { agent: snapshot.agent, activeTurn: `${turn.turnId ?? turn.id ?? ''}:${turn.startedAt ?? ''}:${Boolean(turn.turnId ?? turn.id)}`, childSet: `${children.source}:${children.items.map((child) => `${child.id}:${child.status}`).sort().join(',')}`, cache: this.cacheState(snapshot.agent, snapshot.timeline) };
   }
   private async confirmationReceipt(kind: Confirmation['kind'], session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>, why: string) {
@@ -526,7 +518,7 @@ export class ArcpService {
     const event = await this.publishChannelEvent({ id: input.sourceMessageId ? idFor('event', `delivery:${input.sourceMessageId}:${session.id}`) : undefined, workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'attention', urgency: 'urgent', decisionRequired: false, summary: `Channel interrupt ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), state: 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
-    try { await this.channelFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
+    try { await this.adapterFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
     catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
   }
   async deliver(input: { fromActorId: string; runtimeSessionId: string; body: string; command?: 'normal' | 'interrupt'; reason?: string; cacheConfirmation?: string; sourceMessageId?: string }): Promise<Delivery | Record<string, unknown>> {
@@ -548,7 +540,7 @@ export class ArcpService {
     const deliveryId = input.sourceMessageId ? idFor('delivery', `companion:${input.sourceMessageId}:${session.id}`) : `delivery_${randomUUID()}`;
     const event = await this.publishChannelEvent({ id: input.sourceMessageId ? idFor('event', `delivery:${input.sourceMessageId}:${session.id}`) : undefined, workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: `Channel delivery ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const held = !('allow' in cache);
-    const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), ...('allow' in cache && cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), ...(held ? { reason: cache.why } : {}), state: held ? 'held' : command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
+    const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), ...('allow' in cache && cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(held ? { reason: cache.why } : input.reason ? { reason: input.reason.trim() } : {}), state: held ? 'held' : command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     if (held) return { ...cache, deliveryId };
     await this.pump(); return this.store.snapshot().deliveries.find((item) => item.id === delivery.id)!;
@@ -592,16 +584,15 @@ export class ArcpService {
         await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'running'; return item; });
         try {
           // Adapter rechecks immediately before its non-steering start-turn operation.
-          const event = delivery.eventId ? this.store.snapshot().channelEvents.find((item) => item.id === delivery.eventId) : undefined;
-          await this.channelFor(session).startTurn(session.externalId, delivery.body, delivery.id);
+          await this.adapterFor(session).startTurn(session.externalId, delivery.body, delivery.id);
           await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; });
         } catch { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
       }
-      if ('prune' in this.store && typeof (this.store as any).prune === 'function') await (this.store as any).prune();
+      if (this.store.prune) await this.store.prune();
     })().finally(() => { this.pumping = undefined; if (this.pumpAgain) { this.pumpAgain = false; void this.pump(); } });
     return this.pumping;
   }
-  async acknowledge(id: string, reason: string, generation?: number): Promise<Delivery> {
+  async acknowledge(id: string, generation?: number): Promise<Delivery> {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (generation !== undefined && generation !== delivery.generation) throw new ArcpError('stale_generation', 'delivery generation is stale');
@@ -659,7 +650,7 @@ export class ArcpService {
     const targetRole = input.targetRole ?? (taskNotification ? 'manager' : undefined);
     const notifying = input.notify !== false || taskNotification;
     if (notifying && !input.targetMemberId && !input.targetActorId && !targetRole && !input.targetSubscription) throw new ArcpError('invalid_request', 'notifying channel events require an explicit target', 'target');
-    const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
+    const contentHash = contentAddress(summary, evidenceRefs);
     const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs };
     const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
     const existing = state.channelEvents.find((item) => item.id === id);
@@ -772,7 +763,7 @@ export class ArcpService {
     if (refresh) await this.observe(id);
     const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
     const requested = this.requested(session); let agent: Record<string, any> | undefined; let timeline: unknown[] | undefined; let source: 'sdk' | 'cli' | undefined;
-    if (session.externalId) try { const snapshot = await this.channelFor(session).snapshot(session.externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
+    if (session.externalId) try { const snapshot = await this.adapterFor(session).snapshot(session.externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
     const current = agent ?? {}; const usage = safeJson(current.lastUsage); const numeric = (value: unknown): number | 'unknown' => typeof value === 'number' && Number.isFinite(value) ? value : 'unknown';
     const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
     const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
@@ -792,7 +783,7 @@ export class ArcpService {
       if (attention === true) facts.push({ kind: 'attention', summary: `Runtime ${session.id} requires attention` });
       await Promise.all(facts.map((fact) => this.publishChannelEvent({ id: idFor('event', `observation:${session.externalId ?? session.id}:${fact.kind}:${sampleBucket}:${session.workspaceId}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`), workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: 'urgent', decisionRequired: true, summary: fact.summary, evidenceRefs: [] })));
     }
-    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.channelFor(session)), workSummary: await this.workSummary(session.workspace) };
+    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
   }
   async panorama(workspaceId: string, refresh = false) {
     const context = this.context(workspaceId); const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId); const runtime = await Promise.all(sessions.map((item) => this.runtimeStatus(item.id, refresh)));

@@ -4,6 +4,7 @@ import { statSync } from 'node:fs';
 import path from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import type { State, ChannelEvent } from './arcp.js';
+import { contentAddress, normalizeChannelEvent } from './content.js';
 
 /** The application-facing persistence seam. Implementations own their storage format. */
 export interface StateStore {
@@ -11,6 +12,7 @@ export interface StateStore {
   init(): Promise<void>;
   snapshot(): State;
   mutate<T>(fn: (state: State) => T): Promise<T>;
+  prune?(): Promise<void>;
 }
 
 export interface DatabaseStatus {
@@ -47,12 +49,10 @@ export interface ImportReport {
 
 type SqliteRow = Record<string, unknown>;
 const OBSERVATION_LIMIT = 100;
-const SCHEMA_VERSION = 2;
 const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [] });
 const json = (value: unknown): string => JSON.stringify(value);
 const parse = <T>(value: unknown, fallback: T): T => { try { return value === null || value === undefined ? fallback : JSON.parse(String(value)) as T; } catch { return fallback; } };
 const hash = (value: unknown): string => createHash('sha256').update(typeof value === 'string' ? value : stableJson(value)).digest('hex');
-const contentHash = (summary: string, evidenceRefs: string[]): string => createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
@@ -66,22 +66,8 @@ function safeState(value: Partial<State>): State {
   state.memberCredentials = {};
   state.sessions = state.sessions.map((session) => ({ ...session, workspace: undefined }));
   state.deliveries = state.deliveries.map((delivery) => ({ ...delivery, body: '' }));
-  state.channelEvents = state.channelEvents.map((event) => normalizeEvent(event as unknown as Record<string, unknown>));
+  state.channelEvents = state.channelEvents.map((event) => normalizeChannelEvent(event as unknown as Record<string, unknown>));
   return state;
-}
-function normalizeEvent(value: Record<string, unknown>): ChannelEvent {
-  if (value.content && typeof value.content === 'object') {
-    return { ...value, kind: String(value.kind ?? 'finding'), urgency: value.urgency === 'urgent' ? 'urgent' : 'normal', decisionRequired: Boolean(value.decisionRequired), createdAt: String(value.createdAt ?? '1970-01-01T00:00:00.000Z') } as unknown as ChannelEvent;
-  }
-  const summary = String(value.summary ?? '');
-  const evidenceRefs = Array.isArray(value.evidenceRefs) ? value.evidenceRefs.map(String) : [];
-  const at = String(value.createdAt ?? value.deliveredAt ?? value.processedAt ?? value.acknowledgedAt ?? '1970-01-01T00:00:00.000Z');
-  const transitions: Array<{ state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string }> = [{ state: 'queued', at }];
-  for (const state of ['delivered', 'processed', 'acknowledged'] as const) if (typeof value[`${state}At`] === 'string') transitions.push({ state, at: String(value[`${state}At`]) });
-  const final = String(value.deliveryState ?? transitions.at(-1)?.state ?? 'queued') as 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn';
-  if (final !== 'queued' && !transitions.some((item) => item.state === final)) transitions.push({ state: final, at });
-  const { summary: _summary, evidenceRefs: _evidenceRefs, content: _content, transitions: _transitions, ...envelope } = value;
-  return { ...envelope, kind: String(value.kind ?? 'finding'), urgency: value.urgency === 'urgent' ? 'urgent' : 'normal', decisionRequired: Boolean(value.decisionRequired), content: { summary, evidenceRefs, contentHash: hash({ summary, evidenceRefs }), sensitivity: 'normal', retention: 'standard' }, deliveryState: final, transitions, createdAt: at } as unknown as ChannelEvent;
 }
 
 const MIGRATIONS: Array<[number, string]> = [
@@ -101,15 +87,31 @@ const MIGRATIONS: Array<[number, string]> = [
     CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS knowledge (id TEXT PRIMARY KEY, workspace_id TEXT, content_id TEXT REFERENCES content(id), payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY, workspace_id TEXT, content_id TEXT REFERENCES content(id), payload TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS corrections (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS gates (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtime_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS runtime_observations_runtime_idx ON runtime_observations(runtime_id, id);
-    CREATE TABLE IF NOT EXISTS legacy_records (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(source_file, record_index));
     CREATE TABLE IF NOT EXISTS migration_audit (source_file TEXT NOT NULL, source_hash TEXT NOT NULL, imported_at TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(source_file, source_hash));
   `],
-  [2, `CREATE INDEX IF NOT EXISTS event_journal_workspace_idx ON event_journal(workspace_id, created_at); CREATE INDEX IF NOT EXISTS event_journal_kind_idx ON event_journal(kind, created_at);`],
 ];
+
+export function resolveDatabasePath(dirOrFile: string): string {
+  return dirOrFile.endsWith('.sqlite') || dirOrFile.endsWith('.db') ? dirOrFile : path.join(dirOrFile, 'arcp-state.sqlite');
+}
+
+const projection = (state: State) => ({
+  actors: state.actors,
+  bindings: state.bindings,
+  workspaces: state.workspaces,
+  members: state.members,
+  goals: state.goals,
+  tasks: state.tasks,
+  sessions: state.sessions,
+  deliveries: state.deliveries,
+  knowledge: state.knowledge,
+  results: state.results,
+  channelEvents: state.channelEvents,
+});
+type StateProjection = ReturnType<typeof projection>;
+const projectionRecords = (value: StateProjection): number => Object.values(value).reduce((count, records) => count + records.length, 0);
 
 export class SQLiteStateStore implements StateStore {
   readonly file: string;
@@ -118,7 +120,7 @@ export class SQLiteStateStore implements StateStore {
   private write: Promise<unknown> = Promise.resolve();
 
   constructor(dirOrFile: string) {
-    this.file = dirOrFile.endsWith('.sqlite') || dirOrFile.endsWith('.db') ? dirOrFile : path.join(dirOrFile, 'arcp-state.sqlite');
+    this.file = resolveDatabasePath(dirOrFile);
   }
 
   private get connection(): DatabaseSync {
@@ -133,6 +135,10 @@ export class SQLiteStateStore implements StateStore {
     const db = this.connection;
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
+    // These objects were never populated by the SQLite projection. Remove
+    // leftovers from pre-release databases while keeping runtime observations
+    // and all durable ARCP projections intact.
+    db.exec('DROP TABLE IF EXISTS corrections; DROP TABLE IF EXISTS gates; DROP TABLE IF EXISTS legacy_records; DROP INDEX IF EXISTS event_journal_workspace_idx; DROP INDEX IF EXISTS event_journal_kind_idx;');
     const applied = new Set((db.prepare('SELECT version FROM schema_migrations').all() as SqliteRow[]).map((row) => Number(row.version)));
     for (const [version, sql] of MIGRATIONS) {
       if (applied.has(version)) continue;
@@ -199,7 +205,7 @@ export class SQLiteStateStore implements StateStore {
 
   private persistWithinTransaction(state: State): void {
     this.persistContent(state);
-    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'corrections', 'gates', 'channel_events']) this.connection.exec(`DELETE FROM ${table}`);
+    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'channel_events']) this.connection.exec(`DELETE FROM ${table}`);
     this.persistRows('workspaces', state.workspaces);
     this.persistRows('actors', state.actors);
     this.persistRows('actor_bindings', state.bindings);
@@ -208,8 +214,6 @@ export class SQLiteStateStore implements StateStore {
     this.persistRows('tasks', state.tasks);
     this.persistRows('runtimes', state.sessions.map((session) => ({ ...session, workspace: undefined })));
     this.persistRows('deliveries', state.deliveries.map((delivery) => ({ ...delivery, body: '' })));
-    this.persistRows('corrections', []);
-    this.persistRows('gates', []);
     this.persistContentRows('knowledge', state.knowledge, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.text, evidenceRefs: [], sensitivity: 'normal', retention: 'standard' } }));
     this.persistContentRows('results', state.results, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.summary, evidenceRefs: item.evidenceRefs, sensitivity: 'normal', retention: 'standard' } }));
     this.persistEvents(state.channelEvents);
@@ -222,9 +226,9 @@ export class SQLiteStateStore implements StateStore {
   }
 
   private persistContent(state: State): void {
-    for (const event of state.channelEvents) this.ensureContent(event.content.contentHash, event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
-    for (const entry of state.knowledge) this.ensureContent(contentHash(entry.text, []), entry.text, []);
-    for (const result of state.results) this.ensureContent(contentHash(result.summary, result.evidenceRefs), result.summary, result.evidenceRefs);
+    for (const event of state.channelEvents) this.ensureContent(contentAddress(event.content.summary, event.content.evidenceRefs), event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
+    for (const entry of state.knowledge) this.ensureContent(contentAddress(entry.text, []), entry.text, []);
+    for (const result of state.results) this.ensureContent(contentAddress(result.summary, result.evidenceRefs), result.summary, result.evidenceRefs);
   }
 
   /** Content is addressed by its immutable payload hash, regardless of which
@@ -246,7 +250,7 @@ export class SQLiteStateStore implements StateStore {
       delete payload.text;
       delete payload.summary;
       delete payload.evidenceRefs;
-      const contentId = this.ensureContent(contentHash(value.content.summary, value.content.evidenceRefs), value.content.summary, value.content.evidenceRefs, value.content.sensitivity, value.content.retention);
+      const contentId = this.ensureContent(contentAddress(value.content.summary, value.content.evidenceRefs), value.content.summary, value.content.evidenceRefs, value.content.sensitivity, value.content.retention);
       statement.run(record.id, value.workspace_id, contentId, json(payload));
     }
   }
@@ -256,7 +260,7 @@ export class SQLiteStateStore implements StateStore {
     const projection = this.connection.prepare('INSERT INTO channel_events(event_id, envelope, content_id, delivery_state, created_at, delivered_at, processed_at, acknowledged_at, undeliverable_reason, related_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const transition = this.connection.prepare('INSERT OR IGNORE INTO event_transitions(event_id, state, at) VALUES (?, ?, ?)');
     for (const event of events) {
-      const contentId = this.ensureContent(event.content.contentHash, event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
+      const contentId = this.ensureContent(contentAddress(event.content.summary, event.content.evidenceRefs), event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
       const { content: _content, transitions: _transitions, deliveryState: _deliveryState, deliveredAt: _deliveredAt, processedAt: _processedAt, acknowledgedAt: _acknowledgedAt, undeliverableReason: _undeliverableReason, ...envelope } = event;
       const prior = this.connection.prepare('SELECT kind, urgency, decision_required, content_id, created_at FROM event_journal WHERE event_id = ?').get(event.id) as SqliteRow | undefined;
       if (prior && (String(prior.kind) !== event.kind || String(prior.urgency) !== event.urgency || Number(prior.decision_required) !== (event.decisionRequired ? 1 : 0) || String(prior.content_id) !== contentId || String(prior.created_at) !== event.createdAt)) throw new Error(`ChannelEvent id ${event.id} conflicts with the append-only journal`);
@@ -310,17 +314,27 @@ export class SQLiteStateStore implements StateStore {
       const value = JSON.parse(text); return Array.isArray(value) ? value : Object.values(value ?? {});
     };
     const files = [statePath, ...(await readdir(root)).filter((name) => name !== 'arcp-state.json' && (name === 'reminders.json' || name.endsWith('.jsonl'))).map((name) => path.join(root, name))];
+    const expectedProjection = projection(sourceState);
+    const expectedProjectionHash = hash(expectedProjection);
     const sourceReports: ImportReport['sources'] = [];
     for (const file of files) {
       const text = file === statePath ? stateText : await readFile(file, 'utf8');
       const values = legacyValues(file, text);
-      const importedValues = values;
-      sourceReports.push({ file: path.basename(file), records: values.length, contentHash: hash(values), importedRecords: importedValues.length, importedHash: hash(importedValues), match: values.length === importedValues.length });
+      sourceReports.push({ file: path.basename(file), records: values.length, contentHash: hash(values), importedRecords: 0, importedHash: hash([]), match: false });
     }
-    const stateRecords = Object.values(sourceState).filter((value) => Array.isArray(value)).flat() as unknown[];
-    const stateReport = { records: stateRecords.length, contentHash: hash(sourceState), importedRecords: stateRecords.length, importedHash: hash(sourceState), match: true };
-    const existing = (this.connection.prepare('SELECT source_file, source_hash, report FROM migration_audit WHERE source_file = ?').all('arcp-state.json') as SqliteRow[]).find((row) => String(row.source_hash) === hash(stateText));
-    if (existing) return { imported: false, noop: true, sources: parse<ImportReport['sources']>(parse<Record<string, unknown>>(existing.report, {}).sources, sourceReports), state: parse<ImportReport['state']>(parse<Record<string, unknown>>(existing.report, {}).state, stateReport) };
+    const stateSourceReport = sourceReports.find((item) => item.file === 'arcp-state.json')!;
+    stateSourceReport.records = projectionRecords(expectedProjection);
+    stateSourceReport.contentHash = expectedProjectionHash;
+    const currentProjection = projection(this.loadState());
+    const existing = (this.connection.prepare('SELECT source_hash FROM migration_audit WHERE source_file = ?').all('arcp-state.json') as SqliteRow[]).find((row) => String(row.source_hash) === hash(stateText));
+    if (existing && hash(currentProjection) === expectedProjectionHash) {
+      const importedState = { records: projectionRecords(currentProjection), contentHash: hash(currentProjection), importedRecords: projectionRecords(currentProjection), importedHash: hash(currentProjection), match: true };
+      stateSourceReport.importedRecords = importedState.importedRecords;
+      stateSourceReport.importedHash = importedState.importedHash;
+      stateSourceReport.match = importedState.match;
+      return { imported: false, noop: true, sources: sourceReports, state: importedState };
+    }
+    const stateReport: ImportReport['state'] = { records: projectionRecords(expectedProjection), contentHash: expectedProjectionHash, importedRecords: 0, importedHash: hash([]), match: false };
     const report: ImportReport = { imported: true, noop: false, sources: sourceReports, state: stateReport };
     const db = this.connection;
     db.exec('BEGIN IMMEDIATE');
@@ -328,8 +342,18 @@ export class SQLiteStateStore implements StateStore {
     try {
       this.state = sourceState;
       this.persistWithinTransaction(this.state);
+      const importedProjection = projection(this.loadState());
+      const importedHash = hash(importedProjection);
+      report.state.importedRecords = projectionRecords(importedProjection);
+      report.state.importedHash = importedHash;
+      report.state.match = report.state.records === report.state.importedRecords && report.state.contentHash === importedHash;
+      if (!report.state.match) throw new Error(`legacy import verification failed: expected ${report.state.records} records, read ${report.state.importedRecords}`);
+      stateSourceReport.importedRecords = report.state.importedRecords;
+      stateSourceReport.importedHash = importedHash;
+      stateSourceReport.match = true;
+      this.state = this.loadState();
       const audit = db.prepare('INSERT INTO migration_audit(source_file, source_hash, imported_at, report) VALUES (?, ?, ?, ?)');
-      for (const file of files) { const text = file === statePath ? stateText : await readFile(file, 'utf8'); const values = legacyValues(file, text); values.forEach((value, index) => db.prepare('INSERT OR IGNORE INTO legacy_records(source_file, record_index, record_hash, kind) VALUES (?, ?, ?, ?)').run(path.basename(file), index, hash(value), file === statePath ? 'state' : 'reminder')); audit.run(path.basename(file), hash(text), new Date().toISOString(), json(report)); }
+      for (const file of files) { const text = file === statePath ? stateText : await readFile(file, 'utf8'); audit.run(path.basename(file), hash(text), new Date().toISOString(), json(report)); }
       db.exec('COMMIT');
       return report;
     } catch (error) { db.exec('ROLLBACK'); this.state = before; throw error; }
@@ -341,6 +365,3 @@ export class SQLiteStateStore implements StateStore {
 function awaitableStat(file: string): string {
   try { return `0${(statSync(file).mode & 0o777).toString(8)}`; } catch { return '0600'; }
 }
-
-export { OBSERVATION_LIMIT };
-export { SQLiteStateStore as SqliteStateStore };

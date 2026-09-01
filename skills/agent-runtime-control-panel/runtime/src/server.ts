@@ -55,9 +55,8 @@ export async function createServer(service = new CompanionService(undefined, und
   service.setArcpDeliveryPolicy({
     isRecipient: (recipient) => arcp.isRuntimeRecipient(recipient),
     dispatch: (message, prompt) => arcp.deliverCompanionMessage(message, prompt),
-    dispatchRaw: (message, body) => arcp.deliverCompanionMessage(message, body),
     status: async (deliveryId) => arcp.deliveryStatus(deliveryId),
-    acknowledge: (deliveryId, reason) => arcp.acknowledge(deliveryId, reason),
+    acknowledge: (deliveryId) => arcp.acknowledge(deliveryId),
     withdraw: (deliveryId, reason) => arcp.withdraw(deliveryId, reason),
   });
   // The policy must exist before Companion's startup reconciliation examines
