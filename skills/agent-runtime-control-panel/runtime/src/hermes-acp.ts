@@ -7,7 +7,7 @@ type ApcProcess = ChildProcessWithoutNullStreams;
 type Session = { process: ApcProcess; nextId: number; pending: Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>; status: 'running' | 'idle' | 'attention' | 'terminal'; timeline: unknown[]; externalId?: string; context?: RuntimeLaunchContext; lastDeliveryId?: string; lastTurnState?: string; lastFactKey?: string; lastFactAt?: number };
 type SpawnFn = (command: string, args: string[], options: { stdio: ['pipe', 'pipe', 'pipe']; env?: Record<string, string> }) => ApcProcess;
 export type SafePointEvent = { externalId: string; deliveryId?: string; state: 'idle' | 'attention' | 'terminal' };
-export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent'; sampleBucket?: number };
+export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'phase_completed' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent'; sampleBucket?: number };
 export type AcpResultFact = { externalId: string; taskId: string; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string };
 
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' ? value as Record<string, any> : {}; }
@@ -32,7 +32,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   onResult(listener: (fact: AcpResultFact) => void): () => void { this.resultListeners.add(listener); return () => this.resultListeners.delete(listener); }
   private emit(event: SafePointEvent): void { for (const listener of this.listeners) listener(event); }
   private setState(externalId: string, session: Session, state: Session['status'], turnState?: string): void {
-    session.status = state; if (turnState) session.lastTurnState = turnState;
+    session.status = state; if (turnState) session.lastTurnState = turnState.includes('permission') || turnState.includes('requires_action') || state === 'attention' ? 'requires_action' : state === 'idle' ? 'idle' : 'running';
     if (state !== 'running') this.emit({ externalId, ...(session.lastDeliveryId ? { deliveryId: session.lastDeliveryId } : {}), state });
   }
   private wire(externalId: string, session: Session): void {
@@ -50,13 +50,13 @@ export class HermesAcpAdapter implements RuntimeAdapter {
           continue;
         }
         if (message.method === 'session/update') this.onUpdate(session.externalId ?? externalId, session, record(message.params?.update));
-        if (message.method === 'session/request_permission') this.emitFact({ externalId: session.externalId ?? externalId, kind: 'permission', urgency: 'urgent', summary: 'Hermes ACP requested permission' }, session);
+        if (message.method === 'session/request_permission') { this.setState(session.externalId ?? externalId, session, 'attention', 'requires_action'); this.emitFact({ externalId: session.externalId ?? externalId, kind: 'permission', urgency: 'urgent', summary: 'Hermes ACP requested permission' }, session); }
       }
     });
     session.process.stderr.on('data', () => undefined);
     session.process.on('close', () => {
       for (const pending of session.pending.values()) pending.reject(new Error('Hermes ACP process exited'));
-      session.pending.clear(); if (session.status !== 'terminal') this.setState(externalId, session, 'terminal', 'process_exit');
+      session.pending.clear(); if (session.status !== 'terminal') { this.setState(externalId, session, 'terminal', 'running'); this.emitFact({ externalId, kind: 'runtime_health', urgency: 'urgent', summary: 'Hermes ACP process exited unexpectedly' }, session); this.emitFact({ externalId, kind: 'transport_uncertainty', urgency: 'urgent', summary: 'Hermes ACP transport is uncertain after process exit' }, session); }
     });
   }
   private onUpdate(externalId: string, session: Session, update: Record<string, any>): void {
@@ -64,11 +64,12 @@ export class HermesAcpAdapter implements RuntimeAdapter {
     const resultFact = record(update.result);
     if (resultFact.taskId && ['candidate', 'failed', 'unknown'].includes(String(resultFact.status))) for (const listener of this.resultListeners) listener({ externalId, taskId: String(resultFact.taskId), status: String(resultFact.status) as AcpResultFact['status'], summary: String(resultFact.summary ?? ''), sourceId: String(resultFact.resultId ?? resultFact.id ?? `acp:${externalId}:${resultFact.taskId}:${resultFact.expectedFence ?? ''}:${resultFact.status}:${resultFact.summary ?? ''}`), ...(Array.isArray(resultFact.evidenceRefs) ? { evidenceRefs: resultFact.evidenceRefs.map(String) } : {}), ...(typeof resultFact.expectedFence === 'number' ? { expectedFence: resultFact.expectedFence } : {}) });
     if (kind) session.timeline.push({ type: kind, timestamp: new Date().toISOString() });
-    if (kind.includes('error') || kind.includes('permission')) this.setState(externalId, session, 'attention', kind);
+    if (kind.includes('error') || kind.includes('permission') || kind.includes('requires_action')) this.setState(externalId, session, 'attention', 'requires_action');
     else if (kind.includes('complete') || kind.includes('idle') || kind === 'turn_end' || kind === 'prompt_end') this.setState(externalId, session, 'idle', kind);
     else if (kind.includes('close') || kind.includes('terminal') || kind.includes('exit')) this.setState(externalId, session, 'terminal', kind);
     else if (kind) this.setState(externalId, session, 'running', kind);
-    if (kind.includes('plan')) this.emitFact({ externalId, kind: 'phase_progress', urgency: 'normal', summary: 'Hermes ACP phase progress' }, session);
+    if (kind.includes('complete') || kind === 'turn_end' || kind === 'prompt_end') this.emitFact({ externalId, kind: 'phase_completed', urgency: 'normal', summary: 'Hermes ACP phase completed' }, session);
+    else if (kind.includes('plan')) this.emitFact({ externalId, kind: 'phase_progress', urgency: 'normal', summary: 'Hermes ACP phase progress' }, session);
     else if (kind.includes('permission') || kind.includes('requires_action')) this.emitFact({ externalId, kind: 'attention', urgency: 'urgent', summary: 'Hermes ACP requires attention' }, session);
     else if (kind.includes('error')) this.emitFact({ externalId, kind: 'transport_uncertainty', urgency: 'urgent', summary: 'Hermes ACP transport is uncertain' }, session);
     else if (kind && !kind.includes('complete') && !kind.includes('idle')) this.emitFact({ externalId, kind: kind.includes('tool') || kind.includes('message') || kind.includes('usage') ? 'material_progress' : 'phase_progress', urgency: 'normal', summary: 'Hermes ACP runtime progress' }, session);
