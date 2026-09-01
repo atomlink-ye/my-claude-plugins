@@ -64,8 +64,7 @@ class RefusingAnalyst implements StewardAnalyst {
 const iso = (offsetMs: number) => new Date(Date.now() + offsetMs).toISOString();
 
 async function control(root: string, cli = new FakeCli()) {
-  const companion = { store: { dir: root }, postMessage: async () => ({}), deleteMessage: async () => ({}) };
-  const service = new ArcpService(companion as any, cli as any);
+  const service = new ArcpService(root, cli as any);
   await service.init();
   return service;
 }

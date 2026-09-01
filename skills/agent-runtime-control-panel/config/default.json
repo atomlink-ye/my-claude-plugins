@@ -1,6 +1,6 @@
 {
   "host": "127.0.0.1",
-  "port": 8787,
+  "port": 18787,
   "dataEnv": "ARCP_DATA",
   "apiKeyEnv": "ARCP_API_KEY",
   "adapter": "paseo",

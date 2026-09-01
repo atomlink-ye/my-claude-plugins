@@ -26,7 +26,9 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 - `opencode-orchestrator` was folded into runtime-specific companion skills.
 - `task-iteration`, `agentic-orchestration`, and `team-lead-orchestration` were removed from the bundle.
 - `daytona-companion` was removed; sandbox lifecycle is superseded by `sandbox-ctl`.
-- `paseo-reminder` is retained as a compatibility entrypoint and now runs from `agent-runtime-control-panel/runtime`.
+- `paseo-reminder` and its loopback port 8787 are retired. `agent-runtime-control-panel` is the only
+  cooperation path; its Channel, Delivery, Knowledge and Result concepts replace the reminder,
+  message, child-watch and correction-gate surfaces.
 
 ## Agent Memory quick start
 

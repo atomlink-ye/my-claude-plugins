@@ -28,11 +28,10 @@ class SilentCli {
   }
 }
 
-const companionFor = (root: string) => ({ store: { dir: root }, postMessage: async () => ({ id: 'message-1', delivery: { status: 'pending' } }), deleteMessage: async () => ({}) });
 
 async function control(root: string, store?: any) {
   const cli = new SilentCli();
-  const service = new ArcpService(companionFor(root) as any, cli as any, store);
+  const service = new ArcpService(root, cli as any, store);
   await service.init();
   return { service, cli };
 }

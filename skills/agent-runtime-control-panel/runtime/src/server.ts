@@ -1,254 +1,60 @@
 import http from 'node:http';
+import path from 'node:path';
 import { URL } from 'node:url';
-import { CompanionService } from './service.js';
-import { PaseoScheduleObserver } from './schedule-observer.js';
-import { PaseoContextUsageObserver } from './context-usage-observer.js';
-import { CompanionError, invalidValue, missingField } from './errors.js';
+import { homedir } from 'node:os';
 import { ArcpService } from './arcp.js';
 import { handleArcp } from './arcp-server.js';
 
-export interface CompanionServer {
+export interface ArcpServer {
   server: http.Server;
-  service: CompanionService;
   arcp: ArcpService;
 }
 
-async function readBody(req: http.IncomingMessage): Promise<any> {
-  let data = '';
-  for await (const chunk of req) data += String(chunk);
-  if (!data.trim()) return {};
-  try { return JSON.parse(data); } catch { throw new CompanionError('invalid_value', 'invalid JSON'); }
-}
 function send(res: http.ServerResponse, status: number, value: unknown): void {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.end(JSON.stringify(value));
 }
-function required(value: unknown, name: string): string {
-  if (typeof value !== 'string' || !value.trim()) missingField(name);
-  return value;
+
+/** Durable state directory. `PASEO_COMPANION_DATA` is accepted as a path name
+ * only, so a state directory created under the older name stays readable. */
+export function resolveDataDir(): string {
+  const explicit = process.env.ARCP_DATA ?? process.env.PASEO_COMPANION_DATA;
+  if (explicit) return explicit;
+  const state = process.env.XDG_STATE_HOME ?? path.join(homedir(), '.local/state');
+  return path.join(state, 'agent-runtime-control-panel/data');
 }
 
-const ROUTES = [
-  ['GET', '/health', []], ['GET', '/self/runtime', []], ['GET', '/heartbeats', []],
-  ['DELETE', '/heartbeats/:id', ['reason']], ['GET', '/wakeup-sources', ['agentId']],
-  ['PUT', '/wakeup-sources/:id', ['agentId', 'cadence']], ['DELETE', '/wakeup-sources/:id', ['agentId']],
-  ['GET', '/children', ['agentId']], ['PUT', '/children/:childId', ['agentId']],
-  ['DELETE', '/children/:childId', ['agentId', 'reason']], ['PUT', '/children/:childId/watch', ['agentId']],
-  ['DELETE', '/children/:childId/watch', ['agentId', 'reason']], ['GET', '/children/:id/briefing', []],
-  ['POST', '/reminders', ['agentId', 'message']], ['GET', '/reminders', []], ['GET', '/reminders/:id', []], ['DELETE', '/reminders/:id', ['reason']],
-  ['POST', '/idle-reminders', ['agentId', 'message', 'thresholdSeconds']], ['GET', '/idle-reminders', []],
-  ['DELETE', '/idle-reminders/:id', ['reason']], ['POST', '/messages', ['to', 'from', 'body']],
-  ['GET', '/messages', []], ['DELETE', '/messages/:id', ['reason']], ['POST', '/compact-wake', ['agentId', 'compact']],
-  ['GET', '/context-usage', []],
-  ['POST', '/ledger', ['type', 'target', 'verdict', 'reason']], ['GET', '/ledger', []],
-  ['POST', '/ledger/:id/revoke', ['reason']],
-  ['POST', '/corrections', ['managerId', 'auditorId', 'findings']], ['GET', '/corrections', []],
-  ['POST', '/corrections/:id/resolve', ['findingId', 'verdict']], ['GET', '/gate', ['managerId']],
-] as const;
-const ERROR_STATUS: Record<string, number> = { missing_field: 400, invalid_value: 400, not_found: 404, ambiguous_id: 409, state_corrupt: 503, cli_error: 502 };
-
-export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver(), undefined, { contextUsageObserver: new PaseoContextUsageObserver() })): Promise<CompanionServer> {
-  const arcp = new ArcpService(service);
+export async function createServer(dataDir = resolveDataDir()): Promise<ArcpServer> {
+  const arcp = new ArcpService(dataDir);
   await arcp.init();
-  service.setInterruptRecipientPolicy((recipient) => arcp.state().sessions.some((session) => session.provider === 'claude' && session.externalId === recipient));
-  service.setArcpDeliveryPolicy({
-    isRecipient: (recipient) => arcp.isRuntimeRecipient(recipient),
-    dispatch: (message, prompt) => arcp.deliverCompanionMessage(message, prompt),
-    status: async (deliveryId) => arcp.deliveryStatus(deliveryId),
-    acknowledge: (deliveryId) => arcp.acknowledge(deliveryId),
-    withdraw: (deliveryId, reason) => arcp.withdraw(deliveryId, reason),
-  });
-  // The policy must exist before Companion's startup reconciliation examines
-  // persisted records; otherwise it could re-create a heartbeat for an ARCP
-  // recipient during the first boot tick.
-  await service.init();
   const server = http.createServer(async (req, res) => {
     try {
       if (await handleArcp(req, res, arcp)) return;
       const method = req.method || 'GET';
-      const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
-      const pathname = url.pathname;
-      const arcpKey = process.env.ARCP_API_KEY ?? process.env.PASEO_COMPANION_API_KEY;
-      const legacyAuthorized = Boolean(arcpKey && String(req.headers['x-arcp-api-key'] ?? '') === arcpKey);
-      let authenticatedActor;
-      let authenticatedMember;
-      try { const key = String(req.headers['x-arcp-actor-key'] ?? ''); if (key) authenticatedActor = arcp.actorForCredential(key); } catch { /* authorization below */ }
-      try { const key = String(req.headers['x-arcp-member-key'] ?? ''); if (key) authenticatedMember = arcp.memberForCredential(key); } catch { /* authorization below */ }
-      const legacyCredential = legacyAuthorized || Boolean(authenticatedActor) || Boolean(authenticatedMember);
-      if (arcpKey && process.env.ARCP_ALLOW_LEGACY_UNAUTH !== '1' && pathname !== '/health' && !legacyCredential) { send(res, 401, { code: 'unauthorized' }); return; }
-      if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
-      if (method === 'GET' && pathname === '/self/runtime') { const runtime = service.runtime(); send(res, 200, arcpKey ? { pid: runtime.pid, port: runtime.port } : runtime); return; }
-      if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats(url.searchParams.get('includeDead') === '1')); return; }
-      if (method === 'GET' && pathname === '/wakeup-sources') {
-        const agentId = required(url.searchParams.get('agentId'), 'agentId');
-        send(res, 200, await service.listWakeupSources(agentId)); return;
+      const pathname = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`).pathname;
+      // `/health` is the launcher's liveness probe and stays unauthenticated.
+      // `/self/runtime` reports only pid and port once a key is configured.
+      if (method === 'GET' && pathname === '/health') { send(res, 200, arcp.health()); return; }
+      const apiKey = process.env.ARCP_API_KEY ?? process.env.PASEO_COMPANION_API_KEY;
+      if (method === 'GET' && pathname === '/self/runtime') {
+        const runtime = arcp.runtime();
+        if (!apiKey) { send(res, 200, runtime); return; }
+        const supplied = String(req.headers['x-arcp-api-key'] ?? '');
+        if (supplied !== apiKey) { send(res, 401, { code: 'unauthorized' }); return; }
+        send(res, 200, { pid: runtime.pid, port: runtime.port }); return;
       }
-      const wakeupSourceMatch = pathname.match(/^\/wakeup-sources\/([^/]+)$/);
-      if (wakeupSourceMatch && method === 'PUT') {
-        const body = await readBody(req);
-        const agentId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
-        const cadence = required(body.cadence ?? url.searchParams.get('cadence'), 'cadence');
-        send(res, 200, await service.registerWakeupSource(decodeURIComponent(wakeupSourceMatch[1]), agentId, cadence)); return;
-      }
-      if (wakeupSourceMatch && method === 'DELETE') {
-        const agentId = required(url.searchParams.get('agentId'), 'agentId');
-        send(res, 200, await service.deleteWakeupSource(decodeURIComponent(wakeupSourceMatch[1]), agentId)); return;
-      }
-      const heartbeatMatch = pathname.match(/^\/heartbeats\/([^/]+)$/);
-      if (method === 'DELETE' && heartbeatMatch) {
-        const body = await readBody(req);
-        const reason = required(body.reason, 'reason');
-        const result = await service.deleteHeartbeat(decodeURIComponent(heartbeatMatch[1]), reason);
-        send(res, typeof result === 'object' && result && 'retirementPending' in result && (result as any).retirementPending ? 202 : 200, result); return;
-      }
-      if (method === 'GET' && pathname === '/children') {
-        const agentId = required(url.searchParams.get('agentId'), 'agentId');
-        send(res, 200, await service.listChildren(agentId)); return;
-      }
-      const childExactMatch = pathname.match(/^\/children\/([^/]+)$/);
-      if ((method === 'DELETE' || method === 'PUT') && childExactMatch) {
-        const body = await readBody(req);
-        const managerId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
-        const childId = decodeURIComponent(childExactMatch[1]);
-        if (method === 'DELETE') {
-          const reason = required(body.reason, 'reason');
-          const result = await service.unsubscribeChildWatch(managerId, childId, reason);
-          send(res, result.retirementPending ? 202 : 200, result); return;
-        }
-        send(res, 200, await service.resubscribeChildWatch(managerId, childId, typeof body.reason === 'string' ? body.reason : undefined)); return;
-      }
-      if (method === 'POST' && pathname === '/reminders') {
-        const body = await readBody(req);
-        if (body.id !== undefined) invalidValue('caller-supplied reminder id is not supported', 'id');
-        const agentId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId'); required(body.message, 'message');
-        send(res, 201, await service.createReminder({ ...body, agentId })); return;
-      }
-      if (method === 'GET' && pathname === '/reminders') {
-        send(res, 200, service.listReminders(url.searchParams.get('agentId') || undefined)); return;
-      }
-      if (method === 'POST' && pathname === '/idle-reminders') {
-        const body = await readBody(req);
-        required(body.agentId, 'agentId'); required(body.message, 'message');
-        send(res, 201, await service.createIdleReminder(body)); return;
-      }
-      if (method === 'GET' && pathname === '/idle-reminders') {
-        send(res, 200, await service.listIdleReminders(url.searchParams.get('agentId') || undefined)); return;
-      }
-      if (method === 'GET' && pathname === '/context-usage') {
-        send(res, 200, await service.listContextUsage(url.searchParams.get('agentId') || undefined)); return;
-      }
-      const idleReminderMatch = pathname.match(/^\/idle-reminders\/([^/]+)$/);
-      if (method === 'DELETE' && idleReminderMatch) {
-        const body = await readBody(req);
-        const reason = required(body.reason, 'reason');
-        send(res, 200, await service.deleteIdleReminder(decodeURIComponent(idleReminderMatch[1]), reason)); return;
-      }
-      if (method === 'POST' && pathname === '/messages') {
-        const body = await readBody(req);
-        required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
-        if (arcp.isRuntimeRecipient(body.to) && !authenticatedActor) {
-          send(res, 409, { code: 'migration_auth_hold', message: 'an ARCP actor credential is required to address an ARCP Runtime; legacy from is not an authenticated sender' }); return;
-        }
-        if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') invalidValue('urgency must be normal or urgent', 'urgency', ['normal', 'urgent']);
-        const { promptKind: _internalPromptKind, actionCommand: _internalActionCommand, kind: _internalKind, recoveryManagerId: _internalRecoveryManagerId, recoveryCounts: _internalRecoveryCounts, recoveryRunIds: _internalRecoveryRunIds, ...publicBody } = body;
-        send(res, 201, await service.postMessage(publicBody)); return;
-      }
-      if (method === 'GET' && pathname === '/messages') {
-        send(res, 200, service.getMessages({
-          to: url.searchParams.get('to') || undefined,
-          from: url.searchParams.get('from') || undefined,
-          status: url.searchParams.get('status') || undefined,
-          replyTo: url.searchParams.get('replyTo') || undefined,
-        })); return;
-      }
-      const messageMatch = pathname.match(/^\/messages\/([^/]+)$/);
-      if (method === 'DELETE' && messageMatch) {
-        const body = await readBody(req);
-        const reason = required(body.reason, 'reason');
-        const result = await service.deleteMessage(decodeURIComponent(messageMatch[1]), reason);
-        send(res, result.retirementPending ? 202 : 200, result); return;
-      }
-      const reminderMatch = pathname.match(/^\/reminders\/([^/]+)$/);
-      if (method === 'GET' && reminderMatch) {
-        send(res, 200, service.getReminder(decodeURIComponent(reminderMatch[1]))); return;
-      }
-      if (method === 'DELETE' && reminderMatch) {
-        const body = await readBody(req);
-        const reason = required(body.reason, 'reason');
-        const result = await service.deleteReminder(decodeURIComponent(reminderMatch[1]), reason);
-        send(res, typeof result === 'object' && result && 'retirementPending' in result && (result as any).retirementPending ? 202 : 200, result); return;
-      }
-      const childWatchMatch = pathname.match(/^\/children\/([^/]+)\/watch$/);
-      if ((method === 'DELETE' || method === 'PUT') && childWatchMatch) {
-        const body = await readBody(req);
-        const managerId = required(url.searchParams.get('agentId') ?? body.agentId, 'agentId');
-        const childId = decodeURIComponent(childWatchMatch[1]);
-        if (method === 'DELETE') {
-          const reason = required(body.reason, 'reason');
-          const result = await service.unsubscribeChildWatch(managerId, childId, reason);
-          send(res, result.retirementPending ? 202 : 200, result); return;
-        }
-        send(res, 200, await service.resubscribeChildWatch(managerId, childId, typeof body.reason === 'string' ? body.reason : undefined)); return;
-      }
-      if (method === 'POST' && pathname === '/compact-wake') {
-        const body = await readBody(req);
-        required(body.agentId, 'agentId'); required(body.compact, 'compact');
-        send(res, 202, await service.compactWake(body)); return;
-      }
-      const briefingMatch = pathname.match(/^\/children\/([^/]+)\/briefing$/);
-      if (method === 'GET' && briefingMatch) {
-        send(res, 200, await service.briefing(decodeURIComponent(briefingMatch[1]), url.searchParams.get('since') || undefined)); return;
-      }
-      if (method === 'POST' && pathname === '/ledger') {
-        const body = await readBody(req);
-        required(body.target, 'target');
-        send(res, 201, await service.addLedger(body)); return;
-      }
-      if (method === 'GET' && pathname === '/ledger') {
-        send(res, 200, service.listLedger(url.searchParams.get('type') || undefined, url.searchParams.get('target') || undefined)); return;
-      }
-      if (method === 'POST' && pathname === '/corrections') {
-        const body = await readBody(req);
-        const managerId = required(body.managerId, 'managerId');
-        const auditorId = required(body.auditorId, 'auditorId');
-        send(res, 201, await service.createCorrection({ managerId, auditorId, findings: body.findings })); return;
-      }
-      if (method === 'GET' && pathname === '/corrections') {
-        send(res, 200, service.listCorrections(url.searchParams.get('managerId') || undefined, url.searchParams.get('status') || undefined)); return;
-      }
-      const correctionResolveMatch = pathname.match(/^\/corrections\/([^/]+)\/resolve$/);
-      if (method === 'POST' && correctionResolveMatch) {
-        const body = await readBody(req);
-        send(res, 200, await service.resolveCorrection(decodeURIComponent(correctionResolveMatch[1]), {
-          findingId: body.findingId,
-          verdict: body.verdict,
-          note: body.note,
-        })); return;
-      }
-      if (method === 'GET' && pathname === '/gate') {
-        const managerId = required(url.searchParams.get('managerId'), 'managerId');
-        send(res, 200, service.getCorrectionGate(managerId)); return;
-      }
-      const revokeMatch = pathname.match(/^\/ledger\/([^/]+)\/revoke$/);
-      if (method === 'POST' && revokeMatch) {
-        const body = await readBody(req);
-        const reason = required(body.reason, 'reason');
-        send(res, 200, await service.revokeLedger(decodeURIComponent(revokeMatch[1]), reason)); return;
-      }
-      send(res, 404, { error: 'not found', code: 'not_found', routes: ROUTES.map(([routeMethod, path, requiredFields]) => ({ method: routeMethod, path, requiredFields, possibleCodes: ['missing_field', 'invalid_value', 'not_found', 'ambiguous_id', 'state_corrupt', 'cli_error'] })) });
+      send(res, 404, { code: 'not_found', message: 'ARCP serves /v1, /health and /self/runtime only' });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const companionError = error instanceof CompanionError ? error : new CompanionError('cli_error', message);
-      send(res, ERROR_STATUS[companionError.code] ?? 500, { error: companionError.message, code: companionError.code, ...(companionError.field ? { field: companionError.field } : {}), ...(companionError.allowed ? { allowed: companionError.allowed } : {}) });
+      send(res, 500, { code: 'internal_error', message: error instanceof Error ? error.message : 'internal error' });
     }
   });
-  return { server, service, arcp };
+  return { server, arcp };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const port = Number(process.env.PORT || 8787);
+  const port = Number(process.env.PORT || 18787);
   const app = await createServer();
-  app.service.setPort(port);
-  app.server.listen(port, '127.0.0.1', () => console.log(`paseo-reminder listening on http://127.0.0.1:${port}`));
+  app.arcp.setPort(port);
+  app.server.listen(port, '127.0.0.1', () => console.log(`ARCP listening on http://127.0.0.1:${port}`));
 }

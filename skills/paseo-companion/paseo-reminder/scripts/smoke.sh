@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$(cd "$(dirname "$0")/../../../agent-runtime-control-panel/runtime/scripts" && pwd)/smoke.sh" "$@"

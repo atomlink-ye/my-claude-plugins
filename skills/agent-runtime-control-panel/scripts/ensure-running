@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if (( $# != 0 )); then echo "arguments are not accepted; set ARCP_* environment values" >&2; exit 2; fi
-: "${PORT:=8787}"
+: "${PORT:=18787}"
 case "$PORT" in (*[!0-9]*|'') echo "PORT must be numeric" >&2; exit 2;; esac
 script_dir=$(cd "$(dirname "$0")" && pwd)
 skill_root=$(cd "$script_dir/.." && pwd)

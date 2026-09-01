@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+// One-time archive of the retired passive-reminder state directory.
+//
+// The archive is a copy. Nothing in the source directory is moved, rewritten or
+// removed: deleting the retired records is a separate Owner-gated action that
+// must be able to read a verified archive first.
+import { createHash } from 'node:crypto';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+
+const argv = process.argv.slice(2);
+const flags = {};
+for (let i = 0; i < argv.length; i += 1) {
+  if (!argv[i].startsWith('--')) { usage(`unexpected argument: ${argv[i]}`); }
+  const name = argv[i].slice(2);
+  const value = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[i += 1] : true;
+  flags[name] = value;
+}
+
+function usage(message) {
+  process.stderr.write(`${message}\n\nusage: archive-legacy-reminder-state --data DIR --out DIR\n`
+    + '  --data DIR  retired reminder state directory to archive (read-only)\n'
+    + '  --out DIR   archive destination; must not already exist\n');
+  process.exit(2);
+}
+
+if (typeof flags.data !== 'string') usage('--data DIR is required');
+if (typeof flags.out !== 'string') usage('--out DIR is required');
+const source = path.resolve(flags.data);
+const destination = path.resolve(flags.out);
+if (destination === source || destination.startsWith(`${source}${path.sep}`)) usage('--out must be outside --data');
+
+const sourceStat = await stat(source).catch(() => undefined);
+if (!sourceStat?.isDirectory()) usage(`--data is not a directory: ${source}`);
+if (await stat(destination).catch(() => undefined)) usage(`--out already exists: ${destination}`);
+
+function records(text) {
+  try {
+    const value = JSON.parse(text);
+    return Array.isArray(value) ? value.length : value && typeof value === 'object' ? Object.keys(value).length : 1;
+  } catch {
+    // Append-only .jsonl sidecars and anything unparseable are counted by line.
+    return text.split('\n').filter((line) => line.trim()).length;
+  }
+}
+
+const names = (await readdir(source, { withFileTypes: true }))
+  .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+  .map((entry) => entry.name)
+  .sort();
+if (!names.length) usage(`--data holds no archivable files: ${source}`);
+
+await mkdir(destination, { recursive: false, mode: 0o700 });
+const files = [];
+for (const name of names) {
+  const bytes = await readFile(path.join(source, name));
+  await writeFile(path.join(destination, name), bytes, { mode: 0o600 });
+  // Verify the written copy rather than the buffer we just held, so a partial
+  // or truncated write fails the archive instead of being reported as clean.
+  const written = await readFile(path.join(destination, name));
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (createHash('sha256').update(written).digest('hex') !== digest) {
+    process.stderr.write(`archive copy does not match source: ${name}\n`);
+    process.exit(1);
+  }
+  files.push({ name, bytes: bytes.length, sha256: digest, records: records(bytes.toString('utf8')) });
+}
+
+const manifest = {
+  kind: 'legacy-reminder-state-archive',
+  archivedAt: new Date().toISOString(),
+  source,
+  totalRecords: files.reduce((sum, file) => sum + file.records, 0),
+  files,
+};
+await writeFile(path.join(destination, 'MANIFEST.json'), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+
+// The source is still intact; deletion is a separate Owner-gated action.
+const remaining = (await readdir(source)).length;
+if (!remaining) { process.stderr.write('source directory is empty after archiving\n'); process.exit(1); }
+process.stdout.write(`${JSON.stringify({ archive: destination, files: files.length, totalRecords: manifest.totalRecords, sourceRetained: true }, null, 2)}\n`);

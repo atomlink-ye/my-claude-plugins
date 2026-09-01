@@ -8,23 +8,21 @@ export type TuiOptions = {
   refreshMs?: number;
 };
 
-const count = (value: Record<string, number> | undefined) => Object.values(value ?? {}).reduce((total, item) => total + Number(item), 0);
 const scalar = (value: unknown) => typeof value === 'number' ? value.toFixed(2) : String(value ?? 'unknown');
 
 /** Deterministic, deliberately redacted panorama used by `arcp tui --snapshot`
  * and the interactive renderer.  It is presentation-only: it never mutates
- * ARCP or Companion state. */
+ * ARCP state. */
 export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expanded = false): string {
   const runtime = Array.isArray(view.runtime) ? view.runtime : [];
   const workspace = view.workspace ?? {};
   const roster = Array.isArray(view.roster) ? view.roster : [];
   const tasks = Array.isArray(view.tasks) ? view.tasks : [];
   const goals = Array.isArray(view.goals) ? view.goals : [];
-  const legacy = view.legacy ?? {};
   const blocked = Array.isArray(view.blocked) ? view.blocked : [];
   const blockedByRuntime = new Map<string, any>(blocked.map((item: any) => [String(item.runtimeSessionId), item]));
   const minutes = (ms: unknown) => typeof ms === 'number' && Number.isFinite(ms) ? `${Math.floor(ms / 60000)}m` : 'unknown';
-  const tabs = ['overview', 'runtimes', 'legacy'];
+  const tabs = ['overview', 'runtimes'];
   const lines = [
     `ARCP TUI · ${workspace.purpose ?? workspace.id ?? 'workspace'}`,
     `tab=${tabs[tab]} selected=${selected + 1}/${Math.max(runtime.length, 1)} expanded=${expanded ? 'yes' : 'no'}`,
@@ -42,7 +40,6 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     if (expanded && index === selected) lines.push(`  SCM dirty=${scalar(work.dirty)} diff=${JSON.stringify(work.diffstat ?? 'unknown')} provider-children=${(children.items ?? []).map((child: any) => `${child.id}:${child.status}`).join(',') || 'none'} context=${scalar(observation.context?.used)}/${scalar(observation.context?.max)}`);
   }
   lines.push(`Blocked ${blocked.length}${blocked.length ? ` · oldest ${minutes(blocked[0]?.ageMs)}` : ''}`);
-  lines.push(`Legacy reminders=${count(legacy.reminders)} messages=${count(legacy.messages)} trackedChildren=${legacy.trackedChildren?.total ?? 0} correctionGates=${legacy.blockedGateCount ?? 0}`);
   lines.push('Keys: arrows select · tab view · enter details · r refresh · q quit');
   return lines.join('\n');
 }
