@@ -466,7 +466,7 @@ export class ArcpService {
         return item;
       });
       if (!this.pumping) void this.pump(); return updated;
-    } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); void this.emitTransportUncertainty(uncertain); return uncertain; }
+    } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
   }
   async reconcile(id: string): Promise<RuntimeSession> {
     const prior = this.store.snapshot().sessions.find((item) => item.id === id);
@@ -475,13 +475,13 @@ export class ArcpService {
       if (prior.runtimeKind === 'external') {
         const adapter = this.adapterFor(prior) as RuntimeAdapter & { reconcileExternal?: (externalId: string) => Promise<boolean> };
         const valid = adapter.reconcileExternal ? await adapter.reconcileExternal(prior.externalId ?? '') : false;
-        if (!valid) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); void this.emitTransportUncertainty(uncertain); return uncertain; }
+        if (!valid) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
       }
       const agents = (await this.channelFor(prior).registry()).value;
       const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => String(item.id ?? item.agentId) === prior.externalId) : undefined;
-      if (!match) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); void this.emitTransportUncertainty(uncertain); return uncertain; }
+      if (!match) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
       return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = sessionState(match.status ?? match.Status); item.lastObservedAt = now(); return item; });
-    } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); void this.emitTransportUncertainty(uncertain); return uncertain; }
+    } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
   }
   private cacheThresholds() { return { expiringMinutes: Number(process.env.ARCP_CACHE_EXPIRING_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiringMinutes), expiredMinutes: Number(process.env.ARCP_CACHE_EXPIRED_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiredMinutes) }; }
   private cacheState(agent: Record<string, any>, timeline: unknown[] = []) {
@@ -629,8 +629,9 @@ export class ArcpService {
     const { summary: _summary, evidenceRefs: _evidenceRefs, ...envelope } = publicInput;
     const event: ChannelEvent = { ...envelope, id, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at: now() }], createdAt: now() };
     state.channelEvents.push(event);
-    if (input.notify !== false && event.workspaceId) {
-      const targetMembers = state.members.filter((member) => member.workspaceId === event.workspaceId && (!event.targetMemberId || member.id === event.targetMemberId) && (!event.targetActorId || member.actorId === event.targetActorId) && (!event.targetRole || member.role === event.targetRole) && (!event.targetSubscription || event.targetSubscription === '*' || member.role === event.targetSubscription || member.capabilities.includes(event.targetSubscription)));
+    if ((input.notify !== false || ['task_candidate', 'task_failed', 'task_unknown', 'task_completed'].includes(event.kind)) && event.workspaceId) {
+      const targetRole = event.targetRole ?? (['task_candidate', 'task_failed', 'task_unknown', 'task_completed'].includes(event.kind) ? 'manager' : undefined);
+      const targetMembers = state.members.filter((member) => member.workspaceId === event.workspaceId && (!event.targetMemberId || member.id === event.targetMemberId) && (!event.targetActorId || member.actorId === event.targetActorId) && (!targetRole || member.role === targetRole) && (!event.targetSubscription || event.targetSubscription === '*' || member.role === event.targetSubscription || member.capabilities.includes(event.targetSubscription)));
       const targetMemberIds = new Set(targetMembers.map((member) => member.id));
       const targetSessions = state.sessions.filter((session) => session.workspaceId === event.workspaceId && session.memberId && targetMemberIds.has(session.memberId));
       for (const session of targetSessions) {
@@ -647,8 +648,8 @@ export class ArcpService {
     if (state === 'delivered') event.deliveredAt = at; else if (state === 'processed') event.processedAt = at; else if (state === 'acknowledged') event.acknowledgedAt = at;
   }
   private async emitTransportUncertainty(session: RuntimeSession): Promise<void> {
-    await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} health is uncertain`, evidenceRefs: [] });
-    await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} transport is uncertain`, evidenceRefs: [] });
+    await this.store.mutate((state) => { this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} health is uncertain`, evidenceRefs: [] }); this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} transport is uncertain`, evidenceRefs: [] }); });
+    if (!this.pumping) await this.pump();
   }
   async publishChannelEvent(input: ChannelEventInput): Promise<ChannelEvent> {
     if (!input.summary?.trim()) throw new ArcpError('invalid_request', 'channel event summary is required');

@@ -119,7 +119,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   }
   async interrupt(externalId: string, _body: string): Promise<CliResult> {
     const session = this.sessions.get(externalId); if (!session) throw new Error('Hermes ACP session is unavailable');
-    await this.request(externalId, session, 'session/cancel', { sessionId: externalId }); this.setState(externalId, session, 'attention', 'cancelled'); return result({ id: externalId });
+    await this.request(externalId, session, 'session/cancel', { sessionId: externalId }); this.setState(externalId, session, 'idle', 'idle'); return result({ id: externalId, cancelled: true });
   }
   async stop(externalId: string): Promise<CliResult> {
     const session = this.sessions.get(externalId); if (!session) return result({ id: externalId, stopped: false });
