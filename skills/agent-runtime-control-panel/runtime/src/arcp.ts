@@ -19,8 +19,10 @@ export interface Actor { id: string; clientIdentity: string; label: string; crea
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; workspaceId?: string; state: GoalState; createdAt: string; updatedAt: string; }
 export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress';
-export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; summary: string; evidenceRefs: string[]; deliveryState: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate'; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; relatedEventId?: string; }
-type ChannelEventInput = Omit<ChannelEvent, 'id' | 'createdAt' | 'deliveryState'> & { id?: string; notify?: boolean };
+export interface ChannelEventContent { summary: string; evidenceRefs: string[]; contentHash: string; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded'; }
+export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate'; at: string; }
+export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; relatedEventId?: string; }
+type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; notify?: boolean };
 export interface RuntimeLaunchContext { workspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; eventId?: string; state: DeliveryState; createdAt: string; sourceMessageId?: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
@@ -73,7 +75,8 @@ export class ArcpStore {
     await mkdir(path.dirname(this.file), { recursive: true });
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
-      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents: (parsed as any).channelEvents ?? [], confirmations: parsed.confirmations ?? [] };
+      const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, any>>; const channelEvents = legacyEvents.map((item) => item.content ? item : ({ ...item, content: { summary: String(item.summary ?? ''), evidenceRefs: Array.isArray(item.evidenceRefs) ? item.evidenceRefs : [], contentHash: createHash('sha256').update(JSON.stringify({ summary: String(item.summary ?? ''), evidenceRefs: Array.isArray(item.evidenceRefs) ? item.evidenceRefs : [] })).digest('hex'), sensitivity: 'normal', retention: 'standard' }, transitions: [{ state: item.deliveryState ?? 'queued', at: item.createdAt ?? new Date().toISOString() }] })) as ChannelEvent[];
+      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
     }
@@ -451,7 +454,7 @@ export class ArcpService {
         item.state = requested.every((value, index) => !value || sameSetting(value, actual[index])) ? sessionState(observed.status ?? observed.Status) : 'attention'; item.lastObservedAt = now();
         for (const delivery of state.deliveries.filter((value) => value.runtimeSessionId === id && value.generation === item.generation && ['delivered', 'running'].includes(value.state))) {
           if (item.state === 'running') delivery.state = 'running';
-          else if (item.state === 'idle' || item.state === 'terminal') { delivery.state = 'processed'; delivery.processedAt = now(); const event = delivery.eventId ? state.channelEvents.find((value) => value.id === delivery.eventId) : undefined; if (event) { event.deliveryState = 'processed'; event.processedAt = delivery.processedAt; } }
+          else if (item.state === 'idle' || item.state === 'terminal') { delivery.state = 'processed'; delivery.processedAt = now(); const event = delivery.eventId ? state.channelEvents.find((value) => value.id === delivery.eventId) : undefined; if (event) this.transitionEvent(event, 'processed', delivery.processedAt); }
         }
         return item;
       });
@@ -521,7 +524,7 @@ export class ArcpService {
     const event = await this.publishChannelEvent({ id: input.sourceMessageId ? idFor('event', `delivery:${input.sourceMessageId}:${session.id}`) : undefined, workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'attention', urgency: 'urgent', decisionRequired: false, summary: `Channel interrupt ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), state: 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
-    try { await this.channelFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) { event.deliveryState = 'delivered'; event.deliveredAt = item.deliveredAt; } return item; }); }
+    try { await this.channelFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
     catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'transport_indeterminate'; return item; }); }
   }
   async deliver(input: { fromActorId: string; runtimeSessionId: string; body: string; command?: 'normal' | 'interrupt'; reason?: string; cacheConfirmation?: string; sourceMessageId?: string }): Promise<Delivery | Record<string, unknown>> {
@@ -582,13 +585,13 @@ export class ArcpService {
           const facts = await this.facts(session);
           if (facts.cache.state !== 'fresh' && !delivery.cacheAuthorized) { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.safePointStatus = `cache_${facts.cache.state}`; return item; }); continue; }
         }
-        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'attempting'; if (event) { event.deliveryState = 'delivered'; event.deliveredAt = now(); } return item; });
+        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'attempting'; if (event) this.transitionEvent(event, 'delivered'); return item; });
         try {
           // Adapter rechecks immediately before its non-steering start-turn operation.
           const event = delivery.eventId ? this.store.snapshot().channelEvents.find((item) => item.id === delivery.eventId) : undefined;
           await this.channelFor(session).sendEvent(event ?? await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: delivery.fromActorId, targetActorId: session.actorId, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: `Channel delivery ${delivery.id}`, evidenceRefs: [] }), session.externalId, delivery.id, delivery.body);
-          await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) { event.deliveryState = 'delivered'; event.deliveredAt = item.deliveredAt; } return item; });
-        } catch { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) event.deliveryState = 'transport_indeterminate'; return item; }); }
+          await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; });
+        } catch { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
       }
     })().finally(() => { this.pumping = undefined; if (this.pumpAgain) { this.pumpAgain = false; void this.pump(); } });
     return this.pumping;
@@ -601,15 +604,20 @@ export class ArcpService {
     return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) { event.deliveryState = 'acknowledged'; event.acknowledgedAt = item.acknowledgedAt; } return item; });
   }
   private appendChannelEvent(state: State, input: ChannelEventInput): ChannelEvent {
-    const id = input.id ?? `event_${randomUUID()}`;
+    const summary = input.summary.trim(); const evidenceRefs = input.evidenceRefs ?? [];
+    if (/(?:credential|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[^\s]+/i.test(summary) || /(?:^|\s)(?:\/Users\/|\/private\/|\/tmp\/|[A-Za-z]:\\)/.test(summary) || /(?:<thinking>|chain[- ]of[- ]thought|internal reasoning|transcript body)/i.test(summary) || evidenceRefs.some((ref) => ref.startsWith('/') || ref.includes('\\')) || evidenceRefs.some((ref) => /(?:credential|api[_-]?key|access[_-]?token|secret)\s*[:=]/i.test(ref))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'summary');
+    const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
+    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole: input.targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, summary, evidenceRefs, ...(!input.id ? { sampleBucket: Math.floor(Date.now() / 60_000) } : {}) };
+    const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
     const existing = state.channelEvents.find((item) => item.id === id);
     if (existing) {
-      const conflict = existing.workspaceId !== input.workspaceId || existing.kind !== input.kind || existing.summary !== input.summary || existing.taskId !== input.taskId || existing.resultId !== input.resultId;
+      const conflict = existing.workspaceId !== input.workspaceId || existing.kind !== input.kind || existing.taskId !== input.taskId || existing.resultId !== input.resultId || existing.targetMemberId !== input.targetMemberId || existing.targetActorId !== input.targetActorId || existing.targetRole !== input.targetRole || existing.content.contentHash !== contentHash;
       if (conflict) throw new ArcpError('invalid_request', 'channel event id conflicts with its durable payload', 'id');
       return existing;
     }
     const { notify: _notify, ...publicInput } = input;
-    const event: ChannelEvent = { ...publicInput, id, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], deliveryState: 'queued', createdAt: now() };
+    const { summary: _summary, evidenceRefs: _evidenceRefs, ...envelope } = publicInput;
+    const event: ChannelEvent = { ...envelope, id, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at: now() }], createdAt: now() };
     state.channelEvents.push(event);
     if (input.notify !== false && event.workspaceId) {
       const targetMembers = state.members.filter((member) => member.workspaceId === event.workspaceId && (!event.targetMemberId || member.id === event.targetMemberId) && (!event.targetActorId || member.actorId === event.targetActorId) && (!event.targetRole || member.role === event.targetRole) && (!event.targetSubscription || event.targetSubscription === '*' || member.role === event.targetSubscription || member.capabilities.includes(event.targetSubscription)));
@@ -618,10 +626,15 @@ export class ArcpService {
       for (const session of targetSessions) {
         const deliveryId = idFor('delivery', `event:${event.id}:${session.id}`);
         if (state.deliveries.some((delivery) => delivery.id === deliveryId)) continue;
-        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: event.summary, command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
+        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: event.content.summary, command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
       }
     }
     return event;
+  }
+  private transitionEvent(event: ChannelEvent, state: ChannelTransition['state'], at = now()): void {
+    if (event.transitions.at(-1)?.state === state) return;
+    event.transitions.push({ state, at }); event.deliveryState = state;
+    if (state === 'delivered') event.deliveredAt = at; else if (state === 'processed') event.processedAt = at; else if (state === 'acknowledged') event.acknowledgedAt = at;
   }
   async publishChannelEvent(input: ChannelEventInput): Promise<ChannelEvent> {
     if (!input.summary?.trim()) throw new ArcpError('invalid_request', 'channel event summary is required');
