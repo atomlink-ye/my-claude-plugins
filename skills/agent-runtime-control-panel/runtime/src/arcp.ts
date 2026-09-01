@@ -283,11 +283,16 @@ export class ArcpService {
       const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[] };
       if (Array.isArray(config.profiles) && config.profiles.every((item) => item?.id && item.provider && item.model && item.role)) this.profileData = config.profiles;
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
-    this.pumpTimer = setInterval(() => { void this.pump(); }, 2_000); this.pumpTimer.unref();
+    // The automatic supervision trigger rides the existing delivery pump rather
+    // than introducing a scheduler. It is inert until a Workspace has a policy.
+    this.pumpTimer = setInterval(() => { void this.pump(); void this.evaluateSupervision(); }, 2_000); this.pumpTimer.unref();
     // Startup is not complete until persisted safe-point deliveries have been
     // reconciled. Awaiting this makes restart behavior deterministic: delivered
     // rows are observed/processed, while waiting rows are eligible exactly once.
     await this.pump();
+    // Startup also reconciles supervision budgets, so a breach that elapsed
+    // while the control plane was down is recorded once rather than missed.
+    await this.evaluateSupervision();
   }
   close(): void { if (this.pumpTimer) clearInterval(this.pumpTimer); }
   registerActor(input: { clientIdentity: string; label?: string; channel?: 'hermes' | 'local'; profileRef?: string; conversationRef?: string }): Promise<{ actor: Actor; binding: ActorBinding; credential?: string }> {

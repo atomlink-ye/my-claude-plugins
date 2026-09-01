@@ -1,14 +1,17 @@
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { SQLiteStateStore } from '../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
 import { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, evaluateSupervision, supervisionReviewId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
 // A supervision clock is a parameter, never a wall clock: every instant below is
-// derived from this base so a slow or loaded host cannot change an outcome.
-const T0 = Date.parse('2026-03-01T00:00:00.000Z');
+// derived from this base so a slow or loaded host cannot change an outcome. The
+// base is far in the future on purpose: the service also evaluates on its own
+// pump tick using the real clock, and no fixture subject may be old enough for
+// that tick to reach a budget and race an assertion.
+const T0 = Date.parse('2126-03-01T00:00:00.000Z');
 const at = (ms: number) => new Date(T0 + ms).toISOString();
 
 class SilentCli {
@@ -55,6 +58,7 @@ const analysisEvents = (service: ArcpService, workspaceId: string) =>
   service.state().channelEvents.filter((event) => event.kind === 'workspace_analysis_required' && event.workspaceId === workspaceId);
 
 describe('supervision budgets, state and reconciliation', () => {
+  afterEach(() => { vi.useRealTimers(); });
   it('separates durable material progress from streamed progress and keepalives', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-progress-'));
     const { service, workspace, worker, task } = await scenario(root);
@@ -231,6 +235,55 @@ describe('supervision budgets, state and reconciliation', () => {
     expect(service.state().supervisionPolicies).toHaveLength(1);
     expect(await service.evaluateSupervision(T0 + 900_000)).toHaveLength(0);
     service.close();
+  });
+
+  it('reaches a budget on the delivery pump tick, with no scheduler of its own', async () => {
+    // Fake timers make the 2-second pump interval an advanced instant rather
+    // than a wall-clock wait. They are installed before the service is
+    // constructed, because the interval is created during init.
+    vi.useFakeTimers();
+    try {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-tick-'));
+      const { service, workspace } = await scenario(root);
+      await service.configureSupervision({ workspaceId: workspace.id, inactivityAfterMs: 1_000, cooldownMs: 3_600_000 });
+      const stale = new Date(Date.now() - 3_600_000).toISOString();
+      await service.store.mutate((state: any) => state.tasks.push({ id: 'task_tick_subject', workspaceId: workspace.id, title: 'tick subject', lifecycle: 'claimed', ownerMemberId: state.members.find((member: any) => member.role === 'worker').id, fence: 1, createdAt: stale, updatedAt: stale }));
+      expect(service.supervisionReviews(workspace.id)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(service.supervisionReviews(workspace.id).map((review) => review.subjectId)).toEqual(['task_tick_subject']);
+      // Further ticks are idempotent: the trigger is a tick, not a retry loop.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(service.supervisionReviews(workspace.id)).toHaveLength(1);
+      expect(analysisEvents(service, workspace.id)).toHaveLength(1);
+      service.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles a budget that elapsed while the control plane was down, once', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-startup-'));
+    const { service, workspace } = await scenario(root);
+    await service.configureSupervision({ workspaceId: workspace.id, inactivityAfterMs: 1_000, cooldownMs: 3_600_000 });
+    // A subject whose durable instants sit an hour in the real past, so the
+    // startup reconcile reaches the budget without any injected clock and
+    // without racing one: the margin is an hour against a one-second budget.
+    const stale = new Date(Date.now() - 3_600_000).toISOString();
+    await service.store.mutate((state: any) => state.tasks.push({ id: 'task_stale_subject', workspaceId: workspace.id, title: 'stale subject', lifecycle: 'claimed', ownerMemberId: state.members.find((member: any) => member.role === 'worker').id, fence: 1, createdAt: stale, updatedAt: stale }));
+    expect(service.supervisionReviews(workspace.id)).toHaveLength(0);
+    service.close();
+
+    const { service: restarted } = await control(root);
+    // No explicit tick: the reconcile happened during init.
+    const reviews = restarted.supervisionReviews(workspace.id);
+    expect(reviews.map((review) => review.subjectId)).toEqual(['task_stale_subject']);
+    expect(analysisEvents(restarted, workspace.id)).toHaveLength(1);
+    restarted.close();
+
+    const { service: again } = await control(root);
+    expect(again.supervisionReviews(workspace.id)).toEqual(reviews);
+    expect(analysisEvents(again, workspace.id)).toHaveLength(1);
+    again.close();
   });
 
   for (const [label, makeStore] of [
