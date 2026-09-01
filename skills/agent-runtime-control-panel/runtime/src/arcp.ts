@@ -75,7 +75,7 @@ export class ArcpStore {
     await mkdir(path.dirname(this.file), { recursive: true });
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
-      const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, any>>; const channelEvents = legacyEvents.map((item) => item.content ? item : ({ ...item, content: { summary: String(item.summary ?? ''), evidenceRefs: Array.isArray(item.evidenceRefs) ? item.evidenceRefs : [], contentHash: createHash('sha256').update(JSON.stringify({ summary: String(item.summary ?? ''), evidenceRefs: Array.isArray(item.evidenceRefs) ? item.evidenceRefs : [] })).digest('hex'), sensitivity: 'normal', retention: 'standard' }, transitions: [{ state: item.deliveryState ?? 'queued', at: item.createdAt ?? new Date().toISOString() }] })) as ChannelEvent[];
+      const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, any>>; const channelEvents = legacyEvents.map((item) => item.content ? item as ChannelEvent : migrateLegacyChannelEvent(item));
       this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
@@ -125,6 +125,13 @@ const safeModeRank = (value: unknown) => {
 const safeJson = (value: unknown): Record<string, any> => asRecord(value);
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => execFile('git', args, { cwd, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+}
+function migrateLegacyChannelEvent(item: Record<string, any>): ChannelEvent {
+  const summary = String(item.summary ?? ''); const evidenceRefs = Array.isArray(item.evidenceRefs) ? item.evidenceRefs.map(String) : []; const { summary: _summary, evidenceRefs: _evidenceRefs, content: _content, transitions: _transitions, ...envelope } = item;
+  const at = item.createdAt ?? item.deliveredAt ?? item.processedAt ?? item.acknowledgedAt ?? '1970-01-01T00:00:00.000Z'; const transitions: ChannelTransition[] = [{ state: 'queued', at }];
+  for (const [state, timestamp] of [['delivered', item.deliveredAt], ['processed', item.processedAt], ['acknowledged', item.acknowledgedAt]] as const) if (typeof timestamp === 'string') transitions.push({ state, at: timestamp });
+  const final = item.deliveryState; if (final === 'transport_indeterminate' && !transitions.some((entry) => entry.state === final)) transitions.push({ state: final, at: item.transportUncertainAt ?? at });
+  const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex'); return { ...envelope, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: transitions.at(-1)!.state, transitions, createdAt: item.createdAt ?? at } as ChannelEvent;
 }
 
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
@@ -238,8 +245,8 @@ export class ArcpService {
     this.channels.set(adapter.adapterId, adapter.adapterId === 'paseo' ? new PaseoChannelAdapter(adapter) : new AcpChannelAdapter(adapter));
     const onSafePoint = (adapter as RuntimeAdapter & { onSafePoint?: (listener: (event: SafePointEvent) => void) => () => void }).onSafePoint;
     if (onSafePoint) onSafePoint.call(adapter, () => { void this.pump(); });
-    const onFact = (adapter as RuntimeAdapter & { onFact?: (listener: (fact: { externalId: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; summary: string }) => void) => () => void }).onFact;
-    if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }); });
+    const onFact = (adapter as RuntimeAdapter & { onFact?: (listener: (fact: { externalId: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; summary: string; sampleBucket?: number }) => void) => () => void }).onFact;
+    if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ ...(fact.sampleBucket !== undefined ? { id: idFor('event', `observation:${fact.externalId}:${fact.kind}:${fact.sampleBucket}`) } : {}), workspaceId: session.workspaceId, goalId: session.goalId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }); });
     const onResult = (adapter as RuntimeAdapter & { onResult?: (listener: (fact: { externalId: string; taskId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string }) => void) => () => void }).onResult;
     if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) void this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId }).catch(() => undefined); });
   }
@@ -525,7 +532,7 @@ export class ArcpService {
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), state: 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     try { await this.channelFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
-    catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'transport_indeterminate'; return item; }); }
+    catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
   }
   async deliver(input: { fromActorId: string; runtimeSessionId: string; body: string; command?: 'normal' | 'interrupt'; reason?: string; cacheConfirmation?: string; sourceMessageId?: string }): Promise<Delivery | Record<string, unknown>> {
     if (!input.body?.trim()) throw new ArcpError('invalid_request', 'body is required');
@@ -585,7 +592,7 @@ export class ArcpService {
           const facts = await this.facts(session);
           if (facts.cache.state !== 'fresh' && !delivery.cacheAuthorized) { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.safePointStatus = `cache_${facts.cache.state}`; return item; }); continue; }
         }
-        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'attempting'; if (event) this.transitionEvent(event, 'delivered'); return item; });
+        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'attempting'; return item; });
         try {
           // Adapter rechecks immediately before its non-steering start-turn operation.
           const event = delivery.eventId ? this.store.snapshot().channelEvents.find((item) => item.id === delivery.eventId) : undefined;
@@ -605,9 +612,12 @@ export class ArcpService {
   }
   private appendChannelEvent(state: State, input: ChannelEventInput): ChannelEvent {
     const summary = input.summary.trim(); const evidenceRefs = input.evidenceRefs ?? [];
-    if (/(?:credential|api[_-]?key|access[_-]?token|secret)\s*[:=]\s*[^\s]+/i.test(summary) || /(?:^|\s)(?:\/Users\/|\/private\/|\/tmp\/|[A-Za-z]:\\)/.test(summary) || /(?:<thinking>|chain[- ]of[- ]thought|internal reasoning|transcript body)/i.test(summary) || evidenceRefs.some((ref) => ref.startsWith('/') || ref.includes('\\')) || evidenceRefs.some((ref) => /(?:credential|api[_-]?key|access[_-]?token|secret)\s*[:=]/i.test(ref))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'summary');
+    const prohibitedAssignment = /(?:credential|authorization|bearer|api[_-]?(?:key|secret)|access[_-]?token|token|secret|password|passwd|private[_-]?key)\s*[:=]\s*[^\s]+/i;
+    const prohibitedPath = /(?:^|[\s=:])(?:file:\/\/\/|\/Users\/|\/private\/|\/tmp\/|\/var\/|\/home\/|[A-Za-z]:\\)/i;
+    const prohibitedTranscript = /(?:<thinking>|<assistant>|<user>|chain[- ]of[- ]thought|internal reasoning|transcript|reason\s*[:=])/i;
+    if (prohibitedAssignment.test(summary) || prohibitedPath.test(summary) || prohibitedTranscript.test(summary) || evidenceRefs.some((ref) => prohibitedPath.test(ref) || prohibitedAssignment.test(ref) || /path\s*=/i.test(ref))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'summary');
     const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
-    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole: input.targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, summary, evidenceRefs, ...(!input.id ? { sampleBucket: Math.floor(Date.now() / 60_000) } : {}) };
+    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole: input.targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, summary, evidenceRefs };
     const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
     const existing = state.channelEvents.find((item) => item.id === id);
     if (existing) {

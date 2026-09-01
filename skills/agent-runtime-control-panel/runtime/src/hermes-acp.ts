@@ -7,7 +7,7 @@ type ApcProcess = ChildProcessWithoutNullStreams;
 type Session = { process: ApcProcess; nextId: number; pending: Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>; status: 'running' | 'idle' | 'attention' | 'terminal'; timeline: unknown[]; externalId?: string; context?: RuntimeLaunchContext; lastDeliveryId?: string; lastTurnState?: string; lastFactKey?: string; lastFactAt?: number };
 type SpawnFn = (command: string, args: string[], options: { stdio: ['pipe', 'pipe', 'pipe']; env?: Record<string, string> }) => ApcProcess;
 export type SafePointEvent = { externalId: string; deliveryId?: string; state: 'idle' | 'attention' | 'terminal' };
-export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent' };
+export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent'; sampleBucket?: number };
 export type AcpResultFact = { externalId: string; taskId: string; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string };
 
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' ? value as Record<string, any> : {}; }
@@ -73,7 +73,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
     else if (kind.includes('error')) this.emitFact({ externalId, kind: 'transport_uncertainty', urgency: 'urgent', summary: 'Hermes ACP transport is uncertain' }, session);
     else if (kind && !kind.includes('complete') && !kind.includes('idle')) this.emitFact({ externalId, kind: kind.includes('tool') || kind.includes('message') || kind.includes('usage') ? 'material_progress' : 'phase_progress', urgency: 'normal', summary: 'Hermes ACP runtime progress' }, session);
   }
-  private emitFact(fact: ChannelFact, session?: Session): void { const key = `${fact.externalId}:${fact.kind}:${fact.summary}`; const nowMs = Date.now(); if (session && session.lastFactKey === key && (session.lastFactAt ?? 0) + 30_000 > nowMs) return; if (session) { session.lastFactKey = key; session.lastFactAt = nowMs; } for (const listener of this.factListeners) listener(fact); }
+  private emitFact(fact: ChannelFact, session?: Session): void { const key = `${fact.externalId}:${fact.kind}:${fact.summary}`; const nowMs = Date.now(); if (session && session.lastFactKey === key && (session.lastFactAt ?? 0) + 30_000 > nowMs) return; if (session) { session.lastFactKey = key; session.lastFactAt = nowMs; } for (const listener of this.factListeners) listener({ ...fact, sampleBucket: Math.floor(nowMs / 60_000) }); }
   private request(externalId: string, session: Session, method: string, params: Record<string, any>, timeoutMs = 30_000): Promise<any> {
     const id = session.nextId++;
     const request = new Promise((resolve, reject) => {
