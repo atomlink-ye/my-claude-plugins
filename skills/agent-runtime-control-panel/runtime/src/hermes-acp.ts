@@ -8,7 +8,7 @@ type Session = { process: ApcProcess; nextId: number; pending: Map<number, { res
 type SpawnFn = (command: string, args: string[], options: { stdio: ['pipe', 'pipe', 'pipe']; env?: Record<string, string> }) => ApcProcess;
 export type SafePointEvent = { externalId: string; deliveryId?: string; state: 'idle' | 'attention' | 'terminal' };
 export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent' };
-export type AcpResultFact = { externalId: string; taskId: string; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs?: string[]; expectedFence?: number };
+export type AcpResultFact = { externalId: string; taskId: string; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string };
 
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' ? value as Record<string, any> : {}; }
 function result(value: unknown): CliResult { return { value, stdout: '', stderr: '' }; }
@@ -62,7 +62,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   private onUpdate(externalId: string, session: Session, update: Record<string, any>): void {
     const kind = String(update.sessionUpdate ?? update.type ?? update.status ?? '').toLowerCase();
     const resultFact = record(update.result);
-    if (resultFact.taskId && ['candidate', 'failed', 'unknown'].includes(String(resultFact.status))) for (const listener of this.resultListeners) listener({ externalId, taskId: String(resultFact.taskId), status: String(resultFact.status) as AcpResultFact['status'], summary: String(resultFact.summary ?? ''), ...(Array.isArray(resultFact.evidenceRefs) ? { evidenceRefs: resultFact.evidenceRefs.map(String) } : {}), ...(typeof resultFact.expectedFence === 'number' ? { expectedFence: resultFact.expectedFence } : {}) });
+    if (resultFact.taskId && ['candidate', 'failed', 'unknown'].includes(String(resultFact.status))) for (const listener of this.resultListeners) listener({ externalId, taskId: String(resultFact.taskId), status: String(resultFact.status) as AcpResultFact['status'], summary: String(resultFact.summary ?? ''), sourceId: String(resultFact.resultId ?? resultFact.id ?? `acp:${externalId}:${resultFact.taskId}:${resultFact.expectedFence ?? ''}:${resultFact.status}:${resultFact.summary ?? ''}`), ...(Array.isArray(resultFact.evidenceRefs) ? { evidenceRefs: resultFact.evidenceRefs.map(String) } : {}), ...(typeof resultFact.expectedFence === 'number' ? { expectedFence: resultFact.expectedFence } : {}) });
     if (kind) session.timeline.push({ type: kind, timestamp: new Date().toISOString() });
     if (kind.includes('error') || kind.includes('permission')) this.setState(externalId, session, 'attention', kind);
     else if (kind.includes('complete') || kind.includes('idle') || kind === 'turn_end' || kind === 'prompt_end') this.setState(externalId, session, 'idle', kind);
