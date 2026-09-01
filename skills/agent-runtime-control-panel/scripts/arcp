@@ -12,6 +12,7 @@ const HELP = `ARCP ControlWorkspace commands:
   channel list WORKSPACE [--kind K] [--state S] [--decision-required]
   channel ack EVENT
   channel resolve EVENT --summary '...' [--verdict accept|refuse]
+  channel ask RUNTIME --question '...' [--options 'a,b']
   channel withdraw DELIVERY
   release DELIVERY [--confirm TOKEN]
   db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH] [--overwrite]
@@ -120,6 +121,7 @@ else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/worksp
 else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])}),...(f['source-id'] === undefined ? {} : {sourceId:String(f['source-id'])})},true);
 else if (area === 'result' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/results`);
 else if (area === 'channel' && action === 'list') { const workspace=p[0]||await workspaceId(); if(workspace) { const decisionRequired = f['decision-required'] === true || f['decision-required'] === 'true' ? '1' : f['decision-required'] === false || f['decision-required'] === 'false' ? '0' : undefined; await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/events?${new URLSearchParams(Object.fromEntries(Object.entries({kind:f.kind,state:f.state,'decision-required':decisionRequired}).filter(([,v])=>v!==undefined))).toString()}`); } }
+else if (area === 'channel' && action === 'ask') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0]||f.runtime)}/decision`,{question:f.question||p.slice(1).join(' '),...(f.options?{options:String(f.options).split(',').map((v)=>v.trim()).filter(Boolean)}:{})});
 else if (area === 'channel' && action === 'ack') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||'acknowledged'});
 else if (area === 'channel' && action === 'resolve') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/resolve`,{summary:f.summary||p.slice(1).join(' ')||'Decision resolved',verdict:bool('refuse')?'refuse':(f.verdict?String(f.verdict):'accept')});
 else if (area === 'channel' && action === 'withdraw') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/withdraw`,{reason:f.reason||'withdrawn'});

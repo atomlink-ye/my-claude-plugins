@@ -13,6 +13,7 @@ function publicContext(value: any) { return { ...value, roster: value.roster.map
 function publicPanorama(value: any) {
   return { workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
+    blocked: value.blocked ?? [],
     events: value.events ?? [], latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef, legacy: value.legacy };
 }
 
@@ -47,6 +48,8 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }
     const panorama = path.match(/^\/v1\/workspaces\/([^/]+)\/panorama$/);
     if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1'))); return true; }
+    const runtimeDecision = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/decision$/);
+    if (method === 'POST' && runtimeDecision) { const input = await body(req); send(res, 201, await service.raiseDecision({ runtimeSessionId: decodeURIComponent(runtimeDecision[1]), question: String(input.question ?? ''), ...(Array.isArray(input.options) ? { options: input.options.map(String) } : {}) }).then((raised) => ({ event: raised.event, session: publicSession(raised.session) }))); return true; }
     const workspaceJoin = path.match(/^\/v1\/workspaces\/([^/]+)\/join$/);
     if (method === 'POST' && workspaceJoin) { const workspaceId = decodeURIComponent(workspaceJoin[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const result = await service.joinWorkspace({ ...(await body(req) as any), workspaceId, actorId: authenticatedActor?.id, ...(actorKey ? {} : memberKey ? { credential: memberKey } : {}) }); send(res, 201, result); return true; }
     const workspaceTasks = path.match(/^\/v1\/workspaces\/([^/]+)\/tasks$/);

@@ -21,6 +21,9 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
   const tasks = Array.isArray(view.tasks) ? view.tasks : [];
   const goals = Array.isArray(view.goals) ? view.goals : [];
   const legacy = view.legacy ?? {};
+  const blocked = Array.isArray(view.blocked) ? view.blocked : [];
+  const blockedByRuntime = new Map<string, any>(blocked.map((item: any) => [String(item.runtimeSessionId), item]));
+  const minutes = (ms: unknown) => typeof ms === 'number' && Number.isFinite(ms) ? `${Math.floor(ms / 60000)}m` : 'unknown';
   const tabs = ['overview', 'runtimes', 'legacy'];
   const lines = [
     `ARCP TUI · ${workspace.purpose ?? workspace.id ?? 'workspace'}`,
@@ -31,8 +34,14 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     const session = item.session ?? {}, observation = item.observation ?? {}, children = item.children ?? {}, work = item.workSummary ?? {};
     const prefix = index === selected ? '>' : ' ';
     lines.push(`${prefix} Runtime ${session.id ?? 'unknown'} ${session.provider ?? 'unknown'}/${session.model ?? 'unknown'} state=${session.state ?? 'unknown'} health=${observation.health ?? 'unknown'} cache=${observation.cache?.state ?? 'unknown'} context=${scalar(observation.context?.ratio)} compaction=${observation.compaction?.status ?? 'unknown'} children=${children.items?.length ?? 0}`);
+    const parked = blockedByRuntime.get(String(session.id));
+    // A runtime blocked on an unanswered decision reports the same provider
+    // status as a healthy one, so the blocked record is the only thing that can
+    // put it on screen. Round 2 lost over an hour to exactly this blind spot.
+    if (parked) lines.push(`    BLOCKED on decision ${parked.eventId} age=${minutes(parked.ageMs)} options=${(parked.options ?? []).length}`);
     if (expanded && index === selected) lines.push(`  SCM dirty=${scalar(work.dirty)} diff=${JSON.stringify(work.diffstat ?? 'unknown')} provider-children=${(children.items ?? []).map((child: any) => `${child.id}:${child.status}`).join(',') || 'none'} context=${scalar(observation.context?.used)}/${scalar(observation.context?.max)}`);
   }
+  lines.push(`Blocked ${blocked.length}${blocked.length ? ` · oldest ${minutes(blocked[0]?.ageMs)}` : ''}`);
   lines.push(`Legacy reminders=${count(legacy.reminders)} messages=${count(legacy.messages)} trackedChildren=${legacy.trackedChildren?.total ?? 0} correctionGates=${legacy.blockedGateCount ?? 0}`);
   lines.push('Keys: arrows select · tab view · enter details · r refresh · q quit');
   return lines.join('\n');

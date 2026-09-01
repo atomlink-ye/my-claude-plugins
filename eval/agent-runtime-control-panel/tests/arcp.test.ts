@@ -635,3 +635,127 @@ describe('ARCP decision verdicts', () => {
     expect(rejected.status).toBe(400);
   });
 });
+
+describe('ARCP blocked-on-decision visibility', () => {
+  let app: Awaited<ReturnType<typeof createServer>> | undefined;
+  afterEach(async () => { if (app) { app.service.close(); await new Promise<void>((resolve) => app!.server.close(() => resolve())); } app = undefined; });
+
+  async function runningRuntime(root: string) {
+    const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'blocked-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'blocked runtimes' });
+    const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const goal = await service.createGoal({ actorId: actor.id, title: 'blocked goal', workspaceId: workspace.workspace.id });
+    const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'ask me something' });
+    await service.claimTask(task.id, worker.member.id, 0);
+    // A runtime waiting on an in-turn question looks exactly like this: the
+    // provider turn is still open, so status alone cannot tell them apart.
+    await service.store.mutate((state: any) => state.sessions.push({ id: 'blocked-runtime', actorId: actor.id, goalId: goal.id, taskId: task.id, bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', state: 'running', lastTurnState: 'running', createdAt: new Date().toISOString() }));
+    return { service, actor, workspace, worker, goal, task };
+  }
+
+  it('writes the blocked record when the question is raised, since status never shows it', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-blocked-raise-'));
+    const { service, workspace, worker, task } = await runningRuntime(root);
+    expect(service.blockedRuntimes(workspace.workspace.id)).toEqual([]);
+
+    const raised = await service.raiseDecision({ runtimeSessionId: 'blocked-runtime', question: 'Delete the stale branch or keep it?', options: ['delete', 'keep'] });
+    expect(raised.event).toMatchObject({ kind: 'decision_required', decisionRequired: true, targetRole: 'owner', urgency: 'urgent', decisionOptions: ['delete', 'keep'] });
+    expect(raised.event.content.summary).toBe('Delete the stale branch or keep it?');
+
+    const parked = service.blockedRuntimes(workspace.workspace.id);
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ runtimeSessionId: 'blocked-runtime', eventId: raised.event.id, question: 'Delete the stale branch or keep it?', options: ['delete', 'keep'], taskId: task.id });
+    expect(parked[0].ageMs).toBeGreaterThanOrEqual(0);
+
+    // The point of the record: the runtime is still reporting itself healthy.
+    const blockedSession = service.state().sessions.find((item) => item.id === 'blocked-runtime')!;
+    expect(blockedSession.state).toBe('running');
+    expect(blockedSession.lastTurnState).toBe('running');
+    expect(blockedSession.blockedSince).toEqual(expect.any(String));
+
+    // Re-raising the same unanswered question must not multiply prompts.
+    const again = await service.raiseDecision({ runtimeSessionId: 'blocked-runtime', question: 'Delete the stale branch or keep it?', options: ['delete', 'keep'] });
+    expect(again.event.id).toBe(raised.event.id);
+    expect(service.state().channelEvents.filter((event) => event.kind === 'decision_required' && event.taskId === task.id)).toHaveLength(1);
+    await expect(service.raiseDecision({ runtimeSessionId: 'blocked-runtime', question: 'A different question entirely' })).rejects.toMatchObject({ code: 'invalid_request' });
+    service.close();
+
+    // The blocked record and its start time survive a restart, which is what
+    // makes the age trustworthy after a crash.
+    const reopened = await control(root);
+    const survived = reopened.blockedRuntimes(workspace.workspace.id);
+    expect(survived).toHaveLength(1);
+    expect(survived[0].eventId).toBe(raised.event.id);
+    expect(survived[0].options).toEqual(['delete', 'keep']);
+
+    // Answering releases the runtime; refusing still leaves the Task open.
+    const answered = await reopened.resolveDecision(raised.event.id, workspace.member.id, 'keep it for now', 'refuse');
+    expect(answered).toMatchObject({ kind: 'decision_resolved', relatedEventId: raised.event.id, verdict: 'refuse' });
+    expect(reopened.blockedRuntimes(workspace.workspace.id)).toEqual([]);
+    expect(reopened.state().tasks.find((item) => item.id === task.id)?.lifecycle).toBe('claimed');
+    expect(reopened.state().sessions.find((item) => item.id === 'blocked-runtime')?.blockedOnEventId).toBeUndefined();
+    expect(worker.member.id).toBeDefined();
+    reopened.close();
+  });
+
+  it('shows a blocked runtime and its age in panorama and the TUI, and shows nothing when none is blocked', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-blocked-visible-'));
+    app = await createServer(new CompanionService(undefined, new Store(root)));
+    const service = app.arcp;
+    const { actor } = await service.registerActor({ clientIdentity: 'blocked-visible' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'blocked visibility' });
+    const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const goal = await service.createGoal({ actorId: actor.id, title: 'visible goal', workspaceId: workspace.workspace.id });
+    await service.store.mutate((state: any) => state.sessions.push({ id: 'blocked-runtime', actorId: actor.id, goalId: goal.id, bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', state: 'running', lastTurnState: 'running', createdAt: new Date().toISOString() }));
+
+    const clean = await service.panorama(workspace.workspace.id);
+    expect(clean.blocked).toEqual([]);
+    const cleanSnapshot = renderTuiSnapshot(clean);
+    expect(cleanSnapshot).toContain('Blocked 0');
+    expect(cleanSnapshot).not.toContain('BLOCKED on decision');
+
+    const raised = await service.raiseDecision({ runtimeSessionId: 'blocked-runtime', question: 'Overwrite the release tag?', options: ['overwrite', 'abort'] });
+    await service.store.mutate((state: any) => { state.sessions.find((item: any) => item.id === 'blocked-runtime').blockedSince = new Date(Date.now() - 91 * 60_000).toISOString(); });
+
+    const view = await service.panorama(workspace.workspace.id);
+    expect(view.blocked).toHaveLength(1);
+    expect(view.blocked[0].eventId).toBe(raised.event.id);
+    expect(view.blocked[0].ageMs).toBeGreaterThanOrEqual(91 * 60_000);
+    const snapshot = renderTuiSnapshot(view);
+    expect(snapshot).toContain(`BLOCKED on decision ${raised.event.id} age=91m options=2`);
+    expect(snapshot).toContain('Blocked 1 · oldest 91m');
+  });
+
+  it('raises and answers a blocked decision over the HTTP surface and refuses private data in the options', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-blocked-http-'));
+    app = await createServer(new CompanionService(undefined, new Store(root)));
+    await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const { actor } = await app.arcp.registerActor({ clientIdentity: 'blocked-http' });
+    const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.id, purpose: 'blocked HTTP' });
+    const worker = await app.arcp.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const goal = await app.arcp.createGoal({ actorId: actor.id, title: 'blocked http goal', workspaceId: workspace.workspace.id });
+    await app.arcp.store.mutate((state: any) => state.sessions.push({ id: 'http-blocked-runtime', actorId: actor.id, goalId: goal.id, bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', state: 'running', lastTurnState: 'running', createdAt: new Date().toISOString() }));
+    const headers = { 'x-arcp-member-key': workspace.credential, 'content-type': 'application/json' };
+
+    const rejected = await fetch(`${base}/v1/runtime-sessions/http-blocked-runtime/decision`, { method: 'POST', headers, body: JSON.stringify({ question: 'Which file do I keep?', options: ['keep /Users/private/notes.md', 'discard'] }) });
+    expect(rejected.status).toBe(400);
+    expect(app.arcp.blockedRuntimes(workspace.workspace.id)).toEqual([]);
+
+    const raised = await fetch(`${base}/v1/runtime-sessions/http-blocked-runtime/decision`, { method: 'POST', headers, body: JSON.stringify({ question: 'Which branch do I keep?', options: ['mine', 'theirs'] }) });
+    expect(raised.status).toBe(201);
+    const raisedBody: any = await raised.json();
+    expect(raisedBody.event).toMatchObject({ kind: 'decision_required', decisionRequired: true, decisionOptions: ['mine', 'theirs'] });
+    expect(raisedBody.session.blockedOnEventId).toBe(raisedBody.event.id);
+    expect(JSON.stringify(raisedBody)).not.toContain('externalId');
+
+    const panorama: any = await (await fetch(`${base}/v1/workspaces/${workspace.workspace.id}/panorama`, { headers })).json();
+    expect(panorama.blocked).toEqual([expect.objectContaining({ runtimeSessionId: 'http-blocked-runtime', eventId: raisedBody.event.id, options: ['mine', 'theirs'] })]);
+
+    const resolved = await fetch(`${base}/v1/events/${raisedBody.event.id}/resolve`, { method: 'POST', headers, body: JSON.stringify({ summary: 'keep mine', verdict: 'accept' }) });
+    expect(resolved.status).toBe(200);
+    const after: any = await (await fetch(`${base}/v1/workspaces/${workspace.workspace.id}/panorama`, { headers })).json();
+    expect(after.blocked).toEqual([]);
+  });
+});
