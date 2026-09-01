@@ -13,7 +13,7 @@ esac
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 plugin_root=$(cd "$script_dir/../../.." && pwd)
-package_root="$plugin_root/skills/paseo-companion/paseo-reminder"
+package_root="$plugin_root/skills/agent-runtime-control-panel/runtime"
 server="$package_root/dist/server.js"
 if [[ ! -f "$server" ]]; then
   echo "paseo companion build is missing: $server (run pnpm --dir '$package_root' build)" >&2
@@ -136,4 +136,3 @@ done
 if runtime=$(health_runtime); then printf '%s\n' "$runtime"; exit 0; fi
 echo "paseo companion health check timed out on 127.0.0.1:$PORT; see $log_file" >&2
 exit 1
-

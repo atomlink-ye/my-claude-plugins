@@ -12,6 +12,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 | [mve-first-development](skills/mve-first-development/) | Shape/Probe/Prove/Protect/Harden stage router for early product delivery |
 | [opencode-companion](skills/opencode-companion/) | OpenCode serve/session/job/review runtime via direct companion scripts |
 | [paseo-companion](skills/paseo-companion/) | Paseo CLI runtime: agents, terminals, schedules, worktrees, host/port targeting |
+| [agent-runtime-control-panel](skills/agent-runtime-control-panel/) | Durable local control plane for ARCP Actors, Goals, live-validated Paseo sessions, and safe-point deliveries |
 | [google-workspace](skills/google-workspace/) | Google Docs/Drive/Sheets via the `gws` CLI |
 | [mcp-skill](skills/mcp-skill/) | On-demand MCP server invocation via MCPorter |
 | [figma-console](skills/figma-console/) | Schema-first local Figma Desktop Bridge workflow |
@@ -25,6 +26,7 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 - `opencode-orchestrator` was folded into runtime-specific companion skills.
 - `task-iteration`, `agentic-orchestration`, and `team-lead-orchestration` were removed from the bundle.
 - `daytona-companion` was removed; sandbox lifecycle is superseded by `sandbox-ctl`.
+- `paseo-reminder` is retained as a compatibility entrypoint and now runs from `agent-runtime-control-panel/runtime`.
 
 ## Agent Memory quick start
 

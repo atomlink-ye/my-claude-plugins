@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then echo "arguments are not accepted; set PORT" >&2; exit 2; fi
+: "${PORT:?PORT is required}"
+case "$PORT" in (*[!0-9]*|'') echo "PORT must be numeric" >&2; exit 2;; esac
+base="http://127.0.0.1:${PORT}"
+runtime=$(curl -fsS "$base/self/runtime")
+pid=$(node -e 'const v=JSON.parse(process.argv[1]); if (!Number.isInteger(v.pid)) process.exit(2); process.stdout.write(String(v.pid))' "$runtime")
+data_dir=$(node -e 'const v=JSON.parse(process.argv[1]); if (!v.dataDir) process.exit(2); process.stdout.write(v.dataDir)' "$runtime")
+command -v lsof >/dev/null 2>&1 || { echo "lsof is required for exact listener verification" >&2; exit 1; }
+listener_pids=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN | sort -u || true)
+if [[ "$listener_pids" != "$pid" ]]; then
+  echo "runtime pid $pid is not the sole listener on port $PORT (found: ${listener_pids:-none})" >&2
+  exit 1
+fi
+"$(dirname "$0")/backup-companion-data"
+kill -TERM "$pid"
+for _ in {1..50}; do
+  if ! kill -0 "$pid" 2>/dev/null && ! lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+  sleep 0.1
+done
+if kill -0 "$pid" 2>/dev/null; then
+  echo "companion pid $pid did not exit" >&2
+  exit 1
+fi
+if lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "port $PORT is still occupied; refusing to start" >&2
+  exit 1
+fi
+root=$(cd "$(dirname "$0")/.." && pwd)
+PASEO_COMPANION_DATA="$data_dir" PORT="$PORT" nohup node "$root/dist/server.js" >"${TMPDIR:-/tmp}/paseo-reminder-${PORT}.log" 2>&1 </dev/null &
+new_pid=$!
+for _ in {1..60}; do
+  if health=$(curl -fsS "$base/health" 2>/dev/null); then
+    checked=$(curl -fsS "$base/self/runtime")
+    checked_pid=$(node -e 'const v=JSON.parse(process.argv[1]); process.stdout.write(String(v.pid))' "$checked")
+    checked_dir=$(node -e 'const v=JSON.parse(process.argv[1]); process.stdout.write(String(v.dataDir))' "$checked")
+    [[ "$checked_pid" == "$new_pid" && "$checked_dir" == "$data_dir" ]] || { echo "runtime validation failed" >&2; exit 1; }
+    printf '%s\n' "$checked"
+    exit 0
+  fi
+  if ! kill -0 "$new_pid" 2>/dev/null; then
+    echo "companion failed to start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+echo "companion health check timed out" >&2
+exit 1

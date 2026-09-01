@@ -11,7 +11,7 @@
       "author": {"name": "atomlink-ye"},
       "source": "./",
       "strict": false,
-      "skills": ["./skills/sandbox-ctl","./skills/google-workspace","./skills/mcp-skill","./skills/mve-first-development","./skills/opencode-companion","./skills/paseo-companion","./skills/agent-memory","./skills/figma-console","./skills/workspace-org-prac"]
+      "skills": ["./skills/sandbox-ctl","./skills/google-workspace","./skills/mcp-skill","./skills/mve-first-development","./skills/opencode-companion","./skills/paseo-companion","./skills/agent-runtime-control-panel","./skills/agent-memory","./skills/figma-console","./skills/workspace-org-prac"]
     },
     {"name":"skill-creator","description":"Optional standalone skill for creating, evaluating, packaging, and improving Claude Code skills.","version":"0.3.0","author":{"name":"atomlink-ye"},"source":"./","strict":false,"skills":["./skills/skill-creator"]}
   ]

@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+const [command, ...args] = process.argv.slice(2);
+const base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 8787}`;
+const key = process.env.ARCP_API_KEY;
+if (!key) { console.error('ARCP_API_KEY is required'); process.exit(2); }
+const request = async (method, path, body) => {
+  const response = await fetch(`${base}${path}`, { method, headers: { 'x-arcp-api-key': key, ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  const value = await response.json(); console.log(JSON.stringify(value, null, 2)); if (!response.ok) process.exitCode = 1;
+};
+if (command === 'profile' && args[0] === 'discovery') await request('GET', '/v1/discovery');
+else if (command === 'actor' && args[0] === 'register') await request('POST', '/v1/actors', { clientIdentity: args[1], label: args[2] === '--label' ? args[3] : undefined });
+else if (command === 'goal' && args[0] === 'create') await request('POST', '/v1/goals', { actorId: args[1], title: args.slice(2).join(' ') });
+else if (command === 'runtime' && args[0] === 'launch') await request('POST', '/v1/runtime-sessions', { actorId: args[1], goalId: args[2], profileId: args[3], workspace: args[4] });
+else if (command === 'runtime' && ['observe', 'reconcile'].includes(args[0])) await request('POST', `/v1/runtime-sessions/${encodeURIComponent(args[1])}/${args[0]}`);
+else if (command === 'delivery' && ['create', 'interrupt'].includes(args[0])) await request('POST', '/v1/deliveries', { fromActorId: args[1], runtimeSessionId: args[2], body: args.slice(3).join(' '), command: args[0] === 'interrupt' ? 'interrupt' : 'normal' });
+else if (command === 'delivery' && args[0] === 'ack') await request('POST', `/v1/deliveries/${encodeURIComponent(args[1])}/ack`, { reason: args.slice(2).join(' ') || 'processed' });
+else { console.error('usage: arcp profile discovery | actor register ID [--label LABEL] | goal create ACTOR TITLE | runtime launch ACTOR GOAL PROFILE [WORKSPACE] | runtime observe|reconcile ID | delivery create|interrupt ACTOR RUNTIME BODY | delivery ack ID [REASON]'); process.exit(2); }
