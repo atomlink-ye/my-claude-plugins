@@ -260,11 +260,14 @@ export class ArcpService {
   private async pump(): Promise<void> {
     if (this.pumping) return this.pumping;
     this.pumping = (async () => {
-      for (const delivery of this.store.snapshot().deliveries.filter((item) => item.command === 'normal' && item.state === 'waiting_safe_point')) {
+      for (const delivery of this.store.snapshot().deliveries.filter((item) => item.command === 'normal' && ['waiting_safe_point', 'delivered', 'running'].includes(item.state))) {
         const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
         if (!session?.externalId || session.generation !== delivery.generation) continue;
         let observed: RuntimeSession;
         try { observed = await this.observe(session.id); } catch { continue; }
+        // A post-dispatch observation advances delivered → running → processed in observe().
+        // Only waiting_safe_point is eligible to begin a turn; indeterminate is deliberately excluded.
+        if (delivery.state !== 'waiting_safe_point') continue;
         if (!['idle', 'terminal'].includes(observed.state)) continue;
         await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); return item; });
         try {
