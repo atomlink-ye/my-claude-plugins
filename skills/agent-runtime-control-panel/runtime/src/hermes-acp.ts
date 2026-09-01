@@ -5,9 +5,10 @@ import type { ChannelAdapter, ChannelEvent, ChildObservation, Profile, RuntimeAd
 type JsonRpcMessage = { jsonrpc?: string; id?: number; method?: string; params?: Record<string, any>; result?: any; error?: { message?: string } };
 type ApcProcess = ChildProcessWithoutNullStreams;
 type Session = { process: ApcProcess; nextId: number; pending: Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>; status: 'running' | 'idle' | 'attention' | 'terminal'; timeline: unknown[]; externalId?: string; context?: RuntimeLaunchContext; lastDeliveryId?: string; lastTurnState?: string };
-type SpawnFn = (command: string, args: string[], options: { stdio: ['pipe', 'pipe', 'pipe'] }) => ApcProcess;
+type SpawnFn = (command: string, args: string[], options: { stdio: ['pipe', 'pipe', 'pipe']; env?: Record<string, string> }) => ApcProcess;
 export type SafePointEvent = { externalId: string; deliveryId?: string; state: 'idle' | 'attention' | 'terminal' };
 export type ChannelFact = { externalId: string; kind: 'phase_progress' | 'material_progress' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty'; summary: string; urgency: 'normal' | 'urgent' };
+export type AcpResultFact = { externalId: string; taskId: string; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs?: string[]; expectedFence?: number };
 
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' ? value as Record<string, any> : {}; }
 function result(value: unknown): CliResult { return { value, stdout: '', stderr: '' }; }
@@ -23,10 +24,12 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   private readonly sessions = new Map<string, Session>();
   private readonly listeners = new Set<(event: SafePointEvent) => void>();
   private readonly factListeners = new Set<(fact: ChannelFact) => void>();
+  private readonly resultListeners = new Set<(fact: AcpResultFact) => void>();
   constructor(private readonly spawnProcess: SpawnFn = ((command, args, options) => spawn(command, args, options) as ApcProcess)) {}
 
   onSafePoint(listener: (event: SafePointEvent) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   onFact(listener: (fact: ChannelFact) => void): () => void { this.factListeners.add(listener); return () => this.factListeners.delete(listener); }
+  onResult(listener: (fact: AcpResultFact) => void): () => void { this.resultListeners.add(listener); return () => this.resultListeners.delete(listener); }
   private emit(event: SafePointEvent): void { for (const listener of this.listeners) listener(event); }
   private setState(externalId: string, session: Session, state: Session['status'], turnState?: string): void {
     session.status = state; if (turnState) session.lastTurnState = turnState;
@@ -58,6 +61,8 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   }
   private onUpdate(externalId: string, session: Session, update: Record<string, any>): void {
     const kind = String(update.sessionUpdate ?? update.type ?? update.status ?? '').toLowerCase();
+    const resultFact = record(update.result);
+    if (resultFact.taskId && ['candidate', 'failed', 'unknown'].includes(String(resultFact.status))) for (const listener of this.resultListeners) listener({ externalId, taskId: String(resultFact.taskId), status: String(resultFact.status) as AcpResultFact['status'], summary: String(resultFact.summary ?? ''), ...(Array.isArray(resultFact.evidenceRefs) ? { evidenceRefs: resultFact.evidenceRefs.map(String) } : {}), ...(typeof resultFact.expectedFence === 'number' ? { expectedFence: resultFact.expectedFence } : {}) });
     if (kind) session.timeline.push({ type: kind, timestamp: new Date().toISOString() });
     if (kind.includes('error') || kind.includes('permission')) this.setState(externalId, session, 'attention', kind);
     else if (kind.includes('complete') || kind.includes('idle') || kind === 'turn_end' || kind === 'prompt_end') this.setState(externalId, session, 'idle', kind);
@@ -78,8 +83,8 @@ export class HermesAcpAdapter implements RuntimeAdapter {
     session.process.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     return request;
   }
-  private async connected(cwd: string): Promise<{ externalId: string; session: Session }> {
-    const child = this.spawnProcess('hermes', ['acp', '--accept-hooks'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  private async connected(cwd: string, context?: RuntimeLaunchContext): Promise<{ externalId: string; session: Session }> {
+    const child = this.spawnProcess('hermes', ['acp', '--accept-hooks'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env as Record<string, string>, ...(context?.memberCredential ? { ARCP_RUNTIME_MEMBER_CREDENTIAL: context.memberCredential } : {}), ...(context?.clientStatePath ? { ARCP_CLIENT_STATE: context.clientStatePath } : {}) } });
     const session: Session = { process: child, nextId: 1, pending: new Map(), status: 'idle', timeline: [] };
     const temporaryId = `pending-${process.pid}-${Date.now()}`; this.wire(temporaryId, session);
     await this.request(temporaryId, session, 'initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'arcp', version: '0.1.0' } });
@@ -91,7 +96,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
   models(provider: string): Promise<CliResult> { return Promise.resolve(result(provider === 'hermes' ? [{ id: 'hermes-agent' }] : [])); }
   modes(provider: string): Promise<string[] | undefined> { return Promise.resolve(provider === 'hermes' ? ['default', 'accept_edits', 'dont_ask'] : []); }
   async launch(_profile: Profile, _goalTitle: string, workspace?: string, context?: RuntimeLaunchContext): Promise<CliResult> {
-    const connected = await this.connected(workspace || process.cwd()); connected.session.context = context; return result({ id: connected.externalId, acpSessionId: connected.externalId, pid: connected.session.process.pid });
+    const connected = await this.connected(workspace || process.cwd(), context); connected.session.context = context; return result({ id: connected.externalId, acpSessionId: connected.externalId, pid: connected.session.process.pid });
   }
   observe(externalId: string): Promise<CliResult> {
     const session = this.sessions.get(externalId); if (!session) return Promise.reject(new Error('Hermes ACP session is unavailable'));

@@ -15,6 +15,8 @@ Default durable state is `${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-co
 
 `actor register`, `workspace create`, and `workspace join` save issued credentials to the mode-0600 client state and print `credentialStored:true`, never the bearer value. Pass `--show-credential` only for a deliberate one-time transfer. Workspace creation also provisions the owner's Member credential, so no follow-up join is needed before heartbeat, task claim, Knowledge, or Result commands.
 
+List commands use the same boundary as the existing context/panorama surface: a Member sees only its own Workspace, while an authenticated Actor or admin key is the deliberate discovery plane and may list all Workspaces.
+
 ## External Hermes ACP runtime
 
 `external register` creates a sibling Hermes ACP on-call Runtime sharing this ARCP Workspace, Knowledge, and Delivery surface. It does not attach to the operator's existing Feishu Hermes conversation; that Feishu Hermes remains Owner and the human channel entry point. The real adapter uses the local `hermes acp` binary over stdio JSON-RPC.

@@ -15,11 +15,12 @@ export class PaseoCli {
     this.timeoutMs = timeoutMs;
   }
 
-  async run(args: string[], options: { agentId?: string; cwd?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CliResult> {
+  async run(args: string[], options: { agentId?: string; cwd?: string; timeoutMs?: number; signal?: AbortSignal; env?: Record<string, string> } = {}): Promise<CliResult> {
     const env = { ...process.env } as Record<string, string>;
     // Caller identity is request-scoped; do not inherit a launch-time identity.
     delete env.PASEO_AGENT_ID;
     if (options.agentId) env.PASEO_AGENT_ID = options.agentId;
+    if (options.env) Object.assign(env, options.env);
     return new Promise((resolve, reject) => {
       const child = spawn(this.bin, args, { cwd: options.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';

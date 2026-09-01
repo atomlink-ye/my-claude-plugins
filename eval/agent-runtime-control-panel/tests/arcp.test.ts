@@ -20,8 +20,10 @@ class FakeCli {
   private lastMode = 'auto';
   sends = 0;
   lastLaunchArgs: string[] = [];
+  lastEnv: Record<string, string> = {};
   constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown) {}
-  async run(args: string[]) {
+  async run(args: string[], options: { env?: Record<string, string> } = {}) {
+    if (options.env) this.lastEnv = options.env;
     if (this.fail && args[0] === 'run') throw new Error('timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
@@ -53,7 +55,7 @@ class FakeAcpProcess extends EventEmitter {
     });
   }
   kill(): boolean { this.exitCode = 0; this.emit('close'); return true; }
-  update(sessionUpdate: string): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-session-1', update: { sessionUpdate } } }) + '\n'); }
+  update(sessionUpdate: string, extra: Record<string, unknown> = {}): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-session-1', update: { sessionUpdate, ...extra } } }) + '\n'); }
 }
 async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown) {
   const companion = { store: { dir: root }, postMessage: async () => ({ id: 'message-1', delivery: { status: 'pending' } }), deleteMessage: async () => ({}) };
@@ -98,6 +100,7 @@ describe('ARCP MVE control core', () => {
     expect(service.memberForCredential(workspace.credential).id).toBe(workspace.member.id);
     expect((service.cli as any).lastLaunchArgs.join(' ')).toContain(`arcp knowledge add ${workspace.workspace.id}`);
     expect((service.cli as any).lastLaunchArgs.join(' ')).toContain(`arcp result submit ${workspace.workspace.id}`);
+    expect((service.cli as any).lastEnv.ARCP_RUNTIME_MEMBER_CREDENTIAL).toBe((started as any).credential); expect((service.cli as any).lastEnv.ARCP_CLIENT_STATE).toContain('/runtime-members/');
   });
   it('maps Hermes ACP turn-end events to the existing idle observation and safe-point event', async () => {
     const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any); const launched = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'canary', '.');
@@ -109,6 +112,22 @@ describe('ARCP MVE control core', () => {
     const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any); const launched = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'loss', '.'); const sessionId = String((launched.value as any).id);
     const turn = adapter.startTurn(sessionId, 'one turn', 'delivery-1'); process.kill(); await expect(turn).rejects.toThrow('Hermes ACP process exited');
     expect(process.promptCount).toBe(1); expect(await adapter.reconcileExternal(sessionId)).toBe(false); expect(process.promptCount).toBe(1);
+  });
+  it('persists an ACP-created Result and delivers its decision request to the manager channel', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-acp-result-')); const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any);
+    const companion = { store: { dir: root }, postMessage: async () => ({}), deleteMessage: async () => ({}) }; const service = new ArcpService(companion as any, new FakeCli() as any, undefined, undefined, [adapter]); await service.init();
+    const { actor, binding } = await service.registerActor({ clientIdentity: 'acp-result-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'ACP result' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'acp-worker', role: 'worker' }); const goal = await service.createGoal({ actorId: actor.id, title: 'ACP goal', workspaceId: workspace.workspace.id }); const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'ACP task' }); await service.claimTask(task.id, worker.member.id, 0);
+    const acp = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'ACP result', '.'); const externalId = String((acp.value as any).id);
+    await service.store.mutate((state: any) => { state.sessions.push({ id: 'manager-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: workspace.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'paseo-session-1', createdAt: new Date().toISOString() }); state.sessions.push({ id: 'worker-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'external', adapterId: 'hermes-acp', workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', state: 'idle', externalId, createdAt: new Date().toISOString() }); });
+    process.update('result', { result: { taskId: task.id, status: 'candidate', summary: 'ACP candidate', expectedFence: 1 } }); await new Promise((resolve) => setTimeout(resolve, 20));
+    const state = service.state(); expect(state.results).toHaveLength(1); const candidate = state.channelEvents.find((event) => event.kind === 'task_candidate'); const decision = state.channelEvents.find((event) => event.kind === 'decision_required'); expect(candidate?.resultId).toBe(state.results[0].id); expect(decision?.relatedEventId).toBe(candidate?.id); expect(state.deliveries.some((delivery) => delivery.eventId === decision?.id && delivery.runtimeSessionId === 'manager-runtime')).toBe(true);
+    service.close();
+  });
+  it('deduplicates conflicting ChannelEvent ids and scopes member retrieval across target modes', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-targets-')); const service = await control(root); const { actor } = await service.registerActor({ clientIdentity: 'channel-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'targets' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker', capabilities: ['worker-subscription'] });
+    await service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, targetRole: 'owner', kind: 'decision_required', urgency: 'normal', decisionRequired: true, summary: 'approve candidate', evidenceRefs: [] }); await expect(service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: 'conflict', evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' }); const resolved = await service.resolveDecision('event-stable', workspace.member.id, 'approved'); expect(resolved).toMatchObject({ kind: 'decision_resolved', relatedEventId: 'event-stable' });
+    await service.publishChannelEvent({ id: 'event-worker', workspaceId: workspace.workspace.id, targetMemberId: worker.member.id, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: 'worker update', evidenceRefs: [] }); await service.publishChannelEvent({ id: 'event-subscription', workspaceId: workspace.workspace.id, targetSubscription: 'worker-subscription', kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: 'subscription update', evidenceRefs: [] });
+    expect(service.channelEvents(workspace.workspace.id, workspace.member.id).map((event) => event.id)).toEqual(expect.arrayContaining(['event-stable'])); expect(service.channelEvents(workspace.workspace.id, workspace.member.id).map((event) => event.id)).not.toEqual(expect.arrayContaining(['event-worker', 'event-subscription'])); expect(service.channelEvents(workspace.workspace.id, worker.member.id).map((event) => event.id)).toEqual(expect.arrayContaining(['event-worker', 'event-subscription']));
   });
   it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
@@ -294,9 +313,10 @@ describe('ARCP CLI and TUI presentation', () => {
   });
   it('hands a managed runtime its per-runtime credential without clobbering the owner member', async () => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-start-')); const statePath = path.join(stateDir, 'client.json'); await writeFile(statePath, JSON.stringify({ memberCredential: 'owner-secret', actorCredential: 'actor-secret' }));
-    const server = await new Promise<http.Server>((resolve) => { const value = http.createServer(async (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: { id: 'runtime-1' }, credential: 'managed-secret' })); }); value.listen(0, '127.0.0.1', () => resolve(value)); });
+    const seenKeys: string[] = []; const server = await new Promise<http.Server>((resolve) => { const value = http.createServer(async (req, res) => { seenKeys.push(String(req.headers['x-arcp-member-key'] ?? '')); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: { id: 'runtime-1' }, credential: 'managed-secret' })); }); value.listen(0, '127.0.0.1', () => resolve(value)); });
     const port = (server.address() as any).port; const script = path.join(process.cwd(), '../scripts/arcp'); const output = await execFileAsync(process.execPath, [script, 'start', '--workspace', 'workspace-1', '--title', 'managed'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_CLIENT_STATE: statePath } });
     expect(output.stdout).toContain('credentialStored'); expect(output.stdout).not.toContain('managed-secret'); const saved: any = JSON.parse(await readFile(statePath, 'utf8')); expect(saved.memberCredential).toBe('owner-secret'); expect(saved.runtimeMemberCredentials).toEqual({ 'runtime-1': 'managed-secret' });
+    await execFileAsync(process.execPath, [script, 'task', 'claim', 'task-1', '--runtime', 'runtime-1', '--expected-fence', '0'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_CLIENT_STATE: statePath } }); await execFileAsync(process.execPath, [script, 'result', 'submit', 'workspace-1', '--runtime', 'runtime-1', '--task', 'task-1', '--summary', 'candidate', '--expected-fence', '1'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_CLIENT_STATE: statePath } }); expect(seenKeys.slice(1)).toEqual(['managed-secret', 'managed-secret']);
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
   it('renders a deterministic mutation-free TUI snapshot', () => {
