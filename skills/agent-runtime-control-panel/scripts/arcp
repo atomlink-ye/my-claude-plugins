@@ -13,6 +13,7 @@ const HELP = `ARCP ControlWorkspace commands:
   channel ack EVENT
   channel resolve EVENT --summary '...'
   channel withdraw DELIVERY
+  release DELIVERY [--confirm TOKEN]
   db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH]
   member heartbeat|list WORKSPACE
   goal start|list
@@ -38,7 +39,7 @@ External Runtime note:
   Feishu Hermes conversation; that Hermes remains Owner and the human entry point.
   Runtime communication is a durable ChannelEvent; completion requires a Result,
   never an idle process.`;
-const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel','db','gate','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack'];
+const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel','db','gate','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack','release'];
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
@@ -128,6 +129,7 @@ else if (area === 'runtime' && action === 'status') await call('GET',`/v1/runtim
 else if (area === 'runtime' && action === 'list') await call('GET','/v1/runtime-sessions');
 else if (area === 'reconcile') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0])}/reconcile`);
 else if (area === 'ack') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||p.slice(1).join(' ')||'processed',...(f.generation?{generation:Number(f.generation)}:{})});
+else if (area === 'release') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/release`,{...(f.confirm?{confirmation:f.confirm}:{})});
 else if (area === 'inbox') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/context`); }
 else if (area === 'panorama') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama${f.refresh ? '?refresh=1' : ''}`); }
 else if (area === 'tui') { const workspace=await workspaceId(); if(workspace) { const s=await load(), headers={...(admin?{'x-arcp-api-key':admin}:{}),...(s.actorCredential?{'x-arcp-actor-key':s.actorCredential}:{}),...(s.memberCredential?{'x-arcp-member-key':s.memberCredential}:{})}, fetchPanorama=async(refresh=false)=>{const r=await fetch(`${base}/v1/workspaces/${encodeURIComponent(workspace)}/panorama${refresh?'?refresh=1':''}`,{headers}); const v=await r.json(); if(!r.ok) throw new Error(v.message||v.code||'panorama failed'); return v;}, tui=await import('../runtime/dist/tui.js'); if(f.snapshot){try{console.log(tui.renderTuiSnapshot(await fetchPanorama(false)));}catch(error){console.log(JSON.stringify({code:error instanceof Error?error.message:String(error)},null,2));process.exitCode=1;}} else await tui.runTui({fetchPanorama}); } }

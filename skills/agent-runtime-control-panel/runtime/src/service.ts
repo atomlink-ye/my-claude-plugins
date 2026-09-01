@@ -18,6 +18,11 @@ import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, 
 export interface ArcpDeliveryPolicy {
   isRecipient(recipient: string): boolean;
   dispatch(message: MessageRecord, prompt: string): Promise<{ deliveryId: string; state: string }>;
+  /** Deliver an already-rendered body (for provider commands and envelopes). */
+  dispatchRaw?(message: MessageRecord, body: string): Promise<{ deliveryId: string; state: string }>;
+  status?(deliveryId: string): Promise<{ state: string } | undefined>;
+  acknowledge?(deliveryId: string, reason: string): Promise<unknown>;
+  withdraw?(deliveryId: string, reason: string): Promise<unknown>;
 }
 
 const REMINDER_TTL = '30m';
@@ -43,6 +48,13 @@ function tagText(value: unknown): string {
 }
 function tagAttribute(value: unknown): string {
   return tagText(value).replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+}
+function untagText(value: string): string {
+  return value.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&quot;', '"').replaceAll('&apos;', "'").replaceAll('&amp;', '&');
+}
+function envelopeBody(value: string): string {
+  const match = /^<paseo-reminder-delivery[\s\S]*?\n\s*<item[\s\S]*?\n\s*<body>([\s\S]*)<\/body>\n\s*(?:<ack>[\s\S]*<\/ack>\n\s*)?<\/item>[\s\S]*<\/paseo-reminder-delivery>$/.exec(value.trim());
+  return match ? untagText(match[1]) : value;
 }
 function lowerStatus(value: any): string { return String(value ?? '').toLowerCase(); }
 function cronForDelay(seconds: number): string {
@@ -1262,6 +1274,12 @@ export class CompanionService {
     }
     if (message.status === 'acknowledged') return { id, status: 'acknowledged', retirementPending: false };
     if ((message.mode ?? 'notify') === 'ack' && ['delivered', 'unacknowledged'].includes(message.status)) {
+      if (message.transportOwner === 'arcp' && message.ownerDeliveryId && this.arcpDeliveryPolicy?.acknowledge) {
+        try {
+          await this.arcpDeliveryPolicy.acknowledge(message.ownerDeliveryId, reason);
+          await this.store.updateMessage(id, { ownerDeliveryState: 'acknowledged' });
+        } catch { /* local acknowledgement remains durable; reconcile can retry transport */ }
+      }
       await this.store.updateMessage(id, { status: 'acknowledged', acknowledgedAt: new Date().toISOString(), acknowledgementReason: reason });
       await this.store.addLedger({ type: 'deferred', target: id, verdict: 'message-acknowledged', reason });
       await this.store.pruneMessages();
@@ -1276,6 +1294,10 @@ export class CompanionService {
   }
 
   private async cleanupCancelledMessage(id: string): Promise<boolean> {
+    const message = this.store.getMessages().find((item) => item.id === id);
+    if (message?.transportOwner === 'arcp' && message.ownerDeliveryId && this.arcpDeliveryPolicy?.withdraw) {
+      try { await this.arcpDeliveryPolicy.withdraw(message.ownerDeliveryId, 'message cancelled'); } catch { /* delivered/unknown owners are reconciled by ARCP */ }
+    }
     const schedules = this.store.getMessageSchedules().filter((schedule) => schedule.batchIds.includes(id));
     for (const schedule of schedules) {
       if (['pending', 'active', 'running'].includes(schedule.status)) {
@@ -1519,14 +1541,44 @@ export class CompanionService {
   }
 
   private async ensureMessageDeliveryOnce(recipient: string): Promise<void> {
+    // A coordinator-driven compact owns this recipient until its wake step has
+    // settled. This guard must cover ARCP and legacy transports alike.
+    if ((this.quietUntil.get(recipient) ?? 0) > Date.now()) return;
     if (this.arcpRecipient(recipient)) {
-      for (const message of this.store.getMessages().filter((item) => item.to === recipient && item.status === 'pending')) {
+      // Let concurrent durable writes join the same ARCP batch generation.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.arcpDeliveryPolicy!.status) {
+        for (const message of this.store.getMessages().filter((item) => item.to === recipient && item.status === 'pending' && item.ownerDeliveryId)) {
+          const owner = await this.arcpDeliveryPolicy!.status(message.ownerDeliveryId!);
+          if (owner && ['delivered', 'running', 'processed', 'acknowledged'].includes(owner.state)) {
+            await this.store.updateMessage(message.id, { ownerDeliveryState: owner.state, status: 'delivered', deliveredAt: new Date().toISOString() });
+            await this.finalizeAcceptedArcpMessage(message.id, message.ownerDeliveryId!);
+          }
+        }
+      }
+      const eligible = this.store.getMessages().filter((item) => item.to === recipient && item.status === 'pending'
+        // A safe-point delivery already owned by ARCP is being progressed by
+        // its pump; only cache-held owners need an explicit release retry.
+        && (!item.ownerDeliveryId || item.ownerDeliveryState === 'held' || item.ownerDeliveryState?.startsWith('held')));
+      const held = eligible.filter((item) => item.ownerDeliveryId && (item.ownerDeliveryState === 'held' || item.ownerDeliveryState?.startsWith('held')));
+      const pending = held.length ? held : eligible.filter((item) => !item.ownerDeliveryId);
+      if (!pending.length) return;
+      // A compact command and an already-rendered wake envelope are provider
+      // payloads, not legacy message bodies. They must cross ARCP unchanged;
+      // ordinary messages use one coalesced reminder envelope.
+      const rawBody = pending.length === 1 && (/^\/compact\s/.test(pending[0].body) || /^<paseo-reminder-delivery\b/.test(pending[0].body))
+        ? pending[0].body : undefined;
+      const prompt = rawBody ?? this.messagePrompt(recipient, pending);
+      const result = rawBody && this.arcpDeliveryPolicy!.dispatchRaw
+        ? await this.arcpDeliveryPolicy!.dispatchRaw(pending[0], rawBody)
+        : await this.arcpDeliveryPolicy!.dispatch(pending[0], prompt);
+      const delivered = ['delivered', 'running', 'processed', 'acknowledged'].includes(result.state);
+      for (const message of pending) {
         // The callback's ARCP delivery ID is deterministic from this durable
         // record. Re-entering after a crash only reads the same ARCP delivery;
         // it never creates a second heartbeat or a second runtime send.
-        const result = await this.arcpDeliveryPolicy!.dispatch(message, this.messagePrompt(recipient, [message]));
-        const delivered = ['delivered', 'running', 'processed', 'acknowledged'].includes(result.state);
         await this.store.updateMessage(message.id, { transportOwner: 'arcp', ownerDeliveryId: result.deliveryId, ownerDeliveryState: result.state, ...(delivered ? { status: 'delivered', deliveredAt: new Date().toISOString() } : {}) });
+        if (delivered) await this.finalizeAcceptedArcpMessage(message.id, result.deliveryId);
       }
       return;
     }
@@ -1536,7 +1588,6 @@ export class CompanionService {
     // so an unrelated reminder/message cannot interrupt the compact turn
     // (ORACLE-1 3.2/UPSTREAM "Self-compact is not atomic with respect to
     // reminder delivery").
-    if ((this.quietUntil.get(recipient) ?? 0) > Date.now()) return;
     // Let concurrent POSTs finish their durable writes before taking the batch
     // snapshot. This keeps a burst of arrivals to one schedule generation.
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1558,6 +1609,13 @@ export class CompanionService {
     const idle = pending.filter((message) => !interrupt.includes(message));
     if (!idle.length) return;
     await this.createMessageSchedule(recipient, this.sortMessages(idle), 'heartbeat');
+  }
+
+  private async finalizeAcceptedArcpMessage(messageId: string, _deliveryId: string): Promise<void> {
+    const deliveredAt = new Date().toISOString();
+    for (const reminder of this.store.getReminders().filter((item) => item.deliveryMessageId === messageId)) {
+      await this.store.updateReminder(reminder.id, { lastDeliveredAt: deliveredAt, deliveryStatus: 'delivered', ...(reminder.mode === 'once' ? { status: 'deleted', alive: false } : {}) });
+    }
   }
 
   private async completeRecovery(message: MessageRecord): Promise<void> {
@@ -1743,16 +1801,22 @@ export class CompanionService {
       if (signal.aborted || vetoed()) return; // vetoed via DELETE /reminders/:id
     }
     await this.store.updateReminder(localId, { status: 'active' });
-    this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
     try {
+      let compactAccepted = false;
       try {
-        if (this.arcpRecipient(agentId)) await this.postMessage({ to: agentId, from: 'companion', body: `/compact ${compact}`, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
+        if (this.arcpRecipient(agentId)) {
+          const sent = await this.postMessage({ to: agentId, from: 'companion', body: `/compact ${compact}`, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
+          compactAccepted = sent.delivery?.status === 'accepted';
+          if (!compactAccepted) return;
+        }
         else await this.cli.run(['send', agentId, `/compact ${compact}`], { agentId, signal });
       } catch (error) {
         await this.store.updateReminder(localId, { status: 'dead' });
         console.warn(JSON.stringify({ type: 'compact-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) }));
         return;
       }
+      // The coordinator's own compact must pass before this guard is armed.
+      this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
       if (!wake) { await this.store.updateReminder(localId, { status: 'deleted' }); return; }
       const stable = await this.waitForIdleStable(agentId, Date.now() + 15 * 60 * 1000, signal);
       if (!stable) {
@@ -1763,10 +1827,12 @@ export class CompanionService {
       const armed = this.store.findReminder(localId);
       if (!armed || armed.status === 'deleted') return;
       try {
-        if (this.arcpRecipient(agentId)) await this.postMessage({ to: agentId, from: 'companion', body: wake, delivery: 'on-idle', mode: 'ack', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
+        if (this.arcpRecipient(agentId)) await this.postMessage({ to: agentId, from: 'companion', body: armed.prompt, delivery: 'on-idle', mode: 'ack', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
         else await this.cli.run(['send', agentId, armed.prompt], { agentId, signal });
       }
       catch (error) { console.warn(JSON.stringify({ type: 'compact-wake-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) })); }
+      const wakeMessage = this.store.getMessages().find((message) => message.to === agentId && message.promptKind === 'compact-wake' && message.body === armed.prompt);
+      if (this.arcpRecipient(agentId) && wakeMessage?.status !== 'delivered') return;
       await this.store.updateReminder(localId, { status: 'deleted' });
     } finally {
       this.quietUntil.delete(agentId);
@@ -1918,17 +1984,26 @@ export class CompanionService {
     const firedAt = new Date(now).toISOString();
     const deliveryPrompt = reminder.prompt.replace('triggeredAt=pending', `triggeredAt=${firedAt}`);
     const actionCommand = this.cancelCommand(reminder.id, reminder.agentId);
-    const body = deliveryPrompt.replace(/\nCancel this reminder with: .*$/, '');
+    // Legacy reminders persist a complete envelope for heartbeat delivery.
+    // ARCP's message transport supplies its own envelope, so retain only the
+    // inner item body and avoid an escaped nested envelope.
+    const body = envelopeBody(deliveryPrompt.replace(/\nCancel this reminder with: .*$/, ''));
     const sent = await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: reminder.delivery ?? 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
     const runsCompleted = (reminder.runsCompleted ?? 0) + 1;
-    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, deliveryStatus: 'pending', prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
+    const accepted = sent.delivery?.status === 'accepted';
+    await this.store.updateReminder(reminder.id, { deliveryMessageId: sent.id, deliveryStatus: accepted ? 'delivered' : 'pending', prompt: deliveryPrompt, lastFiredAt: firedAt, lastRunAt: firedAt });
     if (reminder.mode === 'repeat' || reminder.everySeconds) {
       const seconds = reminder.everySeconds ?? 0;
       if (reminder.maxRuns !== undefined && runsCompleted >= reminder.maxRuns) await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });
       else if (seconds > 0) await this.store.updateReminder(reminder.id, { nextRunAt: new Date(now + seconds * 1000).toISOString(), runsCompleted });
       else await this.store.updateReminder(reminder.id, { lastRunAt: new Date(now).toISOString() });
-    } else {
+    } else if (accepted) {
       await this.store.updateReminder(reminder.id, { status: 'deleted', alive: false, runsCompleted, lastRunAt: new Date(now).toISOString() });
+    } else {
+      // A held/queued transport has consumed the due firing but not the
+      // reminder itself. Its durable delivery record is the release handle;
+      // the next reconcile must not create another firing.
+      await this.store.updateReminder(reminder.id, { status: 'active', alive: true, runsCompleted, lastRunAt: new Date(now).toISOString() });
     }
   }
 

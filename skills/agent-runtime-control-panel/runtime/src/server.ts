@@ -52,7 +52,14 @@ export async function createServer(service = new CompanionService(undefined, und
   const arcp = new ArcpService(service);
   await arcp.init();
   service.setInterruptRecipientPolicy((recipient) => arcp.state().sessions.some((session) => session.provider === 'claude' && session.externalId === recipient));
-  service.setArcpDeliveryPolicy({ isRecipient: (recipient) => arcp.isRuntimeRecipient(recipient), dispatch: (message, prompt) => arcp.deliverCompanionMessage(message, prompt) });
+  service.setArcpDeliveryPolicy({
+    isRecipient: (recipient) => arcp.isRuntimeRecipient(recipient),
+    dispatch: (message, prompt) => arcp.deliverCompanionMessage(message, prompt),
+    dispatchRaw: (message, body) => arcp.deliverCompanionMessage(message, body),
+    status: async (deliveryId) => arcp.deliveryStatus(deliveryId),
+    acknowledge: (deliveryId, reason) => arcp.acknowledge(deliveryId, reason),
+    withdraw: (deliveryId, reason) => arcp.withdraw(deliveryId, reason),
+  });
   // The policy must exist before Companion's startup reconciliation examines
   // persisted records; otherwise it could re-create a heartbeat for an ARCP
   // recipient during the first boot tick.

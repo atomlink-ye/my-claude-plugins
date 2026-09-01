@@ -63,7 +63,9 @@ export async function runTui(options: TuiOptions): Promise<void> {
   const onKey = (chunk: Buffer) => {
     const key = chunk.toString('utf8'); const total = Math.max(view.runtime?.length ?? 1, 1);
     if (key === 'q' || key === '\u0003') { cleanup(); return; }
-    if (key === 'r') { void refresh(true); return; }
+    // Refresh is intentionally projection-only. A TUI key must never invoke
+    // the mutating observe/pump path or start a runtime turn.
+    if (key === 'r') { void refresh(false); return; }
     if (key === '\t') { tab = (tab + 1) % 3; redraw(); return; }
     if (key === '\r') { expanded = !expanded; redraw(); return; }
     if (key === '\x1b[A') { selected = (selected + total - 1) % total; redraw(); return; }

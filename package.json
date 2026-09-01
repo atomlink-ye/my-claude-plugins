@@ -4,6 +4,7 @@
   "description": "Personal Claude Code plugin marketplace.",
   "type": "module",
   "bin": {
+    "arcp": "./skills/agent-runtime-control-panel/scripts/arcp",
     "agent-memory": "./skills/agent-memory/scripts/agent_memory.py",
     "sandbox-ctl": "./skills/sandbox-ctl/scripts/sandbox-ctl.mjs"
   },

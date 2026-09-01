@@ -11,7 +11,7 @@ import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS } from '../../../skills/a
 import { createServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
 import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
-import { renderTuiSnapshot } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
+import { renderTuiSnapshot, runTui } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
 import { HermesAcpAdapter } from '../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
 
 const execFileAsync = promisify(execFile);
@@ -233,9 +233,9 @@ describe('ARCP MVE control core', () => {
     const service = await control(root, false, ['claude'], { lastUserMessageAt: activity, activeTurn: { id: 'turn-a' } });
     const { actor } = await service.registerActor({ clientIdentity: 'claude-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'guarded Claude' }); const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'claude-manager' });
     const normal = await service.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'safe point delivery' }) as any;
-    expect(normal.action).toBe('hold'); expect(normal.recommendedCommands.join('\n')).toContain('arcp reuse'); expect((service.cli as any).sends).toBe(0);
+    expect(normal.action).toBe('hold'); expect(normal.recommendedCommands.join('\n')).toContain('arcp reuse'); expect(normal.deliveryId).toBeDefined(); expect(service.state().deliveries[0]).toMatchObject({ state: 'held', id: normal.deliveryId }); expect((service.cli as any).sends).toBe(0);
     const interrupt = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test' }) as any;
-    expect(interrupt).toMatchObject({ action: 'hold' }); expect(service.state().deliveries).toHaveLength(0);
+    expect(interrupt).toMatchObject({ action: 'hold' }); expect(service.state().deliveries).toHaveLength(1); expect(service.state().deliveries[0].state).toBe('held');
     (service.cli as any).inspectValue.activeTurn = { id: 'turn-b' };
     const stale = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: interrupt.confirmation }) as any;
     expect(stale).toMatchObject({ action: 'hold', why: expect.stringContaining('stale') }); expect((service.cli as any).sends).toBe(0);
@@ -243,7 +243,71 @@ describe('ARCP MVE control core', () => {
     const sent = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: retry.confirmation }) as any;
     expect(sent.state).toBe('delivered'); expect((service.cli as any).sends).toBe(1);
   });
+  it('persists a stale-cache hold and releases it after a fresh observation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-held-release-')); const activity = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
+    const service = await control(root, false, ['claude'], { lastUserMessageAt: activity });
+    const { actor } = await service.registerActor({ clientIdentity: 'held-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'held delivery' }); const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'claude-manager' });
+    const held: any = await service.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'release me' });
+    expect(held).toMatchObject({ action: 'hold', deliveryId: expect.any(String) }); expect(service.state().deliveries).toHaveLength(1); expect(service.state().deliveries[0]).toMatchObject({ id: held.deliveryId, state: 'held' });
+    (service.cli as any).inspectValue.lastUserMessageAt = new Date().toISOString();
+    await expect(service.release(held.deliveryId)).resolves.toMatchObject({ id: held.deliveryId, state: 'delivered' });
+  });
 });
+
+describe('ARCP Slice C behavioral blockers', () => {
+  it('ships the arcp executable used by emitted acknowledgement commands', async () => {
+    const packageJson = JSON.parse(await readFile(path.join(process.cwd(), '../../../package.json'), 'utf8'));
+    expect(packageJson.bin.arcp).toBe('./skills/agent-runtime-control-panel/scripts/arcp');
+  });
+  it('sends the coordinator compact as a raw ARCP body', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-compact-')); const store = new Store(root); await store.init(); const cli = new FakeCli();
+    const service = new CompanionService(cli as any, store); const bodies: string[] = [];
+    service.setArcpDeliveryPolicy({ isRecipient: (recipient) => recipient === 'runtime', dispatch: async (_message, prompt) => { bodies.push(prompt); return { deliveryId: 'delivery-1', state: 'delivered' }; }, dispatchRaw: async (_message, body) => { bodies.push(body); return { deliveryId: 'delivery-1', state: 'delivered' }; } });
+    const localId = 'compact-test'; await store.addReminder({ id: localId, agentId: 'runtime', name: localId, prompt: '', cron: '', expiresIn: '', status: 'active', schedulingKind: 'in-process', createdAt: new Date().toISOString() });
+    await (service as any).runCompactWake('runtime', 'preserve plan', undefined, 0, false, localId, new AbortController().signal);
+    expect(bodies).toEqual(['/compact preserve plan']);
+  });
+  it('keeps TUI refresh projection-only and never requests a forced panorama', async () => {
+    const input: any = new PassThrough(); input.isTTY = true; input.setRawMode = () => input;
+    const output: any = new PassThrough(); output.isTTY = true;
+    const refreshes: boolean[] = []; const run = runTui({ input, output, refreshMs: 60_000, fetchPanorama: async (refresh) => { refreshes.push(refresh); return { runtime: [] }; } });
+    await new Promise<void>((resolve) => setImmediate(resolve)); input.write('r'); await new Promise<void>((resolve) => setImmediate(resolve)); input.write('q'); await run;
+    expect(refreshes.every((refresh) => refresh === false)).toBe(true);
+  });
+  it('coalesces concurrent ARCP messages into one rendered envelope', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-coalesce-')); const store = new Store(root); await store.init(); const service = new CompanionService(new FakeCli() as any, store); const prompts: string[] = [];
+    service.setArcpDeliveryPolicy({ isRecipient: (recipient) => recipient === 'runtime', dispatch: async (_message, prompt) => { prompts.push(prompt); return { deliveryId: 'delivery-batch', state: 'delivered' }; } });
+    await Promise.all([service.postMessage({ to: 'runtime', from: 'a', body: 'first' }), service.postMessage({ to: 'runtime', from: 'b', body: 'second' })]);
+    expect(prompts).toHaveLength(1); expect(prompts[0].match(/<item id=/g)).toHaveLength(2);
+  });
+  it('blocks ARCP delivery while the compact quiet window is active', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-quiet-')); const store = new Store(root); await store.init(); const service = new CompanionService(new FakeCli() as any, store); let dispatches = 0;
+    service.setArcpDeliveryPolicy({ isRecipient: () => true, dispatch: async () => { dispatches += 1; return { deliveryId: 'delivery', state: 'delivered' }; } }); (service as any).quietUntil.set('runtime', Date.now() + 60_000);
+    await service.postMessage({ to: 'runtime', from: 'worker', body: 'wait' }); expect(dispatches).toBe(0); expect(store.getMessages()[0].status).toBe('pending');
+  });
+  it('reconciles a companion acknowledgement with its owning ARCP delivery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-ack-reconcile-')); const store = new Store(root); await store.init(); const service = new CompanionService(new FakeCli() as any, store); const acknowledged: string[] = [];
+    service.setArcpDeliveryPolicy({ isRecipient: () => true, dispatch: async () => ({ deliveryId: 'delivery-owner', state: 'delivered' }), acknowledge: async (id) => { acknowledged.push(id); } });
+    const message = await service.postMessage({ to: 'runtime', from: 'worker', body: 'ack me', mode: 'ack' }); await service.deleteMessage(message.id, 'processed');
+    expect(acknowledged).toEqual(['delivery-owner']); expect(store.getMessages().find((item) => item.id === message.id)).toMatchObject({ status: 'acknowledged', ownerDeliveryState: 'acknowledged' });
+  });
+  it('does not consume a one-shot reminder until the ARCP hold is accepted', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-reminder-hold-')); const store = new Store(root); await store.init(); const service = new CompanionService(new FakeCli() as any, store); let held = true;
+    service.setArcpDeliveryPolicy({ isRecipient: () => true, dispatch: async () => ({ deliveryId: 'delivery-reminder', state: held ? 'held' : 'delivered' }) });
+    const reminder = await service.createReminder({ agentId: 'runtime', mode: 'once', targetAt: new Date(Date.now() - 1_000).toISOString(), message: 'one shot' });
+    expect(store.getReminders().find((item) => item.id === reminder.id)).toMatchObject({ status: 'active', deliveryStatus: 'pending' });
+    held = false; await (service as any).reconcileMessages();
+    expect(store.getReminders().find((item) => item.id === reminder.id)).toMatchObject({ status: 'deleted', deliveryStatus: 'delivered' });
+  });
+});
+
+describe('ARCP Slice C retention', () => {
+  it('bounds held and queued delivery retention', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-retention-')); const store = new ArcpStore(root); await store.init();
+    await store.mutate((state: any) => { state.deliveries = Array.from({ length: 205 }, (_, index) => ({ id: `delivery-${index}`, fromActorId: 'actor', runtimeSessionId: 'runtime', generation: 1, body: 'held', command: 'normal', state: index % 2 ? 'held' : 'waiting_safe_point', createdAt: new Date(1_000 + index).toISOString() })); });
+    await store.prune(); expect(store.snapshot().deliveries).toHaveLength(200); expect(store.snapshot().deliveries.some((item) => item.state === 'held')).toBe(true);
+  });
+ });
 
 describe('ARCP Slice A channel correctness', () => {
   it('uses the profile role for managed members and permits an explicit role', async () => {
@@ -343,6 +407,8 @@ describe('ARCP HTTP and legacy compatibility', () => {
     await app.service.store.updateReminder(reminder.id, { nextRunAt: new Date(Date.now() - 1_000).toISOString() }); await app.service.reconcileReminders();
     expect(app.service.getMessages({ to: 'paseo-session-1' }).at(-1)).toMatchObject({ promptKind: 'reminder', transportOwner: 'arcp' });
     expect(app.arcp.state().deliveries).toHaveLength(2); expect(cli.sends).toBe(0);
+    const reminderDelivery = app.arcp.state().deliveries.find((delivery) => delivery.sourceMessageId === app.service.getMessages({ to: 'paseo-session-1' }).at(-1)?.id)!;
+    expect(reminderDelivery.body.match(/<paseo-reminder-delivery\b/g)).toHaveLength(1); expect(reminderDelivery.body).not.toContain('&lt;paseo-reminder-delivery');
   });
 
   it('holds unauthenticated ARCP legacy addressing and strips injected internal delivery ids', async () => {

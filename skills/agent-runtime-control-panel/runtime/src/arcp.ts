@@ -15,7 +15,7 @@ export type { StateStore } from './state-store.js';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
 export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'transport_indeterminate';
-export type DeliveryState = 'queued' | 'waiting_safe_point' | 'attempting' | 'delivered' | 'running' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'withdrawn';
+export type DeliveryState = 'queued' | 'held' | 'waiting_safe_point' | 'attempting' | 'delivered' | 'running' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'withdrawn';
 
 export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
@@ -90,6 +90,17 @@ export class ArcpStore implements StateStore {
     this.write = next;
     await next;
     return result;
+  }
+  /** Keep durable transport history bounded; actionable rows are retained up
+   * to the same cap so a permanently held legacy source cannot grow forever. */
+  async prune(maxRows = 200): Promise<void> {
+    await this.mutate((state) => {
+      const deliveries = [...state.deliveries].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      const keep = new Set(deliveries.slice(0, maxRows).map((item) => item.id));
+      const removedEvents = new Set(deliveries.slice(maxRows).map((item) => item.eventId).filter((id): id is string => Boolean(id)));
+      state.deliveries = deliveries.filter((item) => keep.has(item.id));
+      state.channelEvents = state.channelEvents.filter((event) => !removedEvents.has(event.id));
+    });
   }
 }
 
@@ -240,6 +251,7 @@ export class ArcpService {
   }
   async init(): Promise<void> {
     await this.store.init();
+    if ('prune' in this.store && typeof (this.store as any).prune === 'function') await (this.store as any).prune();
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
       const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[] };
@@ -525,15 +537,20 @@ export class ArcpService {
     if (!['normal', 'interrupt'].includes(command)) throw new ArcpError('invalid_request', 'command must be normal or interrupt');
     const existing = input.sourceMessageId ? snapshot.deliveries.find((item) => item.sourceMessageId === input.sourceMessageId && item.runtimeSessionId === session.id) : undefined;
     if (existing) {
+      // A completed source message is terminal: a concurrent reconcile may
+      // have rendered a different coalesced batch, but must not resend it.
+      if (existing.body !== input.body.trim() && ['delivered', 'running', 'processed', 'acknowledged'].includes(existing.state)) return existing;
       if (existing.body !== input.body.trim() || existing.command !== command || existing.generation !== session.generation || existing.fromActorId !== input.fromActorId) throw new ArcpError('invalid_request', 'companion delivery identity conflicts with its durable payload');
       return existing;
     }
     if (command === 'interrupt') return this.interrupt({ fromActorId: input.fromActorId, runtimeSessionId: input.runtimeSessionId, body: input.body, reason: input.reason ?? '', confirmation: input.cacheConfirmation, sourceMessageId: input.sourceMessageId });
-    const cache = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation); if (!('allow' in cache)) return cache;
+    const cache = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation);
     const deliveryId = input.sourceMessageId ? idFor('delivery', `companion:${input.sourceMessageId}:${session.id}`) : `delivery_${randomUUID()}`;
     const event = await this.publishChannelEvent({ id: input.sourceMessageId ? idFor('event', `delivery:${input.sourceMessageId}:${session.id}`) : undefined, workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: `Channel delivery ${deliveryId} queued`, evidenceRefs: [], notify: false });
-    const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), ...(cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
+    const held = !('allow' in cache);
+    const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, eventId: event.id, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), ...('allow' in cache && cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), ...(held ? { reason: cache.why } : {}), state: held ? 'held' : command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
+    if (held) return { ...cache, deliveryId };
     await this.pump(); return this.store.snapshot().deliveries.find((item) => item.id === delivery.id)!;
   }
   async reuse(input: { fromActorId: string; runtimeSessionId: string; body: string; cacheConfirmation?: string }) { return this.deliver({ ...input, command: 'normal' }); }
@@ -549,11 +566,7 @@ export class ArcpService {
     if (session.state === 'terminal') return { deliveryId: idFor('delivery', `companion:${message.id}:${session.id}`), state: 'held_terminal' };
     const requestedInterrupt = message.delivery === 'interrupt' && session.provider !== 'claude';
     const result = await this.deliver({ fromActorId: session.actorId, runtimeSessionId: session.id, body: prompt, command: requestedInterrupt ? 'interrupt' : 'normal', reason: requestedInterrupt ? 'companion urgent delivery' : undefined, sourceMessageId: message.id });
-    if (!('id' in result) || !('state' in result)) {
-      // A held confirmation is not a transport failure. Preserve it as a
-      // durable ARCP-owned hold and never fall back to Companion transport.
-      return { deliveryId: idFor('delivery', `companion:${message.id}:${session.id}`), state: 'held' };
-    }
+    if (!('id' in result) || !('state' in result)) return { deliveryId: String((result as any).deliveryId ?? idFor('delivery', `companion:${message.id}:${session.id}`)), state: 'held' };
     return { deliveryId: String(result.id), state: String(result.state) };
   }
   isRuntimeRecipient(recipient: string): boolean {
@@ -584,6 +597,7 @@ export class ArcpService {
           await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; });
         } catch { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
       }
+      if ('prune' in this.store && typeof (this.store as any).prune === 'function') await (this.store as any).prune();
     })().finally(() => { this.pumping = undefined; if (this.pumpAgain) { this.pumpAgain = false; void this.pump(); } });
     return this.pumping;
   }
@@ -591,8 +605,33 @@ export class ArcpService {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (generation !== undefined && generation !== delivery.generation) throw new ArcpError('stale_generation', 'delivery generation is stale');
-    if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery has not been processed');
-    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', item.acknowledgedAt); return item; });
+    if (!['delivered', 'running', 'processed'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivery has not been processed');
+    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) { if (event.deliveryState === 'delivered') this.transitionEvent(event, 'processed', item.acknowledgedAt); this.transitionEvent(event, 'acknowledged', item.acknowledgedAt); } return item; });
+  }
+  /** Release a cache-held Companion delivery after a fresh observation or an
+   * explicit one-use cache confirmation. */
+  async release(id: string, memberId?: string, cacheConfirmation?: string): Promise<Delivery | Record<string, unknown>> {
+    const snapshot = this.store.snapshot(); const delivery = snapshot.deliveries.find((item) => item.id === id);
+    if (!delivery) throw new ArcpError('not_found', 'delivery not found');
+    if (delivery.state !== 'held') throw new ArcpError('invalid_request', 'delivery is not held');
+    const session = snapshot.sessions.find((item) => item.id === delivery.runtimeSessionId);
+    if (!session || !session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
+    if (memberId && session.memberId !== memberId) throw new ArcpError('unauthorized', 'delivery release is not authorized');
+    const cache = await this.cacheGuard(session, delivery.fromActorId, cacheConfirmation);
+    if (!('allow' in cache)) return { ...cache, deliveryId: delivery.id };
+    await this.store.mutate((state) => {
+      const item = state.deliveries.find((value) => value.id === id)!;
+      item.state = 'waiting_safe_point';
+      if (cache.cacheAuthorized) item.cacheAuthorized = true;
+      item.reason = 'cache hold released';
+      return item;
+    });
+    await this.pump();
+    return this.store.snapshot().deliveries.find((item) => item.id === id)!;
+  }
+  deliveryStatus(id: string): { state: string } | undefined {
+    const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
+    return delivery ? { state: delivery.state } : undefined;
   }
   async withdraw(id: string, reason = 'withdrawn', memberId?: string): Promise<Delivery> {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
