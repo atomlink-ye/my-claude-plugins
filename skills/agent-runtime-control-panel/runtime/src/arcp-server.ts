@@ -8,7 +8,7 @@ function publicSession(value: any) { const { workspace: _workspace, externalId: 
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 function publicActor(value: any) { const { credentialFingerprint: _credentialFingerprint, ...safe } = value; return safe; }
 function publicMember(value: any) { const { credentialHash: _credentialHash, ...safe } = value; return safe; }
-function publicContext(value: any) { return { ...value, roster: value.roster.map(publicMember) }; }
+function publicContext(value: any) { return { ...value, roster: value.roster.map(publicMember), inbox: (value.inbox ?? []).map(publicDelivery) }; }
 
 /** Returns true when an ARCP request was handled. All v1 routes require the local API key. */
 export async function handleArcp(req: http.IncomingMessage, res: http.ServerResponse, service: ArcpService): Promise<boolean> {
@@ -30,18 +30,22 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'POST' && path === '/v1/actors') { if (!admin) throw new ArcpError('unauthorized', 'admin key is required'); const result = await service.registerActor(await body(req) as any); send(res, 201, { actor: publicActor(result.actor), binding: result.binding, ...(result.credential ? { credential: result.credential } : {}) }); return true; }
     if (method === 'GET' && path === '/v1/actors') { send(res, 200, service.state().actors.map(publicActor)); return true; }
     if (method === 'POST' && path === '/v1/workspaces') { const input = await body(req); const ownerActorId = authenticatedActor?.id ?? String(input.ownerActorId ?? ''); send(res, 201, await service.createWorkspace({ ...input, ownerActorId } as any)); return true; }
+    if (method === 'POST' && path === '/v1/start') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); send(res, 201, publicSession((await service.startManaged({ ...input, actorId: authenticatedActor.id } as any)).session)); return true; }
     const workspaceContext = path.match(/^\/v1\/workspaces\/([^/]+)\/context$/);
-    if (method === 'GET' && workspaceContext) { send(res, 200, publicContext(service.context(decodeURIComponent(workspaceContext[1]), authenticatedMember?.id))); return true; }
+    if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }
     const workspaceJoin = path.match(/^\/v1\/workspaces\/([^/]+)\/join$/);
-    if (method === 'POST' && workspaceJoin) { const result = await service.joinWorkspace({ ...(await body(req) as any), workspaceId: decodeURIComponent(workspaceJoin[1]), actorId: authenticatedActor?.id }); send(res, 201, result); return true; }
+    if (method === 'POST' && workspaceJoin) { const workspaceId = decodeURIComponent(workspaceJoin[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const result = await service.joinWorkspace({ ...(await body(req) as any), workspaceId, actorId: authenticatedActor?.id, ...(actorKey ? {} : memberKey ? { credential: memberKey } : {}) }); send(res, 201, result); return true; }
     const workspaceTasks = path.match(/^\/v1\/workspaces\/([^/]+)\/tasks$/);
     if (method === 'POST' && workspaceTasks) { send(res, 201, await service.createTask({ ...(await body(req) as any), workspaceId: decodeURIComponent(workspaceTasks[1]) } as any)); return true; }
     const taskClaim = path.match(/^\/v1\/tasks\/([^/]+)\/claim$/);
     if (method === 'POST' && taskClaim) { const memberKey = String(req.headers['x-arcp-member-key'] ?? ''); const member = service.memberForCredential(memberKey); const input = await body(req); send(res, 200, await service.claimTask(decodeURIComponent(taskClaim[1]), member.id, typeof input.expectedFence === 'number' ? input.expectedFence : undefined)); return true; }
     const workspaceKnowledge = path.match(/^\/v1\/workspaces\/([^/]+)\/knowledge$/);
     if (method === 'POST' && workspaceKnowledge) { const member = service.memberForCredential(String(req.headers['x-arcp-member-key'] ?? '')); send(res, 201, await service.addKnowledge({ ...(await body(req) as any), workspaceId: decodeURIComponent(workspaceKnowledge[1]), authorMemberId: member.id } as any)); return true; }
+    if (method === 'GET' && workspaceKnowledge) { const member = authenticatedMember; const workspaceId = decodeURIComponent(workspaceKnowledge[1]); if (!member || member.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const q = url.searchParams.get('q')?.toLowerCase() ?? ''; const kind = url.searchParams.get('kind') ?? ''; const tag = url.searchParams.get('tag') ?? ''; const entries = service.state().knowledge.filter((item) => item.workspaceId === workspaceId && (!q || item.text.toLowerCase().includes(q)) && (!kind || item.kind === kind) && (!tag || item.tags.includes(tag))); send(res, 200, entries); return true; }
     const workspaceResults = path.match(/^\/v1\/workspaces\/([^/]+)\/results$/);
     if (method === 'POST' && workspaceResults) { const member = service.memberForCredential(String(req.headers['x-arcp-member-key'] ?? '')); send(res, 201, await service.submitResult({ ...(await body(req) as any), workspaceId: decodeURIComponent(workspaceResults[1]), memberId: member.id } as any)); return true; }
+    const heartbeat = path.match(/^\/v1\/members\/([^/]+)\/heartbeat$/);
+    if (method === 'POST' && heartbeat) { if (!authenticatedMember || authenticatedMember.id !== decodeURIComponent(heartbeat[1])) throw new ArcpError('not_found', 'member not found'); const input = await body(req); send(res, 200, await service.heartbeat(authenticatedMember.id, input.presence as any)); return true; }
     if (method === 'POST' && path === '/v1/actor-bindings') { send(res, 201, await service.bindActor(await body(req) as any)); return true; }
     if (method === 'GET' && path === '/v1/actor-bindings') { send(res, 200, service.state().bindings); return true; }
     if (method === 'POST' && path === '/v1/goals') { const input = await body(req); const actorId = authenticatedActor?.id ?? String(input.actorId ?? ''); send(res, 201, await service.createGoal({ ...input, actorId } as any)); return true; }
@@ -57,5 +61,5 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const ack = path.match(/^\/v1\/deliveries\/([^/]+)\/ack$/);
     if (method === 'POST' && ack) { const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), String(value.reason ?? 'processed'), typeof value.generation === 'number' ? value.generation : undefined))); return true; }
     send(res, 404, { code: 'not_found' }); return true;
-  } catch (error) { const code = error instanceof ArcpError ? error.code : 'internal_error'; const status = code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : ['unknown_recipient', 'unknown_sender', 'profile_unavailable', 'goal_held', 'stale_generation'].includes(code) ? 409 : code === 'invalid_request' ? 400 : 500; send(res, status, { code }); return true; }
+  } catch (error) { const code = error instanceof ArcpError ? error.code : 'internal_error'; const status = code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : ['unknown_recipient', 'unknown_sender', 'profile_unavailable', 'goal_held', 'stale_generation', 'task_held', 'safe_point_lost', 'workspace_closed'].includes(code) ? 409 : code === 'invalid_request' ? 400 : 500; send(res, status, { code }); return true; }
 }

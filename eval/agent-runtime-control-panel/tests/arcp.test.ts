@@ -31,12 +31,12 @@ describe('ARCP MVE control core', () => {
     const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'shared canary' });
     const joined = await service.joinWorkspace({ workspaceId: workspace.id, label: 'native-pi', role: 'reviewer', capabilities: ['knowledge', 'results'] });
     const task = await service.createTask({ workspaceId: workspace.id, title: 'review control plane' });
-    await service.claimTask(task.id, joined.member.id);
+    await service.claimTask(task.id, joined.member.id, 0);
     await expect(service.claimTask(task.id, 'missing-member')).rejects.toMatchObject({ code: 'unknown_recipient' });
     await service.addKnowledge({ workspaceId: workspace.id, authorMemberId: joined.member.id, kind: 'learning', text: 'native members share context' });
     await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: joined.member.id, status: 'candidate', summary: 'review complete', expectedFence: 1 });
     const restarted = await control(root); const context = restarted.context(workspace.id);
-    expect(context.roster).toHaveLength(1); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
+    expect(context.roster).toHaveLength(2); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
   });
   it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
