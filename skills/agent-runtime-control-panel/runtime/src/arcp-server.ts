@@ -2,6 +2,7 @@ import type http from 'node:http';
 import { URL } from 'node:url';
 import { ArcpError, ArcpService } from './arcp.js';
 import type { DecisionVerdict, Member } from './arcp.js';
+import { CodexRuntimeAnalyst, StewardError, WorkspaceSteward, stewardViewOf } from './steward.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
@@ -15,6 +16,31 @@ function publicPanorama(value: any) {
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
     blocked: value.blocked ?? [],
     events: value.events ?? [], latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef, legacy: value.legacy };
+}
+
+/**
+ * Build the per-Workspace Workspace Steward. Both triggers - Lane A's
+ * supervision breach and this file's member-requested route - construct the
+ * Steward here, so neither can quietly acquire a different execution path.
+ */
+export async function stewardFor(service: ArcpService, workspaceId: string): Promise<WorkspaceSteward> {
+  const state = service.state();
+  const workspace = state.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) throw new ArcpError('not_found', 'workspace not found');
+  const existing = state.members.find((item) => item.workspaceId === workspaceId && item.role === 'steward');
+  // The Steward authors as itself, never as the Owner or Manager whose
+  // credential happened to trigger it. R2-F21 was exactly that misattribution.
+  const member = existing ?? (await service.joinWorkspace({ workspaceId, label: 'workspace-steward', role: 'steward', capabilities: ['read_context', 'write_knowledge'] })).member;
+  const policy = {
+    workspaceId,
+    stewardProfileId: process.env.ARCP_STEWARD_PROFILE ?? 'codex-worker',
+    stewardMemberId: member.id,
+    cooldownMs: Number(process.env.ARCP_STEWARD_COOLDOWN_MS ?? 900_000),
+    automatic: process.env.ARCP_STEWARD_AUTOMATIC !== '0',
+    manualProgressWindowMs: Number(process.env.ARCP_STEWARD_PROGRESS_WINDOW_MS ?? 1_800_000),
+  };
+  const analyst = new CodexRuntimeAnalyst(service, { profileId: policy.stewardProfileId, actorId: workspace.ownerActorId, waitMs: Number(process.env.ARCP_STEWARD_WAIT_MS ?? 300_000) });
+  return new WorkspaceSteward(stewardViewOf(service), analyst, policy);
 }
 
 /** Returns true when an ARCP request was handled. All v1 routes require the local API key. */
@@ -65,6 +91,22 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && workspaceResults) { const workspaceId = decodeURIComponent(workspaceResults[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, service.state().results.filter((item) => item.workspaceId === workspaceId)); return true; }
     const workspaceMembers = path.match(/^\/v1\/workspaces\/([^/]+)\/members$/);
     if (method === 'GET' && workspaceMembers) { const workspaceId = decodeURIComponent(workspaceMembers[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, service.state().members.filter((item) => item.workspaceId === workspaceId).map(publicMember)); return true; }
+    const stewardAnalyses = path.match(/^\/v1\/workspaces\/([^/]+)\/steward\/analyses$/);
+    if (method === 'POST' && stewardAnalyses) {
+      const workspaceId = decodeURIComponent(stewardAnalyses[1]);
+      if (!authenticatedMember || authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'a member credential for this workspace is required');
+      const input = await body(req);
+      const steward = await stewardFor(service, workspaceId);
+      send(res, 200, await steward.requestAnalysis({ workspaceId, subjectTaskId: String(input.taskId ?? ''), requestedByMemberId: authenticatedMember.id }));
+      return true;
+    }
+    const stewardReports = path.match(/^\/v1\/workspaces\/([^/]+)\/steward\/reports$/);
+    if (method === 'GET' && stewardReports) {
+      const workspaceId = decodeURIComponent(stewardReports[1]);
+      if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
+      send(res, 200, (await stewardFor(service, workspaceId)).reports(workspaceId));
+      return true;
+    }
     const workspaceEvents = path.match(/^\/v1\/workspaces\/([^/]+)\/events$/);
     if (method === 'GET' && workspaceEvents) {
       const workspaceId = decodeURIComponent(workspaceEvents[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
@@ -114,5 +156,5 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const release = path.match(/^\/v1\/deliveries\/([^/]+)\/release$/);
     if (method === 'POST' && release) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.release(decodeURIComponent(release[1]), authenticatedMember.id, typeof value.confirmation === 'string' ? value.confirmation : undefined))); return true; }
     send(res, 404, { code: 'not_found', message: 'ARCP route not found' }); return true;
-  } catch (error) { const code = error instanceof ArcpError ? error.code : 'internal_error'; const status = code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : ['unknown_recipient', 'unknown_sender', 'profile_unavailable', 'goal_held', 'launch_held', 'stale_generation', 'task_held', 'safe_point_lost', 'workspace_closed'].includes(code) ? 409 : code === 'invalid_request' ? 400 : 500; const message = error instanceof ArcpError ? error.message : 'internal error'; send(res, status, { code, message, ...(error instanceof ArcpError && error.field ? { field: error.field } : {}) }); return true; }
+  } catch (error) { const code = error instanceof ArcpError || error instanceof StewardError ? error.code : 'internal_error'; const status = code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : ['unknown_recipient', 'unknown_sender', 'profile_unavailable', 'goal_held', 'launch_held', 'stale_generation', 'task_held', 'safe_point_lost', 'workspace_closed', 'steward_provider_unavailable'].includes(code) ? 409 : code === 'invalid_request' ? 400 : 500; const message = error instanceof ArcpError || error instanceof StewardError ? error.message : 'internal error'; send(res, status, { code, message, ...(error instanceof ArcpError && error.field ? { field: error.field } : {}) }); return true; }
 }
