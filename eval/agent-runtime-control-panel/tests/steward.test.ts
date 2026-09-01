@@ -256,6 +256,26 @@ describe('Workspace Steward — classification from durable progress, not livene
     service.close();
   });
 
+  it('reads the durable blocked-on-decision record and routes a parked runtime to OWNER_DECISION, not STUCK', async () => {
+    // Catches: classifying a runtime that is waiting on an unanswered decision
+    // as STUCK and recommending a steer, and catches reading blockedness from
+    // session.state, which observe() overwrites from provider status.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'steward-blocked-'));
+    const service = await control(root);
+    const { workspaceId, stewardMember, task, session } = await seed(service);
+    const asked = await service.raiseDecision({ runtimeSessionId: session.id, question: 'which base branch should I use?', options: ['main', 'feat'] });
+    const live = service.state().sessions.find((item) => item.id === session.id)!;
+    expect(live.state).toBe('running');
+    expect(live.blockedOnEventId).toBeDefined();
+
+    const steward = new WorkspaceSteward(stewardViewOf(service), new RecordingAnalyst(), policyFor(workspaceId, stewardMember.id));
+    const outcome = await steward.onSupervisionBreach(breachFor(workspaceId, task.id, task.fence));
+    expect(outcome.classification).toBe('DEGRADED');
+    expect(outcome.recommendation).toBe('OWNER_DECISION');
+    expect(outcome.evidenceRefs).toContain(asked.event.id);
+    service.close();
+  });
+
   it('recommends PARK for a subject task that has already reached a terminal lifecycle', async () => {
     // Catches: supervising a finished task, which would recommend STEER on work
     // that no longer exists.

@@ -263,6 +263,7 @@ export class WorkspaceSteward {
       subject.id,
       ...(session ? [session.id] : []),
       ...(request.breachEventId ? [request.breachEventId] : []),
+      ...(session?.blockedOnEventId ? [session.blockedOnEventId] : []),
       ...materialProgress.refs,
     ];
 
@@ -383,6 +384,13 @@ function classify(input: {
   }
   if (TERMINAL_TASK_LIFECYCLES.has(subject.lifecycle)) {
     return { classification: 'HEALTHY', recommendation: 'PARK', why: `subject task is ${subject.lifecycle}; there is nothing left to supervise` };
+  }
+  // Lane C's durable blocked-on-decision record is the canonical representation
+  // of a runtime parked on an unanswered question. It lives in session fields
+  // rather than session.state precisely because observe() overwrites state, so
+  // it must be read here; a blocked runtime is not a stalled one.
+  if (session?.blockedOnEventId) {
+    return { classification: 'DEGRADED', recommendation: 'OWNER_DECISION', why: `runtime ${session.id} is blocked on unanswered decision ${session.blockedOnEventId} since ${session.blockedSince ?? 'an unrecorded time'}; only the Owner/Deputy can clear it` };
   }
   const attention = session?.state === 'attention' || observation?.attention === true || (typeof observation?.pendingPermissions === 'number' && observation.pendingPermissions > 0);
   if (attention) {
