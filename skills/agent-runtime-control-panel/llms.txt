@@ -2,6 +2,6 @@
 
 Use `scripts/arcp` as the product surface. Do not compose raw HTTP requests. Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create/join a ControlWorkspace.
 
-Useful CLI workflows: `workspace create --purpose …`, `workspace join WORKSPACE --label …`, `workspace context WORKSPACE`, `task create WORKSPACE --title …`, `task claim TASK`, `knowledge add WORKSPACE --text …`, and `result submit WORKSPACE --task TASK --summary …`.
+Useful CLI workflows: `workspace create --purpose …`, `workspace join WORKSPACE --label …`, `workspace context WORKSPACE`, `task create WORKSPACE --title …`, `task claim TASK --expected-fence N`, `knowledge add WORKSPACE --text …`, and `result submit WORKSPACE --task TASK --summary … --expected-fence N`. Read the current fence from `workspace context` or `panorama`; claim returns the next fence required for Result submission.
 
 Profiles are preferences only. ARCP validates provider/model/mode live and fails closed; it never auto-selects another model. Normal deliveries use safe-point on-idle transport. Interrupt requires `command:"interrupt"`. Unknown logical recipients return 409 before delivery persistence. A provider timeout or missing handle remains `transport_indeterminate` until explicit reconcile.
