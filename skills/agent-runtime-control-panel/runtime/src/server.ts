@@ -247,8 +247,8 @@ export async function createServer(service = new CompanionService(undefined, und
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const port = Number(process.env.PORT || 8787);
+  const port = Number(process.env.PORT || 18787);
   const app = await createServer();
   app.service.setPort(port);
-  app.server.listen(port, '127.0.0.1', () => console.log(`paseo-reminder listening on http://127.0.0.1:${port}`));
+  app.server.listen(port, '127.0.0.1', () => console.log(`ARCP listening on http://127.0.0.1:${port}`));
 }

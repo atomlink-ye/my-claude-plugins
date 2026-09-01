@@ -178,12 +178,12 @@ export class CompanionService {
     return `arcp ${kind === 'message' ? 'message ack' : kind === 'reminder' ? 'reminder delete' : 'idle delete'} ${id} --reason processed`;
   }
   setPort(port: number): void { this.port = port; }
-  private endpointBase(): string { return `http://127.0.0.1:${this.port || Number(process.env.PORT || 8787)}`; }
+  private endpointBase(): string { return `http://127.0.0.1:${this.port || Number(process.env.PORT || 18787)}`; }
   health(): Record<string, unknown> {
     return { status: 'ok', uptimeSeconds: Math.floor((Date.now() - Date.parse(this.startedAt)) / 1000), startedAt: this.startedAt, lastReconcileAt: this.lastReconcileAt ?? null };
   }
   runtime(): Record<string, unknown> {
-    return { pid: process.pid, cwd: process.cwd(), dataDir: this.store.dir, port: this.port || Number(process.env.PORT || 8787) };
+    return { pid: process.pid, cwd: process.cwd(), dataDir: this.store.dir, port: this.port || Number(process.env.PORT || 18787) };
   }
 
   async listChildren(agentId: string): Promise<ChildrenResult> {
