@@ -84,7 +84,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
     return request;
   }
   private async connected(cwd: string, context?: RuntimeLaunchContext): Promise<{ externalId: string; session: Session }> {
-    const child = this.spawnProcess('hermes', ['acp', '--accept-hooks'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env as Record<string, string>, ...(context?.memberCredential ? { ARCP_RUNTIME_MEMBER_CREDENTIAL: context.memberCredential } : {}), ...(context?.clientStatePath ? { ARCP_CLIENT_STATE: context.clientStatePath } : {}) } });
+    const child = this.spawnProcess('hermes', ['acp', '--accept-hooks'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env as Record<string, string>, ...(context?.clientStatePath ? { ARCP_CLIENT_STATE: context.clientStatePath } : {}) } });
     const session: Session = { process: child, nextId: 1, pending: new Map(), status: 'idle', timeline: [] };
     const temporaryId = `pending-${process.pid}-${Date.now()}`; this.wire(temporaryId, session);
     await this.request(temporaryId, session, 'initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'arcp', version: '0.1.0' } });
