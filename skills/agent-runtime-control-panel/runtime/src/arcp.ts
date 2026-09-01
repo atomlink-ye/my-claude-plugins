@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { PaseoCli, asRecord } from './cli.js';
 import { CompanionService } from './service.js';
 import { createPaseoClient } from '@getpaseo/client';
+import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
@@ -25,7 +26,8 @@ export interface Result { id: string; workspaceId: string; taskId: string; membe
 export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
 export interface ActionResult { action: 'launch' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; }
 export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; cache: { activityAt?: string; ageMinutes: number | 'unknown'; state: 'fresh' | 'expiring' | 'expired' | 'unknown' }; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
-export interface ManagedChild { id: string; status: string; role: string; }
+export interface ManagedChild { id: string; provider?: string; title?: string; status: string; createdAt?: string; updatedAt?: string; source: 'paseo_parent' | 'provider_subagents'; }
+export interface ChildObservation { source: 'provider_subagents' | 'paseo_parent' | 'unavailable' | 'none'; items: ManagedChild[]; }
 export interface WorkSummary { latestCommit?: { sha: string; subject: string; time: string }; dirty: boolean | 'unknown'; diffstat: { files: number; insertions: number; deletions: number } | 'unknown'; }
 export interface LegacySummary { reminders: Record<string, number>; messages: Record<string, number>; trackedChildren: { total: number; statuses: Record<string, number> }; openCorrectionInstances: number; blockedGateCount: number; }
 interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
@@ -111,6 +113,13 @@ export class PaseoAdapter {
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: 5_000 }); }
   registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: 5_000 }); }
+  async providerSubagents(parentAgentId: string): Promise<ChildObservation> {
+    if (!(this.cli instanceof PaseoCli)) return { source: 'unavailable', items: [] };
+    const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws'; const url = raw.includes('://') ? raw : `ws://${raw}`;
+    const client = new DaemonClient({ url, clientId: `arcp-subagents-${process.pid}-${parentAgentId.slice(0, 8)}`, clientType: 'cli', webSocketFactory: (target: string, options: any) => new WebSocket(target, options), reconnect: { enabled: false } } as any);
+    try { await client.connect(); const payload = safeJson(await client.listProviderSubagents(parentAgentId, { timeout: 5_000 })); const rows = Array.isArray(payload.subagents) ? payload.subagents.map(safeJson) : []; return { source: 'provider_subagents', items: rows.map((item) => ({ id: String(item.id), ...(setting(item.provider) ? { provider: String(item.provider) } : {}), ...(setting(item.title) ? { title: String(item.title) } : {}), status: String(item.status ?? 'unknown'), ...(setting(item.createdAt) ? { createdAt: String(item.createdAt) } : {}), ...(setting(item.updatedAt) ? { updatedAt: String(item.updatedAt) } : {}), source: 'provider_subagents' as const })).filter((item) => item.id) }; }
+    catch { return { source: 'unavailable', items: [] }; } finally { await client.close().catch(() => undefined); }
+  }
   /** Public SDK mode ids are authoritative. CLI `provider ls` emits display
    * labels, which must never be treated as ids when the SDK is reachable. */
   async modes(provider: string): Promise<string[] | undefined> {
@@ -369,7 +378,7 @@ export class ArcpService {
   private async facts(session: RuntimeSession) {
     if (!session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
     const snapshot = await this.adapter.snapshot(session.externalId); const children = await this.children(session.externalId); const turn = safeJson(snapshot.agent.activeTurn);
-    return { agent: snapshot.agent, activeTurn: `${turn.turnId ?? turn.id ?? ''}:${turn.startedAt ?? ''}:${Boolean(turn.turnId ?? turn.id)}`, childSet: children.map((child) => `${child.id}:${child.status}`).sort().join(','), cache: this.cacheState(snapshot.agent, snapshot.timeline) };
+    return { agent: snapshot.agent, activeTurn: `${turn.turnId ?? turn.id ?? ''}:${turn.startedAt ?? ''}:${Boolean(turn.turnId ?? turn.id)}`, childSet: `${children.source}:${children.items.map((child) => `${child.id}:${child.status}`).sort().join(',')}`, cache: this.cacheState(snapshot.agent, snapshot.timeline) };
   }
   private async confirmationReceipt(kind: Confirmation['kind'], session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>, why: string) {
     const token = randomBytes(24).toString('base64url'); const expiresAt = new Date(Date.now() + Number(process.env.ARCP_CONFIRMATION_SECONDS ?? 300) * 1000).toISOString();
@@ -475,12 +484,14 @@ export class ArcpService {
   async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number }): Promise<Result> { return this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); if (!task || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', 'result fence is stale'); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); return result; }); }
   context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const memberSessions = new Set(state.sessions.filter((session) => session.workspaceId === workspaceId && (!memberId || session.memberId === memberId)).map((session) => session.id)); return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), inbox: memberId ? state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged') : [] }; }
   private requested(session: RuntimeSession): RuntimeSettings { return { provider: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}) }; }
-  private async children(externalId?: string): Promise<ManagedChild[]> {
-    if (!externalId) return [];
+  private async children(externalId?: string): Promise<ChildObservation> {
+    if (!externalId) return { source: 'unavailable', items: [] };
+    const provider = await this.adapter.providerSubagents(externalId);
     try {
-      const agents = (await this.adapter.registry()).value; if (!Array.isArray(agents)) return [];
-      return agents.map(asRecord).filter((item) => String(item.ParentAgentId ?? item.parentAgentId ?? '') === externalId).map((item) => ({ id: String(item.id ?? item.agentId), status: String(item.status ?? item.Status ?? 'unknown'), role: String(asRecord(item.labels).role ?? item.role ?? 'unknown') })).filter((item) => item.id);
-    } catch { return []; }
+      const agents = (await this.adapter.registry()).value; if (!Array.isArray(agents)) return provider;
+      const parent = agents.map(asRecord).filter((item) => String(item.ParentAgentId ?? item.parentAgentId ?? '') === externalId).map((item) => ({ id: String(item.id ?? item.agentId), status: String(item.status ?? item.Status ?? 'unknown'), source: 'paseo_parent' as const })).filter((item) => item.id);
+      const all = [...provider.items, ...parent.filter((item) => !provider.items.some((child) => child.id === item.id))]; return { source: provider.source === 'provider_subagents' ? 'provider_subagents' : parent.length ? 'paseo_parent' : provider.source, items: all };
+    } catch { return provider.source === 'provider_subagents' ? provider : { source: 'unavailable', items: [] }; }
   }
   private async workSummary(cwd?: string): Promise<WorkSummary> {
     if (!cwd) return { dirty: 'unknown', diffstat: 'unknown' };
@@ -497,7 +508,7 @@ export class ArcpService {
     const open = corrections.filter((item) => item.status === 'open' && item.findings.some((finding) => finding.resolution === null));
     return { reminders: count(reminders), messages: count(messages), trackedChildren: { total: children.length, statuses: children.length ? { unknown: children.length } : {} }, openCorrectionInstances: open.length, blockedGateCount: new Set(open.map((item) => item.managerId)).size };
   }
-  async runtimeStatus(id: string, refresh = false): Promise<{ session: RuntimeSession; observation: RuntimeObservation; children: ManagedChild[]; workSummary: WorkSummary }> {
+  async runtimeStatus(id: string, refresh = false): Promise<{ session: RuntimeSession; observation: RuntimeObservation; children: ChildObservation; workSummary: WorkSummary }> {
     if (refresh) await this.observe(id);
     const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
     const requested = this.requested(session); let agent: Record<string, any> | undefined; let timeline: unknown[] | undefined; let source: 'sdk' | 'cli' | undefined;
@@ -506,7 +517,7 @@ export class ArcpService {
     const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
     const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
     const mismatch = Boolean((requested.provider && !sameSetting(requested.provider, observed.provider)) || (requested.model && !sameSetting(requested.model, observed.model)) || (requested.mode && !sameSetting(requested.mode, observed.mode)) || (requested.thinking && !sameSetting(requested.thinking, observed.thinking)));
-    const cacheInfo = agent ? this.cacheState(current) : { activityAt: undefined, ageMinutes: undefined, state: 'unknown' as const };
+    const cacheInfo = agent ? this.cacheState(current, timeline ?? []) : { activityAt: undefined, ageMinutes: undefined, state: 'unknown' as const };
     const compactions = Array.isArray(timeline) ? timeline.map(safeJson).filter((item) => item.type === 'compaction') : [];
     const lastCompaction = compactions.at(-1); const observedAt = agent ? now() : session.lastObservedAt; const age = observedAt ? Date.now() - Date.parse(observedAt) : NaN;
     const freshness: RuntimeObservation['freshness'] = agent ? 'fresh' : !observedAt ? 'unavailable' : Number.isFinite(age) && age > 60_000 ? 'stale' : 'unknown';

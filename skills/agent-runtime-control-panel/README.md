@@ -27,6 +27,8 @@ Then run the focused tests. For a real provider dogfood, run `arcp doctor`, then
 
 Use `arcp panorama --refresh` during work and `arcp runtime status RUNTIME --refresh` for the focused view. They project context/usage quality, attention, compaction only when observed, safe child descriptors, requested-vs-observed settings, a path-free commit/diffstat, and redacted legacy status counts. A launch timeout or absent handle is `transport_indeterminate`; call `runtime reconcile`, do not relaunch.
 
+For Paseo-managed sessions, child observation merges parent-bound Agents with best-effort provider-owned subagents. Each item is limited to id/provider/title/status/timestamps and is labelled `provider_subagents`, `paseo_parent`, `none`, or `unavailable`; unavailable provider internals never block work.
+
 For Claude, `interrupt` is deliberately two-stage and server-enforced: the first `arcp interrupt RUNTIME --reason X --body X` has no runtime side effect and returns a confirmation. Re-run the supplied command with `--confirm TOKEN`; ARCP re-observes the active turn and child set and rejects a stale token. Claude normal `send` and `reuse` use provider activity time: under 55 minutes is fresh; 55–60 is expiring; 60+ is expired. A hold offers a fresh-session handoff command or confirmed reuse. Panorama reports this activity age/cache state; ARCP never sends artificial keepalives or compacts to preserve cache.
 
 ## Compatibility
