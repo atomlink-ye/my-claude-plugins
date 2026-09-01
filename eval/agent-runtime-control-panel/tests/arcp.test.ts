@@ -560,3 +560,78 @@ describe('ARCP CLI and TUI presentation', () => {
     expect(snapshot).toContain('ARCP TUI · canary'); expect(snapshot).toContain('Runtime r1'); expect(snapshot).toContain('Legacy reminders=1 messages=2'); expect(snapshot).not.toContain('\x1b[');
   });
 });
+
+describe('ARCP decision verdicts', () => {
+  let app: Awaited<ReturnType<typeof createServer>> | undefined;
+  afterEach(async () => { if (app) { app.service.close(); await new Promise<void>((resolve) => app!.server.close(() => resolve())); } app = undefined; });
+
+  async function candidateAwaitingDecision(root: string) {
+    const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'verdict-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'verdicts' });
+    const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' });
+    const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'judge me' });
+    await service.claimTask(task.id, worker.member.id, 0);
+    await service.submitResult({ workspaceId: workspace.workspace.id, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'candidate for judgement', expectedFence: 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.taskId === task.id)!;
+    return { service, workspace, manager, worker, task, decision };
+  }
+
+  it('leaves the Task open when a decision is refused, and completes it only on accept', async () => {
+    const refusedRoot = await mkdtemp(path.join(os.tmpdir(), 'arcp-verdict-refuse-'));
+    const refused = await candidateAwaitingDecision(refusedRoot);
+    expect(refused.service.state().tasks.find((item) => item.id === refused.task.id)?.lifecycle).toBe('waiting');
+    const refusal = await refused.service.resolveDecision(refused.decision.id, refused.manager.member.id, 'rework the candidate', 'refuse');
+    const afterRefusal = refused.service.state();
+    expect(refusal).toMatchObject({ kind: 'decision_resolved', relatedEventId: refused.decision.id, verdict: 'refuse' });
+    expect(afterRefusal.tasks.find((item) => item.id === refused.task.id)?.lifecycle).toBe('waiting');
+    expect(afterRefusal.channelEvents.some((event) => event.kind === 'task_completed' && event.taskId === refused.task.id)).toBe(false);
+    expect(afterRefusal.channelEvents.find((event) => event.id === refused.decision.id)).toMatchObject({ decisionRequired: false, verdict: 'refuse' });
+    refused.service.close();
+
+    // The verdict is durable, not an in-memory decoration of the reply.
+    const reopened = await control(refusedRoot);
+    expect(reopened.state().channelEvents.find((event) => event.id === refused.decision.id)?.verdict).toBe('refuse');
+    expect(reopened.state().tasks.find((item) => item.id === refused.task.id)?.lifecycle).toBe('waiting');
+    reopened.close();
+
+    const accepted = await candidateAwaitingDecision(await mkdtemp(path.join(os.tmpdir(), 'arcp-verdict-accept-')));
+    const acceptance = await accepted.service.resolveDecision(accepted.decision.id, accepted.manager.member.id, 'ship it', 'accept');
+    const afterAcceptance = accepted.service.state();
+    expect(acceptance).toMatchObject({ kind: 'decision_resolved', verdict: 'accept' });
+    expect(afterAcceptance.tasks.find((item) => item.id === accepted.task.id)?.lifecycle).toBe('completed');
+    expect(afterAcceptance.channelEvents.some((event) => event.kind === 'task_completed' && event.taskId === accepted.task.id)).toBe(true);
+    accepted.service.close();
+  });
+
+  it('rejects a verdict it cannot judge with rather than silently accepting', async () => {
+    const held = await candidateAwaitingDecision(await mkdtemp(path.join(os.tmpdir(), 'arcp-verdict-invalid-')));
+    await expect(held.service.resolveDecision(held.decision.id, held.manager.member.id, 'maybe', 'steer' as any)).rejects.toMatchObject({ code: 'invalid_request', field: 'verdict' });
+    expect(held.service.state().tasks.find((item) => item.id === held.task.id)?.lifecycle).toBe('waiting');
+    expect(held.service.state().channelEvents.find((event) => event.id === held.decision.id)?.decisionRequired).toBe(true);
+    held.service.close();
+  });
+
+  it('carries the refusal verdict through the HTTP resolve route', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-verdict-http-'));
+    app = await createServer(new CompanionService(undefined, new Store(root)));
+    await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const { actor } = await app.arcp.registerActor({ clientIdentity: 'verdict-http' });
+    const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.id, purpose: 'verdict HTTP' });
+    const manager = await app.arcp.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' });
+    const worker = await app.arcp.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const task = await app.arcp.createTask({ workspaceId: workspace.workspace.id, title: 'http judge me' });
+    await app.arcp.claimTask(task.id, worker.member.id, 0);
+    await app.arcp.submitResult({ workspaceId: workspace.workspace.id, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'http candidate', expectedFence: 1 });
+    const decision = app.arcp.state().channelEvents.find((event) => event.kind === 'decision_required' && event.taskId === task.id)!;
+    const headers = { 'x-arcp-member-key': manager.credential!, 'content-type': 'application/json' };
+    const response = await fetch(`${base}/v1/events/${decision.id}/resolve`, { method: 'POST', headers, body: JSON.stringify({ summary: 'not yet', verdict: 'refuse' }) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ kind: 'decision_resolved', verdict: 'refuse' });
+    expect(app.arcp.state().tasks.find((item) => item.id === task.id)?.lifecycle).toBe('waiting');
+    const rejected = await fetch(`${base}/v1/events/${decision.id}/resolve`, { method: 'POST', headers, body: JSON.stringify({ summary: 'nonsense', verdict: 'maybe' }) });
+    expect(rejected.status).toBe(400);
+  });
+});

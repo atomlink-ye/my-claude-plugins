@@ -21,13 +21,14 @@ export type DeliveryState = 'queued' | 'held' | 'waiting_safe_point' | 'attempti
 export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; workspaceId?: string; state: GoalState; createdAt: string; updatedAt: string; }
+export type DecisionVerdict = 'accept' | 'refuse';
 export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress';
 export interface ChannelEventContent { summary: string; evidenceRefs: string[]; contentHash: string; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded'; }
 export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string; }
-export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; undeliverableReason?: string; relatedEventId?: string; }
-type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; notify?: boolean };
+export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; }
+type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; verdict?: DecisionVerdict; notify?: boolean };
 export interface RuntimeLaunchContext { workspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; eventId?: string; state: DeliveryState; createdAt: string; sourceMessageId?: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
@@ -699,11 +700,11 @@ export class ArcpService {
     const notifying = input.notify !== false || taskNotification;
     if (notifying && !input.targetMemberId && !input.targetActorId && !targetRole && !input.targetSubscription) throw new ArcpError('invalid_request', 'notifying channel events require an explicit target', 'target');
     const contentHash = contentAddress(summary, evidenceRefs);
-    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs };
+    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs, verdict: input.verdict };
     const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
     const existing = state.channelEvents.find((item) => item.id === id);
     if (existing) {
-      const existingPayload = { workspaceId: existing.workspaceId, goalId: existing.goalId, taskId: existing.taskId, resultId: existing.resultId, sourceMemberId: existing.sourceMemberId, sourceActorId: existing.sourceActorId, targetMemberId: existing.targetMemberId, targetActorId: existing.targetActorId, targetRole: existing.targetRole, targetSubscription: existing.targetSubscription, kind: existing.kind, urgency: existing.urgency, decisionRequired: existing.decisionRequired, relatedEventId: existing.relatedEventId, summary: existing.content.summary, evidenceRefs: existing.content.evidenceRefs }; const conflict = JSON.stringify(existingPayload) !== JSON.stringify(stablePayload);
+      const existingPayload = { workspaceId: existing.workspaceId, goalId: existing.goalId, taskId: existing.taskId, resultId: existing.resultId, sourceMemberId: existing.sourceMemberId, sourceActorId: existing.sourceActorId, targetMemberId: existing.targetMemberId, targetActorId: existing.targetActorId, targetRole: existing.targetRole, targetSubscription: existing.targetSubscription, kind: existing.kind, urgency: existing.urgency, decisionRequired: existing.decisionRequired, relatedEventId: existing.relatedEventId, summary: existing.content.summary, evidenceRefs: existing.content.evidenceRefs, verdict: existing.verdict }; const conflict = JSON.stringify(existingPayload) !== JSON.stringify(stablePayload);
       if (conflict) throw new ArcpError('invalid_request', 'channel event id conflicts with its durable payload', 'id');
       return existing;
     }
@@ -759,7 +760,18 @@ export class ArcpService {
     const workspace = state.workspaces.find((item) => item.id === workspaceId);
     return state.channelEvents.filter((event) => event.workspaceId === workspaceId && (!member || intendedTarget(event, member, workspace, true)));
   }
-  async resolveDecision(eventId: string, sourceMemberId: string, summary = 'Decision resolved'): Promise<ChannelEvent> {
+  /**
+   * Answer a `decision_required` event with an explicit verdict.
+   *
+   * The verdict is the judgement, not the prose: only `accept` may complete the
+   * Task the decision was holding. A `refuse` records the same durable
+   * `decision_resolved` event and clears the outstanding flag, but deliberately
+   * leaves the Task open so the refused work can be reworked or reassigned.
+   * Before this existed, resolving any decision completed its Task
+   * unconditionally, so "resolved" meant "marked complete" rather than "judged".
+   */
+  async resolveDecision(eventId: string, sourceMemberId: string, summary = 'Decision resolved', verdict: DecisionVerdict = 'accept'): Promise<ChannelEvent> {
+    if (verdict !== 'accept' && verdict !== 'refuse') throw new ArcpError('invalid_request', 'decision verdict must be accept or refuse', 'verdict');
     const resolved = await this.store.mutate((state) => {
       const triggering = state.channelEvents.find((event) => event.id === eventId && event.kind === 'decision_required');
       const resolver = state.members.find((member) => member.id === sourceMemberId);
@@ -768,16 +780,31 @@ export class ArcpService {
       const workspace = state.workspaces.find((item) => item.id === triggering.workspaceId);
       if (!intendedTarget(triggering, resolver, workspace)) throw new ArcpError('unauthorized', 'decision resolver is not an intended target');
       triggering.decisionRequired = false;
-      if (triggering.taskId) {
+      triggering.verdict = verdict;
+      if (verdict === 'accept' && triggering.taskId) {
         const task = state.tasks.find((item) => item.id === triggering.taskId);
         if (task) {
           task.lifecycle = 'completed'; task.updatedAt = now();
           this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: task.id, resultId: triggering.resultId, sourceMemberId, targetRole: 'manager', kind: 'task_completed', urgency: 'normal', decisionRequired: false, summary: `Task ${task.id} completed by durable Result`, evidenceRefs: [], notify: false });
         }
       }
-      return this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: triggering.taskId, resultId: triggering.resultId, sourceMemberId, targetMemberId: triggering.sourceMemberId, targetActorId: triggering.sourceActorId, ...(triggering.sourceMemberId || triggering.sourceActorId ? {} : { targetRole: 'owner' }), kind: 'decision_resolved', urgency: 'normal', decisionRequired: false, summary, evidenceRefs: [], relatedEventId: eventId });
+      this.releaseBlockedRuntimes(state, eventId);
+      return this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: triggering.taskId, resultId: triggering.resultId, sourceMemberId, targetMemberId: triggering.sourceMemberId, targetActorId: triggering.sourceActorId, ...(triggering.sourceMemberId || triggering.sourceActorId ? {} : { targetRole: 'owner' }), kind: 'decision_resolved', urgency: 'normal', decisionRequired: false, verdict, summary, evidenceRefs: [], relatedEventId: eventId });
     });
     await this.pump(); return resolved;
+  }
+  /**
+   * Clear the blocked-on-decision record from every runtime that was parked on
+   * this event. The record is written when the prompt is raised, so it is
+   * cleared here rather than re-derived from provider status: a runtime waiting
+   * on a tool prompt reports the same `state=running, lastTurnState=running` as
+   * a healthy one, and nothing observable distinguishes them.
+   */
+  private releaseBlockedRuntimes(state: State, eventId: string): void {
+    for (const session of state.sessions) {
+      if (session.blockedOnEventId !== eventId) continue;
+      delete session.blockedOnEventId; delete session.blockedSince; delete session.blockedQuestion;
+    }
   }
   async createWorkspace(input: { ownerActorId: string; purpose: string }): Promise<{ workspace: ControlWorkspace; member: Member; credential: string }> {
     if (!input.purpose?.trim()) throw new ArcpError('invalid_request', 'workspace purpose is required');

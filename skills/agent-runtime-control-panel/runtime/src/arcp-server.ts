@@ -1,7 +1,7 @@
 import type http from 'node:http';
 import { URL } from 'node:url';
 import { ArcpError, ArcpService } from './arcp.js';
-import type { Member } from './arcp.js';
+import type { DecisionVerdict, Member } from './arcp.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
@@ -77,7 +77,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
       send(res, 200, events); return true;
     }
     const eventResolve = path.match(/^\/v1\/events\/([^/]+)\/resolve$/);
-    if (method === 'POST' && eventResolve) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.resolveDecision(decodeURIComponent(eventResolve[1]), authenticatedMember.id, typeof input.summary === 'string' ? input.summary : 'Decision resolved')); return true; }
+    if (method === 'POST' && eventResolve) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.resolveDecision(decodeURIComponent(eventResolve[1]), authenticatedMember.id, typeof input.summary === 'string' ? input.summary : 'Decision resolved', input.verdict === undefined ? 'accept' : input.verdict as DecisionVerdict)); return true; }
     const eventAck = path.match(/^\/v1\/events\/([^/]+)\/ack$/);
     if (method === 'POST' && eventAck) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.acknowledgeEvent(decodeURIComponent(eventAck[1]), authenticatedMember.id, typeof input.reason === 'string' ? input.reason : 'acknowledged')); return true; }
     const heartbeat = path.match(/^\/v1\/members\/([^/]+)\/heartbeat$/);
