@@ -5,14 +5,14 @@ import { PaseoCli, asRecord } from './cli.js';
 import { CompanionService } from './service.js';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
-export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'transport_indeterminate';
+export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'transport_indeterminate';
 export type DeliveryState = 'queued' | 'waiting_safe_point' | 'delivered' | 'acknowledged' | 'transport_indeterminate';
 
-export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
+export interface Actor { id: string; clientIdentity: string; label: string; credentialFingerprint?: string; createdAt: string; }
 export interface ActorBinding { id: string; actorId: string; adapter: 'paseo'; remoteActorId: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; state: GoalState; createdAt: string; updatedAt: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; profileId: string; provider: string; model: string; mode: string; thinking: string; workspace?: string; externalId?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
-export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; body: string; command: 'normal' | 'interrupt'; state: DeliveryState; companionMessageId?: string; createdAt: string; deliveredAt?: string; acknowledgedAt?: string; }
+export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; body: string; command: 'normal' | 'interrupt'; state: DeliveryState; companionMessageId?: string; safePointObservedAt?: string; createdAt: string; deliveredAt?: string; acknowledgedAt?: string; }
 interface State { actors: Actor[]; bindings: ActorBinding[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; }
 
 const empty = (): State => ({ actors: [], bindings: [], goals: [], sessions: [], deliveries: [] });
@@ -83,16 +83,22 @@ export class ArcpService {
   readonly adapter: PaseoAdapter;
   constructor(readonly companion: CompanionService, readonly cli = new PaseoCli(), store?: ArcpStore) { this.store = store ?? new ArcpStore(companion.store.dir); this.adapter = new PaseoAdapter(cli); }
   async init(): Promise<void> { await this.store.init(); }
-  registerActor(input: { clientIdentity: string; label?: string }): Promise<{ actor: Actor; binding: ActorBinding }> {
+  registerActor(input: { clientIdentity: string; label?: string; credentialFingerprint?: string }): Promise<{ actor: Actor; binding: ActorBinding }> {
     const clientIdentity = input.clientIdentity?.trim();
     if (!clientIdentity) throw new ArcpError('invalid_request', 'clientIdentity is required');
     return this.store.mutate((state) => {
       let actor = state.actors.find((item) => item.clientIdentity === clientIdentity);
-      if (!actor) { actor = { id: idFor('actor', clientIdentity), clientIdentity, label: input.label?.trim() || 'ARCP client', createdAt: now() }; state.actors.push(actor); }
+      if (!actor) { actor = { id: idFor('actor', clientIdentity), clientIdentity, label: input.label?.trim() || 'ARCP client', ...(input.credentialFingerprint ? { credentialFingerprint: input.credentialFingerprint } : {}), createdAt: now() }; state.actors.push(actor); }
+      else if (input.credentialFingerprint && actor.credentialFingerprint !== input.credentialFingerprint) actor.credentialFingerprint = input.credentialFingerprint;
       let binding = state.bindings.find((item) => item.actorId === actor!.id && item.adapter === 'paseo');
       if (!binding) { binding = { id: idFor('binding', `${actor.id}:paseo:1`), actorId: actor.id, adapter: 'paseo', remoteActorId: actor.id, generation: 1, createdAt: now() }; state.bindings.push(binding); }
       return { actor, binding };
     });
+  }
+  actorForCredential(credentialFingerprint: string): Actor {
+    const actor = this.store.snapshot().actors.find((item) => item.credentialFingerprint === credentialFingerprint);
+    if (!actor) throw new ArcpError('unknown_sender', 'API key is not bound to an actor');
+    return actor;
   }
   async bindActor(input: { actorId: string; remoteActorId?: string }): Promise<ActorBinding> {
     return this.store.mutate((state) => {
@@ -143,6 +149,9 @@ export class ArcpService {
     const goal = state.goals.find((item) => item.id === input.goalId && item.actorId === input.actorId);
     const binding = state.bindings.find((item) => item.actorId === input.actorId && item.adapter === 'paseo');
     if (!goal || !binding) throw new ArcpError('unknown_recipient', 'actor or goal is not registered');
+    if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal')) {
+      throw new ArcpError('goal_held', 'goal already has a primary runtime session');
+    }
     const discovered = await this.discovery();
     const available = discovered.profiles.find((item) => item.id === profile.id)?.available;
     if (!available) throw new ArcpError('profile_unavailable', 'requested provider, model, or mode is unavailable');
@@ -152,7 +161,11 @@ export class ArcpService {
       const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace)).value);
       const externalId = String(result.id ?? result.agentId ?? '');
       if (!externalId) throw new Error('Paseo did not return a runtime identity');
-      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.externalId = externalId; stored.state = 'running'; stored.lastObservedAt = now(); return stored; });
+      const inspected = asRecord((await this.adapter.observe(externalId)).value);
+      const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.mode ?? inspected.Mode, inspected.thinking ?? inspected.Thinking];
+      const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
+      const matchesPlan = observed.every((value, index) => typeof value === 'string' && capabilityToken(String(value)) === capabilityToken(expected[index]));
+      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.externalId = externalId; stored.state = matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); return stored; });
     } catch {
       return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = 'transport_indeterminate'; return stored; });
     }
@@ -184,8 +197,16 @@ export class ArcpService {
     if (!['normal', 'interrupt'].includes(command)) throw new ArcpError('invalid_request', 'command must be normal or interrupt');
     const delivery: Delivery = { id: `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, body: input.body.trim(), command, state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
+    if (command === 'normal') {
+      const observed = await this.observe(session.id);
+      if (!['idle', 'terminal'].includes(observed.state)) return this.store.snapshot().deliveries.find((item) => item.id === delivery.id)!;
+      await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.safePointObservedAt = now(); return item; });
+    }
     try {
-      const sent = await this.companion.postMessage({ to: session.externalId, from: input.fromActorId, body: input.body.trim(), delivery: command === 'interrupt' ? 'interrupt' : 'on-idle', mode: 'ack' });
+      // The legacy companion supplies the durable tagged envelope and ACK ledger.  ARCP only
+      // selects its direct send transport after it has observed an idle/terminal safe point;
+      // normal requests never arm the compatibility heartbeat transport.
+      const sent = await this.companion.postMessage({ to: session.externalId, from: input.fromActorId, body: input.body.trim(), delivery: 'interrupt', mode: 'ack' });
       return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.companionMessageId = sent.id; item.state = sent.delivery?.status === 'accepted' ? 'delivered' : item.state; if (item.state === 'delivered') item.deliveredAt = now(); return item; });
     } catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'transport_indeterminate'; return item; }); }
   }

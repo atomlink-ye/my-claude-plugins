@@ -15,7 +15,7 @@ class FakeCli {
     if (args[0] === 'provider' && args[1] === 'models' && args[2] === 'codex') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
     if (args[0] === 'run') return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' };
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
-    if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle' }, stdout: '', stderr: '' };
+    if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium' }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
 }
@@ -48,8 +48,9 @@ describe('ARCP MVE control core', () => {
     expect(service.state().deliveries).toEqual([]);
     const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'canary' });
     const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    await expect(service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' })).rejects.toMatchObject({ code: 'goal_held' });
     const delivery = await service.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'continue' });
-    expect(delivery).toMatchObject({ command: 'normal', state: 'waiting_safe_point' });
+    expect(delivery).toMatchObject({ command: 'normal', state: 'waiting_safe_point', safePointObservedAt: expect.any(String) });
     expect((await service.acknowledge(delivery.id, 'processed')).state).toBe('acknowledged');
   });
 
@@ -59,7 +60,8 @@ describe('ARCP MVE control core', () => {
     const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
     expect(runtime.state).toBe('transport_indeterminate');
     expect((await service.reconcile(runtime.id)).state).toBe('transport_indeterminate');
-    await expect(service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'claude-manager' })).rejects.toMatchObject({ code: 'profile_unavailable' });
+    const heldGoal = await service.createGoal({ actorId: actor.id, title: 'unavailable profile' });
+    await expect(service.launch({ actorId: actor.id, goalId: heldGoal.id, profileId: 'claude-manager' })).rejects.toMatchObject({ code: 'profile_unavailable' });
   });
 });
 
