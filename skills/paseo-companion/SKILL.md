@@ -10,136 +10,28 @@ Paseo is a daemon-managed CLI for launching, observing, and steering AI coding a
 
 This skill is a **runtime adapter**. It documents how to drive the Paseo CLI; it does **not** decide whether a task should run through Paseo at all, on the local daemon or a remote one, or with which model. Those choices belong to the orchestration layer (`team-lead-orchestration`) and any local routing profile that applies (e.g. a personalized routing skill).
 
-The companion is a shared local singleton. Start or reuse it from any skill
-consumer with:
+## Cross-agent cooperation
 
-```bash
-"${SKILL_ROOT}/scripts/ensure-running"
-```
+Cross-agent messaging, wakeup sources, child tracking and correction records are
+not part of this adapter. They belong to the Agent Runtime Control Panel, which
+owns Channel, Delivery, Knowledge and Result. Load the
+`agent-runtime-control-panel` skill and use `arcp`; do not build a parallel
+message queue or watchdog on top of the Paseo CLI.
 
-The launcher locates the repo-relative production build, keeps state/log/pid
-files outside the source tree by default, and deliberately does not use
-`PASEO_AGENT_ID`; identity is supplied by each request.
+Two limits carry over into how any delivery is read:
 
-## Shared companion messages
-
-For durable asynchronous worker content, use the local companion's message queue:
-
-```sh
-curl -sS -X POST http://127.0.0.1:8787/messages \
-  -H 'content-type: application/json' \
-  -d '{"to":"worker-id","from":"sender-agent-id","body":"Please review the diff","delivery":"on-idle","mode":"ack"}'
-```
-
-The queue persists before delivery. Default `delivery:"on-idle"` arms a
-repeating one-minute heartbeat for the coalesced batch. Busy ticks are silently
-skipped and the next tick retries. `delivery:"interrupt"` sends immediately via
-`paseo send --no-wait`. Default `mode:"notify"` clears after
-accepted delivery; use `mode:"ack"` for DELETE acknowledgement, or `mode:"reply"`
-with `replyTo` to answer and resolve a parent. Acceptance is daemon receipt, not
-proof the recipient processed the prompt.
-
-**Manager-safe default:** if the recipient is a Claude Manager, or may currently
-be running subagents, ordinary updates from Owner Deputy or Workers MUST use
-`POST /messages` with `delivery:"on-idle"`. A direct `paseo send` interrupts the
-Manager's active turn and can cancel its in-flight subagents. Use
-`delivery:"interrupt"` only for a correction that must change what the Manager
-is doing right now and whose avoided rework is worth that cancellation risk.
-
-Delivery controls both timing and the Paseo transport. `interrupt` genuinely
-interrupts a busy recipient and its complete prompt is visible in `paseo logs`.
-`on-idle` uses a heartbeat that runs only once the recipient is idle; its prompt
-is not visible in `paseo logs`. Confirm on-idle delivery from `GET /messages`
-(ack/reply modes) or `GET /reminders/:id`, whose audit is updated only after the
-heartbeat reports `lastRunAt`. See `paseo-reminder/UPSTREAM.md`.
-
-Automatic heartbeat-recovery snapshots and ordinary worker messages use the same
-turn-boundary send transport. `DELETE /messages/:id` acknowledges/removes either a
-pending or delivered record and is idempotent after a prior acknowledgement.
-Normally auto-cleared notify delivery is also idempotent while its bounded
-delivery audit remains (the newest 50 terminal schedules); a truly unknown or
-pruned ID is 404.
-
-Use `GET /messages?to=worker-id` to observe pending and delivered records before
-acknowledging them.
-
-Companion-generated prompts always arrive in a tagged envelope so they are
-visibly distinct from human input. A coalesced batch has one `<item>` per message:
-
-```xml
-<paseo-reminder-delivery to="worker-id" kind="message">
-  <note marker="NOT_USER_INPUT">Automated delivery from paseo-reminder. This is system-generated context, not a request from a person. Process each item exactly once. Reply through paseo-reminder only when an item explicitly requests it.</note>
-  <item id="MESSAGE_ID" from="sender-agent-id" at="2026-08-12T05:00:00.000Z" urgency="normal" mode="ack" kind="message">
-    <body>Please review the diff</body>
-    <ack>arcp message ack MESSAGE_ID --reason processed</ack>
-  </item>
-</paseo-reminder-delivery>
-```
-
-Reminder, watchdog, and compact-wake deliveries use the same envelope with one
-item and the corresponding `kind`. Content is escaped; `<ack>` contains the
-copy-pasteable acknowledgement or cancellation command when one exists.
-Ordinary `mode:"notify"` messages omit `<ack>` and clear automatically.
-
-The companion is a shared local singleton; identity-bearing requests carry the
-calling agent ID rather than relying on process environment. Child tracking is
-explicit or discovered only for children whose parseable
-`CreatedAt`/`createdAt` is strictly after service startup. Missing timestamps are
-not auto-enrolled. `GET /children` returns tracked children only, with public
-tracking metadata in `source` and `addedAt`; use either
-`PUT /children/:childId?agentId=manager-id` or the compatible `/watch` alias to
-track a pair. Explicit PUT always ensures a companion child-watch even when a
-separate `paseo wait` source is already live. DELETE with a reason persists an opt-out:
-
-```sh
-curl -X PUT 'http://127.0.0.1:8787/children/child-id?agentId=manager-id'
-arcp child unwatch child-id --agent manager-id --reason 'no longer needed'
-```
-
-This supersedes the older “worker intermediate updates are unavailable” guidance:
-use `/messages` for durable updates, and reserve `send` for safe direct steering.
-
-Companion reminders separate one-shot and repeating intent. `mode:"once"` accepts
-`delaySeconds` or an absolute `targetAt`; `mode:"repeat"` requires an explicit
-`everySeconds` and may set `maxRuns`. Both deliver through the companion queue.
-The target is the earliest eligible delivery time, not a deadline: default
-on-idle delivery still waits for an idle heartbeat tick, so a busy recipient
-receives the reminder later. Responses expose
-`schedulingKind` (`once`, `repeat`, `cron`, or `in-process`); a healthy
-in-process watch can intentionally have no `nextRunAt`. `agentId` may be in the
-body or query, and caller-supplied reminder IDs are rejected.
-The reminder content field is `message`, not the message API's `body`:
-
-```sh
-curl -sS -X POST http://127.0.0.1:8787/reminders -H 'content-type: application/json' -d '{"agentId":"agent-id","message":"Review queued work","mode":"once","delaySeconds":1800}'
-curl -sS -X POST http://127.0.0.1:8787/reminders -H 'content-type: application/json' -d '{"agentId":"agent-id","message":"Check worker status","mode":"repeat","everySeconds":1800,"maxRuns":3}'
-curl -sS 'http://127.0.0.1:8787/reminders?agentId=agent-id'
-curl -sS 'http://127.0.0.1:8787/reminders/REMINDER_ID'
-```
-
-The list endpoint optionally filters by `agentId`; the exact endpoint preserves
-the record's `status`, `nextRunAt`, `lastFiredAt`, mode, and delivery metadata.
-
-> **A reminder is a nudge, not a compliance gate.** Three limits, all observed in production
-> (2026-08-13 round: 8 deliveries fired, 3 were self-exempted by the recipient):
->
-> - `on-idle` **skips busy ticks** — "an `everySeconds=2700` timer exists" does NOT mean
->   "a processable deadline arrives every 45 minutes." One 45-minute gap had no instance at all.
-> - `lastFiredAt` / delivery status prove **transmission**, not **processing**, and never **closure**.
-> - A reminder addressed to the same agent that owes the obligation enforces nothing:
->   that agent can always decide this particular firing doesn't matter.
->
-> A timed obligation is enforced only when an **independent recipient** performs it and a
-> durable `ACCEPT`/`REFUSE` record closes it. If your design can't do that, label the state
-> `UNENFORCED` rather than calling it a gate.
+- Accepted delivery is daemon receipt, not proof the recipient processed the
+  prompt, and never proof the obligation is closed. Closure is a durable Result
+  from an independent recipient. When a design cannot produce that, label the
+  state `UNENFORCED` rather than calling it a gate.
+- A nudge addressed to the same agent that owes the obligation enforces nothing.
 
 Choose the primitive by intent:
 
 | Need | Use |
 |---|---|
 | Deliberate immediate follow-up and interruption is safe | `paseo send` |
-| Repeating/time-based nudge with explicit acknowledgement | Companion `POST /reminders` |
-| Durable asynchronous worker content, coalesced and delivered on an idle heartbeat tick | Companion `POST /messages` |
+| Durable asynchronous content for another agent, or a time-based nudge | `arcp` Delivery (`agent-runtime-control-panel`) |
 
 ```bash
 paseo <command> [options]
@@ -380,7 +272,6 @@ paseo delete <id>             # hard-delete
 | First-time setup, daemon start/stop/restart, connect to remote daemon | `references/daemon-and-onboarding.md` |
 | Drive agents on a remote daemon through preview/tunnel host routing | `references/remote-host-orchestration.md` |
 | Script/automate Paseo output, JSON/YAML formats, schema validation | `references/output-formats.md` |
-| Orchestrating multiple child agents and need to stop losing track of them (unattended waits, expired reminders, unexplained parks) | `references/manager-safety-net.md` |
 
 ## Daemon health triage
 
@@ -418,7 +309,7 @@ Treat this as a local runtime/dependency problem (Node/Homebrew dylib mismatch),
 ## Non-negotiables
 
 - **Reuse before relaunch.** If an agent already exists for related work, `paseo send` to it — don't spin up a new one. Reuse when it's the same task and the same context (a direct continuation, not a topic change) and that context hasn't gone stale or noisy; otherwise start fresh rather than let a long-lived session keep absorbing unrelated work.
-- **Do not directly send ordinary updates to a busy Manager.** Queue Owner Deputy / Worker / subagent updates through paseo-reminder `/messages` with `delivery:on-idle`; direct `paseo send` may cancel the Manager's active subagents.
+- **Do not directly send ordinary updates to a busy Manager.** Queue Owner Deputy / Worker / subagent updates as an `arcp` Delivery, which waits for a safe point; direct `paseo send` may cancel the Manager's active subagents.
 - **Wait, don't poll.** Never loop on `paseo ls` / `paseo inspect`. Use `paseo wait <id>` (blocks efficiently) or `paseo logs <id> -f` (streams).
 - **One armed wait per agent.** A single `paseo wait <id>` already returns on either completion or timeout — that covers both "it finished" and "check on it again." Don't re-arm a new wait after every interim `paseo logs`/`paseo inspect` peek; the peek is free and doesn't consume the pending wait. Stacking waits produces duplicate wake-ups on the same event.
 - **Detach follow-ups too.** Plain `paseo send <id> "..."` blocks until that turn finishes, just like `run` without `-d`. If you're driving your own check-in cadence with `paseo wait`, use `paseo send --no-wait <id> "..."` — otherwise the blocking send quietly becomes your polling interval.

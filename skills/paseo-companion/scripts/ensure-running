@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-script_dir=$(cd "$(dirname "$0")" && pwd)
-: "${ARCP_RUNTIME_DIR:=${PASEO_COMPANION_RUNTIME_DIR:-${XDG_STATE_HOME:-${HOME:?HOME is required}}/paseo-companion}}"
-export ARCP_RUNTIME_DIR
-exec "$script_dir/../../agent-runtime-control-panel/scripts/ensure-running" "$@"
