@@ -58,13 +58,21 @@ function stableJson(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
   return JSON.stringify(value);
 }
-function safeState(value: Partial<State>): State {
+/**
+ * Return the exact state shape that is allowed to cross the persistence seam.
+ * Keep this as the one redaction/normalization transform used by persistence,
+ * import expectations, and read-back verification.
+ */
+function postRedactionState(value: Partial<State>): State {
   const state = { ...emptyState(), ...value } as State;
   // Credentials are deliberately process-local. They are accepted by the JSON
   // compatibility store, but never copied into SQLite.
   state.credentials = {};
   state.memberCredentials = {};
-  state.sessions = state.sessions.map((session) => ({ ...session, workspace: undefined }));
+  state.sessions = state.sessions.map((session) => {
+    const { workspace: _workspace, ...durable } = session;
+    return durable;
+  });
   state.deliveries = state.deliveries.map((delivery) => ({ ...delivery, body: '' }));
   state.channelEvents = state.channelEvents.map((event) => normalizeChannelEvent(event as unknown as Record<string, unknown>));
   return state;
@@ -85,6 +93,7 @@ const MIGRATIONS: Array<[number, string]> = [
     CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtimes (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS confirmations (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS knowledge (id TEXT PRIMARY KEY, workspace_id TEXT, content_id TEXT REFERENCES content(id), payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY, workspace_id TEXT, content_id TEXT REFERENCES content(id), payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtime_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL);
@@ -99,21 +108,64 @@ export function resolveDatabasePath(dirOrFile: string): string {
   return dirOrFile.endsWith('.sqlite') || dirOrFile.endsWith('.db') ? dirOrFile : path.join(dirOrFile, 'arcp-state.sqlite');
 }
 
-const projection = (state: State) => ({
-  actors: state.actors,
-  bindings: state.bindings,
-  workspaces: state.workspaces,
-  members: state.members,
-  goals: state.goals,
-  tasks: state.tasks,
-  sessions: state.sessions,
-  deliveries: state.deliveries,
-  knowledge: state.knowledge,
-  results: state.results,
-  channelEvents: state.channelEvents,
-});
+const projection = (state: Partial<State>) => {
+  const durable = postRedactionState(state);
+  return {
+    actors: durable.actors,
+    bindings: durable.bindings,
+    workspaces: durable.workspaces,
+    members: durable.members,
+    goals: durable.goals,
+    tasks: durable.tasks,
+    sessions: durable.sessions,
+    deliveries: durable.deliveries,
+    knowledge: durable.knowledge,
+    results: durable.results,
+    channelEvents: durable.channelEvents,
+    confirmations: durable.confirmations,
+  };
+};
 type StateProjection = ReturnType<typeof projection>;
 const projectionRecords = (value: StateProjection): number => Object.values(value).reduce((count, records) => count + records.length, 0);
+
+function firstDifference(expected: unknown, actual: unknown, at = 'state'): string {
+  return findDifference(expected, actual, at) ?? `${at}: values are equal`;
+}
+
+function findDifference(expected: unknown, actual: unknown, at: string): string | undefined {
+  if (Object.is(expected, actual)) return undefined;
+  if (Array.isArray(expected) || Array.isArray(actual)) {
+    if (!Array.isArray(expected) || !Array.isArray(actual)) return `${at}: expected ${describeValue(expected)}, actual ${describeValue(actual)}`;
+    if (expected.length !== actual.length) return `${at}.length: expected ${expected.length}, actual ${actual.length}`;
+    for (let index = 0; index < expected.length; index += 1) {
+      const difference = findDifference(expected[index], actual[index], `${at}[${index}]`);
+      if (difference) return difference;
+    }
+    return undefined;
+  }
+  if ((expected && typeof expected === 'object') || (actual && typeof actual === 'object')) {
+    if (!expected || typeof expected !== 'object' || !actual || typeof actual !== 'object') return `${at}: expected ${describeValue(expected)}, actual ${describeValue(actual)}`;
+    const keys = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort();
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(expected, key)) return `${at}.${key}: expected <absent>, actual ${describeValue((actual as Record<string, unknown>)[key])}`;
+      if (!Object.prototype.hasOwnProperty.call(actual, key)) return `${at}.${key}: expected ${describeValue((expected as Record<string, unknown>)[key])}, actual <absent>`;
+      const difference = findDifference((expected as Record<string, unknown>)[key], (actual as Record<string, unknown>)[key], `${at}.${key}`);
+      if (difference) return difference;
+    }
+    return undefined;
+  }
+  return `${at}: expected ${describeValue(expected)}, actual ${describeValue(actual)}`;
+}
+
+function describeValue(value: unknown): string {
+  let rendered: string;
+  try { rendered = stableJson(value) ?? String(value); } catch { rendered = String(value); }
+  return rendered.length > 240 ? `${rendered.slice(0, 237)}...` : rendered;
+}
+
+function verificationError(scope: string, expectedRecords: number, expectedHash: string, actualRecords: number, actualHash: string, expected: unknown, actual: unknown): Error {
+  return new Error(`legacy import verification failed${scope ? ` for ${scope}` : ''}: expected ${expectedRecords} records (hash ${expectedHash}), actual ${actualRecords} records (hash ${actualHash}); first difference: ${firstDifference(expected, actual)}`);
+}
 
 export class SQLiteStateStore implements StateStore {
   readonly file: string;
@@ -139,7 +191,7 @@ export class SQLiteStateStore implements StateStore {
     db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
     // These CREATEs are repeated outside the numbered migration so a database
     // created by an earlier schema-1 build gains the import projection too.
-    db.exec('CREATE TABLE IF NOT EXISTS legacy_reminders (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, imported_at TEXT NOT NULL, PRIMARY KEY(source_file, record_index)); CREATE INDEX IF NOT EXISTS legacy_reminders_hash_idx ON legacy_reminders(record_hash);');
+    db.exec('CREATE TABLE IF NOT EXISTS legacy_reminders (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, imported_at TEXT NOT NULL, PRIMARY KEY(source_file, record_index)); CREATE INDEX IF NOT EXISTS legacy_reminders_hash_idx ON legacy_reminders(record_hash); CREATE TABLE IF NOT EXISTS confirmations (id TEXT PRIMARY KEY, payload TEXT NOT NULL);');
     // These objects were never populated by the SQLite projection. Remove
     // leftovers from pre-release databases while keeping runtime observations
     // and all durable ARCP projections intact.
@@ -213,9 +265,14 @@ export class SQLiteStateStore implements StateStore {
       const transitions = (db.prepare('SELECT state, at FROM event_transitions WHERE event_id = ? ORDER BY rowid').all(String(row.event_id)) as SqliteRow[]).map((item) => ({ state: String(item.state), at: String(item.at) }));
       return { ...event, id: String(row.event_id), content: content.get(String(row.content_id)) ?? { summary: '', evidenceRefs: [], contentHash: '', sensitivity: 'normal', retention: 'standard' }, deliveryState: String(row.delivery_state), transitions, createdAt: String(row.created_at), ...(row.delivered_at ? { deliveredAt: String(row.delivered_at) } : {}), ...(row.processed_at ? { processedAt: String(row.processed_at) } : {}), ...(row.acknowledged_at ? { acknowledgedAt: String(row.acknowledged_at) } : {}), ...(row.undeliverable_reason ? { undeliverableReason: String(row.undeliverable_reason) } : {}) } as unknown as ChannelEvent;
     });
-    const knowledge = (db.prepare('SELECT payload, content_id FROM knowledge').all() as SqliteRow[]).map((row) => ({ ...parse<Record<string, unknown>>(row.payload, {}), text: content.get(String(row.content_id))?.summary ?? '', tags: parse<string[]>(parse<Record<string, unknown>>(row.payload, {}).tags, []) }));
+    const knowledge = (db.prepare('SELECT payload, content_id FROM knowledge').all() as SqliteRow[]).map((row) => {
+      const payload = parse<Record<string, unknown>>(row.payload, {});
+      const tags = Array.isArray(payload.tags) ? payload.tags.map(String) : [];
+      return { ...payload, text: content.get(String(row.content_id))?.summary ?? '', tags };
+    });
     const results = (db.prepare('SELECT payload, content_id FROM results').all() as SqliteRow[]).map((row) => { const payload = parse<Record<string, unknown>>(row.payload, {}); const item = content.get(String(row.content_id)); return { ...payload, summary: item?.summary ?? '', evidenceRefs: item?.evidenceRefs ?? [] }; });
-    return safeState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents });
+    const confirmations = rows('confirmations').map(({ id: _id, ...confirmation }) => confirmation) as unknown as State['confirmations'];
+    return postRedactionState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents, confirmations });
   }
 
   private persist(state: State): void {
@@ -231,20 +288,22 @@ export class SQLiteStateStore implements StateStore {
   }
 
   private persistWithinTransaction(state: State): void {
-    this.persistContent(state);
-    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'channel_events']) this.connection.exec(`DELETE FROM ${table}`);
-    this.persistRows('workspaces', state.workspaces);
-    this.persistRows('actors', state.actors);
-    this.persistRows('actor_bindings', state.bindings);
-    this.persistRows('goals', state.goals);
-    this.persistRows('members', state.members);
-    this.persistRows('tasks', state.tasks);
-    this.persistRows('runtimes', state.sessions.map((session) => ({ ...session, workspace: undefined })));
-    this.persistRows('deliveries', state.deliveries.map((delivery) => ({ ...delivery, body: '' })));
-    this.persistContentRows('knowledge', state.knowledge, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.text, evidenceRefs: [], sensitivity: 'normal', retention: 'standard' } }));
-    this.persistContentRows('results', state.results, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.summary, evidenceRefs: item.evidenceRefs, sensitivity: 'normal', retention: 'standard' } }));
-    this.persistEvents(state.channelEvents);
-    this.persistObservations(state);
+    const durable = postRedactionState(state);
+    this.persistContent(durable);
+    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events']) this.connection.exec(`DELETE FROM ${table}`);
+    this.persistRows('workspaces', durable.workspaces);
+    this.persistRows('actors', durable.actors);
+    this.persistRows('actor_bindings', durable.bindings);
+    this.persistRows('goals', durable.goals);
+    this.persistRows('members', durable.members);
+    this.persistRows('tasks', durable.tasks);
+    this.persistRows('runtimes', durable.sessions);
+    this.persistRows('deliveries', durable.deliveries);
+    this.persistRows('confirmations', durable.confirmations.map((confirmation) => ({ ...confirmation, id: confirmation.tokenHash })));
+    this.persistContentRows('knowledge', durable.knowledge, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.text, evidenceRefs: [], sensitivity: 'normal', retention: 'standard' } }));
+    this.persistContentRows('results', durable.results, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.summary, evidenceRefs: item.evidenceRefs, sensitivity: 'normal', retention: 'standard' } }));
+    this.persistEvents(durable.channelEvents);
+    this.persistObservations(durable);
   }
 
   private persistRows(table: string, records: Array<{ id: string }>): void {
@@ -315,7 +374,7 @@ export class SQLiteStateStore implements StateStore {
   status(): DatabaseStatus {
     const db = this.connection;
     const counts: Record<string, number> = {};
-    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
+    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
     const mode = awaitableStat(this.file);
     return { path: this.file, schemaVersion: Number((db.prepare('SELECT max(version) AS version FROM schema_migrations').get() as SqliteRow).version ?? 0), journalMode: String((db.prepare('PRAGMA journal_mode').get() as SqliteRow).journal_mode), foreignKeys: Number((db.prepare('PRAGMA foreign_keys').get() as SqliteRow).foreign_keys), busyTimeout: Number((db.prepare('PRAGMA busy_timeout').get() as SqliteRow).timeout), observations: counts.runtime_observations, tables: counts, mode };
   }
@@ -340,7 +399,7 @@ export class SQLiteStateStore implements StateStore {
     // single, deterministic source snapshot to import.
     const stateText = await readFile(statePath, 'utf8');
     const parsedState = JSON.parse(stateText) as Partial<State>;
-    const sourceState = safeState(parsedState);
+    const sourceState = postRedactionState(parsedState);
     const legacyValues = (file: string, text: string): unknown[] => {
       if (file === statePath) return Object.values(parsedState).filter((value) => Array.isArray(value)).flat();
       if (file.endsWith('.jsonl')) return text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -351,7 +410,7 @@ export class SQLiteStateStore implements StateStore {
       const file = path.join(root, name); const text = await readFile(file, 'utf8');
       return { file, text, values: legacyValues(file, text) };
     }))];
-    const expectedProjection = projection(sourceState); const expectedProjectionHash = hash(expectedProjection);
+    const expectedProjection = projection(parsedState); const expectedProjectionHash = hash(expectedProjection);
     const stateSourceReport = { file: 'arcp-state.json', records: projectionRecords(expectedProjection), contentHash: expectedProjectionHash, importedRecords: 0, importedHash: hash([]), match: false };
     // Sidecar proof is based on the per-record hashes read back from SQLite;
     // retaining the raw source hash separately in migration_audit detects file
@@ -386,7 +445,7 @@ export class SQLiteStateStore implements StateStore {
         this.persistWithinTransaction(this.state);
         const importedProjection = projection(this.loadState()); const importedHash = hash(importedProjection);
         report.state.importedRecords = projectionRecords(importedProjection); report.state.importedHash = importedHash; report.state.match = report.state.records === report.state.importedRecords && report.state.contentHash === importedHash;
-        if (!report.state.match) throw new Error(`legacy import verification failed: expected ${report.state.records} records, read ${report.state.importedRecords}`);
+        if (!report.state.match) throw verificationError('', report.state.records, report.state.contentHash, report.state.importedRecords, report.state.importedHash, expectedProjection, importedProjection);
         stateSourceReport.importedRecords = report.state.importedRecords; stateSourceReport.importedHash = importedHash; stateSourceReport.match = true;
         const insert = db.prepare('INSERT INTO legacy_reminders(source_file, record_index, record_hash, kind, payload, imported_at) VALUES (?, ?, ?, ?, ?, ?)');
         const importedAt = new Date().toISOString();
@@ -402,7 +461,11 @@ export class SQLiteStateStore implements StateStore {
           const rows = (db.prepare('SELECT record_index, record_hash FROM legacy_reminders WHERE source_file = ? ORDER BY record_index').all(source) as SqliteRow[]);
           const importedValues = rows.map((row) => String(row.record_hash)); const sourceReport = sourceReports.find((item) => item.file === source)!;
           sourceReport.importedRecords = rows.length; sourceReport.importedHash = hash(importedValues); sourceReport.match = sourceReport.records === rows.length && sourceReport.importedHash === hash(input.values.map((value) => hash(value)));
-          if (!sourceReport.match) throw new Error(`legacy import verification failed for ${source}: expected ${sourceReport.records} records, read ${rows.length}`);
+          if (!sourceReport.match) {
+            const expectedRecords = input.values.map((value) => hash(value));
+            const importedRecords = rows.map((row) => String(row.record_hash));
+            throw verificationError(source, sourceReport.records, sourceReport.contentHash, rows.length, sourceReport.importedHash, expectedRecords, importedRecords);
+          }
         }
         this.state = this.loadState();
         const audit = db.prepare('INSERT OR REPLACE INTO migration_audit(source_file, source_hash, imported_at, report) VALUES (?, ?, ?, ?)');

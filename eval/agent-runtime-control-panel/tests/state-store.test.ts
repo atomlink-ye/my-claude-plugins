@@ -53,6 +53,16 @@ describe('SQLite StateStore', () => {
     expect(String(await raw)).not.toContain('credential-secret'); expect(String(await raw)).not.toContain('private prompt'); db.close();
   });
 
+  it('round-trips knowledge tags through a newly opened SQLite store', async () => {
+    const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
+    const tagged = { id: 'knowledge-tagged', workspaceId: 'workspace-1', authorMemberId: 'member-1', kind: 'learning' as const, text: 'Tagged durable learning', tags: ['sqlite', 'round-trip', 'r2-f13'], createdAt: '2026-01-01T00:00:00.000Z' };
+    await store.mutate((state) => state.knowledge.push(tagged));
+    store.close();
+    const reopened = new SQLiteStateStore(dir); await reopened.init();
+    expect(reopened.snapshot().knowledge).toContainEqual(tagged);
+    reopened.close();
+  });
+
   it('retains the observation bound independently for each runtime', async () => {
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
     await store.mutate((state: any) => {
@@ -115,8 +125,27 @@ describe('SQLite StateStore', () => {
     const store = new SQLiteStateStore(dir); await store.init();
     const original = (store as any).persistEvents;
     (store as any).persistEvents = function (events: unknown[]) { return original.call(this, events.slice(0, 1)); };
-    await expect(store.importLegacy(source)).rejects.toThrow(/import verification failed/);
+    await expect(store.importLegacy(source)).rejects.toThrow(/expected 2 records \(hash [0-9a-f]{64}\), actual 1 records \(hash [0-9a-f]{64}\); first difference: state\.channelEvents\.length: expected 2, actual 1/);
     expect(store.status().tables.event_journal).toBe(0);
     store.close();
+  });
+
+  it('audits every durable field after reopening a realistic campaign state', async () => {
+    const sourceDir = path.resolve(import.meta.dirname, '../../../.local/arcp-campaign/data');
+    const source = JSON.parse(await readFile(path.join(sourceDir, 'arcp-state.json'), 'utf8')) as any;
+    const expected = structuredClone(source);
+    expected.credentials = {};
+    expected.memberCredentials = {};
+    expected.sessions = expected.sessions.map(({ workspace, ...session }: any) => session);
+    expected.deliveries = expected.deliveries.map((delivery: any) => ({ ...delivery, body: '' }));
+
+    const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
+    const report = await store.importLegacy(sourceDir);
+    expect(report.state.match).toBe(true);
+    store.close();
+    const reopened = new SQLiteStateStore(dir); await reopened.init();
+    expect(reopened.snapshot()).toEqual(expected);
+    expect(reopened.snapshot().knowledge.some((entry) => entry.tags.length > 0)).toBe(true);
+    reopened.close();
   });
 });
