@@ -10,6 +10,9 @@ import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, normalizeChannelEvent } from './content.js';
+import { channelCardFor, projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
+export { projectChannelEvent, renderChannelCard, channelCardFor } from './channel-projection.js';
+export type { ChannelProjection, ChannelProjectionFacts } from './channel-projection.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
@@ -79,6 +82,17 @@ function intendedTarget(event: ChannelEvent, member: Member, workspace: ControlW
     && (!event.targetRole || event.targetRole === member.role)
     && (!event.targetSubscription || event.targetSubscription === '*' || event.targetSubscription === member.role || member.capabilities.includes(event.targetSubscription));
 }
+
+/** The durable records the one canonical projection builder is allowed to read. */
+function projectionFacts(state: State): ChannelProjectionFacts {
+  return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results };
+}
+
+/** A durable event plus its canonical human projection, attached at read time. */
+export type ProjectedChannelEvent = ChannelEvent & { projection: ChannelProjection };
+
+/** A queued delivery plus the projection of the event that produced it. */
+export type ProjectedDelivery = Delivery & { projection?: ChannelProjection };
 
 /** A compact, independently durable ARCP state file. It intentionally stores public IDs and
  * metadata only: provider handles, prompts, credentials, and host paths never enter it. */
@@ -712,7 +726,7 @@ export class ArcpService {
       for (const session of targetSessions) {
         const deliveryId = idFor('delivery', `event:${event.id}:${session.id}`);
         if (state.deliveries.some((delivery) => delivery.id === deliveryId)) continue;
-        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: event.content.summary, command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
+        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: channelCardFor(event, projectionFacts(state)), command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
       }
     }
     return event;
@@ -743,11 +757,20 @@ export class ArcpService {
       this.transitionEvent(event, 'acknowledged'); return event;
     });
   }
-  channelEvents(workspaceId: string, memberId?: string): ChannelEvent[] {
+  /**
+   * Channel events for a workspace, each carrying its canonical human
+   * projection. The projection is computed here, at read time, from durable
+   * facts; the append-only journal is never rewritten, so events recorded
+   * before the projection existed are just as readable as new ones.
+   */
+  channelEvents(workspaceId: string, memberId?: string): ProjectedChannelEvent[] {
     const state = this.store.snapshot();
     const member = memberId ? state.members.find((item) => item.id === memberId) : undefined;
     const workspace = state.workspaces.find((item) => item.id === workspaceId);
-    return state.channelEvents.filter((event) => event.workspaceId === workspaceId && (!member || intendedTarget(event, member, workspace, true)));
+    const facts = projectionFacts(state);
+    return state.channelEvents
+      .filter((event) => event.workspaceId === workspaceId && (!member || intendedTarget(event, member, workspace, true)))
+      .map((event) => ({ ...event, projection: projectChannelEvent(event, facts) }));
   }
   /**
    * Answer a `decision_required` event with an explicit verdict.
@@ -866,7 +889,15 @@ export class ArcpService {
   async claimTask(taskId: string, memberId: string, expectedFence?: number): Promise<Task> { const claimed = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === taskId); const member = state.members.find((item) => item.id === memberId); if (!task || !member || task.workspaceId !== member.workspaceId) throw new ArcpError('unknown_recipient', 'task or member is unknown'); if (expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== expectedFence) throw new ArcpError('stale_generation', `task claim fence is stale; current fence is ${task.fence}`); if (task.ownerMemberId === memberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) return task; if (task.ownerMemberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) throw new ArcpError('task_held', 'task already has an active claim'); task.ownerMemberId = memberId; task.fence += 1; task.lifecycle = 'claimed'; task.updatedAt = now(); member.lifecycle = 'busy'; member.updatedAt = now(); return task; }); await this.publishChannelEvent({ workspaceId: claimed.workspaceId, taskId: claimed.id, sourceMemberId: claimed.ownerMemberId, targetRole: 'manager', kind: 'task_claimed', urgency: 'normal', decisionRequired: false, summary: `Task ${claimed.id} claimed at fence ${claimed.fence}`, evidenceRefs: [] }); return claimed; }
   async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string; targetMemberId?: string }): Promise<KnowledgeEntry> { const entry = await this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); if (input.kind === 'blocker' || input.kind === 'evidence') await this.publishChannelEvent({ workspaceId: entry.workspaceId, taskId: entry.taskId, goalId: entry.goalId, sourceMemberId: entry.authorMemberId, ...(input.targetMemberId ? { targetMemberId: input.targetMemberId } : {}), ...(input.targetMemberId ? {} : { targetRole: 'manager' }), kind: input.kind === 'blocker' ? 'blocker' : 'finding', urgency: input.kind === 'blocker' ? 'urgent' : 'normal', decisionRequired: input.kind === 'blocker', summary: `${input.kind} knowledge ${entry.id}`, evidenceRefs: [] }); return entry; }
   async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); if (!task || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, targetRole: 'manager', kind: 'decision_required', urgency: 'normal', decisionRequired: true, summary: `Result ${result.id} requires Manager decision`, evidenceRefs: [], relatedEventId: candidate.id }); return result; }); await this.pump(); return submitted; }
-  context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const memberSessions = new Set(state.sessions.filter((session) => session.workspaceId === workspaceId && (!memberId || session.memberId === memberId)).map((session) => session.id)); return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), events: this.channelEvents(workspaceId, memberId), inbox: memberId ? state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged') : [] }; }
+  context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const memberSessions = new Set(state.sessions.filter((session) => session.workspaceId === workspaceId && (!memberId || session.memberId === memberId)).map((session) => session.id)); return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), events: this.channelEvents(workspaceId, memberId), inbox: memberId ? this.projectedInbox(state, memberSessions) : [] }; }
+  /** The member inbox renders the same canonical projection as `channel list`. */
+  private projectedInbox(state: State, memberSessions: Set<string>): ProjectedDelivery[] {
+    const facts = projectionFacts(state);
+    return state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged').map((item) => {
+      const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined;
+      return event ? { ...item, projection: projectChannelEvent(event, facts) } : item;
+    });
+  }
   private requested(session: RuntimeSession): RuntimeSettings { return { provider: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}) }; }
   private async children(externalId?: string, adapter: RuntimeAdapter = this.adapter): Promise<ChildObservation> {
     if (!externalId) return { source: 'unavailable', items: [] };

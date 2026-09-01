@@ -1,4 +1,5 @@
 import type { ReadStream, WriteStream } from 'node:tty';
+import { renderChannelCard, type ChannelProjection } from './channel-projection.js';
 
 type Panorama = Record<string, any>;
 export type TuiOptions = {
@@ -7,6 +8,9 @@ export type TuiOptions = {
   output?: WriteStream;
   refreshMs?: number;
 };
+
+/** How many Channel cards the snapshot shows; the rest stay one line of count. */
+export const TUI_EVENT_CARDS = 3;
 
 const scalar = (value: unknown) => typeof value === 'number' ? value.toFixed(2) : String(value ?? 'unknown');
 
@@ -40,6 +44,14 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     if (expanded && index === selected) lines.push(`  SCM dirty=${scalar(work.dirty)} diff=${JSON.stringify(work.diffstat ?? 'unknown')} provider-children=${(children.items ?? []).map((child: any) => `${child.id}:${child.status}`).join(',') || 'none'} context=${scalar(observation.context?.used)}/${scalar(observation.context?.max)}`);
   }
   lines.push(`Blocked ${blocked.length}${blocked.length ? ` · oldest ${minutes(blocked[0]?.ageMs)}` : ''}`);
+  // Channel cards come from the one canonical projection builder. The TUI must
+  // never format event text itself, or it drifts back to opaque ids on screen.
+  const events = (Array.isArray(view.events) ? view.events : []).filter((item: any) => item?.projection);
+  const recent = events.slice(-TUI_EVENT_CARDS);
+  lines.push(`Channel ${events.length}${recent.length ? ` · latest ${recent.length}` : ''}`);
+  for (const item of recent) {
+    for (const line of renderChannelCard(item.projection as ChannelProjection).split('\n')) lines.push(`  ${line}`);
+  }
   lines.push('Keys: arrows select · tab view · enter details · r refresh · q quit');
   return lines.join('\n');
 }
