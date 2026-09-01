@@ -24,6 +24,35 @@ else if (area === 'start') { const s=await load(); await call('POST','/v1/start'
 else if (area === 'send') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'normal',cacheConfirmation:f.confirm});
 else if (area === 'reuse') await call('POST','/v1/reuse',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),cacheConfirmation:f.confirm});
 else if (area === 'interrupt') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'interrupt',reason:f.reason,cacheConfirmation:f.confirm});
+else if (area === 'reminder' && action === 'add') await call('POST','/reminders',{agentId:f.agent||p[0],message:f.message||p.slice(1).join(' '),mode:f.mode||'once',...(f['delay-seconds']?{delaySeconds:Number(f['delay-seconds'])}:{}),...(f['every-seconds']?{everySeconds:Number(f['every-seconds'])}:{})});
+else if (area === 'reminder' && action === 'list') await call('GET',`/reminders${f.agent?`?agentId=${encodeURIComponent(f.agent)}`:''}`);
+else if (area === 'reminder' && action === 'get') await call('GET',`/reminders/${encodeURIComponent(p[0])}`);
+else if (area === 'reminder' && action === 'delete') await call('DELETE',`/reminders/${encodeURIComponent(p[0])}`,{reason:f.reason||'retired'});
+else if (area === 'message' && action === 'send') await call('POST','/messages',{to:f.to||p[0],from:f.from||p[1],body:f.body||p.slice(2).join(' '),delivery:f.delivery,mode:f.mode,urgency:f.urgency});
+else if (area === 'message' && action === 'list') await call('GET','/messages');
+else if (area === 'message' && action === 'ack') await call('DELETE',`/messages/${encodeURIComponent(p[0])}`,{reason:f.reason||action});
+else if (area === 'message' && action === 'reply') await call('POST','/messages',{to:f.to||p[1],from:f.from||p[2],body:f.body||p.slice(3).join(' '),delivery:f.delivery||'on-idle',mode:'reply',replyTo:p[0]});
+else if (area === 'child' && action === 'list') await call('GET',`/children?agentId=${encodeURIComponent(f.agent||p[0])}`);
+else if (area === 'child' && action === 'watch') await call('PUT',`/children/${encodeURIComponent(p[0])}?agentId=${encodeURIComponent(f.agent||p[1])}`,{});
+else if (area === 'child' && action === 'unwatch') await call('DELETE',`/children/${encodeURIComponent(p[0])}?agentId=${encodeURIComponent(f.agent||p[1])}`,{reason:f.reason||'unwatch'});
+else if (area === 'child' && action === 'briefing') await call('GET',`/children/${encodeURIComponent(p[0])}/briefing${f.since?`?since=${encodeURIComponent(f.since)}`:''}`);
+else if (area === 'correction' && action === 'open') await call('POST','/corrections',{managerId:f.manager, auditorId:f.auditor, findings:[{text:f.text||p.join(' ')}]});
+else if (area === 'correction' && action === 'list') await call('GET','/corrections');
+else if (area === 'correction' && action === 'resolve') await call('POST',`/corrections/${encodeURIComponent(p[0])}/resolve`,{findingId:f.finding,verdict:f.verdict,note:f.note});
+else if (area === 'gate') await call('GET',`/gate?managerId=${encodeURIComponent(f.manager||p[0])}`);
+else if (area === 'wakeup' && action === 'list') await call('GET',`/wakeup-sources?agentId=${encodeURIComponent(f.agent||p[0])}`);
+else if (area === 'wakeup' && action === 'add') await call('PUT',`/wakeup-sources/${encodeURIComponent(p[0])}?agentId=${encodeURIComponent(f.agent||p[1])}`,{cadence:f.cadence});
+else if (area === 'wakeup' && action === 'delete') await call('DELETE',`/wakeup-sources/${encodeURIComponent(p[0])}?agentId=${encodeURIComponent(f.agent||p[1])}`,{});
+else if (area === 'heartbeat' && action === 'list') await call('GET','/heartbeats');
+else if (area === 'heartbeat' && action === 'delete') await call('DELETE',`/heartbeats/${encodeURIComponent(p[0])}`,{reason:f.reason||'retired'});
+else if (area === 'context' && action === 'usage') await call('GET',`/context-usage${f.agent?`?agentId=${encodeURIComponent(f.agent)}`:''}`);
+else if (area === 'idle' && action === 'add') await call('POST','/idle-reminders',{agentId:f.agent||p[0],message:f.message||p.slice(1).join(' '),thresholdSeconds:Number(f['threshold-seconds']),once:f.once===true});
+else if (area === 'idle' && action === 'list') await call('GET',`/idle-reminders${f.agent?`?agentId=${encodeURIComponent(f.agent)}`:''}`);
+else if (area === 'idle' && action === 'delete') await call('DELETE',`/idle-reminders/${encodeURIComponent(p[0])}`,{reason:f.reason||'retired'});
+else if (area === 'ledger' && action === 'add') await call('POST','/ledger',{type:f.type,target:f.target||p[0],verdict:f.verdict,reason:f.reason,recovery:f.recovery});
+else if (area === 'ledger' && action === 'list') await call('GET','/ledger');
+else if (area === 'ledger' && action === 'revoke') await call('POST',`/ledger/${encodeURIComponent(p[0])}/revoke`,{reason:f.reason});
+else if (area === 'compact') await call('POST','/compact-wake',{agentId:f.agent||p[0],compact:f.compact||p.slice(1).join(' '),wake:f.wake,delaySeconds:f['delay-seconds']?Number(f['delay-seconds']):undefined});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')},true);
 else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])})},true);
 else if (area === 'status') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/panorama`); }
@@ -32,6 +61,7 @@ else if (area === 'reconcile') await call('POST',`/v1/runtime-sessions/${encodeU
 else if (area === 'ack') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||p.slice(1).join(' ')||'processed'});
 else if (area === 'inbox') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/context`); }
 else if (area === 'panorama') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/panorama${f.refresh ? '?refresh=1' : ''}`); }
+else if (area === 'tui') { const s=await load(); const r=await fetch(`${base}/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/panorama`,{headers:{...(admin?{'x-arcp-api-key':admin}:{}),...(s.actorCredential?{'x-arcp-actor-key':s.actorCredential}:{})}}); const v=await r.json(); if(!r.ok){console.log(JSON.stringify(v,null,2));process.exitCode=1;} else { const lines=[`ARCP ${v.workspace?.purpose||'panorama'}`,`Goals ${v.goals?.length||0} Tasks ${v.tasks?.length||0} Members ${v.roster?.length||0}`,...(v.runtime||[]).map(x=>`${x.session.provider}/${x.session.model} ${x.session.state} children:${x.children?.items?.length||0} health:${x.observation.health} cache:${x.observation.cache?.state||'unknown'} context:${x.observation.context?.ratio??'unknown'}`),`Legacy reminders:${Object.values(v.legacy?.reminders||{}).reduce((a,b)=>a+b,0)} messages:${Object.values(v.legacy?.messages||{}).reduce((a,b)=>a+b,0)}`, 'keys: arrows/tab/enter r refresh q quit']; console.log(lines.join('\n')); } }
 else if (area === 'member' && action === 'heartbeat') { const s=await load(); await call('POST',`/v1/members/${encodeURIComponent(s.memberId)}/heartbeat`,{presence:f.status||'idle'},true); }
 else if (area === 'knowledge' && action === 'search') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=${encodeURIComponent(f.q||'')}&kind=${encodeURIComponent(f.kind||'')}&tag=${encodeURIComponent(f.tag||'')}`);
 else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(); if (s.workspaceId) await call('GET',`/v1/workspaces/${encodeURIComponent(s.workspaceId)}/context`); }
