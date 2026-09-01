@@ -592,10 +592,14 @@ export class ArcpService {
     if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery has not been processed');
     return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', item.acknowledgedAt); return item; });
   }
-  async withdraw(id: string, reason = 'withdrawn'): Promise<Delivery> {
+  async withdraw(id: string, reason = 'withdrawn', memberId?: string): Promise<Delivery> {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (['delivered', 'running', 'processed', 'acknowledged'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivered delivery cannot be withdrawn');
+    if (memberId) {
+      const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
+      if (!session || session.memberId !== memberId) throw new ArcpError('unauthorized', 'delivery withdrawal is not authorized');
+    }
     return this.store.mutate((state) => {
       const item = state.deliveries.find((value) => value.id === id)!;
       item.state = 'withdrawn'; item.reason = reason.trim() || 'withdrawn';

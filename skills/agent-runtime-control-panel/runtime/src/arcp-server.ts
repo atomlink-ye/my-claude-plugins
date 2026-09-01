@@ -63,9 +63,20 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const workspaceMembers = path.match(/^\/v1\/workspaces\/([^/]+)\/members$/);
     if (method === 'GET' && workspaceMembers) { const workspaceId = decodeURIComponent(workspaceMembers[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, service.state().members.filter((item) => item.workspaceId === workspaceId).map(publicMember)); return true; }
     const workspaceEvents = path.match(/^\/v1\/workspaces\/([^/]+)\/events$/);
-    if (method === 'GET' && workspaceEvents) { const workspaceId = decodeURIComponent(workspaceEvents[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, service.channelEvents(workspaceId, authenticatedMember?.id)); return true; }
+    if (method === 'GET' && workspaceEvents) {
+      const workspaceId = decodeURIComponent(workspaceEvents[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
+      const kind = url.searchParams.get('kind'); const state = url.searchParams.get('state'); const decisionRequired = url.searchParams.get('decision-required');
+      let events = service.channelEvents(workspaceId, authenticatedMember?.id);
+      if (kind) events = events.filter((event) => event.kind === kind);
+      if (state) events = events.filter((event) => event.deliveryState === state);
+      if (decisionRequired === '1' || decisionRequired === 'true') events = events.filter((event) => event.decisionRequired);
+      if (decisionRequired === '0' || decisionRequired === 'false') events = events.filter((event) => !event.decisionRequired);
+      send(res, 200, events); return true;
+    }
     const eventResolve = path.match(/^\/v1\/events\/([^/]+)\/resolve$/);
     if (method === 'POST' && eventResolve) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.resolveDecision(decodeURIComponent(eventResolve[1]), authenticatedMember.id, typeof input.summary === 'string' ? input.summary : 'Decision resolved')); return true; }
+    const eventAck = path.match(/^\/v1\/events\/([^/]+)\/ack$/);
+    if (method === 'POST' && eventAck) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.acknowledgeEvent(decodeURIComponent(eventAck[1]), authenticatedMember.id, typeof input.reason === 'string' ? input.reason : 'acknowledged')); return true; }
     const heartbeat = path.match(/^\/v1\/members\/([^/]+)\/heartbeat$/);
     if (method === 'POST' && heartbeat) { if (!authenticatedMember || authenticatedMember.id !== decodeURIComponent(heartbeat[1])) throw new ArcpError('not_found', 'member not found'); const input = await body(req); send(res, 200, await service.heartbeat(authenticatedMember.id, input.presence as any)); return true; }
     if (method === 'POST' && path === '/v1/actor-bindings') { send(res, 201, await service.bindActor(await body(req) as any)); return true; }
@@ -92,6 +103,8 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && path === '/v1/deliveries') { send(res, 200, service.state().deliveries.map(publicDelivery)); return true; }
     const ack = path.match(/^\/v1\/deliveries\/([^/]+)\/ack$/);
     if (method === 'POST' && ack) { const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), String(value.reason ?? 'processed'), typeof value.generation === 'number' ? value.generation : undefined))); return true; }
+    const withdraw = path.match(/^\/v1\/deliveries\/([^/]+)\/withdraw$/);
+    if (method === 'POST' && withdraw) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.withdraw(decodeURIComponent(withdraw[1]), String(value.reason ?? 'withdrawn'), authenticatedMember.id))); return true; }
     send(res, 404, { code: 'not_found', message: 'ARCP route not found' }); return true;
   } catch (error) { const code = error instanceof ArcpError ? error.code : 'internal_error'; const status = code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : ['unknown_recipient', 'unknown_sender', 'profile_unavailable', 'goal_held', 'launch_held', 'stale_generation', 'task_held', 'safe_point_lost', 'workspace_closed'].includes(code) ? 409 : code === 'invalid_request' ? 400 : 500; const message = error instanceof ArcpError ? error.message : 'internal error'; send(res, status, { code, message, ...(error instanceof ArcpError && error.field ? { field: error.field } : {}) }); return true; }
 }
