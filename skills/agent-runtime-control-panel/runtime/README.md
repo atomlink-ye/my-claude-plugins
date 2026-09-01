@@ -24,23 +24,24 @@ agents happens through ARCP Channel, Delivery, Knowledge and Result — see
 
 ## Upstream Paseo constraints
 
-`UPSTREAM.md` records the observed Paseo daemon gaps this runtime works around,
-including the two public transports it relies on: `paseo send --no-wait` reaches
-a running recipient and appears as a complete turn in `paseo logs`, while a
-repeating heartbeat skips busy ticks and runs after idle. Heartbeat prompt
-content is never rendered in `paseo logs`, which is why delivery acceptance is
-confirmed from durable ARCP Delivery state rather than from a transcript.
+`UPSTREAM.md` records the observed Paseo daemon gaps this runtime works around:
+no push when a child reaches a terminal state, `ls -g --json` without
+`ParentAgentId`, and the fact that only `paseo send --no-wait` content appears
+in `paseo logs`. Delivery acceptance is therefore confirmed from durable ARCP
+Delivery state rather than from a transcript, and acceptance means daemon
+receipt rather than proof the recipient processed the prompt.
 
 ## Retired passive-reminder state
 
-Port 8787, the `paseo-reminder` package and the passive reminder/child-watch/
-correction-gate workflow are retired. ARCP is the only cooperation path; no
-proxy, shim or forwarding route is offered.
+Port 8787, the `paseo-reminder` package, the unversioned reminder/message/
+child-watch/ledger/correction routes and the runtime that served them are
+removed. This daemon serves `/v1/*`, `/health` and `/self/runtime` and nothing
+else. ARCP Channel, Delivery, Knowledge and Result are the only cooperation
+path; no proxy, shim or forwarding route is offered.
 
-The reminder, message, child-watch, ledger and correction records written by
-that workflow are user data and still exist on disk. They are not a supported
-cooperation surface and must not be used as one. Archive them before any
-plugin reinstall removes the directory that holds them:
+Records written by the retired workflow are user data. Nothing in this runtime
+reads or writes them any more, so archive the directory before a plugin
+reinstall or re-clone removes it:
 
 ```sh
 skills/agent-runtime-control-panel/scripts/archive-legacy-reminder-state \
@@ -49,6 +50,5 @@ skills/agent-runtime-control-panel/scripts/archive-legacy-reminder-state \
 ```
 
 The archive is a verified copy with a `MANIFEST.json` of per-file record counts
-and SHA-256 digests. It never moves or deletes the source. Deleting the records,
-and removing the code that reads them, is a separate Owner-gated step that
-requires this archive to exist first.
+and SHA-256 digests. It never moves or deletes the source. Deleting the records
+is a separate Owner-gated step that requires this archive to exist first.
