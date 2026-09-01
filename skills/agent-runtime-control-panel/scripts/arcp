@@ -4,13 +4,36 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 8787}`, admin = process.env.ARCP_API_KEY;
+const HELP = `ARCP ControlWorkspace commands:
+  workspace create|join|list|context
+  task create|claim|list WORKSPACE
+  knowledge add|search|list WORKSPACE
+  result submit|list WORKSPACE
+  member heartbeat|list WORKSPACE
+  goal start|list
+  runtime status|list
+  reconcile RUNTIME
+  inbox [--workspace WORKSPACE]
+  panorama [--workspace WORKSPACE]
+  status [--workspace WORKSPACE]
+  tui [--workspace WORKSPACE] [--snapshot]
+  gate [MANAGER]
+  canary
+
+Legacy compatibility commands:
+  reminder, message, child, correction, wakeup, idle, compact, heartbeat, ledger
+  start, send, reuse, interrupt, ack, actor, doctor, ensure, preflight`;
+const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','gate','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack'];
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
-const f = {}, p = []; for (let i=0;i<args.length;i++) { if (args[i].startsWith('--')) { f[args[i].slice(2)] = args[i+1] && !args[i+1].startsWith('--') ? args[++i] : true; } else p.push(args[i]); }
+const f = {}, p = []; for (let i=0;i<args.length;i++) { if (args[i].startsWith('--')) { f[args[i].slice(2)] = i + 1 < args.length && !args[i+1].startsWith('--') ? args[++i] : true; } else p.push(args[i]); }
 const bool = (name) => f[name] === true || f[name] === 'true';
 const jsonFlag = (name) => f[name] ? JSON.parse(f[name]) : undefined;
 const call = async (method, path, body, memberOnly=false, redactCredential=false) => { const s = await load(); const h = { ...(!memberOnly && admin ? {'x-arcp-api-key':admin} : {}), ...(!memberOnly && s.actorCredential ? {'x-arcp-actor-key':s.actorCredential} : {}), ...(s.memberCredential ? {'x-arcp-member-key':s.memberCredential} : {}), ...(body ? {'content-type':'application/json'} : {}) }; const r = await fetch(base + path, {method,headers:h,...(body ? {body:JSON.stringify(body)} : {})}); const v = await r.json(); const output = redactCredential && v?.credential ? (() => { const {credential, ...safe}=v; return {...safe,credentialStored:true}; })() : v; console.log(JSON.stringify(output,null,2)); if (!r.ok) process.exitCode=1; return v; };
+const workspaceId = async () => { const s = await load(), value = f.workspace || s.workspaceId; if (!value) { console.error('no workspace selected; run arcp workspace create, arcp workspace join, or pass --workspace WORKSPACE'); process.exitCode = 2; return undefined; } return value; };
+if (area === 'help' || area === '--help' || area === '-h' || (knownHelpAreas.includes(area) && (action === '--help' || action === '-h' || argv.includes('--help') || argv.includes('-h')))) { console.log(HELP); }
+else {
 const launch = () => ({ ...(f.profile ? {profileId:f.profile} : {}), ...(f.provider ? {provider:f.provider} : {}), ...(f.model ? {model:f.model} : {}), ...(f.mode ? {mode:f.mode} : {}), ...(f.thinking ? {thinking:f.thinking} : {}), ...(f.unattended ? {unattended:true} : {}) });
 if (area === 'ensure') process.exitCode = spawnSync(new URL('./ensure-running', import.meta.url).pathname,{stdio:'inherit',env:process.env}).status ?? 1;
 else if (area === 'doctor') await call('GET','/v1/doctor');
@@ -20,9 +43,10 @@ else if (area === 'workspace' && action === 'create') { const v=await call('POST
 else if (area === 'workspace' && action === 'join') { const s=await load(); const v=await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/join`,{label:f.label||p[1],role:f.role||'worker',capabilities:f.capabilities?.split(',')},Boolean(s.memberCredential),!f['show-credential']); if(v.credential) await save({...s,memberCredential:v.credential,memberId:v.member.id,workspaceId:v.member.workspaceId}); }
 else if (area === 'workspace' && action === 'context') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/context`);
 else if (area === 'task' && action === 'create') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/tasks`,{title:f.title||p.slice(1).join(' ')});
+else if (area === 'task' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/tasks`);
 else if (area === 'task' && action === 'claim') await call('POST',`/v1/tasks/${encodeURIComponent(p[0])}/claim`,{...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])})},true);
 else if (area === 'goal' && action === 'start') { const s=await load(); const g=await call('POST','/v1/goals',{title:f.title||p.join(' ')}); if(g.id) await call('POST','/v1/runtime-sessions',{goalId:g.id,...launch(),workspace:f.cwd||process.cwd(),workspaceId:f.workspace||s.workspaceId,memberId:f.member}); }
-else if (area === 'start') { const s=await load(); await call('POST','/v1/start',{workspaceId:f.workspace||s.workspaceId,title:f.title||p.join(' '),...launch(),paseoWorkspaceRef:f['paseo-workspace']||f.cwd||process.cwd()}); }
+else if (area === 'start') { const s=await load(); const v=await call('POST','/v1/start',{workspaceId:f.workspace||s.workspaceId,title:f.title||p.join(' '),...launch(),paseoWorkspaceRef:f['paseo-workspace']||f.cwd||process.cwd()},false,!f['show-credential']); if(v.credential && v.session?.id) await save({...await load(),runtimeMemberCredentials:{...(await load()).runtimeMemberCredentials||{},[v.session.id]:v.credential}}); }
 else if (area === 'send') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'normal',cacheConfirmation:f.confirm});
 else if (area === 'reuse') await call('POST','/v1/reuse',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),cacheConfirmation:f.confirm});
 else if (area === 'interrupt') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'interrupt',reason:f.reason,cacheConfirmation:f.confirm});
@@ -57,14 +81,21 @@ else if (area === 'ledger' && action === 'revoke') await call('POST',`/ledger/${
 else if (area === 'compact') await call('POST','/compact-wake',{agentId:f.agent||p[0],compact:f.compact||p.slice(1).join(' '),...(f.wake?{wake:f.wake}:{}),...(f['delay-seconds']?{delaySeconds:Number(f['delay-seconds'])}:{}),...(f['wait-for-idle']!==undefined?{waitForIdle:bool('wait-for-idle')}:{}),...(f['threshold-percent']||f['threshold-tokens']?{trigger:{metric:'context-percent',...(f['threshold-percent']?{thresholdPercent:Number(f['threshold-percent'])}:{}),...(f['threshold-tokens']?{thresholdTokens:Number(f['threshold-tokens'])}:{}),...(f.comparator?{comparator:f.comparator}:{})}}:{})});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')},true);
 else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])})},true);
-else if (area === 'status') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/panorama`); }
+else if (area === 'result' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/results`);
+else if (area === 'status') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama`); }
+else if (area === 'workspace' && action === 'list') await call('GET','/v1/workspaces');
 else if (area === 'runtime' && action === 'status') await call('GET',`/v1/runtime-sessions/${encodeURIComponent(p[0])}/status${f.refresh ? '?refresh=1' : ''}`);
+else if (area === 'runtime' && action === 'list') await call('GET','/v1/runtime-sessions');
 else if (area === 'reconcile') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0])}/reconcile`);
 else if (area === 'ack') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||p.slice(1).join(' ')||'processed',...(f.generation?{generation:Number(f.generation)}:{})});
-else if (area === 'inbox') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/context`); }
-else if (area === 'panorama') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/panorama${f.refresh ? '?refresh=1' : ''}`); }
-else if (area === 'tui') { const s=await load(), workspace=f.workspace||s.workspaceId, headers={...(admin?{'x-arcp-api-key':admin}:{}),...(s.actorCredential?{'x-arcp-actor-key':s.actorCredential}:{})}, fetchPanorama=async(refresh=false)=>{const r=await fetch(`${base}/v1/workspaces/${encodeURIComponent(workspace)}/panorama${refresh?'?refresh=1':''}`,{headers}); const v=await r.json(); if(!r.ok) throw new Error(v.code||'panorama failed'); return v;}, tui=await import('../runtime/dist/tui.js'); if(f.snapshot){try{console.log(tui.renderTuiSnapshot(await fetchPanorama(false)));}catch(error){console.log(JSON.stringify({code:error instanceof Error?error.message:String(error)},null,2));process.exitCode=1;}} else await tui.runTui({fetchPanorama}); }
+else if (area === 'inbox') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/context`); }
+else if (area === 'panorama') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama${f.refresh ? '?refresh=1' : ''}`); }
+else if (area === 'tui') { const workspace=await workspaceId(); if(workspace) { const s=await load(), headers={...(admin?{'x-arcp-api-key':admin}:{}),...(s.actorCredential?{'x-arcp-actor-key':s.actorCredential}:{}),...(s.memberCredential?{'x-arcp-member-key':s.memberCredential}:{})}, fetchPanorama=async(refresh=false)=>{const r=await fetch(`${base}/v1/workspaces/${encodeURIComponent(workspace)}/panorama${refresh?'?refresh=1':''}`,{headers}); const v=await r.json(); if(!r.ok) throw new Error(v.message||v.code||'panorama failed'); return v;}, tui=await import('../runtime/dist/tui.js'); if(f.snapshot){try{console.log(tui.renderTuiSnapshot(await fetchPanorama(false)));}catch(error){console.log(JSON.stringify({code:error instanceof Error?error.message:String(error)},null,2));process.exitCode=1;}} else await tui.runTui({fetchPanorama}); } }
 else if (area === 'member' && action === 'heartbeat') { const s=await load(); await call('POST',`/v1/members/${encodeURIComponent(s.memberId)}/heartbeat`,{presence:f.status||'idle'},true); }
-else if (area === 'knowledge' && action === 'search') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=${encodeURIComponent(f.q||'')}&kind=${encodeURIComponent(f.kind||'')}&tag=${encodeURIComponent(f.tag||'')}`);
+else if (area === 'member' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/members`);
+else if (area === 'goal' && action === 'list') await call('GET','/v1/goals');
+else if (area === 'knowledge' && action === 'search') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=${encodeURIComponent(f.q ?? '')}&kind=${encodeURIComponent(f.kind||'')}&tag=${encodeURIComponent(f.tag||'')}`);
+else if (area === 'knowledge' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=&kind=&tag=`);
 else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(); if (s.workspaceId) await call('GET',`/v1/workspaces/${encodeURIComponent(s.workspaceId)}/context`); }
-else { console.error('usage: arcp [doctor|ensure|preflight|tui --snapshot|status|panorama] | arcp reminder add|list|delete | message send|list|ack|reply | child list|watch|unwatch | correction open|list|resolve | wakeup list|add|delete | idle add|list|delete | compact | context usage | heartbeat list|delete | ledger add|list|revoke | start|send|reuse|interrupt|ack'); process.exitCode=2; }
+else { console.error(`unknown command: ${argv.find((value) => !value.startsWith('--')) || area}\n\n${HELP}`); process.exitCode=2; }
+}

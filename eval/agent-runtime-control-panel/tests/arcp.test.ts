@@ -59,6 +59,16 @@ describe('ARCP MVE control core', () => {
     const restarted = await control(root); const context = restarted.context(workspace.id);
     expect(context.roster).toHaveLength(2); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
   });
+  it('returns a distinct managed Worker credential without replacing the owner credential', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-managed-')); const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'manager' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'managed worker' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'managed task', profileId: 'codex-worker' });
+    expect(started).toMatchObject({ member: { joinKind: 'managed' }, credential: expect.any(String) });
+    expect((started as any).credential).not.toBe(workspace.credential);
+    expect(service.memberForCredential((started as any).credential).id).toBe((started as any).member.id);
+    expect(service.memberForCredential(workspace.credential).id).toBe(workspace.member.id);
+  });
   it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
     process.env.ARCP_DATA = root;
@@ -195,6 +205,32 @@ describe('ARCP HTTP and legacy compatibility', () => {
     const injected = await fetch(`${base}/v1/deliveries`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-arcp-actor-key': registered.credential! }, body: JSON.stringify({ runtimeSessionId: 'runtime-1', body: 'public body', sourceMessageId: 'legacy-message-id' }) });
     expect(injected.status).toBe(201); expect(app.arcp.state().deliveries[0]?.sourceMessageId).toBeUndefined();
   });
+  it('returns actionable v1 error messages, including the current task fence', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-errors-')); process.env.ARCP_API_KEY = 'test-key';
+    app = await createServer(new CompanionService(undefined, new Store(root))); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const registered = await app.arcp.registerActor({ clientIdentity: 'error-owner' }); const created = await app.arcp.createWorkspace({ ownerActorId: registered.actor.id, purpose: 'errors' });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const headers = { 'x-arcp-member-key': created.credential, 'content-type': 'application/json' };
+    const missing = await fetch(`${base}/v1/tasks/missing/claim`, { method: 'POST', headers, body: '{}' }); const missingBody: any = await missing.json();
+    expect(missing.status).toBe(409); expect(missingBody).toMatchObject({ code: 'unknown_recipient', message: expect.any(String) });
+    const task = await app.arcp.createTask({ workspaceId: created.workspace.id, title: 'fenced' });
+    const stale = await fetch(`${base}/v1/tasks/${task.id}/claim`, { method: 'POST', headers, body: JSON.stringify({ expectedFence: 999 }) }); const staleBody: any = await stale.json();
+    expect(stale.status).toBe(409); expect(staleBody).toMatchObject({ code: 'stale_generation', message: expect.stringContaining('current fence is 0') });
+    const absent = await fetch(`${base}/v1/tasks/${task.id}/claim`, { method: 'POST', headers, body: '{}' }); const absentBody: any = await absent.json();
+    expect(absent.status).toBe(400); expect(absentBody).toMatchObject({ code: 'invalid_request', message: expect.stringContaining('--expected-fence'), field: 'expectedFence' });
+  });
+  it('lists ControlWorkspace resources with member scoping and redaction', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-lists-')); process.env.ARCP_API_KEY = 'test-key';
+    app = await createServer(new CompanionService(undefined, new Store(root))); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const owner = await app.arcp.registerActor({ clientIdentity: 'list-owner' }); const first = await app.arcp.createWorkspace({ ownerActorId: owner.actor.id, purpose: 'first' });
+    const other = await app.arcp.createWorkspace({ ownerActorId: owner.actor.id, purpose: 'other' }); const task = await app.arcp.createTask({ workspaceId: first.workspace.id, title: 'listed' });
+    await app.arcp.addKnowledge({ workspaceId: first.workspace.id, authorMemberId: first.member.id, kind: 'learning', text: 'visible learning' }); await app.arcp.claimTask(task.id, first.member.id, 0); await app.arcp.submitResult({ workspaceId: first.workspace.id, taskId: task.id, memberId: first.member.id, status: 'candidate', summary: 'visible result', expectedFence: 1 });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const headers = { 'x-arcp-member-key': first.credential };
+    const get = async (url: string) => { const response = await fetch(`${base}${url}`, { headers }); return { status: response.status, body: await response.json() as any }; };
+    expect((await get('/v1/workspaces')).body).toEqual([first.workspace]); expect((await get(`/v1/workspaces/${first.workspace.id}/tasks`)).body).toHaveLength(1);
+    expect((await get(`/v1/workspaces/${first.workspace.id}/results`)).body).toHaveLength(1); const members = await get(`/v1/workspaces/${first.workspace.id}/members`); expect(members.body[0]).toMatchObject({ id: first.member.id }); expect(JSON.stringify(members.body)).not.toContain('credential');
+    expect((await get(`/v1/workspaces/${first.workspace.id}/knowledge?q=`)).body).toHaveLength(1); expect((await get('/v1/goals')).status).toBe(200); expect((await get('/v1/runtime-sessions')).status).toBe(200);
+    expect((await get(`/v1/workspaces/${other.workspace.id}/tasks`)).status).toBe(404);
+  });
 });
 
 describe('ARCP CLI and TUI presentation', () => {
@@ -205,6 +241,8 @@ describe('ARCP CLI and TUI presentation', () => {
     const port = (server.address() as any).port; const script = path.join(process.cwd(), '../scripts/arcp');
     await execFileAsync(process.execPath, [script, 'idle', 'add', 'agent-1', 'nudge', '--threshold-percent', '0.8', '--once', 'true'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
     expect(seen[0]).toMatchObject({ url: '/idle-reminders', key: 'cli-key', body: { agentId: 'agent-1', message: 'nudge', thresholdPercent: 0.8, once: true } });
+    await execFileAsync(process.execPath, [script, 'knowledge', 'search', 'workspace-1', '--q', ''], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
+    expect(seen[1]).toMatchObject({ url: '/v1/workspaces/workspace-1/knowledge?q=&kind=&tag=', key: 'cli-key' });
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await expect(execFileAsync(process.execPath, [script, 'reminder', 'list'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}` } })).rejects.toMatchObject({ code: expect.any(Number) });
   });
