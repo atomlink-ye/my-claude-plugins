@@ -120,9 +120,9 @@ paseo schedule inspect <id>       # => Schedule not found / DaemonRpcError
 
 Empirical testing established two distinct public transports. `paseo send
 --no-wait` reaches a running recipient and appears as a complete prompt turn in
-`paseo logs`; paseo-reminder uses it for `delivery:"interrupt"`. A repeating
+`paseo logs`; the ARCP runtime uses it for `delivery:"interrupt"`. A repeating
 heartbeat skips ticks while the recipient is busy and runs on a later tick after
-idle; paseo-reminder uses it for default `delivery:"on-idle"`.
+idle; the ARCP runtime uses it for default `delivery:"on-idle"`.
 
 Heartbeat prompt content is not rendered in `paseo logs`. Its `lastRunAt`, read
 through `heartbeat update <id> --cron <unchanged>`, is therefore the only public

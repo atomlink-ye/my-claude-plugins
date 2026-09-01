@@ -7,6 +7,9 @@
 .tmp-state/
 .tmp/
 node_modules/
+node_modules
+skills/*/node_modules
+skills/*/*/node_modules
 .opencode-state/
 
 .local

@@ -7,7 +7,7 @@ Personal Claude Code plugin marketplace. Contains reusable plugins, tools, and s
 ```
 ├── plugins/          # Plugin manifests and configurations
 ├── skills/           # Skill definitions (loaded by Claude Code)
-│   └── paseo-companion/paseo-reminder/ # Deliberate daemon-source exception; ships with its skill
+│   └── agent-runtime-control-panel/runtime/ # Deliberate daemon-source exception; ships with its skill
 ├── tools/            # Tool implementations (source code only, no tests)
 │   └── agent-wallet/ # Agent Wallet Bridge — EIP-1193 provider injection for Web3
 ├── eval/             # Tests and evaluations for all tools/plugins
@@ -24,11 +24,11 @@ All tests, e2e scripts, and evaluation harnesses for every tool, plugin, or skil
 
 This repo is loaded by other users as a plugin marketplace. Shipping tests or evals inside the artifacts would be confusing and add unnecessary weight. Keep `tools/` and `skills/` clean — only production source code and runtime skill assets.
 
-`skills/paseo-companion/paseo-reminder/` is a deliberate exception to the
-usual source placement rule: this companion daemon ships inside its owning skill
-so discovery and bootstrap remain self-contained. Its tests still live under
-`eval/paseo-reminder/`. This is not a precedent for placing unrelated tool
-implementations under `skills/`.
+`skills/agent-runtime-control-panel/runtime/` is a deliberate exception to the
+usual source placement rule: the ARCP daemon ships inside its owning skill so
+discovery and bootstrap remain self-contained. Its tests live under
+`eval/agent-runtime-control-panel/`. This is not a precedent for placing
+unrelated tool implementations under `skills/`.
 
 Evaluation run results, logs, transcripts, and generated outputs should not be committed under `./eval`. Keep only the original eval inputs and metadata needed to rerun the evaluation.
 

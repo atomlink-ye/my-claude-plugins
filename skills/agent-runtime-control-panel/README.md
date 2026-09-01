@@ -1,6 +1,6 @@
 # Agent Runtime Control Panel
 
-ARCP is a standalone local, CLI-first control plane. A durable ControlWorkspace holds the team's purpose, Members, fenced Tasks, append-only Knowledge, Results and managed RuntimeSessions. Its unversioned reminder/watch/message/correction/gate API remains compatible with `paseo-companion`; `/v1/*` is internal transport for the CLI.
+ARCP is a standalone local, CLI-first control plane. A durable ControlWorkspace holds the team's purpose, Members, fenced Tasks, append-only Knowledge, Results and managed RuntimeSessions. `/v1/*` is internal durable transport for the `arcp` CLI.
 
 ## Start
 
@@ -49,6 +49,8 @@ For Paseo-managed sessions, child observation merges parent-bound Agents with be
 
 For Claude, `interrupt` is deliberately two-stage and server-enforced: the first `arcp interrupt RUNTIME --reason X --body X` has no runtime side effect and returns a confirmation. Re-run the supplied command with `--confirm TOKEN`; ARCP re-observes the active turn and child set and rejects a stale token. Claude normal `send` and `reuse` use provider activity time: under 55 minutes is fresh; 55–60 is expiring; 60+ is expired. A hold offers a fresh-session handoff command or confirmed reuse. Panorama reports this activity age/cache state; ARCP never sends artificial keepalives or compacts to preserve cache.
 
-## Compatibility
+## Retired passive-reminder workflow
 
-Existing `skills/paseo-companion/scripts/ensure-running` now starts this runtime. Existing imports under `skills/paseo-companion/paseo-reminder/src/*`, legacy environment variables, and all non-`/v1` routes forward to the same core.
+Port 8787, the `paseo-reminder` package and the passive reminder/child-watch/correction-gate workflow are retired. ARCP Channel, Delivery, Knowledge and Result are the only cooperation path; no proxy, shim or forwarding route is offered. Legacy `PASEO_COMPANION_RUNTIME_DIR`, `PASEO_COMPANION_DATA`, `PASEO_COMPANION_LOG` and `PASEO_COMPANION_PID` remain accepted as state-path names only, so an existing state directory stays readable.
+
+Reminder, message, child-watch, ledger and correction records written by that workflow are user data and still exist on disk. Archive them with `scripts/archive-legacy-reminder-state --data DIR --out DIR` before any plugin reinstall removes the directory that holds them; see `runtime/README.md`. Deletion of those records, and of the code that reads them, is a separate Owner-gated step.
