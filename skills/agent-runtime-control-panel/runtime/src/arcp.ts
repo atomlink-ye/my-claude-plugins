@@ -4,6 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PaseoCli, asRecord } from './cli.js';
 import { CompanionService } from './service.js';
+import { createPaseoClient } from '@getpaseo/client';
+import WebSocket from 'ws';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
 export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'transport_indeterminate';
@@ -82,8 +84,19 @@ export class PaseoAdapter {
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: 5_000 }); }
   registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: 5_000 }); }
-  /** Normal delivery uses an internal start-turn operation, never the legacy companion queue. */
-  startTurn(externalId: string, body: string, deliveryId: string) { return this.cli.run(['agent', 'start-turn', externalId, '--message-id', deliveryId, '--json', body], { timeoutMs: 10_000 }); }
+  /** Normal delivery uses the public client handle after a second idle/terminal check. */
+  async startTurn(externalId: string, body: string, deliveryId: string) {
+    if (!(this.cli instanceof PaseoCli)) return (this.cli as any).run(['start-turn', externalId, deliveryId, body], { timeoutMs: 10_000 });
+    const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws';
+    const url = raw.includes('://') ? raw : `ws://${raw}`;
+    const client = createPaseoClient({ url, clientId: `arcp-${process.pid}-${deliveryId.slice(0, 8)}`, reconnect: { enabled: false }, webSocketFactory: (target: string, options: any) => new WebSocket(target, options) } as any);
+    await client.connect();
+    try {
+      const handle = client.agents.ref(externalId); const refreshed = await handle.refresh(); const status = normalized(refreshed?.agent?.status);
+      if (!['idle', 'terminal', 'completed', 'stopped'].includes(status)) throw new ArcpError('safe_point_lost', 'runtime changed before start turn');
+      await handle.send(body, { messageId: deliveryId });
+    } finally { await client.close(); }
+  }
   interrupt(externalId: string, body: string) { return this.cli.run(['send', '--no-wait', externalId, body], { timeoutMs: 10_000 }); }
 }
 
