@@ -8,20 +8,21 @@ import { CompanionService } from '../../../skills/agent-runtime-control-panel/ru
 import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 
 class FakeCli {
-  constructor(private readonly fail = false) {}
+  private lastMode = 'auto';
+  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}) {}
   async run(args: string[]) {
     if (this.fail && args[0] === 'run') throw new Error('timed out');
-    if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: 'Enabled', modes: 'Full Access' }], stdout: '', stderr: '' };
-    if (args[0] === 'provider' && args[1] === 'models' && args[2] === 'codex') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
-    if (args[0] === 'run') return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access'] })), stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
+    if (args[0] === 'run') { this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
-    if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium' }, stdout: '', stderr: '' };
+    if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
 }
-async function control(root: string, fail = false) {
+async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}) {
   const companion = { store: { dir: root }, postMessage: async () => ({ id: 'message-1', delivery: { status: 'pending' } }), deleteMessage: async () => ({}) };
-  const service = new ArcpService(companion as any, new FakeCli(fail) as any); await service.init(); return service;
+  const service = new ArcpService(companion as any, new FakeCli(fail, providers, inspectValue) as any); await service.init(); return service;
 }
 
 describe('ARCP MVE control core', () => {
@@ -82,6 +83,35 @@ describe('ARCP MVE control core', () => {
     expect((await service.reconcile(runtime.id)).state).toBe('transport_indeterminate');
     const heldGoal = await service.createGoal({ actorId: actor.id, title: 'unavailable profile' });
     await expect(service.launch({ actorId: actor.id, goalId: heldGoal.id, profileId: 'claude-manager' })).rejects.toMatchObject({ code: 'profile_unavailable' });
+  });
+
+  it('uses auto when Claude/Codex mode is omitted and never silently elevates', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-launch-')); const service = await control(root);
+    const codex = await service.preflight({ profileId: 'codex-worker' });
+    expect(codex).toMatchObject({ action: 'launch', requested: { provider: 'codex', mode: 'auto' }, effective: { mode: 'auto' } });
+    const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'safe default' });
+    const launched = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    expect(launched.mode).toBe('auto'); expect(launched.observed?.mode).toBe('auto');
+    const weak = await service.preflight({ provider: 'codex', model: 'gpt-5.6-terra', mode: 'plan', thinking: 'medium' });
+    expect(weak).toMatchObject({ action: 'hold', launchable: false, requested: { mode: 'plan' }, recommendedCommands: [expect.stringContaining('--profile codex-full-access')] });
+  });
+
+  it('allows only an explicit elevated profile and leaves Pi/Grok mode-less', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-elevated-')); const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'approved disposable' });
+    const elevated = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-full-access' });
+    expect(elevated.mode).toBe('full-access'); expect(elevated.observed?.mode).toBe('full-access');
+    const pi = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-pi-')), false, ['pi']);
+    expect(await pi.preflight({ profileId: 'pi-grok-worker' })).toMatchObject({ action: 'launch', requested: { provider: 'pi', model: 'grok-cli/grok-4.6' } });
+    await expect(pi.preflight({ provider: 'pi', model: 'grok-cli/grok-4.6', mode: 'auto' })).rejects.toMatchObject({ code: 'invalid_request' });
+  });
+
+  it('projects quality-labelled telemetry and retains requested/observed mismatch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-observation-')); const service = await control(root, false, ['codex'], { status: 'permission', mode: 'full-access', pendingPermissions: [{ id: 'permission-private' }], activeTurn: { id: 'turn-1' }, lastUsage: { inputTokens: 12, cachedInputTokens: 4, outputTokens: 8, contextWindowUsedTokens: 50, contextWindowMaxTokens: 100 }, timeline: [{ type: 'compaction', status: 'completed', timestamp: '2026-01-01T00:00:00.000Z' }] });
+    const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'observe' });
+    const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    const status = await service.runtimeStatus(runtime.id);
+    expect(status.observation).toMatchObject({ health: 'attention', mismatch: true, pendingPermissions: 1, context: { used: 50, max: 100, ratio: 0.5, quality: 'reported' }, compaction: { count: 1, status: 'completed' }, requested: { mode: 'auto' }, observed: { mode: 'full-access' } });
   });
 });
 

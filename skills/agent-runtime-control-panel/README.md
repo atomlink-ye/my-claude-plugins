@@ -21,7 +21,9 @@ ARCP_API_KEY=test-key ARCP_RUNTIME_DIR="$root/run" ARCP_DATA="$root/data" PORT=1
 ARCP_API_KEY=test-key ARCP_URL=http://127.0.0.1:18787 skills/agent-runtime-control-panel/scripts/arcp actor register hermes-owner --label Hermes
 ```
 
-Then run the focused tests. For a real provider dogfood, run `profile discovery`, use only a profile marked `available:true`, register an actor, create a goal, then launch `codex-worker`. Queue a normal delivery, wait for a safe point, and ACK it. A launch timeout or absent handle is `transport_indeterminate`; call `runtime reconcile`, do not relaunch.
+Then run the focused tests. For a real provider dogfood, run `arcp doctor`, then `arcp preflight --profile codex-worker`. Claude and Codex profiles deliberately resolve an omitted mode to `auto`; ARCP live-validates it and shows requested versus observed settings after launch. For unattended editing work, copy the exact elevation command from preflight, for example `arcp start --profile codex-full-access --title '<goal>' --unattended`; ARCP never upgrades a mode itself. `claude-bypass-permissions` is offered only when that live mode is available. Pi/Grok stays mode-less.
+
+Use `arcp panorama --refresh` during work and `arcp runtime status RUNTIME --refresh` for the focused view. They project context/usage quality, attention, compaction only when observed, safe child descriptors, requested-vs-observed settings, a path-free commit/diffstat, and redacted legacy status counts. A launch timeout or absent handle is `transport_indeterminate`; call `runtime reconcile`, do not relaunch.
 
 ## Compatibility
 

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PaseoCli, asRecord } from './cli.js';
@@ -14,13 +15,19 @@ export type DeliveryState = 'queued' | 'waiting_safe_point' | 'attempting' | 'de
 export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; state: GoalState; createdAt: string; updatedAt: string; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; generation: number; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; workspace?: string; externalId?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; generation: number; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; state: DeliveryState; createdAt: string; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; fence: number; createdAt: string; updatedAt: string; }
 export interface KnowledgeEntry { id: string; workspaceId: string; authorMemberId: string; kind: 'problem' | 'learning' | 'decision' | 'evidence' | 'runbook' | 'blocker'; text: string; tags: string[]; taskId?: string; goalId?: string; createdAt: string; }
 export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; createdAt: string; }
+export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
+export interface ActionResult { action: 'launch' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; }
+export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
+export interface ManagedChild { id: string; status: string; role: string; }
+export interface WorkSummary { latestCommit?: { sha: string; subject: string; time: string }; dirty: boolean | 'unknown'; diffstat: { files: number; insertions: number; deletions: number } | 'unknown'; }
+export interface LegacySummary { reminders: Record<string, number>; messages: Record<string, number>; trackedChildren: { total: number; statuses: Record<string, number> }; openCorrectionInstances: number; blockedGateCount: number; }
 interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; }
 
 const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [] });
@@ -59,7 +66,9 @@ export class ArcpStore {
 
 export const DEFAULT_PROFILES = [
   { id: 'claude-manager', provider: 'claude', model: 'claude-opus-5', mode: 'auto', thinking: 'medium', role: 'manager' },
-  { id: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
+  { id: 'claude-bypass-permissions', provider: 'claude', model: 'claude-opus-5', mode: 'bypassPermissions', thinking: 'medium', role: 'manager' },
+  { id: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium', role: 'worker' },
+  { id: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
   { id: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', role: 'worker' },
 ] as const;
 
@@ -68,9 +77,23 @@ function capabilityText(value: unknown): string { return String(JSON.stringify(v
 function capabilityToken(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]/g, ''); }
 function sessionState(value: unknown): SessionState {
   const state = normalized(value);
+  if (!state || state === 'unknown') return 'transport_indeterminate';
   if (['completed', 'failed', 'stopped', 'cancelled', 'archived', 'terminal'].includes(state)) return 'terminal';
   if (state === 'idle') return 'idle';
   return 'running';
+}
+const setting = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+const sameSetting = (a: unknown, b: unknown) => !a || !b ? false : capabilityToken(String(a)) === capabilityToken(String(b));
+const safeModeRank = (value: unknown) => {
+  const mode = capabilityToken(String(value ?? ''));
+  if (['plan', 'readonly', 'read', 'ask'].includes(mode)) return 0;
+  if (mode === 'auto') return 1;
+  if (['fullaccess', 'bypasspermissions'].includes(mode)) return 2;
+  return 1;
+};
+const safeJson = (value: unknown): Record<string, any> => asRecord(value);
+async function git(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => execFile('git', args, { cwd, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
 
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
@@ -84,6 +107,25 @@ export class PaseoAdapter {
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: 5_000 }); }
   registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: 5_000 }); }
+  /** Prefer the installed public SDK snapshot/timeline. CLI is retained for older
+   * daemons and adapter facts which the public SDK cannot expose. */
+  async snapshot(externalId: string): Promise<{ agent: Record<string, any>; timeline: unknown[]; source: 'sdk' | 'cli' }> {
+    if (this.cli instanceof PaseoCli) {
+      const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws';
+      const url = raw.includes('://') ? raw : `ws://${raw}`;
+      const client = createPaseoClient({ url, clientId: `arcp-observe-${process.pid}-${externalId.slice(0, 8)}`, reconnect: { enabled: false }, webSocketFactory: (target: string, options: any) => new WebSocket(target, options) } as any);
+      await client.connect();
+      try {
+        const handle = client.agents.ref(externalId); const refreshed = await handle.refresh();
+        if (!refreshed?.agent) throw new Error('Paseo public client did not return a snapshot');
+        const page = await handle.timeline.refetch({ direction: 'tail', limit: 100 });
+        const value = safeJson(page); const timeline = Array.isArray(value.items) ? value.items : Array.isArray(value.timeline) ? value.timeline : [];
+        return { agent: safeJson(refreshed.agent), timeline, source: 'sdk' };
+      } finally { await client.close(); }
+    }
+    const observed = safeJson((await this.observe(externalId)).value);
+    return { agent: observed, timeline: Array.isArray(observed.timeline) ? observed.timeline : [], source: 'cli' };
+  }
   /** Normal delivery uses the public client handle after a second idle/terminal check. */
   async startTurn(externalId: string, body: string, deliveryId: string) {
     if (!(this.cli instanceof PaseoCli)) return (this.cli as any).run(['start-turn', externalId, deliveryId, body], { timeoutMs: 10_000 });
@@ -101,6 +143,7 @@ export class PaseoAdapter {
 }
 
 export type Profile = { id: string; provider: string; model: string; mode?: string; thinking?: string; role: string };
+export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; unattended?: boolean };
 
 export class ArcpService {
   readonly store: ArcpStore;
@@ -153,12 +196,14 @@ export class ArcpService {
       state.goals.push(goal); return goal;
     });
   }
-  async startManaged(input: { actorId: string; workspaceId: string; title: string; profileId: string; paseoWorkspaceRef?: string }): Promise<{ goal: Goal; task: Task; member: Member; session: RuntimeSession }> {
+  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; paseoWorkspaceRef?: string }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
+    const preflight = await this.preflight(input);
+    if (!preflight.launchable) return preflight;
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title });
-    const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${input.profileId}`, role: 'worker', joinKind: 'managed', actorId: input.actorId });
-    const session = await this.launch({ actorId: input.actorId, goalId: goal.id, profileId: input.profileId, workspace: input.paseoWorkspaceRef, workspaceId: input.workspaceId, memberId: joined.member.id });
+    const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role: 'worker', joinKind: 'managed', actorId: input.actorId });
+    const session = await this.launch({ ...input, actorId: input.actorId, goalId: goal.id, workspace: input.paseoWorkspaceRef, workspaceId: input.workspaceId, memberId: joined.member.id });
     return { goal, task, member: joined.member, session };
   }
   async setGoalState(id: string, stateValue: GoalState): Promise<Goal> {
@@ -173,21 +218,69 @@ export class ArcpService {
       const profiles = await Promise.all(this.profiles().map(async (profile) => {
         const provider = providers.map(asRecord).find((item) => String(item.provider).toLowerCase() === profile.provider);
         const providerAvailable = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled';
-        const modes = capabilityText(provider?.modes);
+        const modes = this.modeIds(provider?.modes);
         try {
           const models = (await this.adapter.models(profile.provider)).value;
           const model = Array.isArray(models) ? models.map(asRecord).find((item) => String(item.id).toLowerCase() === profile.model.toLowerCase()) : undefined;
           const thinking = !profile.thinking || (Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.map(String).includes(profile.thinking));
-          const mode = !profile.mode || capabilityToken(modes).includes(capabilityToken(profile.mode));
+          const mode = !profile.mode || modes.some((item) => sameSetting(item, profile.mode));
           return { ...profile, available: providerAvailable && Boolean(model) && thinking && mode };
         } catch { return { ...profile, available: false }; }
       }));
       return { available: true, profiles };
     } catch { return { available: false, profiles: this.profiles().map((profile) => ({ ...profile, available: false })) }; }
   }
-  async launch(input: { actorId: string; goalId: string; profileId: string; workspace?: string; workspaceId?: string; memberId?: string }): Promise<RuntimeSession> {
-    const profile = this.profileData.find((item) => item.id === input.profileId);
-    if (!profile) throw new ArcpError('invalid_request', 'unknown launch profile');
+  private modeIds(value: unknown): string[] {
+    const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
+    return values.map((item) => {
+      const raw = typeof item === 'string' ? item.trim() : setting(safeJson(item).id);
+      const token = capabilityToken(raw ?? '');
+      // Paseo's public provider listing sometimes exposes human labels rather
+      // than IDs. Canonicalize only exact known labels; never substring-match.
+      if (token === 'automode') return 'auto';
+      if (token === 'fullaccess') return 'full-access';
+      if (token === 'bypass') return 'bypassPermissions';
+      if (token === 'planmode') return 'plan';
+      return raw;
+    }).filter((item): item is string => Boolean(item));
+  }
+  private requestedProfile(input: LaunchInput): Profile {
+    const explicit = [input.provider, input.model, input.mode, input.thinking].some((value) => value !== undefined);
+    if (input.profileId && explicit) throw new ArcpError('invalid_request', 'use either a named profile or explicit provider/model/mode/thinking');
+    if (input.profileId || !explicit) {
+      const profile = this.profileData.find((item) => item.id === (input.profileId ?? 'codex-worker'));
+      if (!profile) throw new ArcpError('invalid_request', 'unknown launch profile');
+      return profile;
+    }
+    if (!input.provider?.trim() || !input.model?.trim()) throw new ArcpError('invalid_request', 'explicit launch requires provider and model');
+    if (input.provider === 'pi' && input.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
+    const mode = setting(input.mode); const thinking = setting(input.thinking);
+    return { id: 'explicit', provider: input.provider.trim(), model: input.model.trim(), ...(mode ? { mode } : {}), ...(thinking ? { thinking } : {}), role: 'explicit' };
+  }
+  async preflight(input: LaunchInput): Promise<ActionResult> {
+    const profile = this.requestedProfile(input); const requested: RuntimeSettings = { provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}) };
+    const discovered = await this.discovery();
+    let live = discovered.profiles.find((item) => item.id === profile.id)?.available === true;
+    let liveModes: string[] = [];
+    try {
+      const providers = (await this.adapter.discover()).value; const provider = Array.isArray(providers) ? providers.map(asRecord).find((item) => normalized(item.provider) === normalized(profile.provider)) : undefined; liveModes = this.modeIds(provider?.modes);
+      if (profile.id === 'explicit') {
+        const models = (await this.adapter.models(profile.provider)).value; const model = Array.isArray(models) ? models.map(asRecord).find((item) => sameSetting(item.id, profile.model)) : undefined;
+        live = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled' && Boolean(model) && (!profile.mode || liveModes.some((mode) => sameSetting(mode, profile.mode))) && (!profile.thinking || (Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.some((value: unknown) => sameSetting(value, profile.thinking))));
+      }
+    } catch { /* discovery receipt remains truthful */ }
+    const stronger = profile.provider === 'codex' ? 'full-access' : profile.provider === 'claude' ? 'bypassPermissions' : undefined;
+    const elevatedProfile = profile.provider === 'codex' ? 'codex-full-access' : profile.provider === 'claude' ? 'claude-bypass-permissions' : undefined;
+    const recommendedCommands = stronger && liveModes.some((mode) => sameSetting(mode, stronger)) ? [`arcp start --profile ${elevatedProfile} --title '<goal>'${input.unattended ? ' --unattended' : ''}`] : [];
+    if (!live) return { action: 'hold', launchable: false, why: 'requested provider, model, thinking, or mode is not live-validated', requested, effective: requested, profileId: profile.id, recommendedCommands: profile.mode === 'auto' ? recommendedCommands : [], liveModes };
+    const needsElevation = ['claude', 'codex'].includes(profile.provider) && (safeModeRank(profile.mode) < safeModeRank('auto') || Boolean(input.unattended) && safeModeRank(profile.mode) < 2);
+    if (needsElevation && recommendedCommands.length) return { action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
+    if (needsElevation) return { action: 'warn', launchable: true, why: 'requested mode is weaker than auto and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
+    return { action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes };
+  }
+  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; memberId?: string }): Promise<RuntimeSession> {
+    const preflight = await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
+    const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
     const goal = state.goals.find((item) => item.id === input.goalId && item.actorId === input.actorId);
     const binding = state.bindings.find((item) => item.actorId === input.actorId);
@@ -206,11 +299,14 @@ export class ArcpService {
       const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace)).value);
       const externalId = String(result.id ?? result.agentId ?? '');
       if (!externalId) throw new Error('Paseo did not return a runtime identity');
-      const inspected = asRecord((await this.adapter.observe(externalId)).value);
-      const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.mode ?? inspected.Mode, inspected.thinking ?? inspected.Thinking];
+      // Persist the opaque handle before postflight: reconcile must remain possible
+      // when launch succeeded but the immediate observation timed out.
+      await this.store.mutate((next) => { next.sessions.find((item) => item.id === session.id)!.externalId = externalId; });
+      const snapshot = await this.adapter.snapshot(externalId); const inspected = snapshot.agent;
+      const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.currentModeId ?? inspected.mode ?? inspected.Mode, inspected.effectiveThinkingOptionId ?? inspected.thinkingOptionId ?? inspected.thinking ?? inspected.Thinking];
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
       const matchesPlan = expected.every((expectedValue, index) => !expectedValue || (typeof observed[index] === 'string' && capabilityToken(String(observed[index])) === capabilityToken(expectedValue)));
-      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.externalId = externalId; stored.state = matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); return stored; });
+      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.state = matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); return stored; });
     } catch {
       return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = 'transport_indeterminate'; return stored; });
     }
@@ -220,9 +316,12 @@ export class ArcpService {
     if (!prior) throw new ArcpError('not_found', 'runtime session not found');
     if (!prior.externalId) return prior;
     try {
-      const observed = asRecord((await this.adapter.observe(prior.externalId)).value);
+      const snapshot = await this.adapter.snapshot(prior.externalId); const observed = snapshot.agent;
       const updated = await this.store.mutate((state) => {
-        const item = state.sessions.find((value) => value.id === id)!; item.state = sessionState(observed.status ?? observed.Status); item.lastObservedAt = now();
+        const item = state.sessions.find((value) => value.id === id)!;
+        item.observed = { ...(setting(observed.provider ?? observed.Provider) ? { provider: String(observed.provider ?? observed.Provider) } : {}), ...(setting(observed.model ?? observed.Model) ? { model: String(observed.model ?? observed.Model) } : {}), ...(setting(observed.currentModeId ?? observed.mode ?? observed.Mode) ? { mode: String(observed.currentModeId ?? observed.mode ?? observed.Mode) } : {}), ...(setting(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) ? { thinking: String(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) } : {}) };
+        const requested = [item.provider, item.model, item.mode, item.thinking]; const actual = [item.observed.provider, item.observed.model, item.observed.mode, item.observed.thinking];
+        item.state = requested.every((value, index) => !value || sameSetting(value, actual[index])) ? sessionState(observed.status ?? observed.Status) : 'attention'; item.lastObservedAt = now();
         for (const delivery of state.deliveries.filter((value) => value.runtimeSessionId === id && value.generation === item.generation && ['delivered', 'running'].includes(value.state))) {
           if (item.state === 'running') delivery.state = 'running';
           else if (item.state === 'idle' || item.state === 'terminal') { delivery.state = 'processed'; delivery.processedAt = now(); }
@@ -307,6 +406,51 @@ export class ArcpService {
   async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string }): Promise<KnowledgeEntry> { return this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); }
   async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number }): Promise<Result> { return this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); if (!task || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', 'result fence is stale'); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); return result; }); }
   context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const memberSessions = new Set(state.sessions.filter((session) => session.workspaceId === workspaceId && (!memberId || session.memberId === memberId)).map((session) => session.id)); return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), inbox: memberId ? state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged') : [] }; }
+  private requested(session: RuntimeSession): RuntimeSettings { return { provider: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}) }; }
+  private async children(externalId?: string): Promise<ManagedChild[]> {
+    if (!externalId) return [];
+    try {
+      const agents = (await this.adapter.registry()).value; if (!Array.isArray(agents)) return [];
+      return agents.map(asRecord).filter((item) => String(item.ParentAgentId ?? item.parentAgentId ?? '') === externalId).map((item) => ({ id: String(item.id ?? item.agentId), status: String(item.status ?? item.Status ?? 'unknown'), role: String(asRecord(item.labels).role ?? item.role ?? 'unknown') })).filter((item) => item.id);
+    } catch { return []; }
+  }
+  private async workSummary(cwd?: string): Promise<WorkSummary> {
+    if (!cwd) return { dirty: 'unknown', diffstat: 'unknown' };
+    try {
+      const [commit, status, stat] = await Promise.all([git(cwd, ['log', '-1', '--format=%H%x1f%s%x1f%cI']), git(cwd, ['status', '--porcelain']), git(cwd, ['diff', '--shortstat', 'HEAD'])]);
+      const [sha, subject, time] = commit.trim().split('\x1f'); const match = /(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/.exec(stat);
+      const untracked = status.split('\n').filter((line) => line.startsWith('?? ')).length;
+      return { ...(sha && subject && time ? { latestCommit: { sha, subject, time } } : {}), dirty: Boolean(status.trim()), diffstat: match ? { files: Number(match[1]) + untracked, insertions: Number(match[2] ?? 0), deletions: Number(match[3] ?? 0) } : { files: untracked, insertions: 0, deletions: 0 } };
+    } catch { return { dirty: 'unknown', diffstat: 'unknown' }; }
+  }
+  legacySummary(): LegacySummary {
+    const count = (items: Array<{ status?: string }>) => items.reduce<Record<string, number>>((out, item) => { const status = item.status ?? 'unknown'; out[status] = (out[status] ?? 0) + 1; return out; }, {});
+    const reminders = this.companion.store.getReminders(); const messages = this.companion.store.getMessages(); const children = this.companion.store.getTrackedChildren(); const corrections = this.companion.store.getCorrections();
+    const open = corrections.filter((item) => item.status === 'open' && item.findings.some((finding) => finding.resolution === null));
+    return { reminders: count(reminders), messages: count(messages), trackedChildren: { total: children.length, statuses: children.length ? { unknown: children.length } : {} }, openCorrectionInstances: open.length, blockedGateCount: new Set(open.map((item) => item.managerId)).size };
+  }
+  async runtimeStatus(id: string, refresh = false): Promise<{ session: RuntimeSession; observation: RuntimeObservation; children: ManagedChild[]; workSummary: WorkSummary }> {
+    if (refresh) await this.observe(id);
+    const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
+    const requested = this.requested(session); let agent: Record<string, any> | undefined; let timeline: unknown[] | undefined; let source: 'sdk' | 'cli' | undefined;
+    if (session.externalId) try { const snapshot = await this.adapter.snapshot(session.externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
+    const current = agent ?? {}; const usage = safeJson(current.lastUsage); const numeric = (value: unknown): number | 'unknown' => typeof value === 'number' && Number.isFinite(value) ? value : 'unknown';
+    const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
+    const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
+    const mismatch = Boolean((requested.provider && !sameSetting(requested.provider, observed.provider)) || (requested.model && !sameSetting(requested.model, observed.model)) || (requested.mode && !sameSetting(requested.mode, observed.mode)) || (requested.thinking && !sameSetting(requested.thinking, observed.thinking)));
+    const compactions = Array.isArray(timeline) ? timeline.map(safeJson).filter((item) => item.type === 'compaction') : [];
+    const lastCompaction = compactions.at(-1); const observedAt = agent ? now() : session.lastObservedAt; const age = observedAt ? Date.now() - Date.parse(observedAt) : NaN;
+    const freshness: RuntimeObservation['freshness'] = agent ? 'fresh' : !observedAt ? 'unavailable' : Number.isFinite(age) && age > 60_000 ? 'stale' : 'unknown';
+    // Paseo marks a completed turn as requiring acknowledgement too; that is not
+    // an actionable permission/attention condition for ARCP supervision.
+    const pending = agent ? (Array.isArray(current.pendingPermissions) ? current.pendingPermissions.length : 'unknown') : 'unknown'; const attention = agent ? pending !== 0 || current.attentionReason === 'permission' || current.status === 'permission' : 'unknown';
+    const health: RuntimeObservation['health'] = attention === true || mismatch || session.state === 'attention' ? 'attention' : !agent && !session.externalId ? 'unavailable' : freshness === 'stale' || session.state === 'transport_indeterminate' ? 'degraded' : agent ? 'healthy' : 'unknown';
+    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId), workSummary: await this.workSummary(session.workspace) };
+  }
+  async panorama(workspaceId: string, refresh = false) {
+    const context = this.context(workspaceId); const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId); const runtime = await Promise.all(sessions.map((item) => this.runtimeStatus(item.id, refresh)));
+    return { ...context, goals: state.goals.filter((goal) => sessions.some((session) => session.goalId === goal.id)), runtime, latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, legacy: this.legacySummary() };
+  }
   state() { return this.store.snapshot(); }
 }
 
