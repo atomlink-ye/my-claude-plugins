@@ -8,13 +8,13 @@ const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   task create|claim|list WORKSPACE [--expected-fence N]
   knowledge add|search|list WORKSPACE
-  result submit|list WORKSPACE [--expected-fence N]
+  result submit|list WORKSPACE [--expected-fence N] [--source-id ID]
   channel list WORKSPACE [--kind K] [--state S] [--decision-required]
   channel ack EVENT
   channel resolve EVENT --summary '...'
   channel withdraw DELIVERY
   release DELIVERY [--confirm TOKEN]
-  db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH]
+  db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH] [--overwrite]
   member heartbeat|list WORKSPACE
   goal start|list
   runtime status|list
@@ -60,7 +60,7 @@ else if (area === 'db') {
     else if (action === 'check') console.log(JSON.stringify(store.check(), null, 2));
     else if (action === 'backup') { const out = f.out || p[0]; if (!out) throw new Error('db backup requires --out PATH'); console.log(JSON.stringify(await store.backupTo(String(out)), null, 2)); }
     else if (action === 'export') console.log(JSON.stringify(store.export(f.kind ? String(f.kind) : undefined, f.since ? String(f.since) : undefined), null, 2));
-    else if (action === 'import') { const source = f.from || p[0]; if (!source) throw new Error('db import requires --from DIR'); console.log(JSON.stringify(await store.importLegacy(String(source)), null, 2)); }
+    else if (action === 'import') { const source = f.from || p[0]; if (!source) throw new Error('db import requires --from DIR'); console.log(JSON.stringify(await store.importLegacy(String(source), { overwrite: bool('overwrite') }), null, 2)); }
     else { console.error(`unknown db command: ${action || ''}`); process.exitCode = 2; }
     store.close();
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
@@ -117,7 +117,7 @@ else if (area === 'ledger' && action === 'list') await call('GET','/ledger');
 else if (area === 'ledger' && action === 'revoke') await call('POST',`/ledger/${encodeURIComponent(p[0])}/revoke`,{reason:f.reason});
 else if (area === 'compact') await call('POST','/compact-wake',{agentId:f.agent||p[0],compact:f.compact||p.slice(1).join(' '),...(f.wake?{wake:f.wake}:{}),...(f['delay-seconds']?{delaySeconds:Number(f['delay-seconds'])}:{}),...(f['wait-for-idle']!==undefined?{waitForIdle:bool('wait-for-idle')}:{}),...(f['threshold-percent']||f['threshold-tokens']?{trigger:{metric:'context-percent',...(f['threshold-percent']?{thresholdPercent:Number(f['threshold-percent'])}:{}),...(f['threshold-tokens']?{thresholdTokens:Number(f['threshold-tokens'])}:{}),...(f.comparator?{comparator:f.comparator}:{})}}:{})});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')},true);
-else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])})},true);
+else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])}),...(f['source-id'] === undefined ? {} : {sourceId:String(f['source-id'])})},true);
 else if (area === 'result' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/results`);
 else if (area === 'channel' && action === 'list') { const workspace=p[0]||await workspaceId(); if(workspace) { const decisionRequired = f['decision-required'] === true || f['decision-required'] === 'true' ? '1' : f['decision-required'] === false || f['decision-required'] === 'false' ? '0' : undefined; await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/events?${new URLSearchParams(Object.fromEntries(Object.entries({kind:f.kind,state:f.state,'decision-required':decisionRequired}).filter(([,v])=>v!==undefined))).toString()}`); } }
 else if (area === 'channel' && action === 'ack') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||'acknowledged'});

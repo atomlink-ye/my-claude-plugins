@@ -43,6 +43,7 @@ export interface DatabaseExport {
 export interface ImportReport {
   imported: boolean;
   noop: boolean;
+  displacedRecords: number;
   sources: Array<{ file: string; records: number; contentHash: string; importedRecords: number; importedHash: string; match: boolean }>;
   state: { records: number; contentHash: string; importedRecords: number; importedHash: string; match: boolean };
 }
@@ -392,7 +393,7 @@ export class SQLiteStateStore implements StateStore {
     return { exportedAt: new Date().toISOString(), ...(kind ? { kind } : {}), ...(since ? { since } : {}), events: kind ? events.filter((event) => event.kind === kind) : events, knowledge, results };
   }
 
-  async importLegacy(sourceDir: string): Promise<ImportReport> {
+  async importLegacy(sourceDir: string, options: { overwrite?: boolean } = {}): Promise<ImportReport> {
     const root = path.resolve(sourceDir); const statePath = path.join(root, 'arcp-state.json');
     // Read and parse every source before acquiring the SQLite write transaction.
     // This keeps file I/O out of BEGIN IMMEDIATE and gives a concurrent writer a
@@ -417,7 +418,7 @@ export class SQLiteStateStore implements StateStore {
     // changes without persisting private reminder text.
     const sourceReports: ImportReport['sources'] = [stateSourceReport, ...inputs.slice(1).map((input) => ({ file: path.basename(input.file), records: input.values.length, contentHash: hash(input.values.map((value) => hash(value))), importedRecords: 0, importedHash: hash([]), match: false }))];
     const stateReport: ImportReport['state'] = { records: projectionRecords(expectedProjection), contentHash: expectedProjectionHash, importedRecords: 0, importedHash: hash([]), match: false };
-    const report: ImportReport = { imported: true, noop: false, sources: sourceReports, state: stateReport };
+    const report: ImportReport = { imported: true, noop: false, displacedRecords: 0, sources: sourceReports, state: stateReport };
     const sourceHashes = new Map(inputs.map((input) => [path.basename(input.file), hash(input.text)]));
     return this.enqueue(async () => {
       // Queue the read/no-op decision too: otherwise a concurrent mutation
@@ -437,10 +438,14 @@ export class SQLiteStateStore implements StateStore {
         const importedHash = hash(currentProjection); const importedState = { records: projectionRecords(currentProjection), contentHash: importedHash, importedRecords: projectionRecords(currentProjection), importedHash, match: true };
         stateSourceReport.importedRecords = importedState.importedRecords; stateSourceReport.importedHash = importedState.importedHash; stateSourceReport.match = true;
         for (const source of sourceReports.slice(1)) { source.importedRecords = source.records; source.importedHash = hash(inputs.find((input) => path.basename(input.file) === source.file)!.values.map((value) => hash(value))); source.match = true; }
-        return { imported: false, noop: true, sources: sourceReports, state: importedState };
+        return { imported: false, noop: true, displacedRecords: 0, sources: sourceReports, state: importedState };
       }
+      const legacyRecordCount = Number((this.connection.prepare('SELECT count(*) AS count FROM legacy_reminders').get() as SqliteRow).count);
+      const displacedRecords = projectionRecords(currentProjection) + legacyRecordCount;
+      if (displacedRecords > 0 && !options.overwrite) throw new Error(`SQLite import target is not empty; pass --overwrite to replace it (${displacedRecords} records)`);
       const db = this.connection; const before = structuredClone(this.state); db.exec('BEGIN IMMEDIATE');
       try {
+        report.displacedRecords = displacedRecords;
         this.state = sourceState;
         this.persistWithinTransaction(this.state);
         const importedProjection = projection(this.loadState()); const importedHash = hash(importedProjection);

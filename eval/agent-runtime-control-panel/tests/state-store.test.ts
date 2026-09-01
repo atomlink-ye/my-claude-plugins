@@ -119,6 +119,18 @@ describe('SQLite StateStore', () => {
     await expect(store.importLegacy(source)).rejects.toThrow(); expect(store.status().tables.event_journal).toBe(1); store.close();
   });
 
+  it('rejects wholesale imports into non-empty SQLite targets unless overwrite is explicit', async () => {
+    const source = await root(); const dir = await root();
+    await writeFile(path.join(source, 'arcp-state.json'), JSON.stringify({ channelEvents: [event('incoming')] }, null, 2));
+    const store = new SQLiteStateStore(dir); await store.init(); await store.mutate((state) => state.channelEvents.push(event('existing')));
+    await expect(store.importLegacy(source)).rejects.toThrow(/target is not empty; pass --overwrite/);
+    expect(store.snapshot().channelEvents.map((item) => item.id)).toEqual(['existing']);
+    const report = await store.importLegacy(source, { overwrite: true });
+    expect(report).toMatchObject({ imported: true, noop: false, displacedRecords: 1 });
+    expect(store.snapshot().channelEvents.map((item) => item.id)).toEqual(['incoming']);
+    store.close();
+  });
+
   it('rejects an import when a normalized projection drops a record during persistence', async () => {
     const source = await root(); const dir = await root();
     await writeFile(path.join(source, 'arcp-state.json'), JSON.stringify({ channelEvents: [event('kept'), event('dropped')] }));

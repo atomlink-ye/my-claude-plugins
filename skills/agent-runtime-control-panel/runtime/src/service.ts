@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { PaseoCli, asRecord } from './cli.js';
 import { Store } from './store.js';
 import type { ScheduleObserver } from './schedule-observer.js';
@@ -169,7 +170,10 @@ export class CompanionService {
   setArcpDeliveryPolicy(policy?: ArcpDeliveryPolicy): void { this.arcpDeliveryPolicy = policy; }
   private arcpRecipient(recipient: string): boolean { return Boolean(this.arcpDeliveryPolicy?.isRecipient(recipient)); }
   private actionCommand(kind: 'message' | 'reminder' | 'idle-reminder', id: string, recipient: string): string {
-    if (this.arcpRecipient(recipient)) return kind === 'message' ? `arcp message ack ${id} --reason processed` : kind === 'reminder' ? `arcp reminder delete ${id} --reason processed` : `arcp idle delete ${id} --reason processed`;
+    if (this.arcpRecipient(recipient)) {
+      const script = fileURLToPath(new URL('../../scripts/arcp', import.meta.url));
+      return kind === 'message' ? `node ${script} message ack ${id} --reason processed` : kind === 'reminder' ? `node ${script} reminder delete ${id} --reason processed` : `node ${script} idle delete ${id} --reason processed`;
+    }
     if (process.env.ARCP_ALLOW_LEGACY_UNAUTH === '1') return `curl -X DELETE ${this.endpointBase()}/${kind === 'message' ? 'messages' : kind === 'reminder' ? 'reminders' : 'idle-reminders'}/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
     return `arcp ${kind === 'message' ? 'message ack' : kind === 'reminder' ? 'reminder delete' : 'idle delete'} ${id} --reason processed`;
   }
