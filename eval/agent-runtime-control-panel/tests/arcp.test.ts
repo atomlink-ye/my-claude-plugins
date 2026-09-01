@@ -1,5 +1,7 @@
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { promisify } from 'node:util';
 import http from 'node:http';
 import os from 'node:os';
@@ -10,23 +12,48 @@ import { createServer } from '../../../skills/agent-runtime-control-panel/runtim
 import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
 import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 import { renderTuiSnapshot } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
+import { HermesAcpAdapter } from '../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
 
 const execFileAsync = promisify(execFile);
 
 class FakeCli {
   private lastMode = 'auto';
   sends = 0;
+  lastLaunchArgs: string[] = [];
   constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown) {}
   async run(args: string[]) {
     if (this.fail && args[0] === 'run') throw new Error('timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
-    if (args[0] === 'run') { this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
+    if (args[0] === 'run') { this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'send') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
     if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
+}
+
+class FakeAcpProcess extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly pid = 4242;
+  exitCode: number | null = null;
+  promptCount = 0;
+  constructor() {
+    super();
+    this.stdin.on('data', (chunk) => {
+      for (const line of String(chunk).split('\n').filter(Boolean)) {
+        const request = JSON.parse(line);
+        if (request.method === 'initialize') this.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1 } }) + '\n');
+        if (request.method === 'session/new') this.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { sessionId: 'acp-session-1' } }) + '\n');
+        if (request.method === 'session/prompt') this.promptCount += 1;
+        if (request.method === 'session/cancel') this.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }) + '\n');
+      }
+    });
+  }
+  kill(): boolean { this.exitCode = 0; this.emit('close'); return true; }
+  update(sessionUpdate: string): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-session-1', update: { sessionUpdate } } }) + '\n'); }
 }
 async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown) {
   const companion = { store: { dir: root }, postMessage: async () => ({ id: 'message-1', delivery: { status: 'pending' } }), deleteMessage: async () => ({}) };
@@ -58,6 +85,7 @@ describe('ARCP MVE control core', () => {
     await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: joined.member.id, status: 'candidate', summary: 'review complete', expectedFence: 1 });
     const restarted = await control(root); const context = restarted.context(workspace.id);
     expect(context.roster).toHaveLength(2); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
+    expect(context.events.map((event: any) => event.kind)).toEqual(expect.arrayContaining(['task_claimed', 'task_candidate', 'decision_required']));
   });
   it('returns a distinct managed Worker credential without replacing the owner credential', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-managed-')); const service = await control(root);
@@ -68,6 +96,19 @@ describe('ARCP MVE control core', () => {
     expect((started as any).credential).not.toBe(workspace.credential);
     expect(service.memberForCredential((started as any).credential).id).toBe((started as any).member.id);
     expect(service.memberForCredential(workspace.credential).id).toBe(workspace.member.id);
+    expect((service.cli as any).lastLaunchArgs.join(' ')).toContain(`arcp knowledge add ${workspace.workspace.id}`);
+    expect((service.cli as any).lastLaunchArgs.join(' ')).toContain(`arcp result submit ${workspace.workspace.id}`);
+  });
+  it('maps Hermes ACP turn-end events to the existing idle observation and safe-point event', async () => {
+    const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any); const launched = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'canary', '.');
+    const events: any[] = []; adapter.onSafePoint((event) => events.push(event)); process.update('agent_message_chunk');
+    expect((await adapter.observe(String((launched.value as any).id))).value).toMatchObject({ status: 'running', activeTurn: true }); process.update('turn_completed');
+    expect((await adapter.observe(String((launched.value as any).id))).value).toMatchObject({ status: 'idle', activeTurn: false }); expect(events.at(-1)).toMatchObject({ externalId: 'acp-session-1', state: 'idle' });
+  });
+  it('does not replay an ACP delivery after the subprocess is lost mid-turn', async () => {
+    const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any); const launched = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'loss', '.'); const sessionId = String((launched.value as any).id);
+    const turn = adapter.startTurn(sessionId, 'one turn', 'delivery-1'); process.kill(); await expect(turn).rejects.toThrow('Hermes ACP process exited');
+    expect(process.promptCount).toBe(1); expect(await adapter.reconcileExternal(sessionId)).toBe(false); expect(process.promptCount).toBe(1);
   });
   it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
@@ -250,6 +291,13 @@ describe('ARCP CLI and TUI presentation', () => {
     await expect(execFileAsync(process.execPath, [script, 'mystery'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } })).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('unknown command: mystery') });
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await expect(execFileAsync(process.execPath, [script, 'reminder', 'list'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}` } })).rejects.toMatchObject({ code: expect.any(Number) });
+  });
+  it('hands a managed runtime its per-runtime credential without clobbering the owner member', async () => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-start-')); const statePath = path.join(stateDir, 'client.json'); await writeFile(statePath, JSON.stringify({ memberCredential: 'owner-secret', actorCredential: 'actor-secret' }));
+    const server = await new Promise<http.Server>((resolve) => { const value = http.createServer(async (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ session: { id: 'runtime-1' }, credential: 'managed-secret' })); }); value.listen(0, '127.0.0.1', () => resolve(value)); });
+    const port = (server.address() as any).port; const script = path.join(process.cwd(), '../scripts/arcp'); const output = await execFileAsync(process.execPath, [script, 'start', '--workspace', 'workspace-1', '--title', 'managed'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_CLIENT_STATE: statePath } });
+    expect(output.stdout).toContain('credentialStored'); expect(output.stdout).not.toContain('managed-secret'); const saved: any = JSON.parse(await readFile(statePath, 'utf8')); expect(saved.memberCredential).toBe('owner-secret'); expect(saved.runtimeMemberCredentials).toEqual({ 'runtime-1': 'managed-secret' });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
   it('renders a deterministic mutation-free TUI snapshot', () => {
     const snapshot = renderTuiSnapshot({ workspace: { purpose: 'canary', lifecycle: 'active' }, goals: [{}], tasks: [{}], roster: [{}], runtime: [{ session: { id: 'r1', provider: 'codex', model: 'gpt', state: 'idle' }, observation: { health: 'healthy', cache: { state: 'fresh' }, context: { ratio: 0.5 }, compaction: { status: 'none' } }, children: { items: [] }, workSummary: { dirty: false, diffstat: { files: 0 } } }], legacy: { reminders: { active: 1 }, messages: { pending: 2 }, trackedChildren: { total: 3 }, blockedGateCount: 0 } });

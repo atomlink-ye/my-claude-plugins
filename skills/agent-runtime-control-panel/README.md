@@ -15,6 +15,22 @@ Default durable state is `${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-co
 
 `actor register`, `workspace create`, and `workspace join` save issued credentials to the mode-0600 client state and print `credentialStored:true`, never the bearer value. Pass `--show-credential` only for a deliberate one-time transfer. Workspace creation also provisions the owner's Member credential, so no follow-up join is needed before heartbeat, task claim, Knowledge, or Result commands.
 
+## External Hermes ACP runtime
+
+`external register` creates a sibling Hermes ACP on-call Runtime sharing this ARCP Workspace, Knowledge, and Delivery surface. It does not attach to the operator's existing Feishu Hermes conversation; that Feishu Hermes remains Owner and the human channel entry point. The real adapter uses the local `hermes acp` binary over stdio JSON-RPC.
+
+Real canary (requires `hermes acp --check` to pass):
+
+```sh
+arcp external register WORKSPACE --label hermes-on-call
+arcp external send RUNTIME --body 'Return a short canary Result through ARCP.'
+arcp external status RUNTIME
+arcp panorama --workspace WORKSPACE --refresh
+arcp result list WORKSPACE
+```
+
+If `hermes` is absent, registration fails cleanly with an unavailable-runtime result; no fake adapter is used. A future ChannelBridge may map one ARCP Delivery onto a wake of one specific existing channel thread. That channel-side bridge is intentionally documentation-only here.
+
 ## MVE canary
 
 ```sh
