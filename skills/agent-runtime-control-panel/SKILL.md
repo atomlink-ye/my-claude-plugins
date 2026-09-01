@@ -1,6 +1,13 @@
 ---
 name: agent-runtime-control-panel
-description: "Coordinate a local agent team through the ARCP CLI: create a durable ControlWorkspace, register native or Paseo-managed Members, claim fenced Tasks, share Knowledge and Results, and manage safe-point runtime delivery. Use for local multi-agent collaboration, not raw HTTP composition."
+description: Coordinate agent teams through a durable local CLI.
+version: 0.1.0
+author: atomlink-ye, Hermes Agent
+license: MIT
+platforms: [linux, macos]
+metadata:
+  hermes:
+    tags: [agents, control-plane, paseo, cli]
 ---
 
 # Agent Runtime Control Panel
@@ -13,4 +20,4 @@ Normal messages queue until the recipient reaches a Paseo idle/terminal safe poi
 
 Do not pass provider handles, raw task prompts, secrets, or private host paths into API records. Launch by Goal and named profile. Profile discovery fails closed: ARCP never picks another provider or paid model for a caller.
 
-See [README.md](README.md) for the local canary and [llms.txt](llms.txt) for the API map.
+See [README.md](README.md) for the local canary and [llms.txt](llms.txt) for the CLI map.
