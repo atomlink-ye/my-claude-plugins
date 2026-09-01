@@ -25,6 +25,12 @@ async function control(root: string, fail = false) {
 }
 
 describe('ARCP MVE control core', () => {
+  it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
+    process.env.ARCP_DATA = root;
+    expect(new Store().dir).toBe(root);
+    if (prior === undefined) delete process.env.ARCP_DATA; else process.env.ARCP_DATA = prior;
+  });
   it('keeps actor identity and binding generation stable across restart', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-'));
     const first = await control(root);

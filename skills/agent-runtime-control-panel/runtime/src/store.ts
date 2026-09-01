@@ -21,7 +21,7 @@ export class Store {
   private saveLocks = new Map<string, Promise<void>>();
   private managers = new Set<string>();
 
-  constructor(dir = process.env.PASEO_COMPANION_DATA || path.join(process.cwd(), '.paseo-reminder')) {
+  constructor(dir = process.env.ARCP_DATA || process.env.PASEO_COMPANION_DATA || path.join(process.cwd(), '.paseo-reminder')) {
     this.dir = dir;
   }
 
