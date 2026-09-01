@@ -14,8 +14,16 @@ import type { ChannelEvent, ChannelEventKind, Goal, KnowledgeEntry, Member, Resu
  * before this existed project exactly as well as events written after it.
  */
 export interface ChannelProjectionSender { label: string; role: string; }
+/**
+ * One typed reference. Kept as a pair rather than a pre-joined string so a
+ * renderer can decide its own presentation — a plain-text card joins them, the
+ * Markdown renderer emits a bullet list — without any surface re-parsing text.
+ */
+export interface ChannelProjectionRef { label: string; value: string; }
 export interface ChannelProjection {
   eventId: string;
+  /** The durable event kind, so a renderer can pick a stable status icon. */
+  kind: ChannelEventKind;
   /** Bracket label, e.g. `Completed`, `Decision required`, `Refused`. */
   label: string;
   /** Round/Lane/phase, when it can be established from durable facts. */
@@ -29,13 +37,14 @@ export interface ChannelProjection {
   /** One to three bounded lines drawn from already-approved durable content. */
   summary: string[];
   /** Typed references, rendered last and nowhere else. */
-  refs: string[];
+  refs: ChannelProjectionRef[];
   /** Explicit choices a human must pick between, when the event carries them. */
   options: string[];
   /** True when the first line states a problem to act on, not an outcome. */
   issue: boolean;
   urgency: ChannelEvent['urgency'];
   decisionRequired: boolean;
+  verdict?: ChannelEvent['verdict'];
   deliveryState: ChannelEvent['deliveryState'];
   createdAt: string;
 }
@@ -250,17 +259,18 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
   // Scan for commits only AFTER record ids are removed, so the hex inside an
   // opaque id can never be presented to a human as a commit ref.
   const commits = [...new Set([...withoutIds(String(detail)).matchAll(COMMIT_TOKEN)].map((match) => match[0]))].slice(0, 2);
-  const refs = [
-    ...(task ? [`Task ${task.id}`] : []),
-    ...(result ? [`Result ${result.id}`] : []),
-    ...(knowledge ? [`Knowledge ${knowledge.id}`] : []),
-    ...(event.relatedEventId ? [`Event ${event.relatedEventId}`] : []),
-    ...commits.map((sha) => `Commit ${sha}`),
-    ...evidenceRefs.filter((ref) => ref !== knowledge?.id).map((ref) => `Evidence ${bound(scrub(ref), SUBJECT_MAX)}`),
+  const refs: ChannelProjectionRef[] = [
+    ...(task ? [{ label: 'Task', value: task.id }] : []),
+    ...(result ? [{ label: 'Result', value: result.id }] : []),
+    ...(knowledge ? [{ label: 'Knowledge', value: knowledge.id }] : []),
+    ...(event.relatedEventId ? [{ label: 'Event', value: event.relatedEventId }] : []),
+    ...commits.map((sha) => ({ label: 'Commit', value: sha })),
+    ...evidenceRefs.filter((ref) => ref !== knowledge?.id).map((ref) => ({ label: 'Evidence', value: bound(scrub(ref), SUBJECT_MAX) })),
   ];
 
   return {
     eventId: event.id,
+    kind: event.kind,
     label,
     ...(stage ? { stage: bound(stage, STAGE_MAX) } : {}),
     ...(subject ? { subject } : {}),
@@ -272,6 +282,7 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
     issue: event.decisionRequired || ISSUE_KINDS.has(event.kind),
     urgency: event.urgency,
     decisionRequired: event.decisionRequired,
+    ...(event.verdict ? { verdict: event.verdict } : {}),
     deliveryState: event.deliveryState,
     createdAt: event.createdAt,
   };
@@ -291,7 +302,7 @@ export function renderChannelCard(projection: ChannelProjection): string {
     `${projection.issue ? 'Issue' : 'Outcome'}: ${headline}`,
     ...rest,
     ...(projection.options.length ? [`Next: ${projection.options.join(' · ')}`] : []),
-    ...(projection.refs.length ? [`Refs: ${projection.refs.join(' · ')}`] : []),
+    ...(projection.refs.length ? [`Refs: ${projection.refs.map((ref) => `${ref.label} ${ref.value}`).join(' · ')}`] : []),
   ];
   return lines.join('\n');
 }

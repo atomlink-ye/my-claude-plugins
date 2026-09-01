@@ -10,9 +10,12 @@ import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, normalizeChannelEvent } from './content.js';
-import { channelCardFor, projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
+import { projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
+import { renderChannelMarkdown, type ChannelMarkdownOptions } from './channel-markdown.js';
 export { projectChannelEvent, renderChannelCard, channelCardFor } from './channel-projection.js';
-export type { ChannelProjection, ChannelProjectionFacts } from './channel-projection.js';
+export { renderChannelMarkdown, escapeMarkdown, escapeCode } from './channel-markdown.js';
+export type { ChannelProjection, ChannelProjectionFacts, ChannelProjectionRef } from './channel-projection.js';
+export type { ChannelMarkdownOptions } from './channel-markdown.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
@@ -88,11 +91,20 @@ function projectionFacts(state: State): ChannelProjectionFacts {
   return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results };
 }
 
-/** A durable event plus its canonical human projection, attached at read time. */
-export type ProjectedChannelEvent = ChannelEvent & { projection: ChannelProjection };
+/**
+ * Whether human surfaces may use `<details>`. A Feishu-like target that cannot
+ * expand a collapsible block sets `ARCP_CHANNEL_DETAILS=0` and gets the same
+ * card with a plain final references list; nothing actionable moves.
+ */
+function markdownOptions(): ChannelMarkdownOptions {
+  return { details: process.env.ARCP_CHANNEL_DETAILS !== '0' };
+}
+
+/** A durable event plus its canonical human projection and rendering. */
+export type ProjectedChannelEvent = ChannelEvent & { projection: ChannelProjection; markdown: string };
 
 /** A queued delivery plus the projection of the event that produced it. */
-export type ProjectedDelivery = Delivery & { projection?: ChannelProjection };
+export type ProjectedDelivery = Delivery & { projection?: ChannelProjection; markdown?: string };
 
 /** A compact, independently durable ARCP state file. It intentionally stores public IDs and
  * metadata only: provider handles, prompts, credentials, and host paths never enter it. */
@@ -726,7 +738,7 @@ export class ArcpService {
       for (const session of targetSessions) {
         const deliveryId = idFor('delivery', `event:${event.id}:${session.id}`);
         if (state.deliveries.some((delivery) => delivery.id === deliveryId)) continue;
-        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: channelCardFor(event, projectionFacts(state)), command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
+        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: renderChannelMarkdown(projectChannelEvent(event, projectionFacts(state)), markdownOptions()), command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
       }
     }
     return event;
@@ -770,7 +782,7 @@ export class ArcpService {
     const facts = projectionFacts(state);
     return state.channelEvents
       .filter((event) => event.workspaceId === workspaceId && (!member || intendedTarget(event, member, workspace, true)))
-      .map((event) => ({ ...event, projection: projectChannelEvent(event, facts) }));
+      .map((event) => { const projection = projectChannelEvent(event, facts); return { ...event, projection, markdown: renderChannelMarkdown(projection, markdownOptions()) }; });
   }
   /**
    * Answer a `decision_required` event with an explicit verdict.
@@ -895,7 +907,9 @@ export class ArcpService {
     const facts = projectionFacts(state);
     return state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged').map((item) => {
       const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined;
-      return event ? { ...item, projection: projectChannelEvent(event, facts) } : item;
+      if (!event) return item;
+      const projection = projectChannelEvent(event, facts);
+      return { ...item, projection, markdown: renderChannelMarkdown(projection, markdownOptions()) };
     });
   }
   private requested(session: RuntimeSession): RuntimeSettings { return { provider: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}) }; }

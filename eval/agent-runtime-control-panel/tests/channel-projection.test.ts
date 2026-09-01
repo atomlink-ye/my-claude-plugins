@@ -72,8 +72,8 @@ describe('canonical human-readable Channel projection', () => {
     expect(projection.headline).toContain('R2-REV-F17 is closed');
     expect(projection.headline).not.toContain('knowledge_');
     expect(projection.summary.join(' ')).toMatch(/Only accept completes the Task; a refuse .*leaves the Task lifecycle untouched so refused work stays open/);
-    expect(projection.refs).toContain(`Knowledge ${LANE_C_KNOWLEDGE}`);
-    expect(projection.refs).toContain('Commit 2acda1f');
+    expect(projection.refs).toContainEqual({ label: 'Knowledge', value: LANE_C_KNOWLEDGE });
+    expect(projection.refs).toContainEqual({ label: 'Commit', value: '2acda1f' });
     expect(card).toContain('From: Hermes Owner Deputy · owner');
     expect(card.split('\n').at(-1)).toMatch(/^Refs: /);
     // Nothing above the refs line may carry an opaque record id.
@@ -139,7 +139,7 @@ describe('canonical human-readable Channel projection', () => {
   it('never mistakes the hex inside a record id for a commit ref', () => {
     const facts = laneCFacts();
     facts.knowledge[0].text = 'Recorded against result_093ec616ddc5f1 with no commit of its own yet.';
-    expect(projectChannelEvent(laneCEvent(), facts).refs.some((ref) => ref.startsWith('Commit '))).toBe(false);
+    expect(projectChannelEvent(laneCEvent(), facts).refs.some((ref) => ref.label === 'Commit')).toBe(false);
   });
 
   /**
@@ -200,9 +200,12 @@ describe('canonical human-readable Channel projection', () => {
     const inbox = service.context(workspaceId, manager.member.id).inbox;
     const delivered = inbox.find((item: any) => item.eventId === event.id)!;
     expect(renderChannelCard((delivered as any).projection)).toBe(card);
-    // The provider is handed the same card a human reads, not the raw stub.
-    expect((delivered as any).body).toBe(card);
+    // Channel list, inbox and the provider envelope carry byte-identical
+    // Markdown, so no surface can render its own envelope.
+    expect((delivered as any).markdown).toBe(listed.markdown);
+    expect((delivered as any).body).toBe(listed.markdown);
     expect((delivered as any).body).not.toBe(event.content.summary);
+    expect(listed.markdown).toContain('### ✅ Completed · Round-3 Lane E');
 
     const panorama = await service.panorama(workspaceId);
     const snapshot = renderTuiSnapshot(panorama);
