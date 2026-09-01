@@ -8,20 +8,18 @@ export type TuiOptions = {
   refreshMs?: number;
 };
 
-const count = (value: Record<string, number> | undefined) => Object.values(value ?? {}).reduce((total, item) => total + Number(item), 0);
 const scalar = (value: unknown) => typeof value === 'number' ? value.toFixed(2) : String(value ?? 'unknown');
 
 /** Deterministic, deliberately redacted panorama used by `arcp tui --snapshot`
  * and the interactive renderer.  It is presentation-only: it never mutates
- * ARCP or Companion state. */
+ * ARCP state. */
 export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expanded = false): string {
   const runtime = Array.isArray(view.runtime) ? view.runtime : [];
   const workspace = view.workspace ?? {};
   const roster = Array.isArray(view.roster) ? view.roster : [];
   const tasks = Array.isArray(view.tasks) ? view.tasks : [];
   const goals = Array.isArray(view.goals) ? view.goals : [];
-  const legacy = view.legacy ?? {};
-  const tabs = ['overview', 'runtimes', 'legacy'];
+  const tabs = ['overview', 'runtimes'];
   const lines = [
     `ARCP TUI · ${workspace.purpose ?? workspace.id ?? 'workspace'}`,
     `tab=${tabs[tab]} selected=${selected + 1}/${Math.max(runtime.length, 1)} expanded=${expanded ? 'yes' : 'no'}`,
@@ -33,7 +31,6 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     lines.push(`${prefix} Runtime ${session.id ?? 'unknown'} ${session.provider ?? 'unknown'}/${session.model ?? 'unknown'} state=${session.state ?? 'unknown'} health=${observation.health ?? 'unknown'} cache=${observation.cache?.state ?? 'unknown'} context=${scalar(observation.context?.ratio)} compaction=${observation.compaction?.status ?? 'unknown'} children=${children.items?.length ?? 0}`);
     if (expanded && index === selected) lines.push(`  SCM dirty=${scalar(work.dirty)} diff=${JSON.stringify(work.diffstat ?? 'unknown')} provider-children=${(children.items ?? []).map((child: any) => `${child.id}:${child.status}`).join(',') || 'none'} context=${scalar(observation.context?.used)}/${scalar(observation.context?.max)}`);
   }
-  lines.push(`Legacy reminders=${count(legacy.reminders)} messages=${count(legacy.messages)} trackedChildren=${legacy.trackedChildren?.total ?? 0} correctionGates=${legacy.blockedGateCount ?? 0}`);
   lines.push('Keys: arrows select · tab view · enter details · r refresh · q quit');
   return lines.join('\n');
 }
