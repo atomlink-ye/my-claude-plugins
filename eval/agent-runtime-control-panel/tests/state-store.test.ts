@@ -162,6 +162,9 @@ describe('SQLite StateStore', () => {
       deliveries: [{ id: 'delivery-1', fromActorId: 'actor-1', runtimeSessionId: 'runtime-1', generation: 1, body: 'a prompt body that must never persist', command: 'normal', state: 'waiting_safe_point', createdAt: '2026-01-01T00:00:00.000Z' }],
       channelEvents: [event('event-1', 'audit event')],
       confirmations: [],
+      supervisionPolicies: [{ id: 'policy-1', workspaceId: 'workspace-1', reviewAfterMs: 60_000, inactivityAfterMs: 30_000, cooldownMs: 90_000, stewardProfileId: 'codex-worker', automatic: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+      supervisionReviews: [{ id: 'supervision-1', workspaceId: 'workspace-1', policyId: 'policy-1', subjectKind: 'task', subjectId: 'task-1', generation: 1, reason: 'inactivity_budget', eventId: 'event-1', breachedAt: '2026-01-01T00:01:00.000Z', lastProgressAt: '2026-01-01T00:00:00.000Z', cooldownUntil: '2026-01-01T00:02:30.000Z', state: 'open' }],
+      supervisionSignals: [{ id: 'signal-1', workspaceId: 'workspace-1', subjectId: 'task-1', kind: 'commit', digest: 'e923c2c', observedAt: '2026-01-01T00:00:00.000Z' }],
     };
     const expected = structuredClone(source);
     expected.credentials = {};

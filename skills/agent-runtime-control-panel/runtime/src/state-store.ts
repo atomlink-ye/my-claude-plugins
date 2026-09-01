@@ -50,7 +50,7 @@ export interface ImportReport {
 
 type SqliteRow = Record<string, unknown>;
 const OBSERVATION_LIMIT = 100;
-const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [] });
+const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [] });
 const json = (value: unknown): string => JSON.stringify(value);
 const parse = <T>(value: unknown, fallback: T): T => { try { return value === null || value === undefined ? fallback : JSON.parse(String(value)) as T; } catch { return fallback; } };
 const hash = (value: unknown): string => createHash('sha256').update(typeof value === 'string' ? value : stableJson(value)).digest('hex');
@@ -124,6 +124,9 @@ const projection = (state: Partial<State>) => {
     results: durable.results,
     channelEvents: durable.channelEvents,
     confirmations: durable.confirmations,
+    supervisionPolicies: durable.supervisionPolicies,
+    supervisionReviews: durable.supervisionReviews,
+    supervisionSignals: durable.supervisionSignals,
   };
 };
 type StateProjection = ReturnType<typeof projection>;
@@ -193,6 +196,9 @@ export class SQLiteStateStore implements StateStore {
     // These CREATEs are repeated outside the numbered migration so a database
     // created by an earlier schema-1 build gains the import projection too.
     db.exec('CREATE TABLE IF NOT EXISTS legacy_reminders (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, imported_at TEXT NOT NULL, PRIMARY KEY(source_file, record_index)); CREATE INDEX IF NOT EXISTS legacy_reminders_hash_idx ON legacy_reminders(record_hash); CREATE TABLE IF NOT EXISTS confirmations (id TEXT PRIMARY KEY, payload TEXT NOT NULL);');
+    // Supervision budget state is durable for the same reason deliveries are:
+    // a breach that a restart forgets is a breach that fires twice.
+    db.exec('CREATE TABLE IF NOT EXISTS supervision_policies (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS supervision_reviews (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, subject_id TEXT NOT NULL, generation INTEGER NOT NULL, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS supervision_reviews_subject_idx ON supervision_reviews(subject_id, generation); CREATE TABLE IF NOT EXISTS supervision_signals (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, subject_id TEXT NOT NULL, payload TEXT NOT NULL);');
     // These objects were never populated by the SQLite projection. Remove
     // leftovers from pre-release databases while keeping runtime observations
     // and all durable ARCP projections intact.
@@ -273,7 +279,7 @@ export class SQLiteStateStore implements StateStore {
     });
     const results = (db.prepare('SELECT payload, content_id FROM results').all() as SqliteRow[]).map((row) => { const payload = parse<Record<string, unknown>>(row.payload, {}); const item = content.get(String(row.content_id)); return { ...payload, summary: item?.summary ?? '', evidenceRefs: item?.evidenceRefs ?? [] }; });
     const confirmations = rows('confirmations').map(({ id: _id, ...confirmation }) => confirmation) as unknown as State['confirmations'];
-    return postRedactionState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents, confirmations });
+    return postRedactionState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents, confirmations, supervisionPolicies: rows('supervision_policies') as unknown as State['supervisionPolicies'], supervisionReviews: rows('supervision_reviews') as unknown as State['supervisionReviews'], supervisionSignals: rows('supervision_signals') as unknown as State['supervisionSignals'] });
   }
 
   private persist(state: State): void {
@@ -291,7 +297,7 @@ export class SQLiteStateStore implements StateStore {
   private persistWithinTransaction(state: State): void {
     const durable = postRedactionState(state);
     this.persistContent(durable);
-    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events']) this.connection.exec(`DELETE FROM ${table}`);
+    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events', 'supervision_policies', 'supervision_reviews', 'supervision_signals']) this.connection.exec(`DELETE FROM ${table}`);
     this.persistRows('workspaces', durable.workspaces);
     this.persistRows('actors', durable.actors);
     this.persistRows('actor_bindings', durable.bindings);
@@ -301,6 +307,9 @@ export class SQLiteStateStore implements StateStore {
     this.persistRows('runtimes', durable.sessions);
     this.persistRows('deliveries', durable.deliveries);
     this.persistRows('confirmations', durable.confirmations.map((confirmation) => ({ ...confirmation, id: confirmation.tokenHash })));
+    this.persistScopedRows('supervision_policies', ['workspace_id'], durable.supervisionPolicies, (item) => [item.workspaceId]);
+    this.persistScopedRows('supervision_reviews', ['workspace_id', 'subject_id', 'generation'], durable.supervisionReviews, (item) => [item.workspaceId, item.subjectId, item.generation]);
+    this.persistScopedRows('supervision_signals', ['workspace_id', 'subject_id'], durable.supervisionSignals, (item) => [item.workspaceId, item.subjectId]);
     this.persistContentRows('knowledge', durable.knowledge, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.text, evidenceRefs: [], sensitivity: 'normal', retention: 'standard' } }));
     this.persistContentRows('results', durable.results, (item) => ({ workspace_id: item.workspaceId, content: { summary: item.summary, evidenceRefs: item.evidenceRefs, sensitivity: 'normal', retention: 'standard' } }));
     this.persistEvents(durable.channelEvents);
@@ -310,6 +319,13 @@ export class SQLiteStateStore implements StateStore {
   private persistRows(table: string, records: Array<{ id: string }>): void {
     const statement = this.connection.prepare(`INSERT INTO ${table}(id, payload) VALUES (?, ?)`);
     for (const record of records) statement.run(String(record.id), json(record));
+  }
+
+  /** Rows whose lookup columns are projected beside the payload so supervision
+   * state stays queryable by workspace, subject and generation. */
+  private persistScopedRows<T extends { id: string }>(table: string, columns: string[], records: T[], values: (record: T) => Array<string | number>): void {
+    const statement = this.connection.prepare(`INSERT INTO ${table}(id, ${columns.join(', ')}, payload) VALUES (${Array.from({ length: columns.length + 2 }, () => '?').join(', ')})`);
+    for (const record of records) statement.run(String(record.id), ...values(record), json(record));
   }
 
   private persistContent(state: State): void {
@@ -375,7 +391,7 @@ export class SQLiteStateStore implements StateStore {
   status(): DatabaseStatus {
     const db = this.connection;
     const counts: Record<string, number> = {};
-    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
+    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit', 'supervision_policies', 'supervision_reviews', 'supervision_signals']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
     const mode = awaitableStat(this.file);
     return { path: this.file, schemaVersion: Number((db.prepare('SELECT max(version) AS version FROM schema_migrations').get() as SqliteRow).version ?? 0), journalMode: String((db.prepare('PRAGMA journal_mode').get() as SqliteRow).journal_mode), foreignKeys: Number((db.prepare('PRAGMA foreign_keys').get() as SqliteRow).foreign_keys), busyTimeout: Number((db.prepare('PRAGMA busy_timeout').get() as SqliteRow).timeout), observations: counts.runtime_observations, tables: counts, mode };
   }

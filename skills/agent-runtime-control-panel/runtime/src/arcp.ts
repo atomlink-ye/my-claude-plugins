@@ -12,7 +12,10 @@ import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, normalizeChannelEvent } from './content.js';
+import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 export type { StateStore } from './state-store.js';
+export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
+export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
 export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'transport_indeterminate';
@@ -22,7 +25,7 @@ export interface Actor { id: string; clientIdentity: string; label: string; crea
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; workspaceId?: string; state: GoalState; createdAt: string; updatedAt: string; }
 export type DecisionVerdict = 'accept' | 'refuse';
-export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress';
+export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress' | 'workspace_analysis_required';
 export interface ChannelEventContent { summary: string; evidenceRefs: string[]; contentHash: string; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded'; }
 export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string; }
 export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; }
@@ -57,10 +60,12 @@ export interface RuntimeAdapter {
 }
 export interface LegacySummary { reminders: Record<string, number>; messages: Record<string, number>; trackedChildren: { total: number; statuses: Record<string, number> }; openCorrectionInstances: number; blockedGateCount: number; }
 interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
-export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; }
+export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; }
 
-const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [] });
+const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [] });
 export const CLAUDE_CACHE_DEFAULTS = { expiringMinutes: 55, expiredMinutes: 60 } as const;
+export const DEFAULT_SUPERVISION_COOLDOWN_MS = 900_000;
+export const DEFAULT_STEWARD_PROFILE_ID = 'codex-worker';
 const idFor = (prefix: string, value: string) => `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 20)}`;
 const now = () => new Date().toISOString();
 
@@ -90,7 +95,7 @@ export class ArcpStore implements StateStore {
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
       const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, unknown>>; const channelEvents = legacyEvents.map(normalizeChannelEvent);
-      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [] };
+      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [], supervisionPolicies: parsed.supervisionPolicies ?? [], supervisionReviews: parsed.supervisionReviews ?? [], supervisionSignals: parsed.supervisionSignals ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
     }
@@ -898,6 +903,136 @@ export class ArcpService {
       const untracked = status.split('\n').filter((line) => line.startsWith('?? ')).length;
       return { ...(sha && subject && time ? { latestCommit: { sha, subject, time } } : {}), dirty: Boolean(status.trim()), diffstat: match ? { files: Number(match[1]) + untracked, insertions: Number(match[2] ?? 0), deletions: Number(match[3] ?? 0) } : { files: untracked, insertions: 0, deletions: 0 } };
     } catch { return { dirty: 'unknown', diffstat: 'unknown' }; }
+  }
+  /**
+   * Supervision: configure one budget policy per Workspace, evaluate it against
+   * durable facts, and record a breach as a review subject.
+   *
+   * A breach NEVER kills, retries or duplicates work. It appends one durable
+   * review record and one `workspace_analysis_required` ChannelEvent, both
+   * addressed by a content-derived id so the same breach observed again — on a
+   * later tick or after a restart — resolves to the same two records.
+   */
+  async configureSupervision(input: { workspaceId: string; reviewAfterMs?: number; inactivityAfterMs?: number; cooldownMs?: number; stewardProfileId?: string; automatic?: boolean }): Promise<SupervisionPolicy> {
+    const budget = (value: number | undefined, field: string): number | undefined => {
+      if (value === undefined) return undefined;
+      if (!Number.isSafeInteger(value) || value <= 0) throw new ArcpError('invalid_request', `${field} must be a positive whole number of milliseconds`, field);
+      return value;
+    };
+    const reviewAfterMs = budget(input.reviewAfterMs, 'reviewAfterMs');
+    const inactivityAfterMs = budget(input.inactivityAfterMs, 'inactivityAfterMs');
+    const cooldownMs = budget(input.cooldownMs, 'cooldownMs') ?? DEFAULT_SUPERVISION_COOLDOWN_MS;
+    return this.store.mutate((state) => {
+      if (!state.workspaces.some((item) => item.id === input.workspaceId)) throw new ArcpError('not_found', 'workspace not found');
+      const existing = state.supervisionPolicies.find((item) => item.workspaceId === input.workspaceId);
+      const stewardProfileId = input.stewardProfileId?.trim() || existing?.stewardProfileId || DEFAULT_STEWARD_PROFILE_ID;
+      if (!this.profileData.some((profile) => profile.id === stewardProfileId)) throw new ArcpError('invalid_request', 'steward profile is not a configured profile', 'stewardProfileId');
+      const nextReviewAfterMs = reviewAfterMs ?? existing?.reviewAfterMs;
+      const nextInactivityAfterMs = inactivityAfterMs ?? existing?.inactivityAfterMs;
+      if (nextReviewAfterMs === undefined && nextInactivityAfterMs === undefined) throw new ArcpError('invalid_request', 'a supervision policy needs reviewAfterMs or inactivityAfterMs', 'reviewAfterMs');
+      const at = now();
+      const policy: SupervisionPolicy = {
+        id: existing?.id ?? supervisionPolicyId(input.workspaceId),
+        workspaceId: input.workspaceId,
+        ...(nextReviewAfterMs !== undefined ? { reviewAfterMs: nextReviewAfterMs } : {}),
+        ...(nextInactivityAfterMs !== undefined ? { inactivityAfterMs: nextInactivityAfterMs } : {}),
+        cooldownMs: input.cooldownMs === undefined && existing ? existing.cooldownMs : cooldownMs,
+        stewardProfileId,
+        automatic: input.automatic ?? existing?.automatic ?? true,
+        createdAt: existing?.createdAt ?? at,
+        updatedAt: at,
+      };
+      if (existing) state.supervisionPolicies[state.supervisionPolicies.indexOf(existing)] = policy;
+      else state.supervisionPolicies.push(policy);
+      return policy;
+    });
+  }
+  supervisionPolicy(workspaceId: string): SupervisionPolicy | undefined { return this.store.snapshot().supervisionPolicies.find((item) => item.workspaceId === workspaceId); }
+  supervisionReviews(workspaceId: string): SupervisionReview[] { return this.store.snapshot().supervisionReviews.filter((item) => item.workspaceId === workspaceId); }
+  /**
+   * Record durable evidence that arrived from outside the ARCP record set: a
+   * commit, or a runtime observation. An identical digest is a keepalive: it is
+   * recorded once and never advances the inactivity clock again.
+   */
+  async recordSupervisionSignal(input: { workspaceId: string; subjectId: string; kind: SupervisionSignalKind; digest: string; observedAt?: string }): Promise<SupervisionSignal> {
+    const digest = input.digest?.trim();
+    if (!digest) throw new ArcpError('invalid_request', 'a supervision signal needs a digest', 'digest');
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(digest)) throw new ArcpError('invalid_request', 'a supervision signal digest must be an opaque token', 'digest');
+    const observedAt = input.observedAt ?? now();
+    return this.store.mutate((state) => {
+      if (!state.workspaces.some((item) => item.id === input.workspaceId)) throw new ArcpError('not_found', 'workspace not found');
+      const prior = state.supervisionSignals.filter((item) => item.subjectId === input.subjectId && item.kind === input.kind).sort((a, b) => a.observedAt.localeCompare(b.observedAt) || a.id.localeCompare(b.id)).at(-1);
+      if (prior?.digest === digest) return prior;
+      const signal: SupervisionSignal = { id: supervisionSignalId(input.subjectId, input.kind, digest, observedAt), workspaceId: input.workspaceId, subjectId: input.subjectId, kind: input.kind, digest, observedAt };
+      const existing = state.supervisionSignals.find((item) => item.id === signal.id);
+      if (existing) return existing;
+      state.supervisionSignals.push(signal);
+      return signal;
+    });
+  }
+  private supervisionView(state: State): SupervisionView {
+    return {
+      subjects: state.tasks.map((task) => ({ id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt })),
+      results: state.results.map((result) => ({ taskId: result.taskId, createdAt: result.createdAt })),
+      knowledge: state.knowledge.map((entry) => ({ taskId: entry.taskId, createdAt: entry.createdAt })),
+      events: state.channelEvents.map((event) => ({ taskId: event.taskId, kind: event.kind, createdAt: event.createdAt })),
+      signals: state.supervisionSignals,
+      policies: state.supervisionPolicies,
+      reviews: state.supervisionReviews,
+    };
+  }
+  /** The last durable evidence of work on a Task, with the evidence category. */
+  supervisionProgress(taskId: string): { at: string; source: string } | undefined {
+    const state = this.store.snapshot();
+    const task = state.tasks.find((item) => item.id === taskId);
+    return task ? materialProgressAt(this.supervisionView(state), { id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt }) : undefined;
+  }
+  /**
+   * Evaluate every automatic policy at `nowMs` and durably record any breach.
+   *
+   * The clock is a parameter so a tick is reproducible and never races a wall
+   * clock. Repeated ticks across a breach are idempotent.
+   */
+  async evaluateSupervision(nowMs: number = Date.now()): Promise<SupervisionReview[]> {
+    const created = await this.store.mutate((state) => {
+      const breaches = evaluateSupervision(this.supervisionView(state), nowMs);
+      const reviews: SupervisionReview[] = [];
+      for (const breach of breaches) {
+        if (state.supervisionReviews.some((item) => item.id === breach.reviewId)) continue;
+        const event = this.appendChannelEvent(state, {
+          id: breach.eventId,
+          workspaceId: breach.workspaceId,
+          taskId: breach.subjectId,
+          targetRole: 'manager',
+          kind: 'workspace_analysis_required',
+          urgency: 'urgent',
+          decisionRequired: false,
+          summary: `Workspace analysis required for ${breach.subjectKind} ${breach.subjectId} at generation ${breach.generation}; the ${breach.reason === 'review_budget' ? 'review budget' : 'inactivity budget'} elapsed`,
+          evidenceRefs: [breach.subjectId, breach.policyId],
+        });
+        const review: SupervisionReview = { id: breach.reviewId, workspaceId: breach.workspaceId, policyId: breach.policyId, subjectKind: breach.subjectKind, subjectId: breach.subjectId, generation: breach.generation, reason: breach.reason, eventId: event.id, breachedAt: breach.breachedAt, lastProgressAt: breach.lastProgressAt, cooldownUntil: breach.cooldownUntil, state: 'open' };
+        state.supervisionReviews.push(review);
+        // Elapsed time is not failure. The subject keeps its lifecycle, its
+        // claim and its runtime: nothing here stops, retries or re-queues work.
+        reviews.push(review);
+      }
+      return reviews;
+    });
+    if (created.length > 0) await this.pump();
+    return created;
+  }
+  /** Reconciliation: a Manager or Owner closes the review loop for one breach. */
+  async acknowledgeSupervisionReview(reviewId: string, memberId: string): Promise<SupervisionReview> {
+    return this.store.mutate((state) => {
+      const review = state.supervisionReviews.find((item) => item.id === reviewId);
+      if (!review) throw new ArcpError('not_found', 'supervision review not found');
+      const member = state.members.find((item) => item.id === memberId);
+      const workspace = state.workspaces.find((item) => item.id === review.workspaceId);
+      if (!member || member.workspaceId !== review.workspaceId) throw new ArcpError('unauthorized', 'supervision review acknowledgement is not authorized');
+      if (member.role !== 'manager' && workspace?.ownerMemberId !== member.id) throw new ArcpError('unauthorized', 'supervision review acknowledgement is not authorized');
+      review.state = 'acknowledged'; review.acknowledgedAt = now(); review.acknowledgedByMemberId = memberId;
+      return review;
+    });
   }
   legacySummary(): LegacySummary {
     const count = (items: Array<{ status?: string }>) => items.reduce<Record<string, number>>((out, item) => { const status = item.status ?? 'unknown'; out[status] = (out[status] ?? 0) + 1; return out; }, {});
