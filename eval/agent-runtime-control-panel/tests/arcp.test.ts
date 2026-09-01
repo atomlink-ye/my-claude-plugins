@@ -29,7 +29,7 @@ class FakeCli {
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
     if (args[0] === 'run') { this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
-    if (args[0] === 'send') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
+    if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
     if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
@@ -127,7 +127,7 @@ describe('ARCP MVE control core', () => {
   });
   it('deduplicates conflicting ChannelEvent ids and scopes member retrieval across target modes', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-targets-')); const service = await control(root); const { actor } = await service.registerActor({ clientIdentity: 'channel-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'targets' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker', capabilities: ['worker-subscription'] });
-    const stable = await service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, targetRole: 'owner', kind: 'decision_required', urgency: 'normal', decisionRequired: true, summary: 'approve candidate', evidenceRefs: [] }); expect(stable.content.contentHash).toHaveLength(64); expect(stable.content.summary).toBe('approve candidate'); expect(stable.transitions).toEqual([{ state: 'queued', at: expect.any(String) }]); await expect(service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: 'conflict', evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' }); for (const content of ['Authorization: Bearer abc', 'token=abc', 'path=/Users/private/file', 'file:///tmp/private', 'reason=hidden', '<assistant>transcript']) await expect(service.publishChannelEvent({ workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: content, evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' }); const resolved = await service.resolveDecision('event-stable', workspace.member.id, 'approved'); expect(resolved).toMatchObject({ kind: 'decision_resolved', relatedEventId: 'event-stable' });
+        const stable = await service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, targetRole: 'owner', kind: 'decision_required', urgency: 'normal', decisionRequired: true, summary: 'approve candidate', evidenceRefs: [] }); expect(stable.content.contentHash).toHaveLength(64); expect(stable.content.summary).toBe('approve candidate'); expect(stable.transitions).toEqual([{ state: 'queued', at: expect.any(String) }, { state: 'undeliverable', at: expect.any(String) }]); expect(stable.undeliverableReason).toBe('no live target runtime session'); await expect(service.publishChannelEvent({ id: 'event-stable', workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: 'conflict', evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' }); for (const content of ['Authorization: Bearer abc', 'token=abc', 'path=/Users/private/file', 'file:///tmp/private', 'reason=hidden', '<assistant>transcript']) await expect(service.publishChannelEvent({ workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: content, evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' }); const resolved = await service.resolveDecision('event-stable', workspace.member.id, 'approved'); expect(resolved).toMatchObject({ kind: 'decision_resolved', relatedEventId: 'event-stable' });
     await service.publishChannelEvent({ id: 'event-worker', workspaceId: workspace.workspace.id, targetMemberId: worker.member.id, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: 'worker update', evidenceRefs: [] }); await service.publishChannelEvent({ id: 'event-subscription', workspaceId: workspace.workspace.id, targetSubscription: 'worker-subscription', kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: 'subscription update', evidenceRefs: [] });
     expect(service.channelEvents(workspace.workspace.id, workspace.member.id).map((event) => event.id)).toEqual(expect.arrayContaining(['event-stable'])); expect(service.channelEvents(workspace.workspace.id, workspace.member.id).map((event) => event.id)).not.toEqual(expect.arrayContaining(['event-worker', 'event-subscription'])); expect(service.channelEvents(workspace.workspace.id, worker.member.id).map((event) => event.id)).toEqual(expect.arrayContaining(['event-worker', 'event-subscription']));
   });
@@ -142,7 +142,7 @@ describe('ARCP MVE control core', () => {
     const events = service.state().channelEvents; expect(new Set(events.map((event) => event.kind))).toEqual(new Set(kinds)); expect(events.every((event) => event.taskId === 'task-inventory' && (event.kind.startsWith('task_') ? Boolean(event.resultId) : true))).toBe(true); expect(events.find((event) => event.kind === 'decision_resolved')?.relatedEventId).toBe('inventory-0'); service.close();
   });
   it('resolves a candidate into task_completed and delivers that completion to the manager', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-task-complete-')); const service = await control(root); const { actor } = await service.registerActor({ clientIdentity: 'complete-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'completion' }); const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' }); const goal = await service.createGoal({ actorId: actor.id, title: 'completion goal', workspaceId: workspace.workspace.id }); await service.store.mutate((state: any) => state.sessions.push({ id: 'completion-manager-runtime', actorId: actor.id, goalId: goal.id, bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'paseo-session-1', createdAt: new Date().toISOString() })); const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'complete me' }); await service.claimTask(task.id, worker.member.id, 0); await service.submitResult({ workspaceId: workspace.workspace.id, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'candidate complete', expectedFence: 1 }); const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required')!; await service.resolveDecision(decision.id, manager.member.id, 'accepted'); const state = service.state(); const completed = state.channelEvents.find((event) => event.kind === 'task_completed'); expect(state.tasks.find((item) => item.id === task.id)?.lifecycle).toBe('completed'); expect(completed).toMatchObject({ taskId: task.id, resultId: decision.resultId }); expect(state.deliveries.some((delivery) => delivery.runtimeSessionId === 'completion-manager-runtime' && delivery.eventId === completed?.id)).toBe(true); service.close();
+        const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-task-complete-')); const service = await control(root); const { actor } = await service.registerActor({ clientIdentity: 'complete-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'completion' }); const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' }); const goal = await service.createGoal({ actorId: actor.id, title: 'completion goal', workspaceId: workspace.workspace.id }); await service.store.mutate((state: any) => state.sessions.push({ id: 'completion-manager-runtime', actorId: actor.id, goalId: goal.id, bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'paseo-session-1', createdAt: new Date().toISOString() })); const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'complete me' }); await service.claimTask(task.id, worker.member.id, 0); await service.submitResult({ workspaceId: workspace.workspace.id, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'candidate complete', expectedFence: 1 }); const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required')!; await service.resolveDecision(decision.id, manager.member.id, 'accepted'); const state = service.state(); const completed = state.channelEvents.find((event) => event.kind === 'task_completed'); expect(state.tasks.find((item) => item.id === task.id)?.lifecycle).toBe('completed'); expect(completed).toMatchObject({ taskId: task.id, resultId: decision.resultId }); expect(state.deliveries.some((delivery) => delivery.runtimeSessionId === 'completion-manager-runtime' && delivery.eventId === completed?.id)).toBe(false); service.close();
   });
   it('emits blocker and finding events from Knowledge writes with workspace task references', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-knowledge-events-')); const service = await control(root); const { actor } = await service.registerActor({ clientIdentity: 'knowledge-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'knowledge events' }); const goal = await service.createGoal({ actorId: actor.id, title: 'knowledge goal', workspaceId: workspace.workspace.id }); const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'knowledge task' }); await service.addKnowledge({ workspaceId: workspace.workspace.id, authorMemberId: workspace.member.id, kind: 'blocker', text: 'blocked', taskId: task.id, goalId: goal.id }); await service.addKnowledge({ workspaceId: workspace.workspace.id, authorMemberId: workspace.member.id, kind: 'evidence', text: 'evidence', taskId: task.id, goalId: goal.id }); const events = service.state().channelEvents.filter((event) => event.kind === 'blocker' || event.kind === 'finding'); expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'blocker', taskId: task.id, goalId: goal.id }), expect.objectContaining({ kind: 'finding', taskId: task.id, goalId: goal.id })])); service.close();
@@ -242,6 +242,72 @@ describe('ARCP MVE control core', () => {
     const retry = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test' }) as any;
     const sent = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: retry.confirmation }) as any;
     expect(sent.state).toBe('delivered'); expect((service.cli as any).sends).toBe(1);
+  });
+});
+
+describe('ARCP Slice A channel correctness', () => {
+  it('uses the profile role for managed members and permits an explicit role', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-role-')), false, ['claude']);
+    const { actor } = await service.registerActor({ clientIdentity: 'role-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'role routing' });
+    const manager = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'manager task', profileId: 'claude-manager' });
+    expect((manager as any).member.role).toBe('manager');
+    const explicit = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'explicit role', profileId: 'claude-manager', role: 'on-call' });
+    expect((explicit as any).member.role).toBe('on-call');
+    service.close();
+  });
+
+  it('rejects broadcast notifications and routes only to live non-source sessions', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-routing-')));
+    const { actor } = await service.registerActor({ clientIdentity: 'routing-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'routing' });
+    const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' });
+    const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    await service.store.mutate((state: any) => state.sessions.push(
+      { id: 'live-manager', actorId: actor.id, goalId: 'goal-manager', bindingId: state.bindings[0].id, generation: 1, workspaceId: workspace.workspace.id, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'live-manager', createdAt: new Date().toISOString() },
+      { id: 'dead-worker', actorId: actor.id, goalId: 'goal-worker', bindingId: state.bindings[0].id, generation: 1, workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'terminal', externalId: 'dead-worker', createdAt: new Date().toISOString() },
+    ));
+    await expect(service.publishChannelEvent({ workspaceId: workspace.workspace.id, kind: 'finding', urgency: 'normal', decisionRequired: false, summary: 'broadcast', evidenceRefs: [] })).rejects.toMatchObject({ code: 'invalid_request' });
+    const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, sourceMemberId: worker.member.id, targetRole: 'manager', kind: 'finding', urgency: 'normal', decisionRequired: false, summary: 'live routing', evidenceRefs: [] });
+    expect(service.state().deliveries.filter((item) => item.eventId === event.id).map((item) => item.runtimeSessionId)).toEqual(['live-manager']);
+    service.close();
+  });
+
+  it('marks events with no deliverable target terminal and normalizes provider turn states', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-terminal-')), false, ['codex'], { lastTurnState: 'usage_update' });
+    const { actor } = await service.registerActor({ clientIdentity: 'terminal-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'terminal event' });
+    const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetRole: 'owner', kind: 'decision_required', urgency: 'urgent', decisionRequired: true, summary: 'owner action', evidenceRefs: [] });
+    expect(event.deliveryState).toBe('undeliverable');
+    const goal = await service.createGoal({ actorId: actor.id, title: 'normalize' });
+    const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    expect((await service.observe(runtime.id)).lastTurnState).toBe('idle');
+    service.close();
+  });
+
+  it('emits bounded Paseo permission and attention facts and supports delivery withdrawal', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-facts-')), false, ['codex'], { status: 'permission', pendingPermissions: [{ id: 'p1' }] });
+    const { actor } = await service.registerActor({ clientIdentity: 'facts-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'facts' });
+    const member = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'worker', role: 'worker' });
+    const goal = await service.createGoal({ actorId: actor.id, title: 'facts', workspaceId: workspace.workspace.id });
+    const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, workspaceId: workspace.workspace.id, memberId: member.member.id, profileId: 'codex-worker' });
+    await service.runtimeStatus(runtime.id); await service.runtimeStatus(runtime.id);
+    const facts = service.state().channelEvents.filter((item) => item.sourceMemberId === member.member.id && ['permission', 'attention'].includes(item.kind));
+    expect(facts.map((item) => item.kind).sort()).toEqual(['attention', 'permission']);
+    const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetMemberId: member.member.id, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: 'held', evidenceRefs: [], notify: false });
+    await service.store.mutate((state: any) => state.deliveries.push({ id: 'withdraw-me', fromActorId: actor.id, runtimeSessionId: runtime.id, generation: runtime.generation, body: 'held', command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: new Date().toISOString() }));
+    expect((await service.withdraw('withdraw-me')).state).toBe('withdrawn');
+    service.close();
+  });
+
+  it('does not replay an already-delivered event after service restart', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-restart-delivery-')); const first = await control(root);
+    const { actor } = await first.registerActor({ clientIdentity: 'restart-owner' }); const goal = await first.createGoal({ actorId: actor.id, title: 'restart' });
+    const runtime = await first.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    const delivery = await first.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'once' }) as any;
+    expect(delivery.state).toBe('delivered'); expect((first.cli as any).sends).toBe(1); first.close();
+    const second = await control(root); expect((second.cli as any).sends).toBe(0); expect(second.state().deliveries.find((item) => item.id === delivery.id)?.state).toBe('processed'); second.close();
   });
 });
 

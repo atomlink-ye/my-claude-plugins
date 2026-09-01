@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { CliResult } from './cli.js';
-import type { ChannelAdapter, ChannelEvent, ChildObservation, Profile, RuntimeAdapter, RuntimeLaunchContext } from './arcp.js';
+import type { ChildObservation, Profile, RuntimeAdapter, RuntimeLaunchContext } from './arcp.js';
 
 type JsonRpcMessage = { jsonrpc?: string; id?: number; method?: string; params?: Record<string, any>; result?: any; error?: { message?: string } };
 type ApcProcess = ChildProcessWithoutNullStreams;
@@ -127,23 +127,4 @@ export class HermesAcpAdapter implements RuntimeAdapter {
     session.status = 'terminal'; session.process.kill('SIGTERM'); this.sessions.delete(externalId); return result({ id: externalId, stopped: true });
   }
   async reconcileExternal(externalId: string): Promise<boolean> { const session = this.sessions.get(externalId); if (!session) return false; return session.process.exitCode === null; }
-}
-
-/** ACP is the wire for the same Channel semantics, never a second scheduler. */
-export class AcpChannelAdapter implements ChannelAdapter {
-  readonly channelId = 'acp-channel';
-  readonly adapterId = 'hermes-acp';
-  constructor(private readonly runtime: RuntimeAdapter) {}
-  discover() { return this.runtime.discover(); }
-  models(provider: string) { return this.runtime.models(provider); }
-  modes(provider: string) { return this.runtime.modes(provider); }
-  launch(profile: Profile, goalTitle: string, workspace?: string, context?: RuntimeLaunchContext) { return this.runtime.launch(profile, goalTitle, workspace, context); }
-  observe(externalId: string) { return this.runtime.observe(externalId); }
-  snapshot(externalId: string) { return this.runtime.snapshot(externalId); }
-  registry() { return this.runtime.registry(); }
-  providerSubagents(parentAgentId: string) { return this.runtime.providerSubagents(parentAgentId); }
-  startTurn(externalId: string, body: string, deliveryId: string) { return this.runtime.startTurn(externalId, body, deliveryId); }
-  interrupt(externalId: string, body: string) { return this.runtime.interrupt(externalId, body); }
-  stop(externalId: string) { return this.runtime.stop(externalId); }
-  async sendEvent(event: ChannelEvent, externalId: string, deliveryId: string, body: string): Promise<void> { await this.runtime.startTurn(externalId, body, deliveryId); }
 }
