@@ -16,7 +16,7 @@ export interface Actor { id: string; clientIdentity: string; label: string; crea
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; state: GoalState; createdAt: string; updatedAt: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; generation: number; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
-export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; state: DeliveryState; createdAt: string; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
+export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; fence: number; createdAt: string; updatedAt: string; }
@@ -28,7 +28,7 @@ export interface RuntimeObservation { status: SessionState; activeTurn: boolean 
 export interface ManagedChild { id: string; status: string; role: string; }
 export interface WorkSummary { latestCommit?: { sha: string; subject: string; time: string }; dirty: boolean | 'unknown'; diffstat: { files: number; insertions: number; deletions: number } | 'unknown'; }
 export interface LegacySummary { reminders: Record<string, number>; messages: Record<string, number>; trackedChildren: { total: number; statuses: Record<string, number> }; openCorrectionInstances: number; blockedGateCount: number; }
-interface Confirmation { token: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
+interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
 interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; confirmations: Confirmation[]; }
 
 const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], confirmations: [] });
@@ -359,37 +359,39 @@ export class ArcpService {
     } catch { return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); }
   }
   private cacheThresholds() { return { expiringMinutes: Number(process.env.ARCP_CACHE_EXPIRING_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiringMinutes), expiredMinutes: Number(process.env.ARCP_CACHE_EXPIRED_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiredMinutes) }; }
-  private cacheState(agent: Record<string, any>) {
-    const activityAt = setting(agent.lastUserMessageAt ?? agent.lastActivityAt ?? agent.timelineActivityAt);
+  private cacheState(agent: Record<string, any>, timeline: unknown[] = []) {
+    const turn = safeJson(agent.activeTurn); const times = [agent.lastUserMessageAt, agent.lastActivityAt, turn.startedAt, ...timeline.map((item) => safeJson(item).timestamp ?? safeJson(item).at ?? safeJson(item).createdAt)].map(setting).filter((value): value is string => Boolean(value && Number.isFinite(Date.parse(value))));
+    const activityAt = times.sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     const ageMinutes = activityAt && Number.isFinite(Date.parse(activityAt)) ? Math.max(0, (Date.now() - Date.parse(activityAt)) / 60_000) : undefined;
     const thresholds = this.cacheThresholds(); const state = ageMinutes === undefined ? 'unknown' as const : ageMinutes < thresholds.expiringMinutes ? 'fresh' as const : ageMinutes < thresholds.expiredMinutes ? 'expiring' as const : 'expired' as const;
     return { activityAt, ageMinutes, state };
   }
   private async facts(session: RuntimeSession) {
     if (!session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
-    const snapshot = await this.adapter.snapshot(session.externalId); const children = await this.children(session.externalId);
-    return { agent: snapshot.agent, activeTurn: String(safeJson(snapshot.agent.activeTurn).id ?? ''), childSet: children.map((child) => child.id).sort().join(','), cache: this.cacheState(snapshot.agent) };
+    const snapshot = await this.adapter.snapshot(session.externalId); const children = await this.children(session.externalId); const turn = safeJson(snapshot.agent.activeTurn);
+    return { agent: snapshot.agent, activeTurn: `${turn.turnId ?? turn.id ?? ''}:${turn.startedAt ?? ''}:${Boolean(turn.turnId ?? turn.id)}`, childSet: children.map((child) => `${child.id}:${child.status}`).sort().join(','), cache: this.cacheState(snapshot.agent, snapshot.timeline) };
   }
   private async confirmationReceipt(kind: Confirmation['kind'], session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>, why: string) {
     const token = randomBytes(24).toString('base64url'); const expiresAt = new Date(Date.now() + Number(process.env.ARCP_CONFIRMATION_SECONDS ?? 300) * 1000).toISOString();
-    const record: Confirmation = { token, kind, actorId: input.actorId, runtimeSessionId: session.id, generation: session.generation, ...(input.reason ? { reason: input.reason } : {}), activeTurn: facts.activeTurn, childSet: facts.childSet, ...(facts.cache.activityAt ? { activityAt: facts.cache.activityAt } : {}), expiresAt };
-    const receipt = await this.store.mutate((state) => { state.confirmations = state.confirmations.filter((item) => Date.parse(item.expiresAt) > Date.now()); state.confirmations.push(record); return { action: 'hold' as const, why, confirmation: token, expiresAt, activeTurn: Boolean(facts.activeTurn), childCount: facts.childSet ? facts.childSet.split(',').length : 0, recommendedCommands: kind === 'cache' ? [`arcp start --workspace ${session.workspaceId ?? '<workspace>'} --profile claude-manager --title 'Handoff from ${session.id}'`, `arcp reuse ${session.id} --confirm ${token} --body '<message>'`] : [`arcp interrupt ${session.id} --reason '${input.reason ?? 'reason'}' --confirm ${token} --body '<message>'`] }; });
+    const record: Confirmation = { tokenHash: createHash('sha256').update(token).digest('hex'), kind, actorId: input.actorId, runtimeSessionId: session.id, generation: session.generation, ...(input.reason ? { reason: input.reason } : {}), activeTurn: facts.activeTurn, childSet: facts.childSet, ...(facts.cache.activityAt ? { activityAt: facts.cache.activityAt } : {}), expiresAt };
+    const receipt = await this.store.mutate((state) => { state.confirmations = state.confirmations.filter((item) => Date.parse(item.expiresAt) > Date.now() && !(item.kind === kind && item.actorId === input.actorId && item.runtimeSessionId === session.id)); state.confirmations.push(record); return { action: 'hold' as const, why, confirmation: token, expiresAt, activeTurn: facts.activeTurn.endsWith(':true'), childCount: facts.childSet ? facts.childSet.split(',').length : 0, recommendedCommands: kind === 'cache' ? [`arcp start --workspace ${session.workspaceId ?? '<workspace>'} --profile claude-manager --title 'Handoff from ${session.id}'`, `arcp reuse ${session.id} --confirm ${token} --body '<message>'`] : [`arcp interrupt ${session.id} --reason '${input.reason ?? 'reason'}' --confirm ${token} --body '<message>'`] }; });
     if (kind !== 'cache') return receipt;
     const state = this.store.snapshot(); const goal = state.goals.find((item) => item.id === session.goalId); const task = state.tasks.find((item) => item.workspaceId === session.workspaceId && item.title === goal?.title); const knowledge = state.knowledge.filter((item) => item.workspaceId === session.workspaceId).at(-1); const result = state.results.filter((item) => item.workspaceId === session.workspaceId).at(-1);
     return { ...receipt, handoff: { ...(goal ? { goalId: goal.id } : {}), ...(task ? { taskId: task.id } : {}), ...(knowledge ? { latestKnowledgeRef: knowledge.id } : {}), ...(result ? { latestResultRef: result.id } : {}), workSummary: await this.workSummary(session.workspace) } };
   }
   private async validateConfirmation(kind: Confirmation['kind'], token: string, session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>) {
-    const record = this.store.snapshot().confirmations.find((item) => item.token === token && item.kind === kind);
+    const tokenHash = createHash('sha256').update(token).digest('hex'); const record = this.store.snapshot().confirmations.find((item) => item.tokenHash === tokenHash && item.kind === kind);
     const valid = Boolean(record && Date.parse(record.expiresAt) > Date.now() && record.actorId === input.actorId && record.runtimeSessionId === session.id && record.generation === session.generation && record.reason === input.reason && record.activeTurn === facts.activeTurn && record.childSet === facts.childSet && record.activityAt === facts.cache.activityAt);
-    await this.store.mutate((state) => { state.confirmations = state.confirmations.filter((item) => item.token !== token && Date.parse(item.expiresAt) > Date.now()); });
+    await this.store.mutate((state) => { state.confirmations = state.confirmations.filter((item) => item.tokenHash !== tokenHash && Date.parse(item.expiresAt) > Date.now()); });
     return valid;
   }
   private async cacheGuard(session: RuntimeSession, actorId: string, confirmation?: string) {
-    if (session.provider !== 'claude') return undefined;
+    if (session.provider !== 'claude') return { allow: true as const };
     const facts = await this.facts(session);
-    if (facts.cache.state === 'fresh') return undefined;
-    if (confirmation && await this.validateConfirmation('cache', confirmation, session, { actorId }, facts)) return undefined;
-    return this.confirmationReceipt('cache', session, { actorId }, facts, facts.cache.state === 'unknown' ? 'Claude provider activity is unavailable; reuse requires confirmation' : `Claude cache is ${facts.cache.state}; reuse requires confirmation`);
+    if (facts.cache.state === 'fresh') return { allow: true as const };
+    if (facts.cache.state === 'unknown') return this.confirmationReceipt('cache', session, { actorId }, facts, 'Claude provider activity is unavailable; reuse is held');
+    if (confirmation && await this.validateConfirmation('cache', confirmation, session, { actorId }, facts)) return { allow: true as const, cacheAuthorized: true as const };
+    return this.confirmationReceipt('cache', session, { actorId }, facts, `Claude cache is ${facts.cache.state}; reuse requires confirmation`);
   }
   async interrupt(input: { fromActorId: string; runtimeSessionId: string; body: string; reason: string; confirmation?: string }): Promise<Delivery | Record<string, unknown>> {
     if (!input.reason?.trim() || !input.body?.trim()) throw new ArcpError('invalid_request', 'interrupt reason and body are required');
@@ -412,8 +414,8 @@ export class ArcpService {
     const command = input.command ?? 'normal';
     if (!['normal', 'interrupt'].includes(command)) throw new ArcpError('invalid_request', 'command must be normal or interrupt');
     if (command === 'interrupt') return this.interrupt({ fromActorId: input.fromActorId, runtimeSessionId: input.runtimeSessionId, body: input.body, reason: input.reason ?? '', confirmation: input.cacheConfirmation });
-    const cacheHold = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation); if (cacheHold) return cacheHold;
-    const delivery: Delivery = { id: `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, ...(input.reason ? { reason: input.reason.trim() } : {}), state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
+    const cache = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation); if (!('allow' in cache)) return cache;
+    const delivery: Delivery = { id: `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, ...(cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     await this.pump(); return this.store.snapshot().deliveries.find((item) => item.id === delivery.id)!;
   }
@@ -430,6 +432,10 @@ export class ArcpService {
         // Only waiting_safe_point is eligible to begin a turn; indeterminate is deliberately excluded.
         if (delivery.state !== 'waiting_safe_point') continue;
         if (!['idle', 'terminal'].includes(observed.state)) continue;
+        if (session.provider === 'claude') {
+          const facts = await this.facts(session);
+          if (facts.cache.state !== 'fresh' && !delivery.cacheAuthorized) { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.safePointStatus = `cache_${facts.cache.state}`; return item; }); continue; }
+        }
         await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); return item; });
         try {
           // Adapter rechecks immediately before its non-steering start-turn operation.

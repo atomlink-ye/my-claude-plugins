@@ -52,6 +52,7 @@ export async function createServer(service = new CompanionService(undefined, und
   await service.init();
   const arcp = new ArcpService(service);
   await arcp.init();
+  service.setInterruptRecipientPolicy((recipient) => arcp.state().sessions.some((session) => session.provider === 'claude' && session.externalId === recipient));
   const server = http.createServer(async (req, res) => {
     try {
       if (await handleArcp(req, res, arcp)) return;

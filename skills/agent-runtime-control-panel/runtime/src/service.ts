@@ -91,6 +91,7 @@ export class CompanionService {
   private readonly waitSourceDetector: WaitSourceDetector;
   private readonly watchdogStaleMs: number;
   private readonly contextUsageObserver?: ContextUsageObserver;
+  private interruptRecipientPolicy?: (recipient: string) => boolean;
   /** Recipients whose delivery is held during an in-flight coordinator-driven compact. */
   private readonly quietUntil = new Map<string, number>();
   /** ORACLE-1 §3.4-5: at most one coordinator-driven auto-compact per agent per hour, the
@@ -142,6 +143,7 @@ export class CompanionService {
     this.observers.clear();
     if (this.scheduleObserver && 'close' in this.scheduleObserver && typeof this.scheduleObserver.close === 'function') void this.scheduleObserver.close();
   }
+  setInterruptRecipientPolicy(policy?: (recipient: string) => boolean): void { this.interruptRecipientPolicy = policy; }
   setPort(port: number): void { this.port = port; }
   private endpointBase(): string { return `http://127.0.0.1:${this.port || Number(process.env.PORT || 8787)}`; }
   health(): Record<string, unknown> {
@@ -1161,7 +1163,8 @@ export class CompanionService {
     if (!body.from?.trim()) missingField('from');
     if (!body.body?.trim()) missingField('body');
     if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') invalidValue('urgency must be normal or urgent', 'urgency', ['normal', 'urgent']);
-    const deliveryMode = body.delivery ?? (body.immediate || body.urgency === 'urgent' ? 'interrupt' : 'on-idle');
+    let deliveryMode = body.delivery ?? (body.immediate || body.urgency === 'urgent' ? 'interrupt' : 'on-idle');
+    if (deliveryMode === 'interrupt' && this.interruptRecipientPolicy?.(body.to.trim())) deliveryMode = 'on-idle';
     if (deliveryMode !== 'interrupt' && deliveryMode !== 'on-idle') invalidValue('delivery must be interrupt or on-idle', 'delivery', ['interrupt', 'on-idle']);
     const mode = body.mode ?? 'notify';
     if (!['notify', 'ack', 'reply'].includes(mode)) invalidValue('mode must be notify, ack, or reply', 'mode', ['notify', 'ack', 'reply']);
