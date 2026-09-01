@@ -50,13 +50,14 @@ export class ArcpStore {
 }
 
 export const DEFAULT_PROFILES = [
-  { id: 'claude-manager', provider: 'claude', model: 'opus', mode: 'auto', thinking: 'medium', role: 'manager' },
+  { id: 'claude-manager', provider: 'claude', model: 'anthropic/claude-opus-4-6', mode: 'auto', thinking: 'medium', role: 'manager' },
   { id: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
   { id: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', mode: 'full-access', thinking: 'medium', role: 'worker' },
 ] as const;
 
 function normalized(value: unknown): string { return String(value ?? '').toLowerCase(); }
-function capabilityText(value: unknown): string { return JSON.stringify(value).toLowerCase(); }
+function capabilityText(value: unknown): string { return String(JSON.stringify(value ?? '')).toLowerCase(); }
+function capabilityToken(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]/g, ''); }
 function sessionState(value: unknown): SessionState {
   const state = normalized(value);
   if (['completed', 'failed', 'stopped', 'cancelled', 'archived', 'terminal'].includes(state)) return 'terminal';
@@ -69,6 +70,7 @@ function sessionState(value: unknown): SessionState {
 export class PaseoAdapter {
   constructor(private readonly cli: PaseoCli) {}
   discover() { return this.cli.run(['provider', 'ls', '--json'], { timeoutMs: 5_000 }); }
+  models(provider: string) { return this.cli.run(['provider', 'models', provider, '--json'], { timeoutMs: 5_000 }); }
   launch(profile: typeof DEFAULT_PROFILES[number], goalTitle: string, workspace?: string) {
     return this.cli.run(['run', '-d', '--json', '--provider', profile.provider, '--model', profile.model, '--mode', profile.mode, '--thinking', profile.thinking, ...(workspace ? ['--cwd', workspace] : []), `Work on ARCP Goal: ${goalTitle}`], { timeoutMs: 30_000 });
   }
@@ -118,9 +120,20 @@ export class ArcpService {
   profiles() { return DEFAULT_PROFILES.map((profile) => ({ ...profile, paidModelAutoSelection: false })); }
   async discovery(): Promise<{ available: boolean; profiles: Array<Record<string, unknown>> }> {
     try {
-      const result = await this.adapter.discover();
-      const text = capabilityText(result.value);
-      return { available: true, profiles: this.profiles().map((profile) => ({ ...profile, available: text.includes(profile.provider) && text.includes(profile.model.toLowerCase()) && text.includes(profile.mode.toLowerCase()) })) };
+      const providers = (await this.adapter.discover()).value;
+      if (!Array.isArray(providers)) throw new Error('provider listing is not an array');
+      const profiles = await Promise.all(this.profiles().map(async (profile) => {
+        const provider = providers.map(asRecord).find((item) => String(item.provider).toLowerCase() === profile.provider);
+        const providerAvailable = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled';
+        const modes = capabilityText(provider?.modes);
+        try {
+          const models = (await this.adapter.models(profile.provider)).value;
+          const model = Array.isArray(models) ? models.map(asRecord).find((item) => String(item.id).toLowerCase() === profile.model.toLowerCase()) : undefined;
+          const thinking = Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.map(String).includes(profile.thinking);
+          return { ...profile, available: providerAvailable && Boolean(model) && thinking && capabilityToken(modes).includes(capabilityToken(profile.mode)) };
+        } catch { return { ...profile, available: false }; }
+      }));
+      return { available: true, profiles };
     } catch { return { available: false, profiles: this.profiles().map((profile) => ({ ...profile, available: false })) }; }
   }
   async launch(input: { actorId: string; goalId: string; profileId: string; workspace?: string }): Promise<RuntimeSession> {

@@ -11,7 +11,8 @@ class FakeCli {
   constructor(private readonly fail = false) {}
   async run(args: string[]) {
     if (this.fail && args[0] === 'run') throw new Error('timed out');
-    if (args[0] === 'provider') return { value: [{ provider: 'codex', model: 'gpt-5.6-terra', modes: ['full-access'] }], stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: 'Enabled', modes: 'Full Access' }], stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'models' && args[2] === 'codex') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
     if (args[0] === 'run') return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' };
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle' }, stdout: '', stderr: '' };
@@ -65,7 +66,9 @@ describe('ARCP HTTP and legacy compatibility', () => {
     const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
     expect((await fetch(`${base}/health`)).status).toBe(200);
     expect((await fetch(`${base}/v1/actors`)).status).toBe(401);
-    expect((await fetch(`${base}/v1/actors`, { method: 'POST', headers: { 'x-arcp-api-key': 'test-key', 'content-type': 'application/json' }, body: JSON.stringify({ clientIdentity: 'legacy-owner' }) })).status).toBe(201);
+    const registered = await fetch(`${base}/v1/actors`, { method: 'POST', headers: { 'x-arcp-api-key': 'test-key', 'content-type': 'application/json' }, body: JSON.stringify({ clientIdentity: 'legacy-owner' }) });
+    expect(registered.status).toBe(201);
+    expect(JSON.stringify(await registered.json())).not.toContain('externalId');
     const legacy = await import('../../../skills/paseo-companion/paseo-reminder/src/server.js');
     expect(legacy.createServer).toBeTypeOf('function');
   });

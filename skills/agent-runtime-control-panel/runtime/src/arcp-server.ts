@@ -4,7 +4,7 @@ import { ArcpError, ArcpService } from './arcp.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
-function publicSession(value: any) { const { workspace: _workspace, ...safe } = value; return safe; }
+function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, ...safe } = value; return safe; }
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 
 /** Returns true when an ARCP request was handled. All v1 routes require the local API key. */
