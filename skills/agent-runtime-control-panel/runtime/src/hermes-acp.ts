@@ -50,7 +50,7 @@ export class HermesAcpAdapter implements RuntimeAdapter {
           continue;
         }
         if (message.method === 'session/update') this.onUpdate(session.externalId ?? externalId, session, record(message.params?.update));
-        if (message.method === 'session/request_permission') { this.setState(session.externalId ?? externalId, session, 'attention', 'requires_action'); this.emitFact({ externalId: session.externalId ?? externalId, kind: 'permission', urgency: 'urgent', summary: 'Hermes ACP requested permission' }, session); }
+        if (message.method === 'session/request_permission') { this.setState(session.externalId ?? externalId, session, 'attention', 'requires_action'); this.emitFact({ externalId: session.externalId ?? externalId, kind: 'permission', urgency: 'urgent', summary: 'Hermes ACP requested permission' }, session); this.emitFact({ externalId: session.externalId ?? externalId, kind: 'attention', urgency: 'urgent', summary: 'Hermes ACP requires permission attention' }, session); }
       }
     });
     session.process.stderr.on('data', () => undefined);
