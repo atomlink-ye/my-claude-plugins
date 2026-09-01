@@ -12,7 +12,7 @@ export interface StateStore {
   init(): Promise<void>;
   snapshot(): State;
   mutate<T>(fn: (state: State) => T): Promise<T>;
-  prune?(): Promise<void>;
+  prune?(maxRows?: number): Promise<void>;
 }
 
 export interface DatabaseStatus {
@@ -89,6 +89,8 @@ const MIGRATIONS: Array<[number, string]> = [
     CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY, workspace_id TEXT, content_id TEXT REFERENCES content(id), payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runtime_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, runtime_id TEXT NOT NULL, observed_at TEXT NOT NULL, snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS runtime_observations_runtime_idx ON runtime_observations(runtime_id, id);
+    CREATE TABLE IF NOT EXISTS legacy_reminders (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, imported_at TEXT NOT NULL, PRIMARY KEY(source_file, record_index));
+    CREATE INDEX IF NOT EXISTS legacy_reminders_hash_idx ON legacy_reminders(record_hash);
     CREATE TABLE IF NOT EXISTS migration_audit (source_file TEXT NOT NULL, source_hash TEXT NOT NULL, imported_at TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(source_file, source_hash));
   `],
 ];
@@ -135,10 +137,17 @@ export class SQLiteStateStore implements StateStore {
     const db = this.connection;
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
+    // These CREATEs are repeated outside the numbered migration so a database
+    // created by an earlier schema-1 build gains the import projection too.
+    db.exec('CREATE TABLE IF NOT EXISTS legacy_reminders (source_file TEXT NOT NULL, record_index INTEGER NOT NULL, record_hash TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, imported_at TEXT NOT NULL, PRIMARY KEY(source_file, record_index)); CREATE INDEX IF NOT EXISTS legacy_reminders_hash_idx ON legacy_reminders(record_hash);');
     // These objects were never populated by the SQLite projection. Remove
     // leftovers from pre-release databases while keeping runtime observations
     // and all durable ARCP projections intact.
-    db.exec('DROP TABLE IF EXISTS corrections; DROP TABLE IF EXISTS gates; DROP TABLE IF EXISTS legacy_records; DROP INDEX IF EXISTS event_journal_workspace_idx; DROP INDEX IF EXISTS event_journal_kind_idx;');
+    db.exec('DROP TABLE IF EXISTS corrections; DROP TABLE IF EXISTS gates; DROP INDEX IF EXISTS event_journal_workspace_idx; DROP INDEX IF EXISTS event_journal_kind_idx;');
+    // Keep the historical name queryable for tooling that used the first
+    // migration draft, while storing the richer projection in legacy_reminders.
+    try { db.exec('DROP VIEW IF EXISTS legacy_records'); } catch { /* an old table with this name is left untouched */ }
+    try { db.exec('CREATE VIEW IF NOT EXISTS legacy_records AS SELECT source_file, record_index, record_hash, kind, payload, imported_at FROM legacy_reminders'); } catch { /* an old table already supplies the compatibility name */ }
     const applied = new Set((db.prepare('SELECT version FROM schema_migrations').all() as SqliteRow[]).map((row) => Number(row.version)));
     for (const [version, sql] of MIGRATIONS) {
       if (applied.has(version)) continue;
@@ -173,6 +182,24 @@ export class SQLiteStateStore implements StateStore {
     this.write = operation.catch(() => undefined);
     await operation;
     return result;
+  }
+
+  /** Serialize operations that include their own transaction (for example a
+   * source import) with ordinary state mutations. */
+  private enqueue<T>(fn: () => Promise<T> | T): Promise<T> {
+    const operation = this.write.catch(() => undefined).then(fn);
+    this.write = operation.catch(() => undefined);
+    return operation;
+  }
+
+  async prune(maxRows = 200): Promise<void> {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error('prune maxRows must be a positive integer');
+    await this.mutate((state) => {
+      const deliveries = [...state.deliveries].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      const removedEvents = new Set(deliveries.slice(maxRows).map((item) => item.eventId).filter((id): id is string => Boolean(id)));
+      state.deliveries = deliveries.slice(0, maxRows);
+      state.channelEvents = state.channelEvents.filter((event) => !removedEvents.has(event.id));
+    });
   }
 
   close(): void { this.db?.close(); this.db = undefined; }
@@ -271,7 +298,7 @@ export class SQLiteStateStore implements StateStore {
   }
 
   private persistObservations(state: State): void {
-    const latest = new Map((this.connection.prepare('SELECT runtime_id, snapshot_hash FROM runtime_observations ORDER BY id DESC').all() as SqliteRow[]).map((row) => [String(row.runtime_id), String(row.snapshot_hash)]));
+    const latest = new Map((this.connection.prepare('SELECT runtime_id, snapshot_hash FROM runtime_observations WHERE id IN (SELECT max(id) FROM runtime_observations GROUP BY runtime_id)').all() as SqliteRow[]).map((row) => [String(row.runtime_id), String(row.snapshot_hash)]));
     const insert = this.connection.prepare('INSERT INTO runtime_observations(runtime_id, observed_at, snapshot, snapshot_hash) VALUES (?, ?, ?, ?)');
     for (const session of state.sessions) {
       if (!session.observed || !session.lastObservedAt) continue;
@@ -280,20 +307,22 @@ export class SQLiteStateStore implements StateStore {
       if (latest.get(session.id) === snapshotHash) continue;
       insert.run(session.id, session.lastObservedAt, json(snapshot), snapshotHash);
     }
-    this.connection.exec(`DELETE FROM runtime_observations WHERE id NOT IN (SELECT id FROM runtime_observations ORDER BY id DESC LIMIT ${OBSERVATION_LIMIT})`);
+    const runtimes = (this.connection.prepare('SELECT DISTINCT runtime_id FROM runtime_observations').all() as SqliteRow[]).map((row) => String(row.runtime_id));
+    const prune = this.connection.prepare(`DELETE FROM runtime_observations WHERE runtime_id = ? AND id NOT IN (SELECT id FROM runtime_observations WHERE runtime_id = ? ORDER BY id DESC LIMIT ${OBSERVATION_LIMIT})`);
+    for (const runtimeId of runtimes) prune.run(runtimeId, runtimeId);
   }
 
   status(): DatabaseStatus {
     const db = this.connection;
     const counts: Record<string, number> = {};
-    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'runtime_observations', 'migration_audit']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
+    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
     const mode = awaitableStat(this.file);
     return { path: this.file, schemaVersion: Number((db.prepare('SELECT max(version) AS version FROM schema_migrations').get() as SqliteRow).version ?? 0), journalMode: String((db.prepare('PRAGMA journal_mode').get() as SqliteRow).journal_mode), foreignKeys: Number((db.prepare('PRAGMA foreign_keys').get() as SqliteRow).foreign_keys), busyTimeout: Number((db.prepare('PRAGMA busy_timeout').get() as SqliteRow).timeout), observations: counts.runtime_observations, tables: counts, mode };
   }
 
   check(): DatabaseCheck { const status = this.status(); const db = this.connection; return { ...status, quickCheck: String((db.prepare('PRAGMA quick_check').get() as SqliteRow).quick_check), integrityCheck: String((db.prepare('PRAGMA integrity_check').get() as SqliteRow).integrity_check) }; }
 
-  async backupTo(out: string): Promise<{ out: string; pages: number }> { await mkdir(path.dirname(out), { recursive: true }); this.connection.exec('PRAGMA wal_checkpoint(PASSIVE)'); const pages = await backup(this.connection, out); await chmod(out, 0o600); return { out, pages }; }
+  async backupTo(out: string): Promise<{ out: string; pages: number }> { await mkdir(path.dirname(out), { recursive: true }); this.connection.exec('PRAGMA wal_checkpoint(TRUNCATE)'); const pages = await backup(this.connection, out); this.connection.exec('PRAGMA wal_checkpoint(TRUNCATE)'); await chmod(out, 0o600); return { out, pages }; }
 
   export(kind?: string, since?: string): DatabaseExport {
     const db = this.connection;
@@ -305,7 +334,11 @@ export class SQLiteStateStore implements StateStore {
   }
 
   async importLegacy(sourceDir: string): Promise<ImportReport> {
-    const root = path.resolve(sourceDir); const statePath = path.join(root, 'arcp-state.json'); const stateText = await readFile(statePath, 'utf8');
+    const root = path.resolve(sourceDir); const statePath = path.join(root, 'arcp-state.json');
+    // Read and parse every source before acquiring the SQLite write transaction.
+    // This keeps file I/O out of BEGIN IMMEDIATE and gives a concurrent writer a
+    // single, deterministic source snapshot to import.
+    const stateText = await readFile(statePath, 'utf8');
     const parsedState = JSON.parse(stateText) as Partial<State>;
     const sourceState = safeState(parsedState);
     const legacyValues = (file: string, text: string): unknown[] => {
@@ -313,51 +346,82 @@ export class SQLiteStateStore implements StateStore {
       if (file.endsWith('.jsonl')) return text.split('\n').filter(Boolean).map((line) => JSON.parse(line));
       const value = JSON.parse(text); return Array.isArray(value) ? value : Object.values(value ?? {});
     };
-    const files = [statePath, ...(await readdir(root)).filter((name) => name !== 'arcp-state.json' && (name === 'reminders.json' || name.endsWith('.jsonl'))).map((name) => path.join(root, name))];
-    const expectedProjection = projection(sourceState);
-    const expectedProjectionHash = hash(expectedProjection);
-    const sourceReports: ImportReport['sources'] = [];
-    for (const file of files) {
-      const text = file === statePath ? stateText : await readFile(file, 'utf8');
-      const values = legacyValues(file, text);
-      sourceReports.push({ file: path.basename(file), records: values.length, contentHash: hash(values), importedRecords: 0, importedHash: hash([]), match: false });
-    }
-    const stateSourceReport = sourceReports.find((item) => item.file === 'arcp-state.json')!;
-    stateSourceReport.records = projectionRecords(expectedProjection);
-    stateSourceReport.contentHash = expectedProjectionHash;
-    const currentProjection = projection(this.loadState());
-    const existing = (this.connection.prepare('SELECT source_hash FROM migration_audit WHERE source_file = ?').all('arcp-state.json') as SqliteRow[]).find((row) => String(row.source_hash) === hash(stateText));
-    if (existing && hash(currentProjection) === expectedProjectionHash) {
-      const importedState = { records: projectionRecords(currentProjection), contentHash: hash(currentProjection), importedRecords: projectionRecords(currentProjection), importedHash: hash(currentProjection), match: true };
-      stateSourceReport.importedRecords = importedState.importedRecords;
-      stateSourceReport.importedHash = importedState.importedHash;
-      stateSourceReport.match = importedState.match;
-      return { imported: false, noop: true, sources: sourceReports, state: importedState };
-    }
+    const names = (await readdir(root)).filter((name) => name !== 'arcp-state.json' && (name === 'reminders.json' || name.endsWith('.jsonl'))).sort();
+    const inputs = [{ file: statePath, text: stateText, values: legacyValues(statePath, stateText) }, ...await Promise.all(names.map(async (name) => {
+      const file = path.join(root, name); const text = await readFile(file, 'utf8');
+      return { file, text, values: legacyValues(file, text) };
+    }))];
+    const expectedProjection = projection(sourceState); const expectedProjectionHash = hash(expectedProjection);
+    const stateSourceReport = { file: 'arcp-state.json', records: projectionRecords(expectedProjection), contentHash: expectedProjectionHash, importedRecords: 0, importedHash: hash([]), match: false };
+    // Sidecar proof is based on the per-record hashes read back from SQLite;
+    // retaining the raw source hash separately in migration_audit detects file
+    // changes without persisting private reminder text.
+    const sourceReports: ImportReport['sources'] = [stateSourceReport, ...inputs.slice(1).map((input) => ({ file: path.basename(input.file), records: input.values.length, contentHash: hash(input.values.map((value) => hash(value))), importedRecords: 0, importedHash: hash([]), match: false }))];
     const stateReport: ImportReport['state'] = { records: projectionRecords(expectedProjection), contentHash: expectedProjectionHash, importedRecords: 0, importedHash: hash([]), match: false };
     const report: ImportReport = { imported: true, noop: false, sources: sourceReports, state: stateReport };
-    const db = this.connection;
-    db.exec('BEGIN IMMEDIATE');
-    const before = structuredClone(this.state);
-    try {
-      this.state = sourceState;
-      this.persistWithinTransaction(this.state);
-      const importedProjection = projection(this.loadState());
-      const importedHash = hash(importedProjection);
-      report.state.importedRecords = projectionRecords(importedProjection);
-      report.state.importedHash = importedHash;
-      report.state.match = report.state.records === report.state.importedRecords && report.state.contentHash === importedHash;
-      if (!report.state.match) throw new Error(`legacy import verification failed: expected ${report.state.records} records, read ${report.state.importedRecords}`);
-      stateSourceReport.importedRecords = report.state.importedRecords;
-      stateSourceReport.importedHash = importedHash;
-      stateSourceReport.match = true;
-      this.state = this.loadState();
-      const audit = db.prepare('INSERT INTO migration_audit(source_file, source_hash, imported_at, report) VALUES (?, ?, ?, ?)');
-      for (const file of files) { const text = file === statePath ? stateText : await readFile(file, 'utf8'); audit.run(path.basename(file), hash(text), new Date().toISOString(), json(report)); }
-      db.exec('COMMIT');
-      return report;
-    } catch (error) { db.exec('ROLLBACK'); this.state = before; throw error; }
+    const sourceHashes = new Map(inputs.map((input) => [path.basename(input.file), hash(input.text)]));
+    return this.enqueue(async () => {
+      // Queue the read/no-op decision too: otherwise a concurrent mutation
+      // could land after this method's preflight and be silently ignored.
+      const currentProjection = projection(this.loadState());
+      const auditRows = new Map((this.connection.prepare('SELECT source_file, source_hash FROM migration_audit').all() as SqliteRow[]).map((row) => [String(row.source_file), String(row.source_hash)]));
+      const legacyRows = (name: string) => (this.connection.prepare('SELECT record_index, record_hash FROM legacy_reminders WHERE source_file = ? ORDER BY record_index').all(name) as SqliteRow[]);
+      const importedSidecars = new Set(inputs.slice(1).map((input) => path.basename(input.file)));
+      const storedSidecars = (this.connection.prepare('SELECT DISTINCT source_file FROM legacy_reminders').all() as SqliteRow[]).map((row) => String(row.source_file));
+      const stateMatches = auditRows.get('arcp-state.json') === sourceHashes.get('arcp-state.json') && hash(currentProjection) === expectedProjectionHash;
+      const sidecarsMatch = storedSidecars.every((source) => importedSidecars.has(source)) && inputs.slice(1).every((input, index) => {
+        const source = sourceReports[index + 1]; const rows = legacyRows(path.basename(input.file));
+        const importedValues = rows.map((row) => String(row.record_hash));
+        return auditRows.get(source.file) === sourceHashes.get(source.file) && rows.length === source.records && hash(importedValues) === hash(input.values.map((value) => hash(value)));
+      });
+      if (stateMatches && sidecarsMatch) {
+        const importedHash = hash(currentProjection); const importedState = { records: projectionRecords(currentProjection), contentHash: importedHash, importedRecords: projectionRecords(currentProjection), importedHash, match: true };
+        stateSourceReport.importedRecords = importedState.importedRecords; stateSourceReport.importedHash = importedState.importedHash; stateSourceReport.match = true;
+        for (const source of sourceReports.slice(1)) { source.importedRecords = source.records; source.importedHash = hash(inputs.find((input) => path.basename(input.file) === source.file)!.values.map((value) => hash(value))); source.match = true; }
+        return { imported: false, noop: true, sources: sourceReports, state: importedState };
+      }
+      const db = this.connection; const before = structuredClone(this.state); db.exec('BEGIN IMMEDIATE');
+      try {
+        this.state = sourceState;
+        this.persistWithinTransaction(this.state);
+        const importedProjection = projection(this.loadState()); const importedHash = hash(importedProjection);
+        report.state.importedRecords = projectionRecords(importedProjection); report.state.importedHash = importedHash; report.state.match = report.state.records === report.state.importedRecords && report.state.contentHash === importedHash;
+        if (!report.state.match) throw new Error(`legacy import verification failed: expected ${report.state.records} records, read ${report.state.importedRecords}`);
+        stateSourceReport.importedRecords = report.state.importedRecords; stateSourceReport.importedHash = importedHash; stateSourceReport.match = true;
+        const insert = db.prepare('INSERT INTO legacy_reminders(source_file, record_index, record_hash, kind, payload, imported_at) VALUES (?, ?, ?, ?, ?, ?)');
+        const importedAt = new Date().toISOString();
+        if (importedSidecars.size === 0) db.exec('DELETE FROM legacy_reminders');
+        else db.prepare(`DELETE FROM legacy_reminders WHERE source_file NOT IN (${[...importedSidecars].map(() => '?').join(',')})`).run(...importedSidecars);
+        for (const input of inputs.slice(1)) {
+          const source = path.basename(input.file); db.prepare('DELETE FROM legacy_reminders WHERE source_file = ?').run(source);
+          for (const [index, value] of input.values.entries()) {
+            const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+            const recordHash = hash(value); const kind = String(record.kind ?? 'legacy-reminder');
+            insert.run(source, index, recordHash, kind, json(redactLegacyRecord(value)), importedAt);
+          }
+          const rows = (db.prepare('SELECT record_index, record_hash FROM legacy_reminders WHERE source_file = ? ORDER BY record_index').all(source) as SqliteRow[]);
+          const importedValues = rows.map((row) => String(row.record_hash)); const sourceReport = sourceReports.find((item) => item.file === source)!;
+          sourceReport.importedRecords = rows.length; sourceReport.importedHash = hash(importedValues); sourceReport.match = sourceReport.records === rows.length && sourceReport.importedHash === hash(input.values.map((value) => hash(value)));
+          if (!sourceReport.match) throw new Error(`legacy import verification failed for ${source}: expected ${sourceReport.records} records, read ${rows.length}`);
+        }
+        this.state = this.loadState();
+        const audit = db.prepare('INSERT OR REPLACE INTO migration_audit(source_file, source_hash, imported_at, report) VALUES (?, ?, ?, ?)');
+        for (const input of inputs) audit.run(path.basename(input.file), sourceHashes.get(path.basename(input.file))!, importedAt, json(report));
+        db.exec('COMMIT'); return report;
+      } catch (error) { db.exec('ROLLBACK'); this.state = before; throw error; }
+    });
   }
+}
+
+function redactLegacyRecord(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactLegacyRecord);
+  if (!value || typeof value !== 'object') return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (/body|message|prompt|token|secret|credential|password|private.?key/i.test(key)) continue;
+    result[key] = redactLegacyRecord(item);
+  }
+  return result;
 }
 
 // Keeping this helper synchronous avoids making status a surprising async API for

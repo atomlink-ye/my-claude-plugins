@@ -55,6 +55,13 @@ The deprecated `urgency` alias remains compatible.
 auto-cleared notify deliveries while their bounded delivery audit remains (the
 newest 50 terminal schedules). A truly unknown or pruned ID returns 404.
 
+Delivery safety decisions are explicit and tested: A6 bounds an on-idle delivery
+to one safe-point attempt per durable delivery (busy or uncertain observations
+leave it pending for a later reconciliation); A7 rejects withdrawal after a
+delivery is accepted or processed, while allowing a still-waiting delivery to
+be withdrawn. This prevents a late cancellation from claiming that an already
+sent prompt was undone.
+
 One-shot reminders store an absolute target and fire once. Repeating reminders
 require an explicit `everySeconds`, plus optional `maxRuns`; `delaySeconds` is no
 longer rounded into a recurring cron. `delaySeconds` and `targetAt` are the

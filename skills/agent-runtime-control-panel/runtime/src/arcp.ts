@@ -239,7 +239,11 @@ export class ArcpService {
   private adapterFor(session: RuntimeSession): RuntimeAdapter { return this.adapters.get(session.adapterId || (session.runtimeKind === 'external' ? 'hermes-acp' : 'paseo')) ?? this.adapter; }
   private async prepareRuntimeClientState(sessionId: string, workspaceId: string, memberId: string, credential: string): Promise<string> {
     const root = path.join(path.dirname(this.store.file), 'runtime-members'); const file = path.join(root, `${sessionId}.json`);
-    await mkdir(root, { recursive: true }); await writeFile(file, JSON.stringify({ workspaceId, memberId, runtimeMemberCredentials: { [sessionId]: credential } }) + '\n', { mode: 0o600 }); return file;
+    // `arcp message ack …` is emitted inside the runtime's delivery envelope.
+    // Keep the direct member credential in this already-private per-runtime
+    // state file so that copy-paste acknowledgement is runnable without a
+    // hidden operator credential or an extra selector flag.
+    await mkdir(root, { recursive: true }); await writeFile(file, JSON.stringify({ workspaceId, memberId, memberCredential: credential, runtimeMemberCredentials: { [sessionId]: credential } }) + '\n', { mode: 0o600 }); return file;
   }
   async init(): Promise<void> {
     await this.store.init();
@@ -250,7 +254,10 @@ export class ArcpService {
       if (Array.isArray(config.profiles) && config.profiles.every((item) => item?.id && item.provider && item.model && item.role)) this.profileData = config.profiles;
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
     this.pumpTimer = setInterval(() => { void this.pump(); }, 2_000); this.pumpTimer.unref();
-    void this.pump();
+    // Startup is not complete until persisted safe-point deliveries have been
+    // reconciled. Awaiting this makes restart behavior deterministic: delivered
+    // rows are observed/processed, while waiting rows are eligible exactly once.
+    await this.pump();
   }
   close(): void { if (this.pumpTimer) clearInterval(this.pumpTimer); }
   registerActor(input: { clientIdentity: string; label?: string; channel?: 'hermes' | 'local'; profileRef?: string; conversationRef?: string }): Promise<{ actor: Actor; binding: ActorBinding; credential?: string }> {
@@ -567,7 +574,13 @@ export class ArcpService {
   private async pump(): Promise<void> {
     if (this.pumping) { this.pumpAgain = true; return this.pumping; }
     this.pumping = (async () => {
-      for (const delivery of this.store.snapshot().deliveries.filter((item) => item.command === 'normal' && ['waiting_safe_point', 'delivered', 'running'].includes(item.state))) {
+      // Reconcile accepted history before starting new safe-point work. A
+      // delivery started in this pass must not be immediately turned into
+      // `processed` merely because a later row observes the same idle runtime.
+      const deliveries = this.store.snapshot().deliveries
+        .filter((item) => item.command === 'normal' && ['waiting_safe_point', 'delivered', 'running'].includes(item.state))
+        .sort((a, b) => Number(a.state === 'waiting_safe_point') - Number(b.state === 'waiting_safe_point') || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      for (const delivery of deliveries) {
         const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
         if (!session?.externalId || session.state === 'terminal' || session.generation !== delivery.generation) continue;
         let observed: RuntimeSession;

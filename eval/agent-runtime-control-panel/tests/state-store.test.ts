@@ -53,12 +53,28 @@ describe('SQLite StateStore', () => {
     expect(String(await raw)).not.toContain('credential-secret'); expect(String(await raw)).not.toContain('private prompt'); db.close();
   });
 
+  it('retains the observation bound independently for each runtime', async () => {
+    const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
+    await store.mutate((state: any) => {
+      for (const runtimeId of ['runtime-a', 'runtime-b']) state.sessions.push({ id: runtimeId, actorId: 'actor', goalId: `goal-${runtimeId}`, bindingId: 'binding', generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', provider: 'codex', model: 'model', state: 'idle', createdAt: '2026-01-01T00:00:00.000Z', observed: { mode: 'initial' }, lastObservedAt: '2026-01-01T00:00:00.000Z' });
+    });
+    for (let i = 1; i <= 105; i += 1) await store.mutate((state: any) => { for (const runtime of state.sessions) { runtime.observed = { mode: `${runtime.id}-${i}` }; runtime.lastObservedAt = `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`; } });
+    const db = new DatabaseSync(store.file); expect((db.prepare('SELECT runtime_id, count(*) AS count FROM runtime_observations GROUP BY runtime_id ORDER BY runtime_id').all() as any[])).toEqual([{ runtime_id: 'runtime-a', count: 100 }, { runtime_id: 'runtime-b', count: 100 }]); db.close(); store.close();
+  });
+
+  it('prunes SQLite delivery projections while retaining the append-only journal', async () => {
+    const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
+    await store.mutate((state: any) => { for (let i = 0; i < 4; i += 1) { const id = `delivery-${i}`; state.deliveries.push({ id, fromActorId: 'actor', runtimeSessionId: 'runtime', generation: 1, body: `body-${i}`, command: 'normal', state: 'withdrawn', eventId: `event-${i}`, createdAt: `2026-01-0${i + 1}T00:00:00.000Z` }); state.channelEvents.push(event(`event-${i}`)); } });
+    await store.prune!(2); const db = new DatabaseSync(store.file); expect((db.prepare('SELECT count(*) AS count FROM deliveries').get() as any).count).toBe(2); expect((db.prepare('SELECT count(*) AS count FROM channel_events').get() as any).count).toBe(2); expect((db.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(4); db.close(); store.close();
+  });
+
   it('backs up, exports and idempotently imports copied legacy sources without changing them', async () => {
     const source = await root(); const dbDir = await root();
     const legacy = { actors: [{ id: 'actor-1', clientIdentity: 'owner', label: 'Owner', createdAt: '2026-01-01T00:00:00.000Z' }], channelEvents: [event('legacy-event')], credentials: { hash: 'credential-secret' } };
     await writeFile(path.join(source, 'arcp-state.json'), JSON.stringify(legacy, null, 2)); await writeFile(path.join(source, 'reminders.json'), JSON.stringify([{ id: 'reminder-1', message: 'reminder content' }])); await writeFile(path.join(source, 'reminders.jsonl'), '{"id":"reminder-2","message":"line"}\n');
     const before = await readFile(path.join(source, 'arcp-state.json')); const store = new SQLiteStateStore(dbDir); await store.init();
-    const first = await store.importLegacy(source); expect(first).toMatchObject({ imported: true, noop: false, state: { match: true } }); expect((await readFile(path.join(source, 'arcp-state.json'))).equals(before)).toBe(true);
+    const first = await store.importLegacy(source); expect(first).toMatchObject({ imported: true, noop: false, state: { match: true } }); expect(first.sources.filter((item) => item.file !== 'arcp-state.json')).toEqual(expect.arrayContaining([expect.objectContaining({ file: 'reminders.json', records: 1, match: true }), expect.objectContaining({ file: 'reminders.jsonl', records: 1, match: true })]));
+    const importedDb = new DatabaseSync(store.file); expect((importedDb.prepare('SELECT count(*) AS count FROM legacy_reminders').get() as any).count).toBe(2); expect((importedDb.prepare('SELECT count(*) AS count FROM legacy_records').get() as any).count).toBe(2); expect(String((importedDb.prepare('SELECT payload FROM legacy_reminders').all() as any[])[0].payload)).not.toContain('reminder content'); importedDb.close(); expect((await readFile(path.join(source, 'arcp-state.json'))).equals(before)).toBe(true);
     expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true }); expect(store.export('finding').events).toHaveLength(1);
     const backup = path.join(dbDir, 'backup.sqlite'); await store.backupTo(backup); expect((await stat(backup)).mode & 0o777).toBe(0o600); const backupDb = new DatabaseSync(backup); expect((backupDb.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(1); backupDb.close();
     const raw = await readFile(store.file); expect(raw.toString()).not.toContain('credential-secret'); expect(raw.toString()).not.toContain('reminder content'); store.close();
