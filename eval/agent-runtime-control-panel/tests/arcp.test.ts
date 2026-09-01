@@ -2,13 +2,14 @@ import { mkdtemp, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { ArcpService, CLAUDE_CACHE_DEFAULTS } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { createServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
 import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 
 class FakeCli {
   private lastMode = 'auto';
+  sends = 0;
   constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown) {}
   async run(args: string[]) {
     if (this.fail && args[0] === 'run') throw new Error('timed out');
@@ -16,6 +17,7 @@ class FakeCli {
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
     if (args[0] === 'run') { this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
+    if (args[0] === 'send') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
     if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
@@ -26,6 +28,9 @@ async function control(root: string, fail = false, providers = ['codex'], inspec
 }
 
 describe('ARCP MVE control core', () => {
+  it('keeps the shipped Claude cache thresholds at 55 and 60 minutes', () => {
+    expect(CLAUDE_CACHE_DEFAULTS).toEqual({ expiringMinutes: 55, expiredMinutes: 60 });
+  });
   it('teaches the mandatory claim and result fence commands', async () => {
     const text = await readFile(path.join(process.cwd(), '../../../skills/agent-runtime-control-panel/llms.txt'), 'utf8');
     expect(text).toContain('task claim TASK --expected-fence N');
@@ -121,6 +126,22 @@ describe('ARCP MVE control core', () => {
     const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
     const status = await service.runtimeStatus(runtime.id);
     expect(status.observation).toMatchObject({ health: 'attention', mismatch: true, pendingPermissions: 1, context: { used: 50, max: 100, ratio: 0.5, quality: 'reported' }, compaction: { count: 1, status: 'completed' }, requested: { mode: 'auto' }, observed: { mode: 'full-access' } });
+  });
+
+  it('guards Claude interrupt and stale cache reuse without mutating before confirmation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-claude-guard-')); const activity = new Date(Date.now() - 56 * 60_000).toISOString();
+    const service = await control(root, false, ['claude'], { lastUserMessageAt: activity, activeTurn: { id: 'turn-a' } });
+    const { actor } = await service.registerActor({ clientIdentity: 'claude-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'guarded Claude' }); const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'claude-manager' });
+    const normal = await service.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'safe point delivery' }) as any;
+    expect(normal.action).toBe('hold'); expect(normal.recommendedCommands.join('\n')).toContain('arcp reuse'); expect((service.cli as any).sends).toBe(0);
+    const interrupt = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test' }) as any;
+    expect(interrupt).toMatchObject({ action: 'hold' }); expect(service.state().deliveries).toHaveLength(0);
+    (service.cli as any).inspectValue.activeTurn = { id: 'turn-b' };
+    const stale = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: interrupt.confirmation }) as any;
+    expect(stale).toMatchObject({ action: 'hold', why: expect.stringContaining('stale') }); expect((service.cli as any).sends).toBe(0);
+    const retry = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test' }) as any;
+    const sent = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: retry.confirmation }) as any;
+    expect(sent.state).toBe('delivered'); expect((service.cli as any).sends).toBe(1);
   });
 });
 
