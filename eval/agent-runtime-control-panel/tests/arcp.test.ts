@@ -486,12 +486,19 @@ describe('ARCP CLI and TUI presentation', () => {
     await execFileAsync(process.execPath, [script, 'channel', 'list', 'workspace-1', '--decision-required', 'false'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
     // Catches a mutation that forwards the raw flag value instead of normalizing it.
     expect(seen[3]).toMatchObject({ url: '/v1/workspaces/workspace-1/events?decision-required=0', key: 'cli-key' });
+    await execFileAsync(process.execPath, [script, 'supervision', 'configure', 'workspace-1', '--review-after-ms', '5000', '--cooldown-ms', '60000', '--steward-profile', 'codex-worker', '--automatic', 'false'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
+    // supervision configure is a member-scoped write, like task claim and steward
+    // analyze: it must not carry the admin key. Catches a mutation that drops the
+    // memberOnly flag and would let the CLI configure a policy with only an admin key.
+    expect(seen[4]).toMatchObject({ url: '/v1/workspaces/workspace-1/supervision', key: undefined, body: { reviewAfterMs: 5000, cooldownMs: 60000, stewardProfileId: 'codex-worker', automatic: false } });
+    await execFileAsync(process.execPath, [script, 'supervision', 'status', 'workspace-1'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
+    expect(seen[5]).toMatchObject({ url: '/v1/workspaces/workspace-1/supervision', key: 'cli-key' });
     // The retired 8787 verbs must be unknown commands, not silent no-ops.
     for (const argv of [['reminder', 'list'], ['message', 'send', 'a', 'b', 'c'], ['idle', 'add', 'agent-1', 'nudge'], ['correction', 'list'], ['gate', 'manager-1'], ['ledger', 'list'], ['compact', 'agent-1', 'focus'], ['child', 'list', 'agent-1'], ['wakeup', 'list', 'agent-1'], ['heartbeat', 'list'], ['context', 'usage']]) {
       await expect(execFileAsync(process.execPath, [script, ...argv], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } }))
         .rejects.toMatchObject({ code: 2, stderr: expect.stringContaining(`unknown command: ${argv[0]}`) });
     }
-    expect(seen).toHaveLength(4);
+    expect(seen).toHaveLength(6);
     await expect(execFileAsync(process.execPath, [script, 'workspace', 'frobnicate'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } })).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('unknown command: frobnicate') });
     await expect(execFileAsync(process.execPath, [script, 'mystery'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } })).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('unknown command: mystery') });
     await new Promise<void>((resolve) => server.close(() => resolve()));

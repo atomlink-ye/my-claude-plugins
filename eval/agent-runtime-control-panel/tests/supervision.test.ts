@@ -1,8 +1,10 @@
 import { mkdtemp } from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { handleArcp } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
 import { SQLiteStateStore } from '../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
 import { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, evaluateSupervision, supervisionReviewId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
@@ -50,7 +52,10 @@ async function scenario(root: string, store?: any) {
   // so the fixture never publishes an event it then has to move in time.
   const task = { id: 'task_supervision_subject', workspaceId: created.workspace.id, title: 'bounded proof task', lifecycle: 'claimed' as const, ownerMemberId: worker.member.id, fence: 1, createdAt: at(0), updatedAt: at(0) };
   await service.store.mutate((state: any) => state.tasks.push({ ...task }));
-  return { service, cli, workspace: created.workspace, owner: created.member, manager: manager.member, worker: worker.member, task };
+  return {
+    service, cli, workspace: created.workspace, owner: created.member, manager: manager.member, worker: worker.member, task,
+    ownerCredential: created.credential!, managerCredential: manager.credential!, workerCredential: worker.credential!,
+  };
 }
 
 const analysisEvents = (service: ArcpService, workspaceId: string) =>
@@ -325,4 +330,76 @@ describe('supervision budgets, state and reconciliation', () => {
       (restarted.store as any).close?.();
     });
   }
+});
+
+describe('supervision HTTP route — a thin surface over the existing service API, not a second store', () => {
+  let server: http.Server | undefined;
+  afterEach(async () => { if (server) await new Promise<void>((resolve) => server!.close(() => resolve())); server = undefined; });
+
+  it('lets a Manager configure a policy through /v1/workspaces/:id/supervision and reads back the live policy and its reviews', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-http-configure-'));
+    const { service, workspace, managerCredential } = await scenario(root);
+    server = http.createServer(async (req, res) => { if (!(await handleArcp(req, res, service))) { res.statusCode = 404; res.end('{}'); } });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const headers = { 'x-arcp-member-key': managerCredential, 'content-type': 'application/json' };
+
+    // Before any configuration, the route reports an absent policy rather than
+    // silently omitting the key: `policy: null`, not a missing property.
+    const before = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, { headers });
+    expect(before.status).toBe(200);
+    expect(await before.json()).toEqual({ policy: null, reviews: [] });
+
+    const configured = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, {
+      method: 'POST', headers, body: JSON.stringify({ reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-worker' }),
+    });
+    expect(configured.status).toBe(200);
+    const configuredBody: any = await configured.json();
+    expect(configuredBody).toMatchObject({ workspaceId: workspace.id, reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-worker', automatic: true });
+    // The route must delegate to the one durable policy store, not keep its own
+    // copy: what the HTTP layer returns must equal what the service itself holds.
+    expect(configuredBody).toEqual(service.supervisionPolicy(workspace.id));
+
+    // A breach evaluated directly through the service must be visible through
+    // the same route, proving GET reads the live review state and not a snapshot
+    // taken at configure time.
+    const [review] = await service.evaluateSupervision(T0 + 5_000);
+    const after = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, { headers });
+    const afterBody: any = await after.json();
+    expect(afterBody.policy).toEqual(configuredBody);
+    expect(afterBody.reviews).toEqual([review]);
+    service.close();
+  });
+
+  it('refuses an unauthenticated or non-Manager, non-Owner request to configure, and keeps a policy read scoped to its own Workspace', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-http-authz-'));
+    const { service, workspace, workerCredential } = await scenario(root);
+    const { actor: otherActor } = await service.registerActor({ clientIdentity: 'supervision-other-owner' });
+    const other = await service.createWorkspace({ ownerActorId: otherActor.id, purpose: 'a different workspace' });
+    server = http.createServer(async (req, res) => { if (!(await handleArcp(req, res, service))) { res.statusCode = 404; res.end('{}'); } });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+
+    // No credential at all: refused before routing even begins.
+    const anonymous = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reviewAfterMs: 1_000 }),
+    });
+    expect(anonymous.status).toBe(401);
+
+    // A Worker is a member of the right Workspace but holds neither the Manager
+    // nor the Owner role that budget configuration requires.
+    const workerAttempt = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, {
+      method: 'POST', headers: { 'x-arcp-member-key': workerCredential, 'content-type': 'application/json' }, body: JSON.stringify({ reviewAfterMs: 1_000 }),
+    });
+    expect(workerAttempt.status).toBe(401);
+    expect(service.supervisionPolicy(workspace.id)).toBeUndefined();
+
+    // A member of a different Workspace must not be able to read this one's
+    // supervision policy through the same route.
+    const foreignRead = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, { headers: { 'x-arcp-member-key': other.credential! } });
+    expect(foreignRead.status).toBe(404);
+    service.close();
+  });
 });

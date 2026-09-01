@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','channel','steward','db'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
+const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','channel','steward','supervision','db'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
 const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   task create|claim|list WORKSPACE [--expected-fence N]
@@ -16,6 +16,8 @@ const HELP = `ARCP ControlWorkspace commands:
   channel withdraw DELIVERY
   steward analyze WORKSPACE --task TASK
   steward reports WORKSPACE
+  supervision configure WORKSPACE [--review-after-ms N] [--inactivity-after-ms N] [--cooldown-ms N] [--steward-profile ID] [--automatic true|false]
+  supervision status WORKSPACE
   release DELIVERY [--confirm TOKEN]
   db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH] [--overwrite]
   member heartbeat|list WORKSPACE
@@ -44,7 +46,7 @@ External Runtime note:
   Feishu Hermes conversation; that Hermes remains Owner and the human entry point.
   Runtime communication is a durable ChannelEvent; completion requires a Result,
   never an idle process.`;
-const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','channel','steward','db','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack','release'];
+const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','channel','steward','supervision','db','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack','release'];
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
@@ -100,6 +102,8 @@ else if (area === 'channel' && action === 'ack') await call('POST',`/v1/events/$
 else if (area === 'channel' && action === 'resolve') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/resolve`,{summary:f.summary||p.slice(1).join(' ')||'Decision resolved',verdict:bool('refuse')?'refuse':(f.verdict?String(f.verdict):'accept')});
 else if (area === 'steward' && action === 'analyze') { const workspace=p[0]||await workspaceId(); if(workspace) await call('POST',`/v1/workspaces/${encodeURIComponent(workspace)}/steward/analyses`,{taskId:f.task||p[1]},true); }
 else if (area === 'steward' && action === 'reports') { const workspace=p[0]||await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/steward/reports`); }
+else if (area === 'supervision' && action === 'configure') { const workspace=p[0]||await workspaceId(); if(workspace) await call('POST',`/v1/workspaces/${encodeURIComponent(workspace)}/supervision`,{...(f['review-after-ms']===undefined?{}:{reviewAfterMs:Number(f['review-after-ms'])}),...(f['inactivity-after-ms']===undefined?{}:{inactivityAfterMs:Number(f['inactivity-after-ms'])}),...(f['cooldown-ms']===undefined?{}:{cooldownMs:Number(f['cooldown-ms'])}),...(f['steward-profile']===undefined?{}:{stewardProfileId:String(f['steward-profile'])}),...(f['automatic']===undefined?{}:{automatic:bool('automatic')})},true); }
+else if (area === 'supervision' && action === 'status') { const workspace=p[0]||await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/supervision`); }
 else if (area === 'channel' && action === 'withdraw') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/withdraw`,{reason:f.reason||'withdrawn'});
 else if (area === 'status') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama`); }
 else if (area === 'workspace' && action === 'list') await call('GET','/v1/workspaces');

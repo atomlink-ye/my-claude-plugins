@@ -107,6 +107,31 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
       send(res, 200, (await stewardFor(service, workspaceId)).reports(workspaceId));
       return true;
     }
+    const workspaceSupervision = path.match(/^\/v1\/workspaces\/([^/]+)\/supervision$/);
+    if (method === 'POST' && workspaceSupervision) {
+      const workspaceId = decodeURIComponent(workspaceSupervision[1]);
+      if (!authenticatedMember || authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'a member credential for this workspace is required');
+      // Same authorization as acknowledging a review: Manager or the Workspace
+      // Owner sets the budget that governs the automatic Steward trigger.
+      const workspace = service.state().workspaces.find((item) => item.id === workspaceId);
+      if (authenticatedMember.role !== 'manager' && workspace?.ownerMemberId !== authenticatedMember.id) throw new ArcpError('unauthorized', 'supervision configuration is not authorized');
+      const input = await body(req);
+      send(res, 200, await service.configureSupervision({
+        workspaceId,
+        ...(typeof input.reviewAfterMs === 'number' ? { reviewAfterMs: input.reviewAfterMs } : {}),
+        ...(typeof input.inactivityAfterMs === 'number' ? { inactivityAfterMs: input.inactivityAfterMs } : {}),
+        ...(typeof input.cooldownMs === 'number' ? { cooldownMs: input.cooldownMs } : {}),
+        ...(typeof input.stewardProfileId === 'string' ? { stewardProfileId: input.stewardProfileId } : {}),
+        ...(typeof input.automatic === 'boolean' ? { automatic: input.automatic } : {}),
+      }));
+      return true;
+    }
+    if (method === 'GET' && workspaceSupervision) {
+      const workspaceId = decodeURIComponent(workspaceSupervision[1]);
+      if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
+      send(res, 200, { policy: service.supervisionPolicy(workspaceId) ?? null, reviews: service.supervisionReviews(workspaceId) });
+      return true;
+    }
     const workspaceEvents = path.match(/^\/v1\/workspaces\/([^/]+)\/events$/);
     if (method === 'GET' && workspaceEvents) {
       const workspaceId = decodeURIComponent(workspaceEvents[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
