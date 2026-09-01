@@ -9,10 +9,10 @@ import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/s
 
 class FakeCli {
   private lastMode = 'auto';
-  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}) {}
+  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown) {}
   async run(args: string[]) {
     if (this.fail && args[0] === 'run') throw new Error('timed out');
-    if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access'] })), stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
     if (args[0] === 'run') { this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
@@ -20,9 +20,9 @@ class FakeCli {
     return { value: [], stdout: '', stderr: '' };
   }
 }
-async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}) {
+async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown) {
   const companion = { store: { dir: root }, postMessage: async () => ({ id: 'message-1', delivery: { status: 'pending' } }), deleteMessage: async () => ({}) };
-  const service = new ArcpService(companion as any, new FakeCli(fail, providers, inspectValue) as any); await service.init(); return service;
+  const service = new ArcpService(companion as any, new FakeCli(fail, providers, inspectValue, modeListing) as any, undefined, modeClientFactory); await service.init(); return service;
 }
 
 describe('ARCP MVE control core', () => {
@@ -34,7 +34,8 @@ describe('ARCP MVE control core', () => {
   it('keeps a native member, task fence, knowledge and result in one durable ControlWorkspace', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-workspace-')); const service = await control(root);
     const { actor } = await service.registerActor({ clientIdentity: 'hermes-owner', channel: 'hermes', conversationRef: 'opaque-conversation' });
-    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'shared canary' });
+    const created = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'shared canary' }); const workspace = created.workspace;
+    expect(service.memberForCredential(created.credential).id).toBe(created.member.id);
     const joined = await service.joinWorkspace({ workspaceId: workspace.id, label: 'native-pi', role: 'reviewer', capabilities: ['knowledge', 'results'] });
     const task = await service.createTask({ workspaceId: workspace.id, title: 'review control plane' });
     await expect(service.claimTask(task.id, joined.member.id)).rejects.toMatchObject({ code: 'invalid_request' });
@@ -94,6 +95,14 @@ describe('ARCP MVE control core', () => {
     expect(launched.mode).toBe('auto'); expect(launched.observed?.mode).toBe('auto');
     const weak = await service.preflight({ provider: 'codex', model: 'gpt-5.6-terra', mode: 'plan', thinking: 'medium' });
     expect(weak).toMatchObject({ action: 'hold', launchable: false, requested: { mode: 'plan' }, recommendedCommands: [expect.stringContaining('--profile codex-full-access')] });
+  });
+
+  it('uses public SDK mode ids over CLI human mode labels', async () => {
+    const modeClient = () => ({ connect: async () => {}, close: async () => {}, providers: { listModes: async () => ({ provider: 'codex', modes: [{ id: 'auto' }, { id: 'auto-review' }, { id: 'full-access' }] }) } });
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-sdk-modes-')); const service = await control(root, false, ['codex'], {}, modeClient, 'Default Permissions, Auto-review, Full Access');
+    expect(await service.preflight({ profileId: 'codex-worker' })).toMatchObject({ action: 'launch', liveModes: ['auto', 'auto-review', 'full-access'] });
+    const { actor } = await service.registerActor({ clientIdentity: 'sdk-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'SDK auto' });
+    expect(await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' })).toMatchObject({ mode: 'auto', observed: { mode: 'auto' } });
   });
 
   it('allows only an explicit elevated profile and leaves Pi/Grok mode-less', async () => {

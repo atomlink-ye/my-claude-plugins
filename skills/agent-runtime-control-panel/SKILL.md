@@ -14,7 +14,7 @@ metadata:
 
 ARCP is a local CLI-first control plane. Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create or join a `ControlWorkspace`. Paseo is the first-class managed adapter; native Claude, Codex, Pi/Grok and Hermes may join as Members without Paseo.
 
-Use `scripts/arcp`; the loopback API is internal durable transport. The CLI stores issued Actor/Member credentials in a mode-0600 local state file.
+Use `scripts/arcp`; the loopback API is internal durable transport. The CLI stores issued Actor/Member credentials in a mode-0600 local state file and prints only `credentialStored:true`. Use the explicit one-time `--show-credential` option only when transferring a credential deliberately. `workspace create` also stores the owner Member credential, so the owner can immediately heartbeat, claim Tasks, add Knowledge, and submit Results.
 
 Normal messages queue until the recipient reaches a Paseo idle/terminal safe point. `delivery interrupt` is intentionally separate and may interrupt the active turn. Do not substitute `paseo send` for a normal ARCP delivery.
 

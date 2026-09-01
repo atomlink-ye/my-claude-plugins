@@ -13,6 +13,8 @@ ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/
 
 Default durable state is `${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-control-panel/data`. `ARCP_RUNTIME_DIR`, `ARCP_DATA`, `ARCP_LOG`, and `ARCP_PID` configure it. Legacy `PASEO_COMPANION_RUNTIME_DIR`, `PASEO_COMPANION_DATA`, `PASEO_COMPANION_LOG`, and `PASEO_COMPANION_PID` remain aliases. The server binds loopback only.
 
+`actor register`, `workspace create`, and `workspace join` save issued credentials to the mode-0600 client state and print `credentialStored:true`, never the bearer value. Pass `--show-credential` only for a deliberate one-time transfer. Workspace creation also provisions the owner's Member credential, so no follow-up join is needed before heartbeat, task claim, Knowledge, or Result commands.
+
 ## MVE canary
 
 ```sh

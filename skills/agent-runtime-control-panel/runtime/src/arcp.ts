@@ -98,8 +98,10 @@ async function git(cwd: string, args: string[]): Promise<string> {
 
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
  * this adapter owns only safe Paseo transport/discovery calls and never exposes native handles. */
+type PaseoModeClient = { connect(): Promise<void>; close(): Promise<void>; providers: { listModes(provider: string): Promise<unknown> } };
+
 export class PaseoAdapter {
-  constructor(private readonly cli: PaseoCli) {}
+  constructor(private readonly cli: PaseoCli, private readonly modeClientFactory?: () => PaseoModeClient) {}
   discover() { return this.cli.run(['provider', 'ls', '--json'], { timeoutMs: 5_000 }); }
   models(provider: string) { return this.cli.run(['provider', 'models', provider, '--json'], { timeoutMs: 5_000 }); }
   launch(profile: Profile, goalTitle: string, workspace?: string) {
@@ -107,6 +109,19 @@ export class PaseoAdapter {
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: 5_000 }); }
   registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: 5_000 }); }
+  /** Public SDK mode ids are authoritative. CLI `provider ls` emits display
+   * labels, which must never be treated as ids when the SDK is reachable. */
+  async modes(provider: string): Promise<string[] | undefined> {
+    if (!this.modeClientFactory && !(this.cli instanceof PaseoCli)) return undefined;
+    const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws';
+    const url = raw.includes('://') ? raw : `ws://${raw}`;
+    const client = this.modeClientFactory?.() ?? createPaseoClient({ url, clientId: `arcp-modes-${process.pid}-${provider}`, reconnect: { enabled: false }, webSocketFactory: (target: string, options: any) => new WebSocket(target, options) } as any) as PaseoModeClient;
+    try {
+      await client.connect(); const payload = safeJson(await client.providers.listModes(provider));
+      if (!Array.isArray(payload.modes)) return [];
+      return payload.modes.map((mode) => setting(safeJson(mode).id)).filter((mode): mode is string => Boolean(mode));
+    } catch { return undefined; } finally { await client.close().catch(() => undefined); }
+  }
   /** Prefer the installed public SDK snapshot/timeline. CLI is retained for older
    * daemons and adapter facts which the public SDK cannot expose. */
   async snapshot(externalId: string): Promise<{ agent: Record<string, any>; timeline: unknown[]; source: 'sdk' | 'cli' }> {
@@ -151,7 +166,7 @@ export class ArcpService {
   private profileData: Profile[] = [...DEFAULT_PROFILES];
   private pumpTimer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
-  constructor(readonly companion: CompanionService, readonly cli = new PaseoCli(), store?: ArcpStore) { this.store = store ?? new ArcpStore(companion.store.dir); this.adapter = new PaseoAdapter(cli); }
+  constructor(readonly companion: CompanionService, readonly cli = new PaseoCli(), store?: ArcpStore, modeClientFactory?: () => PaseoModeClient) { this.store = store ?? new ArcpStore(companion.store.dir); this.adapter = new PaseoAdapter(cli, modeClientFactory); }
   async init(): Promise<void> {
     await this.store.init();
     try {
@@ -218,7 +233,7 @@ export class ArcpService {
       const profiles = await Promise.all(this.profiles().map(async (profile) => {
         const provider = providers.map(asRecord).find((item) => String(item.provider).toLowerCase() === profile.provider);
         const providerAvailable = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled';
-        const modes = this.modeIds(provider?.modes);
+        const modes = (await this.adapter.modes(profile.provider)) ?? this.cliModeIds(provider?.modes);
         try {
           const models = (await this.adapter.models(profile.provider)).value;
           const model = Array.isArray(models) ? models.map(asRecord).find((item) => String(item.id).toLowerCase() === profile.model.toLowerCase()) : undefined;
@@ -230,7 +245,7 @@ export class ArcpService {
       return { available: true, profiles };
     } catch { return { available: false, profiles: this.profiles().map((profile) => ({ ...profile, available: false })) }; }
   }
-  private modeIds(value: unknown): string[] {
+  private cliModeIds(value: unknown): string[] {
     const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
     return values.map((item) => {
       const raw = typeof item === 'string' ? item.trim() : setting(safeJson(item).id);
@@ -263,7 +278,7 @@ export class ArcpService {
     let live = discovered.profiles.find((item) => item.id === profile.id)?.available === true;
     let liveModes: string[] = [];
     try {
-      const providers = (await this.adapter.discover()).value; const provider = Array.isArray(providers) ? providers.map(asRecord).find((item) => normalized(item.provider) === normalized(profile.provider)) : undefined; liveModes = this.modeIds(provider?.modes);
+      const providers = (await this.adapter.discover()).value; const provider = Array.isArray(providers) ? providers.map(asRecord).find((item) => normalized(item.provider) === normalized(profile.provider)) : undefined; liveModes = (await this.adapter.modes(profile.provider)) ?? this.cliModeIds(provider?.modes);
       if (profile.id === 'explicit') {
         const models = (await this.adapter.models(profile.provider)).value; const model = Array.isArray(models) ? models.map(asRecord).find((item) => sameSetting(item.id, profile.model)) : undefined;
         live = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled' && Boolean(model) && (!profile.mode || liveModes.some((mode) => sameSetting(mode, profile.mode))) && (!profile.thinking || (Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.some((value: unknown) => sameSetting(value, profile.thinking))));
@@ -385,9 +400,9 @@ export class ArcpService {
     if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery has not been processed');
     return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); return item; });
   }
-  async createWorkspace(input: { ownerActorId: string; purpose: string }): Promise<ControlWorkspace> {
+  async createWorkspace(input: { ownerActorId: string; purpose: string }): Promise<{ workspace: ControlWorkspace; member: Member; credential: string }> {
     if (!input.purpose?.trim()) throw new ArcpError('invalid_request', 'workspace purpose is required');
-    return this.store.mutate((state) => { const owner = state.actors.find((item) => item.id === input.ownerActorId); if (!owner) throw new ArcpError('unknown_recipient', 'owner actor is not registered'); const at = now(); const ownerMember = { id: `member_${randomUUID()}`, workspaceId: `workspace_pending`, actorId: owner.id, joinKind: 'native' as const, label: owner.label, role: 'owner', capabilities: ['claim_task','write_knowledge','submit_result','read_context'], lifecycle: 'active' as Member['lifecycle'], leaseExpiresAt: new Date(Date.now() + 300_000).toISOString(), lastHeartbeatAt: at, createdAt: at, updatedAt: at }; const workspace = { id: `workspace_${randomUUID()}`, purpose: input.purpose.trim(), lifecycle: 'active' as const, ownerActorId: input.ownerActorId, ownerMemberId: ownerMember.id, createdAt: at, updatedAt: at }; ownerMember.workspaceId = workspace.id; state.workspaces.push(workspace); state.members.push(ownerMember); return workspace; });
+    return this.store.mutate((state) => { const owner = state.actors.find((item) => item.id === input.ownerActorId); if (!owner) throw new ArcpError('unknown_recipient', 'owner actor is not registered'); const at = now(); const ownerMember = { id: `member_${randomUUID()}`, workspaceId: `workspace_pending`, actorId: owner.id, joinKind: 'native' as const, label: owner.label, role: 'owner', capabilities: ['claim_task','write_knowledge','submit_result','read_context'], lifecycle: 'active' as Member['lifecycle'], leaseExpiresAt: new Date(Date.now() + 300_000).toISOString(), lastHeartbeatAt: at, createdAt: at, updatedAt: at }; const workspace = { id: `workspace_${randomUUID()}`, purpose: input.purpose.trim(), lifecycle: 'active' as const, ownerActorId: input.ownerActorId, ownerMemberId: ownerMember.id, createdAt: at, updatedAt: at }; ownerMember.workspaceId = workspace.id; const credential = randomBytes(32).toString('base64url'); state.memberCredentials[createHash('sha256').update(credential).digest('hex')] = ownerMember.id; state.workspaces.push(workspace); state.members.push(ownerMember); return { workspace, member: ownerMember, credential }; });
   }
   async joinWorkspace(input: { workspaceId: string; label: string; role: string; capabilities?: string[]; actorId?: string; joinKind?: 'managed' | 'native'; credential?: string }): Promise<{ member: Member; credential?: string }> {
     if (!input.label?.trim() || !input.role?.trim()) throw new ArcpError('invalid_request', 'member label and role are required');
