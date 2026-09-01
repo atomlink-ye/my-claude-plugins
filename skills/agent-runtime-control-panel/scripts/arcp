@@ -18,8 +18,11 @@ else if (area === 'workspace' && action === 'context') await call('GET',`/v1/wor
 else if (area === 'task' && action === 'create') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/tasks`,{title:f.title||p.slice(1).join(' ')});
 else if (area === 'task' && action === 'claim') await call('POST',`/v1/tasks/${encodeURIComponent(p[0])}/claim`);
 else if (area === 'goal' && action === 'start') { const s=await load(); const g=await call('POST','/v1/goals',{title:f.title||p.join(' ')}); if(g.id) await call('POST','/v1/runtime-sessions',{goalId:g.id,profileId:f.profile||'codex-worker',workspace:f.cwd||process.cwd(),workspaceId:f.workspace||s.workspaceId,memberId:f.member}); }
+else if (area === 'send') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'normal'});
+else if (area === 'interrupt') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'interrupt',reason:f.reason});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')});
 else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'completed',summary:f.summary||p.slice(2).join(' ')});
 else if (area === 'status') { const s=await load(); await call('GET',`/v1/workspaces/${encodeURIComponent(f.workspace||s.workspaceId)}/context`); }
 else if (area === 'reconcile') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0])}/reconcile`);
+else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(); if (s.workspaceId) await call('GET',`/v1/workspaces/${encodeURIComponent(s.workspaceId)}/context`); }
 else { console.error('usage: arcp doctor|ensure|actor register ID|workspace create --purpose X|workspace join WS --label X|workspace context WS|task create WS --title X|task claim TASK|knowledge add WS --text X|result submit WS --task TASK --summary X|status|reconcile SESSION'); process.exitCode=2; }
