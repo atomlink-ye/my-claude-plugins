@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 8787}`, admin = process.env.ARCP_API_KEY;
+const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel','db'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 8787}`, admin = process.env.ARCP_API_KEY;
 const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   task create|claim|list WORKSPACE [--expected-fence N]
@@ -13,6 +13,7 @@ const HELP = `ARCP ControlWorkspace commands:
   channel ack EVENT
   channel resolve EVENT --summary '...'
   channel withdraw DELIVERY
+  db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH]
   member heartbeat|list WORKSPACE
   goal start|list
   runtime status|list
@@ -37,7 +38,7 @@ External Runtime note:
   Feishu Hermes conversation; that Hermes remains Owner and the human entry point.
   Runtime communication is a durable ChannelEvent; completion requires a Result,
   never an idle process.`;
-const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel','gate','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack'];
+const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task','knowledge','result','member','goal','runtime','external','reminder','message','child','correction','wakeup','context','idle','ledger','heartbeat','channel','db','gate','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack'];
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
@@ -49,6 +50,20 @@ const workspaceId = async () => { const s = await load(), value = f.workspace ||
 const helpFlag = (value) => value === '--help' || value === '-h';
 const helpRequested = area === 'help' || area === '--help' || area === '-h' || (knownHelpAreas.includes(area) && (helpFlag(action) || helpFlag(twoWord ? argv[2] : argv[1])));
 if (helpRequested || !area) { console.log(HELP); }
+else if (area === 'db') {
+  try {
+    const { SQLiteStateStore } = await import('../runtime/dist/state-store.js');
+    const dbPath = f.db || process.env.ARCP_DB || process.env.ARCP_STATE_DB || process.env.ARCP_DATA || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel');
+    const store = new SQLiteStateStore(dbPath); await store.init();
+    if (action === 'status') console.log(JSON.stringify(store.status(), null, 2));
+    else if (action === 'check') console.log(JSON.stringify(store.check(), null, 2));
+    else if (action === 'backup') { const out = f.out || p[0]; if (!out) throw new Error('db backup requires --out PATH'); console.log(JSON.stringify(await store.backupTo(String(out)), null, 2)); }
+    else if (action === 'export') console.log(JSON.stringify(store.export(f.kind ? String(f.kind) : undefined, f.since ? String(f.since) : undefined), null, 2));
+    else if (action === 'import') { const source = f.from || p[0]; if (!source) throw new Error('db import requires --from DIR'); console.log(JSON.stringify(await store.importLegacy(String(source)), null, 2)); }
+    else { console.error(`unknown db command: ${action || ''}`); process.exitCode = 2; }
+    store.close();
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+}
 else {
 const launch = () => ({ ...(f.profile ? {profileId:f.profile} : {}), ...(f.provider ? {provider:f.provider} : {}), ...(f.model ? {model:f.model} : {}), ...(f.mode ? {mode:f.mode} : {}), ...(f.thinking ? {thinking:f.thinking} : {}), ...(f.unattended ? {unattended:true} : {}) });
 if (area === 'ensure') process.exitCode = spawnSync(new URL('./ensure-running', import.meta.url).pathname,{stdio:'inherit',env:process.env}).status ?? 1;

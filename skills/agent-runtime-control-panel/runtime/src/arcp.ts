@@ -10,6 +10,8 @@ import { createPaseoClient } from '@getpaseo/client';
 import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
+import { SQLiteStateStore, type StateStore } from './state-store.js';
+export type { StateStore } from './state-store.js';
 
 export type GoalState = 'active' | 'completed' | 'cancelled';
 export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'transport_indeterminate';
@@ -53,7 +55,7 @@ export interface RuntimeAdapter {
 }
 export interface LegacySummary { reminders: Record<string, number>; messages: Record<string, number>; trackedChildren: { total: number; statuses: Record<string, number> }; openCorrectionInstances: number; blockedGateCount: number; }
 interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
-interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; }
+export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; }
 
 const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [] });
 export const CLAUDE_CACHE_DEFAULTS = { expiringMinutes: 55, expiredMinutes: 60 } as const;
@@ -62,7 +64,7 @@ const now = () => new Date().toISOString();
 
 /** A compact, independently durable ARCP state file. It intentionally stores public IDs and
  * metadata only: provider handles, prompts, credentials, and host paths never enter it. */
-export class ArcpStore {
+export class ArcpStore implements StateStore {
   private state: State = empty();
   private write = Promise.resolve();
   readonly file: string;
@@ -213,14 +215,14 @@ export type Profile = { id: string; provider: string; model: string; mode?: stri
 export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; role?: string; unattended?: boolean };
 
 export class ArcpService {
-  readonly store: ArcpStore;
+  readonly store: StateStore;
   readonly adapter: RuntimeAdapter;
   private readonly adapters = new Map<string, RuntimeAdapter>();
   private profileData: Profile[] = [...DEFAULT_PROFILES];
   private pumpTimer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
   private pumpAgain = false;
-  constructor(readonly companion: CompanionService, readonly cli = new PaseoCli(), store?: ArcpStore, modeClientFactory?: () => PaseoModeClient, adapters: RuntimeAdapter[] = []) { this.store = store ?? new ArcpStore(companion.store.dir); this.adapter = new PaseoAdapter(cli, modeClientFactory); this.registerAdapter(this.adapter); this.registerAdapter(new HermesAcpAdapter()); for (const adapter of adapters) this.registerAdapter(adapter); }
+  constructor(readonly companion: CompanionService, readonly cli = new PaseoCli(), store?: StateStore, modeClientFactory?: () => PaseoModeClient, adapters: RuntimeAdapter[] = []) { this.store = store ?? (process.env.ARCP_STATE_STORE === 'sqlite' ? new SQLiteStateStore(companion.store.dir) : new ArcpStore(companion.store.dir)); this.adapter = new PaseoAdapter(cli, modeClientFactory); this.registerAdapter(this.adapter); this.registerAdapter(new HermesAcpAdapter()); for (const adapter of adapters) this.registerAdapter(adapter); }
   registerAdapter(adapter: RuntimeAdapter): void {
     this.adapters.set(adapter.adapterId, adapter);
     const onSafePoint = (adapter as RuntimeAdapter & { onSafePoint?: (listener: (event: SafePointEvent) => void) => () => void }).onSafePoint;
