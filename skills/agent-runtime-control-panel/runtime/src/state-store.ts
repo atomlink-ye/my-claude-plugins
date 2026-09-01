@@ -52,6 +52,7 @@ const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, wo
 const json = (value: unknown): string => JSON.stringify(value);
 const parse = <T>(value: unknown, fallback: T): T => { try { return value === null || value === undefined ? fallback : JSON.parse(String(value)) as T; } catch { return fallback; } };
 const hash = (value: unknown): string => createHash('sha256').update(typeof value === 'string' ? value : stableJson(value)).digest('hex');
+const contentHash = (summary: string, evidenceRefs: string[]): string => createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
@@ -221,11 +222,20 @@ export class SQLiteStateStore implements StateStore {
   }
 
   private persistContent(state: State): void {
-    const insert = this.connection.prepare('INSERT OR IGNORE INTO content(id, content_hash, summary, evidence_refs, sensitivity, retention, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    const add = (id: string, summary: string, evidenceRefs: string[], sensitivity: 'normal' | 'sensitive' = 'normal', retention: 'standard' | 'bounded' = 'standard', contentHash = hash({ summary, evidenceRefs })) => insert.run(id, contentHash, summary, json(evidenceRefs), sensitivity, retention, new Date().toISOString());
-    for (const event of state.channelEvents) add(`event-content:${event.content.contentHash}`, event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention, event.content.contentHash);
-    for (const entry of state.knowledge) add(`knowledge-content:${entry.id}`, entry.text, []);
-    for (const result of state.results) add(`result-content:${result.id}`, result.summary, result.evidenceRefs);
+    for (const event of state.channelEvents) this.ensureContent(event.content.contentHash, event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
+    for (const entry of state.knowledge) this.ensureContent(contentHash(entry.text, []), entry.text, []);
+    for (const result of state.results) this.ensureContent(contentHash(result.summary, result.evidenceRefs), result.summary, result.evidenceRefs);
+  }
+
+  /** Content is addressed by its immutable payload hash, regardless of which
+   * projection (event, result, or knowledge) references it. Existing rows from
+   * the pre-canonical layout are reused by hash so upgrades preserve FKs. */
+  private ensureContent(contentHash: string, summary: string, evidenceRefs: string[], sensitivity: 'normal' | 'sensitive' = 'normal', retention: 'standard' | 'bounded' = 'standard'): string {
+    const existing = this.connection.prepare('SELECT id FROM content WHERE content_hash = ?').get(contentHash) as SqliteRow | undefined;
+    if (existing) return String(existing.id);
+    const id = `content:${contentHash}`;
+    this.connection.prepare('INSERT INTO content(id, content_hash, summary, evidence_refs, sensitivity, retention, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, contentHash, summary, json(evidenceRefs), sensitivity, retention, new Date().toISOString());
+    return id;
   }
 
   private persistContentRows<T extends { id: string }>(table: string, records: T[], metadata: (record: T) => { workspace_id: string; content: { summary: string; evidenceRefs: string[]; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded' } }): void {
@@ -236,10 +246,8 @@ export class SQLiteStateStore implements StateStore {
       delete payload.text;
       delete payload.summary;
       delete payload.evidenceRefs;
-      const contentId = `${table}-content:${record.id}`;
+      const contentId = this.ensureContent(contentHash(value.content.summary, value.content.evidenceRefs), value.content.summary, value.content.evidenceRefs, value.content.sensitivity, value.content.retention);
       statement.run(record.id, value.workspace_id, contentId, json(payload));
-      const content = value.content;
-      this.connection.prepare('INSERT OR IGNORE INTO content(id, content_hash, summary, evidence_refs, sensitivity, retention, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(contentId, hash({ summary: content.summary, evidenceRefs: content.evidenceRefs }), content.summary, json(content.evidenceRefs), content.sensitivity, content.retention, new Date().toISOString());
     }
   }
 
@@ -248,7 +256,7 @@ export class SQLiteStateStore implements StateStore {
     const projection = this.connection.prepare('INSERT INTO channel_events(event_id, envelope, content_id, delivery_state, created_at, delivered_at, processed_at, acknowledged_at, undeliverable_reason, related_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const transition = this.connection.prepare('INSERT OR IGNORE INTO event_transitions(event_id, state, at) VALUES (?, ?, ?)');
     for (const event of events) {
-      const contentId = `event-content:${event.content.contentHash}`;
+      const contentId = this.ensureContent(event.content.contentHash, event.content.summary, event.content.evidenceRefs, event.content.sensitivity, event.content.retention);
       const { content: _content, transitions: _transitions, deliveryState: _deliveryState, deliveredAt: _deliveredAt, processedAt: _processedAt, acknowledgedAt: _acknowledgedAt, undeliverableReason: _undeliverableReason, ...envelope } = event;
       const prior = this.connection.prepare('SELECT kind, urgency, decision_required, content_id, created_at FROM event_journal WHERE event_id = ?').get(event.id) as SqliteRow | undefined;
       if (prior && (String(prior.kind) !== event.kind || String(prior.urgency) !== event.urgency || Number(prior.decision_required) !== (event.decisionRequired ? 1 : 0) || String(prior.content_id) !== contentId || String(prior.created_at) !== event.createdAt)) throw new Error(`ChannelEvent id ${event.id} conflicts with the append-only journal`);

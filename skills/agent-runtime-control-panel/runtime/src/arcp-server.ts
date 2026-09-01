@@ -69,7 +69,10 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
       let events = service.channelEvents(workspaceId, authenticatedMember?.id);
       if (kind) events = events.filter((event) => event.kind === kind);
       if (state) events = events.filter((event) => event.deliveryState === state);
-      if (decisionRequired === '1' || decisionRequired === 'true') events = events.filter((event) => event.decisionRequired);
+      // Only decision_required events are accepted by resolveDecision. Other
+      // urgent facts may carry decisionRequired for attention signalling, but
+      // they are not resolvable through this endpoint.
+      if (decisionRequired === '1' || decisionRequired === 'true') events = events.filter((event) => event.kind === 'decision_required' && event.decisionRequired);
       if (decisionRequired === '0' || decisionRequired === 'false') events = events.filter((event) => !event.decisionRequired);
       send(res, 200, events); return true;
     }

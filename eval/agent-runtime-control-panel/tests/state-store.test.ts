@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -58,6 +59,28 @@ describe('SQLite StateStore', () => {
     expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true }); expect(store.export('finding').events).toHaveLength(1);
     const backup = path.join(dbDir, 'backup.sqlite'); await store.backupTo(backup); expect((await stat(backup)).mode & 0o777).toBe(0o600); const backupDb = new DatabaseSync(backup); expect((backupDb.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(1); backupDb.close();
     const raw = await readFile(store.file); expect(raw.toString()).not.toContain('credential-secret'); expect(raw.toString()).not.toContain('reminder content'); store.close();
+  });
+
+  it('reuses one hashed content row for an imported Result and identical task candidate event', async () => {
+    const source = await root(); const dbDir = await root();
+    const summary = 'copied candidate content'; const evidenceRefs: string[] = [];
+    const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
+    const result = { id: 'result-copied', workspaceId: 'workspace-1', taskId: 'task-1', memberId: 'member-1', fence: 1, status: 'candidate' as const, summary, evidenceRefs, createdAt: '2026-01-01T00:00:00.000Z' };
+    const candidate = { ...event('candidate-copied', summary), kind: 'task_candidate' as const, decisionRequired: true, resultId: result.id, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal' as const, retention: 'standard' as const } };
+    await writeFile(path.join(source, 'arcp-state.json'), JSON.stringify({ results: [result], channelEvents: [candidate] }, null, 2));
+    const before = await readFile(path.join(source, 'arcp-state.json')); const beforeHash = createHash('sha256').update(before).digest('hex');
+    const store = new SQLiteStateStore(dbDir); await store.init();
+    expect(await store.importLegacy(source)).toMatchObject({ imported: true, noop: false });
+    const db = new DatabaseSync(store.file);
+    const refs = db.prepare('SELECT r.content_id AS result_content, c.content_id AS event_content FROM results r JOIN channel_events c ON c.event_id = (SELECT event_id FROM event_journal WHERE result_id = r.id) WHERE r.id = ?').get(result.id) as any;
+    expect(refs.result_content).toBe(refs.event_content);
+    expect((db.prepare('SELECT count(*) AS count FROM content').get() as any).count).toBe(1);
+    expect(store.check()).toMatchObject({ quickCheck: 'ok', integrityCheck: 'ok' });
+    db.close();
+    const after = await readFile(path.join(source, 'arcp-state.json')); expect(after.equals(before)).toBe(true); expect(createHash('sha256').update(after).digest('hex')).toBe(beforeHash);
+    expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true });
+    const afterSecond = await readFile(path.join(source, 'arcp-state.json')); expect(afterSecond.equals(before)).toBe(true); expect(createHash('sha256').update(afterSecond).digest('hex')).toBe(beforeHash);
+    store.close();
   });
 
   it('does not mutate an existing database when a copied import is invalid', async () => {
