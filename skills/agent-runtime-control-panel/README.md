@@ -1,13 +1,14 @@
 # Agent Runtime Control Panel
 
-ARCP is a standalone local Skill that extracts and extends the former Paseo Reminder runtime. Its unversioned reminder/watch/message/correction/gate API remains available for `paseo-companion`; the authenticated `/v1/*` surface is the client control API.
+ARCP is a standalone local, CLI-first control plane. A durable ControlWorkspace holds the team's purpose, Members, fenced Tasks, append-only Knowledge, Results and managed RuntimeSessions. Its unversioned reminder/watch/message/correction/gate API remains compatible with `paseo-companion`; `/v1/*` is internal transport for the CLI.
 
 ## Start
 
 ```sh
 pnpm --dir skills/agent-runtime-control-panel/runtime build
-ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/ensure-running
-ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/arcp profile discovery
+ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/arcp ensure
+ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/arcp doctor
+ARCP_API_KEY='choose-a-local-secret' skills/agent-runtime-control-panel/scripts/arcp actor register hermes-owner --channel hermes
 ```
 
 Default durable state is `${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-control-panel/data`. `ARCP_RUNTIME_DIR`, `ARCP_DATA`, `ARCP_LOG`, and `ARCP_PID` configure it. Legacy `PASEO_COMPANION_RUNTIME_DIR`, `PASEO_COMPANION_DATA`, `PASEO_COMPANION_LOG`, and `PASEO_COMPANION_PID` remain aliases. The server binds loopback only.

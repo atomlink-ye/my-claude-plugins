@@ -4,5 +4,9 @@
   "dataEnv": "ARCP_DATA",
   "apiKeyEnv": "ARCP_API_KEY",
   "adapter": "paseo",
-  "profiles": ["claude-manager", "codex-worker", "pi-grok-worker"]
+  "profiles": [
+    {"id":"claude-manager","provider":"claude","model":"anthropic/claude-opus-4-6","mode":"auto","thinking":"medium","role":"manager"},
+    {"id":"codex-worker","provider":"codex","model":"gpt-5.6-terra","mode":"full-access","thinking":"medium","role":"worker"},
+    {"id":"pi-grok-worker","provider":"pi","model":"grok-cli/grok-4.6","role":"worker"}
+  ]
 }

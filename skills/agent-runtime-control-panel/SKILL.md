@@ -1,13 +1,13 @@
 ---
 name: agent-runtime-control-panel
-description: "Run the local Agent Runtime Control Panel (ARCP): register stable agent actors, create goals, live-validate Paseo launch profiles, launch/observe/reconcile runtime sessions, and send durable safe-point or explicit interrupt deliveries. Use whenever coordinating local Claude, Codex, or Pi/Grok runtimes through a durable API."
+description: "Coordinate a local agent team through the ARCP CLI: create a durable ControlWorkspace, register native or Paseo-managed Members, claim fenced Tasks, share Knowledge and Results, and manage safe-point runtime delivery. Use for local multi-agent collaboration, not raw HTTP composition."
 ---
 
 # Agent Runtime Control Panel
 
-ARCP is the local control plane for stable Actors, Goals, Paseo-backed RuntimeSessions, and durable Inbox deliveries. Paseo is the V1 adapter; Claude, Codex, and Pi/Grok are providers selected only from live-validated profiles.
+ARCP is a local CLI-first control plane. Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create or join a `ControlWorkspace`. Paseo is the first-class managed adapter; native Claude, Codex, Pi/Grok and Hermes may join as Members without Paseo.
 
-Start the singleton with `scripts/ensure-running`. Set `ARCP_API_KEY` before starting it, then use `scripts/arcp` for the authenticated Client API. `PASEO_COMPANION_*` names remain legacy aliases; use `ARCP_*` for new configuration.
+Use `scripts/arcp`; the loopback API is internal durable transport. The CLI stores issued Actor/Member credentials in a mode-0600 local state file.
 
 Normal messages queue until the recipient reaches a Paseo idle/terminal safe point. `delivery interrupt` is intentionally separate and may interrupt the active turn. Do not substitute `paseo send` for a normal ARCP delivery.
 

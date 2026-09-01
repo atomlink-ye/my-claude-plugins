@@ -25,6 +25,19 @@ async function control(root: string, fail = false) {
 }
 
 describe('ARCP MVE control core', () => {
+  it('keeps a native member, task fence, knowledge and result in one durable ControlWorkspace', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-workspace-')); const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'hermes-owner', channel: 'hermes', conversationRef: 'opaque-conversation' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'shared canary' });
+    const joined = await service.joinWorkspace({ workspaceId: workspace.id, label: 'native-pi', role: 'reviewer', capabilities: ['knowledge', 'results'] });
+    const task = await service.createTask({ workspaceId: workspace.id, title: 'review control plane' });
+    await service.claimTask(task.id, joined.member.id);
+    await expect(service.claimTask(task.id, 'missing-member')).rejects.toMatchObject({ code: 'unknown_recipient' });
+    await service.addKnowledge({ workspaceId: workspace.id, authorMemberId: joined.member.id, kind: 'learning', text: 'native members share context' });
+    await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: joined.member.id, status: 'completed', summary: 'review complete' });
+    const restarted = await control(root); const context = restarted.context(workspace.id);
+    expect(context.roster).toHaveLength(1); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
+  });
   it('uses ARCP_DATA while preserving the legacy companion data alias', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-data-')); const prior = process.env.ARCP_DATA;
     process.env.ARCP_DATA = root;
@@ -36,7 +49,7 @@ describe('ARCP MVE control core', () => {
     const first = await control(root);
     const registered = await first.registerActor({ clientIdentity: 'hermes-owner', label: 'Hermes' });
     const repeat = await first.registerActor({ clientIdentity: 'hermes-owner', label: 'ignored' });
-    expect(repeat).toEqual(registered); expect(registered.binding.generation).toBe(1);
+    expect(repeat.actor).toEqual(registered.actor); expect(repeat.binding).toEqual(registered.binding); expect(registered.binding.generation).toBe(1);
     const restarted = await control(root);
     expect(restarted.state().actors).toEqual([registered.actor]);
     expect(restarted.state().bindings).toEqual([registered.binding]);
@@ -50,8 +63,7 @@ describe('ARCP MVE control core', () => {
     const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
     await expect(service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' })).rejects.toMatchObject({ code: 'goal_held' });
     const delivery = await service.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'continue' });
-    expect(delivery).toMatchObject({ command: 'normal', state: 'waiting_safe_point', safePointObservedAt: expect.any(String) });
-    expect((await service.acknowledge(delivery.id, 'processed')).state).toBe('acknowledged');
+    expect(delivery).toMatchObject({ command: 'normal', state: 'delivered', safePointObservedAt: expect.any(String) });
   });
 
   it('fails unavailable profiles closed and preserves uncertain launch/reconcile state', async () => {

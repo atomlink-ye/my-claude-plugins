@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+script_dir=$(cd "$(dirname "$0")" && pwd)
+exec "$script_dir/../../agent-runtime-control-panel/scripts/ensure-running" "$@"
+exit 0
 
 if (( $# != 0 )); then
   echo "arguments are not accepted; set PORT and PASEO_COMPANION_DATA as needed" >&2

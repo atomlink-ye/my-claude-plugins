@@ -1,7 +1,7 @@
 # ARCP
 
-Use `scripts/ensure-running` to start the local loopback singleton and `scripts/arcp` as the client. Every `/v1/*` request requires `x-arcp-api-key` or `Authorization: Bearer`.
+Use `scripts/arcp` as the product surface. Do not compose raw HTTP requests. Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create/join a ControlWorkspace.
 
-Routes: `POST /v1/actors`, `POST /v1/actor-bindings`, `POST/GET /v1/goals`, `POST /v1/goals/:id/lifecycle`, `GET /v1/profiles`, `GET /v1/discovery`, `POST/GET /v1/runtime-sessions`, `POST /v1/runtime-sessions/:id/observe`, `POST /v1/runtime-sessions/:id/reconcile`, `POST/GET /v1/deliveries`, and `POST /v1/deliveries/:id/ack`.
+Useful CLI workflows: `workspace create --purpose …`, `workspace join WORKSPACE --label …`, `workspace context WORKSPACE`, `task create WORKSPACE --title …`, `task claim TASK`, `knowledge add WORKSPACE --text …`, and `result submit WORKSPACE --task TASK --summary …`.
 
 Profiles are preferences only. ARCP validates provider/model/mode live and fails closed; it never auto-selects another model. Normal deliveries use safe-point on-idle transport. Interrupt requires `command:"interrupt"`. Unknown logical recipients return 409 before delivery persistence. A provider timeout or missing handle remains `transport_indeterminate` until explicit reconcile.
