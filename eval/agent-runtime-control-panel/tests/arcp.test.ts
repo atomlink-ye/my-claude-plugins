@@ -34,7 +34,7 @@ describe('ARCP MVE control core', () => {
     await service.claimTask(task.id, joined.member.id);
     await expect(service.claimTask(task.id, 'missing-member')).rejects.toMatchObject({ code: 'unknown_recipient' });
     await service.addKnowledge({ workspaceId: workspace.id, authorMemberId: joined.member.id, kind: 'learning', text: 'native members share context' });
-    await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: joined.member.id, status: 'completed', summary: 'review complete' });
+    await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: joined.member.id, status: 'candidate', summary: 'review complete', expectedFence: 1 });
     const restarted = await control(root); const context = restarted.context(workspace.id);
     expect(context.roster).toHaveLength(1); expect(context.tasks[0].fence).toBe(1); expect(context.knowledge).toHaveLength(1); expect(context.results).toHaveLength(1);
   });
