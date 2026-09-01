@@ -58,8 +58,11 @@ export async function createServer(service = new CompanionService(undefined, und
       const method = req.method || 'GET';
       const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
       const pathname = url.pathname;
+      const arcpKey = process.env.ARCP_API_KEY ?? process.env.PASEO_COMPANION_API_KEY;
+      const legacyAuthorized = String(req.headers['x-arcp-api-key'] ?? '') === arcpKey;
+      if (arcpKey && process.env.ARCP_ALLOW_LEGACY_UNAUTH !== '1' && pathname !== '/health' && !legacyAuthorized) { send(res, 401, { code: 'unauthorized' }); return; }
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
-      if (method === 'GET' && pathname === '/self/runtime') { send(res, 200, service.runtime()); return; }
+      if (method === 'GET' && pathname === '/self/runtime') { const runtime = service.runtime(); send(res, 200, arcpKey ? { pid: runtime.pid, port: runtime.port } : runtime); return; }
       if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats(url.searchParams.get('includeDead') === '1')); return; }
       if (method === 'GET' && pathname === '/wakeup-sources') {
         const agentId = required(url.searchParams.get('agentId'), 'agentId');
