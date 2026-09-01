@@ -608,7 +608,7 @@ export class ArcpService {
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (generation !== undefined && generation !== delivery.generation) throw new ArcpError('stale_generation', 'delivery generation is stale');
     if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery has not been processed');
-    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) { event.deliveryState = 'acknowledged'; event.acknowledgedAt = item.acknowledgedAt; } return item; });
+    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', item.acknowledgedAt); return item; });
   }
   private appendChannelEvent(state: State, input: ChannelEventInput): ChannelEvent {
     const summary = input.summary.trim(); const evidenceRefs = input.evidenceRefs ?? [];
@@ -617,11 +617,11 @@ export class ArcpService {
     const prohibitedTranscript = /(?:<thinking>|<assistant>|<user>|chain[- ]of[- ]thought|internal reasoning|transcript|reason\s*[:=])/i;
     if (prohibitedAssignment.test(summary) || prohibitedPath.test(summary) || prohibitedTranscript.test(summary) || evidenceRefs.some((ref) => prohibitedPath.test(ref) || prohibitedAssignment.test(ref) || /path\s*=/i.test(ref))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'summary');
     const contentHash = createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
-    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole: input.targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, summary, evidenceRefs };
+    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole: input.targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs };
     const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
     const existing = state.channelEvents.find((item) => item.id === id);
     if (existing) {
-      const conflict = existing.workspaceId !== input.workspaceId || existing.kind !== input.kind || existing.taskId !== input.taskId || existing.resultId !== input.resultId || existing.targetMemberId !== input.targetMemberId || existing.targetActorId !== input.targetActorId || existing.targetRole !== input.targetRole || existing.content.contentHash !== contentHash;
+      const existingPayload = { workspaceId: existing.workspaceId, goalId: existing.goalId, taskId: existing.taskId, resultId: existing.resultId, sourceMemberId: existing.sourceMemberId, sourceActorId: existing.sourceActorId, targetMemberId: existing.targetMemberId, targetActorId: existing.targetActorId, targetRole: existing.targetRole, targetSubscription: existing.targetSubscription, kind: existing.kind, urgency: existing.urgency, decisionRequired: existing.decisionRequired, relatedEventId: existing.relatedEventId, summary: existing.content.summary, evidenceRefs: existing.content.evidenceRefs }; const conflict = JSON.stringify(existingPayload) !== JSON.stringify(stablePayload);
       if (conflict) throw new ArcpError('invalid_request', 'channel event id conflicts with its durable payload', 'id');
       return existing;
     }
