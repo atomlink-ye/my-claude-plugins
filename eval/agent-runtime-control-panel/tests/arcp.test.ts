@@ -1,4 +1,7 @@
 import { mkdtemp, readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,6 +9,9 @@ import { ArcpService, CLAUDE_CACHE_DEFAULTS } from '../../../skills/agent-runtim
 import { createServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
 import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
+import { renderTuiSnapshot } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
+
+const execFileAsync = promisify(execFile);
 
 class FakeCli {
   private lastMode = 'auto';
@@ -148,7 +154,7 @@ describe('ARCP MVE control core', () => {
 describe('ARCP HTTP and legacy compatibility', () => {
   let app: Awaited<ReturnType<typeof createServer>> | undefined;
   afterEach(async () => { if (app) { app.service.close(); await new Promise<void>((resolve) => app!.server.close(() => resolve())); } app = undefined; delete process.env.ARCP_API_KEY; });
-  it('protects v1 while retaining the unversioned companion health route and old import path', async () => {
+  it('protects v1 while retaining the unversioned companion health route', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-')); process.env.ARCP_API_KEY = 'test-key';
     app = await createServer(new CompanionService(undefined, new Store(root))); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
     const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
@@ -157,7 +163,53 @@ describe('ARCP HTTP and legacy compatibility', () => {
     const registered = await fetch(`${base}/v1/actors`, { method: 'POST', headers: { 'x-arcp-api-key': 'test-key', 'content-type': 'application/json' }, body: JSON.stringify({ clientIdentity: 'legacy-owner' }) });
     expect(registered.status).toBe(201);
     expect(JSON.stringify(await registered.json())).not.toContain('externalId');
-    const legacy = await import('../../../skills/paseo-companion/paseo-reminder/src/server.js');
-    expect(legacy.createServer).toBeTypeOf('function');
+  });
+
+  it('routes an authenticated legacy message to an ARCP runtime exactly once and never creates Companion transport', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-seam-')); process.env.ARCP_API_KEY = 'test-key';
+    const cli = new FakeCli(); app = await createServer(new CompanionService(cli as any, new Store(root))); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const registered = await app.arcp.registerActor({ clientIdentity: 'runtime-owner' });
+    await app.arcp.store.mutate((state: any) => { state.sessions.push({ id: 'runtime-1', actorId: registered.actor.id, goalId: 'goal-1', bindingId: registered.binding.id, generation: 1, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', externalId: 'paseo-session-1', state: 'idle', createdAt: new Date().toISOString() }); });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const response = await fetch(`${base}/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-arcp-actor-key': registered.credential! }, body: JSON.stringify({ to: 'paseo-session-1', from: 'spoofed-legacy-from', body: 'deliver safely', mode: 'ack' }) });
+    expect(response.status).toBe(201); const projected: any = await response.json();
+    expect(projected.delivery).toMatchObject({ transport: 'arcp' }); expect(cli.sends).toBe(0);
+    const audit = app.service.getMessages({ to: 'paseo-session-1' })[0];
+    expect(audit).toMatchObject({ from: 'spoofed-legacy-from', transportOwner: 'arcp', ownerDeliveryId: expect.any(String) });
+    expect(app.arcp.state().deliveries).toHaveLength(1); expect(app.arcp.state().deliveries[0]).toMatchObject({ sourceMessageId: audit.id, fromActorId: registered.actor.id, body: expect.stringContaining(`<ack>arcp message ack ${audit.id}`) });
+    await app.service['ensureMessageDelivery']('paseo-session-1');
+    expect(app.arcp.state().deliveries).toHaveLength(1); expect(cli.sends).toBe(0);
+    const reminder = await app.service.createReminder({ agentId: 'paseo-session-1', delaySeconds: 60, message: 'reminder safe point' });
+    await app.service.store.updateReminder(reminder.id, { nextRunAt: new Date(Date.now() - 1_000).toISOString() }); await app.service.reconcileReminders();
+    expect(app.service.getMessages({ to: 'paseo-session-1' }).at(-1)).toMatchObject({ promptKind: 'reminder', transportOwner: 'arcp' });
+    expect(app.arcp.state().deliveries).toHaveLength(2); expect(cli.sends).toBe(0);
+  });
+
+  it('holds unauthenticated ARCP legacy addressing and strips injected internal delivery ids', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-auth-')); process.env.ARCP_API_KEY = 'test-key';
+    app = await createServer(new CompanionService(undefined, new Store(root))); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const registered = await app.arcp.registerActor({ clientIdentity: 'owner' });
+    await app.arcp.store.mutate((state: any) => { state.sessions.push({ id: 'runtime-1', actorId: registered.actor.id, goalId: 'goal-1', bindingId: registered.binding.id, generation: 1, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', externalId: 'bound-agent', state: 'idle', createdAt: new Date().toISOString() }); });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    expect((await fetch(`${base}/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-arcp-api-key': 'test-key' }, body: JSON.stringify({ to: 'bound-agent', from: 'forged', body: 'no actor' }) })).status).toBe(409);
+    const injected = await fetch(`${base}/v1/deliveries`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-arcp-actor-key': registered.credential! }, body: JSON.stringify({ runtimeSessionId: 'runtime-1', body: 'public body', sourceMessageId: 'legacy-message-id' }) });
+    expect(injected.status).toBe(201); expect(app.arcp.state().deliveries[0]?.sourceMessageId).toBeUndefined();
+  });
+});
+
+describe('ARCP CLI and TUI presentation', () => {
+  it('keeps two-word command parsing, payload booleans, auth, and HTTP exits deterministic', async () => {
+    const seen: any[] = []; const server = await new Promise<http.Server>((resolve) => {
+      const value = http.createServer(async (req: any, res: any) => { let body = ''; for await (const chunk of req) body += chunk; seen.push({ url: req.url, key: req.headers['x-arcp-api-key'], body: body ? JSON.parse(body) : undefined }); res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true })); }); value.listen(0, '127.0.0.1', () => resolve(value));
+    });
+    const port = (server.address() as any).port; const script = path.join(process.cwd(), '../scripts/arcp');
+    await execFileAsync(process.execPath, [script, 'idle', 'add', 'agent-1', 'nudge', '--threshold-percent', '0.8', '--once', 'true'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
+    expect(seen[0]).toMatchObject({ url: '/idle-reminders', key: 'cli-key', body: { agentId: 'agent-1', message: 'nudge', thresholdPercent: 0.8, once: true } });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await expect(execFileAsync(process.execPath, [script, 'reminder', 'list'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}` } })).rejects.toMatchObject({ code: expect.any(Number) });
+  });
+  it('renders a deterministic mutation-free TUI snapshot', () => {
+    const snapshot = renderTuiSnapshot({ workspace: { purpose: 'canary', lifecycle: 'active' }, goals: [{}], tasks: [{}], roster: [{}], runtime: [{ session: { id: 'r1', provider: 'codex', model: 'gpt', state: 'idle' }, observation: { health: 'healthy', cache: { state: 'fresh' }, context: { ratio: 0.5 }, compaction: { status: 'none' } }, children: { items: [] }, workSummary: { dirty: false, diffstat: { files: 0 } } }], legacy: { reminders: { active: 1 }, messages: { pending: 2 }, trackedChildren: { total: 3 }, blockedGateCount: 0 } });
+    expect(snapshot).toContain('ARCP TUI · canary'); expect(snapshot).toContain('Runtime r1'); expect(snapshot).toContain('Legacy reminders=1 messages=2'); expect(snapshot).not.toContain('\x1b[');
   });
 });

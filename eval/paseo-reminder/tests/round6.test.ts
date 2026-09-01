@@ -2,8 +2,8 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
-import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
+import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
+import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 
 class FakeCli {
   agents: Record<string, any> = {};
@@ -97,7 +97,7 @@ describe('round6 watchdog', () => {
     const alertPrompt = initialHeartbeats.find((body) => body.includes('event=child-no-wakeup'))!;
     expect(initialHeartbeats).toHaveLength(2);
     expect(initialHeartbeats.filter((body) => body.includes('event=child-no-wakeup'))).toHaveLength(1);
-    expect(alertPrompt).toContain(`id=${alert.id}`); expect(alertPrompt).toContain(`/reminders/${alert.id}`); expect(alertPrompt).not.toContain('<port>');
+    expect(alertPrompt).toContain(`id=${alert.id}`); expect(alertPrompt).toContain(`arcp reminder delete ${alert.id}`); expect(alertPrompt).not.toContain('<port>');
     expect(cli.sends).toHaveLength(0);
     await service.deleteReminder(alert.id, 'not needed');
     await service.watchdogTick('manager-1'); await service.watchdogTick('manager-1');
@@ -129,7 +129,7 @@ describe('round6 reminders', () => {
     expect(first.cli.heartbeatArgs).toHaveLength(0);
     expect(oneShot.mode).toBe('once'); expect(Date.parse(oneShot.targetAt!)).toBeGreaterThan(Date.now());
     expect(repeat.mode).toBe('repeat'); expect(repeat.everySeconds).toBe(60);
-    expect(oneShot.prompt).toContain(`id=${oneShot.id}`); expect(oneShot.prompt).toContain(`/reminders/${oneShot.id}`); expect(oneShot.prompt).not.toContain('<port>');
+    expect(oneShot.prompt).toContain(`id=${oneShot.id}`); expect(oneShot.prompt).toContain(`arcp reminder delete ${oneShot.id}`); expect(oneShot.prompt).not.toContain('<port>');
   });
   it('lists reminder state and stamps the actual firing time into the delivered prompt', async () => {
     const { service, store, cli } = await makeService({ id: 'manager-1', Status: 'idle', UpdatedAt: new Date().toISOString() });
@@ -145,18 +145,18 @@ describe('round6 reminders', () => {
     expect(cli.sends.at(-1)).toContain('<paseo-reminder-delivery to="manager-1" kind="reminder">');
     expect(cli.sends.at(-1)).toContain('<note marker="NOT_USER_INPUT">');
     expect(cli.sends.at(-1)).toContain(`triggeredAt=${fired.lastFiredAt}`);
-    expect(cli.sends.at(-1)).toContain(`<ack>curl -X DELETE http://127.0.0.1:8787/reminders/${reminder.id}`);
+    expect(cli.sends.at(-1)).toContain(`<ack>arcp reminder delete ${reminder.id}`);
   });
   it('child-watch, compact-wake, and heartbeat-recovery each generate structured IDs and real cancellation commands', async () => {
     const childCase = await makeService({ id: 'child-message', ParentAgentId: 'manager-1', Status: 'running', UpdatedAt: new Date().toISOString() });
     const childWatch = await childCase.service.createReminder({ agentId: 'manager-1', subjectChildId: 'child-message', kind: 'child-watch', watchKind: 'child', delaySeconds: 60, message: 'watch child' });
-    expect(childWatch.prompt).toContain(`id=${childWatch.id}`); expect(childWatch.prompt).toContain(`/reminders/${childWatch.id}`); expect(childWatch.prompt).not.toContain('<port>');
+    expect(childWatch.prompt).toContain(`id=${childWatch.id}`); expect(childWatch.prompt).toContain(`arcp reminder delete ${childWatch.id}`); expect(childWatch.prompt).not.toContain('<port>');
     const compact = await childCase.service.compactWake({ agentId: 'manager-1', compact: 'summarize progress', wake: 'resume' });
     const compactRecord = childCase.store.getReminders().find((item) => item.kind === 'compact-wake')!;
-    expect(compactRecord.prompt).toContain('<paseo-reminder-delivery to="manager-1" kind="compact-wake">'); expect(compactRecord.prompt).toContain(`id=${compactRecord.id}`); expect(compactRecord.prompt).toContain(`/reminders/${compactRecord.id}`); expect(compactRecord.prompt).not.toContain('<port>');
+    expect(compactRecord.prompt).toContain('<paseo-reminder-delivery to="manager-1" kind="compact-wake">'); expect(compactRecord.prompt).toContain(`id=${compactRecord.id}`); expect(compactRecord.prompt).toContain(`arcp reminder delete ${compactRecord.id}`); expect(compactRecord.prompt).not.toContain('<port>');
     await childCase.store.addReminder({ id: 'source-recovery', daemonId: 'hb-source', agentId: 'manager-1', name: 'source-recovery', prompt: 'source', cron: '*/5 * * * *', expiresIn: '1h', status: 'active', alive: true, missedFires: 1, missedRunIds: ['run-1'], createdAt: new Date().toISOString() });
     await childCase.service.reconcileReminders();
-    expect(childCase.cli.sends.some((body) => body.includes('<paseo-reminder-delivery to="manager-1" kind="watchdog">') && body.includes('type=heartbeat-recovery') && body.includes('event=missed-heartbeat') && body.includes('/reminders/companion-recovery-'))).toBe(true);
+    expect(childCase.cli.sends.some((body) => body.includes('<paseo-reminder-delivery to="manager-1" kind="watchdog">') && body.includes('type=heartbeat-recovery') && body.includes('event=missed-heartbeat') && body.includes('arcp reminder delete companion-recovery-'))).toBe(true);
   });
   it('cancelling one-shot, idle, compact-wake, and recovery reminders suppresses later automatic delivery', async () => {
     const one = await makeService({ id: 'manager-1', Status: 'idle', UpdatedAt: new Date().toISOString() });
@@ -194,7 +194,7 @@ describe('round6 reminders', () => {
     const { service, cli, store } = await makeService({ id: 'manager-1', Status: 'idle', UpdatedAt: '2026-01-01T00:00:00.000Z' });
     const reminder = await service.createIdleReminder({ agentId: 'manager-1', thresholdSeconds: 1, message: 'idle nudge' });
     await store.updateIdleReminder(reminder.id, { idleSince: new Date(Date.now() - 5_000).toISOString(), lastObservedUpdatedAt: '2026-01-01T00:00:00.000Z' });
-    await service.listIdleReminders(); expect(cli.sends).toHaveLength(1); expect(cli.sends[0]).toContain('<paseo-reminder-delivery to="manager-1" kind="reminder">'); expect(cli.sends[0]).toContain(`id=${reminder.id}`); expect(cli.sends[0]).toContain(`/idle-reminders/${reminder.id}`); expect(cli.sends[0]).not.toContain('<port>'); expect(store.findIdleReminder(reminder.id)?.idleSince).toBeUndefined();
+    await service.listIdleReminders(); expect(cli.sends).toHaveLength(1); expect(cli.sends[0]).toContain('<paseo-reminder-delivery to="manager-1" kind="reminder">'); expect(cli.sends[0]).toContain(`id=${reminder.id}`); expect(cli.sends[0]).toContain(`arcp idle delete ${reminder.id}`); expect(cli.sends[0]).not.toContain('<port>'); expect(store.findIdleReminder(reminder.id)?.idleSince).toBeUndefined();
     await store.updateIdleReminder(reminder.id, { idleSince: new Date(Date.now() - 5_000).toISOString() });
     await service.listIdleReminders(); expect(cli.sends).toHaveLength(2);
   });

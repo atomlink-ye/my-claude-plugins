@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { commandIsPaseoWait } from '../../../skills/paseo-companion/paseo-reminder/src/wait-source.js';
+import { commandIsPaseoWait } from '../../../skills/agent-runtime-control-panel/runtime/src/wait-source.js';
 
 describe('paseo manager companion', () => {
   it('exports a server factory', async () => {
-    const mod = await import('../../../skills/paseo-companion/paseo-reminder/src/server.js');
+    const mod = await import('../../../skills/agent-runtime-control-panel/runtime/src/server.js');
     expect(typeof mod.createServer).toBe('function');
   });
 
   it('adapts direct daemon schedule RPC payloads without CLI presentation', async () => {
-    const { PaseoScheduleObserver, normalizePaseoWsHost } = await import('../../../skills/paseo-companion/paseo-reminder/src/schedule-observer.js');
+    const { PaseoScheduleObserver, normalizePaseoWsHost } = await import('../../../skills/agent-runtime-control-panel/runtime/src/schedule-observer.js');
     const calls: unknown[] = [];
     const fake = {
       async connect() { calls.push('connect'); },
@@ -26,7 +26,7 @@ describe('paseo manager companion', () => {
   });
 
   it('uses a fresh disposable client for each schedule RPC', async () => {
-    const { PaseoScheduleObserver } = await import('../../../skills/paseo-companion/paseo-reminder/src/schedule-observer.js');
+    const { PaseoScheduleObserver } = await import('../../../skills/agent-runtime-control-panel/runtime/src/schedule-observer.js');
     let created = 0;
     const observer = new PaseoScheduleObserver({ clientFactory: () => {
       let disposed = false;

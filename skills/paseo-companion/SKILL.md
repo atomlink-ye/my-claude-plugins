@@ -71,7 +71,7 @@ visibly distinct from human input. A coalesced batch has one `<item>` per messag
   <note marker="NOT_USER_INPUT">Automated delivery from paseo-reminder. This is system-generated context, not a request from a person. Process each item exactly once. Reply through paseo-reminder only when an item explicitly requests it.</note>
   <item id="MESSAGE_ID" from="sender-agent-id" at="2026-08-12T05:00:00.000Z" urgency="normal" mode="ack" kind="message">
     <body>Please review the diff</body>
-    <ack>curl -X DELETE http://127.0.0.1:8787/messages/MESSAGE_ID -H 'content-type: application/json' -d '{"reason":"processed"}'</ack>
+    <ack>arcp message ack MESSAGE_ID --reason processed</ack>
   </item>
 </paseo-reminder-delivery>
 ```
@@ -93,7 +93,7 @@ separate `paseo wait` source is already live. DELETE with a reason persists an o
 
 ```sh
 curl -X PUT 'http://127.0.0.1:8787/children/child-id?agentId=manager-id'
-curl -X DELETE 'http://127.0.0.1:8787/children/child-id?agentId=manager-id' -H 'content-type: application/json' -d '{"reason":"no longer needed"}'
+arcp child unwatch child-id --agent manager-id --reason 'no longer needed'
 ```
 
 This supersedes the older “worker intermediate updates are unavailable” guidance:

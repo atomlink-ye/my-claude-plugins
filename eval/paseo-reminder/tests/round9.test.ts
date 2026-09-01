@@ -2,9 +2,9 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
-import { createServer } from '../../../skills/paseo-companion/paseo-reminder/src/server.js';
-import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
+import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
+import { createServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
+import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 
 class Round9Cli {
   agents: Record<string, any> = {};

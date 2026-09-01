@@ -9,6 +9,17 @@ import type { ContextUsage, ContextUsageEntry, ContextUsageObserver } from './co
 import { CompanionError, invalidValue, missingField, rejectUnknownFields } from './errors.js';
 import type { AgentInfo, ChildrenResult, CorrectionFinding, CorrectionInstance, CorrectionResolution, FailedCandidate, IdleReminderRecord, LedgerType, MessageDelivery, MessageMode, MessageRecord, MessageScheduleRecord, MessageUrgency, ReminderKind, ReminderMode, ReminderRecord, WakeupSourceRecord, WatchdogSnapshot } from './types.js';
 
+/**
+ * The only bridge from durable Companion audit records to ARCP transport.  It
+ * deliberately uses plain data rather than importing ARCP, so Companion owns
+ * its persistence and ARCP owns runtime delivery without a circular module or
+ * a second queue.
+ */
+export interface ArcpDeliveryPolicy {
+  isRecipient(recipient: string): boolean;
+  dispatch(message: MessageRecord, prompt: string): Promise<{ deliveryId: string; state: string }>;
+}
+
 const REMINDER_TTL = '30m';
 const REMINDER_MAX_TTL_SECONDS = 2 * 60 * 60;
 // Heartbeat schedules carry '--expires-in 30m'; 5m margin covers reconcile jitter.
@@ -92,6 +103,7 @@ export class CompanionService {
   private readonly watchdogStaleMs: number;
   private readonly contextUsageObserver?: ContextUsageObserver;
   private interruptRecipientPolicy?: (recipient: string) => boolean;
+  private arcpDeliveryPolicy?: ArcpDeliveryPolicy;
   /** Recipients whose delivery is held during an in-flight coordinator-driven compact. */
   private readonly quietUntil = new Map<string, number>();
   /** ORACLE-1 §3.4-5: at most one coordinator-driven auto-compact per agent per hour, the
@@ -144,6 +156,13 @@ export class CompanionService {
     if (this.scheduleObserver && 'close' in this.scheduleObserver && typeof this.scheduleObserver.close === 'function') void this.scheduleObserver.close();
   }
   setInterruptRecipientPolicy(policy?: (recipient: string) => boolean): void { this.interruptRecipientPolicy = policy; }
+  setArcpDeliveryPolicy(policy?: ArcpDeliveryPolicy): void { this.arcpDeliveryPolicy = policy; }
+  private arcpRecipient(recipient: string): boolean { return Boolean(this.arcpDeliveryPolicy?.isRecipient(recipient)); }
+  private actionCommand(kind: 'message' | 'reminder' | 'idle-reminder', id: string, recipient: string): string {
+    if (this.arcpRecipient(recipient)) return kind === 'message' ? `arcp message ack ${id} --reason processed` : kind === 'reminder' ? `arcp reminder delete ${id} --reason processed` : `arcp idle delete ${id} --reason processed`;
+    if (process.env.ARCP_ALLOW_LEGACY_UNAUTH === '1') return `curl -X DELETE ${this.endpointBase()}/${kind === 'message' ? 'messages' : kind === 'reminder' ? 'reminders' : 'idle-reminders'}/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    return `arcp ${kind === 'message' ? 'message ack' : kind === 'reminder' ? 'reminder delete' : 'idle delete'} ${id} --reason processed`;
+  }
   setPort(port: number): void { this.port = port; }
   private endpointBase(): string { return `http://127.0.0.1:${this.port || Number(process.env.PORT || 8787)}`; }
   health(): Record<string, unknown> {
@@ -641,8 +660,6 @@ export class CompanionService {
   async createReminder(body: { agentId: string; delaySeconds?: number; targetAt?: string; message: string; context?: object; ackRequired?: boolean; subjectChildId?: string; kind?: ReminderKind; watchKind?: 'child'; name?: string; maxRuns?: number; eventType?: string; criterion?: string; mode?: ReminderMode; cron?: string; everySeconds?: number; delivery?: MessageDelivery; urgency?: MessageUrgency }): Promise<ReminderRecord> {
     if ((body as any).id !== undefined) invalidValue('caller-supplied reminder id is not supported', 'id');
     if (body.mode !== undefined && !['once', 'repeat'].includes(body.mode)) invalidValue('mode must be once or repeat', 'mode', ['once', 'repeat']);
-    // Child watches and explicit heartbeat kinds retain their legacy daemon
-    // implementation. Generic reminders use the direct-send contract below.
     if (body.kind === 'child-watch' || body.watchKind === 'child' || body.kind === 'compact-wake' || body.kind === 'watchdog' || body.kind === 'heartbeat-recovery') {
       return this.createLegacyReminder(body as any);
     }
@@ -665,7 +682,7 @@ export class CompanionService {
         `type=reminder id=${id} target=${body.agentId.trim()} event=${mode === 'once' ? 'scheduled-once' : 'scheduled-repeat'} criterion=${mode === 'once' ? `targetAt=${targetAt}` : `everySeconds=${body.everySeconds}`} triggeredAt=pending`,
         body.message,
         body.context ? `Structured context: ${json(body.context)}` : '',
-        `Cancel this reminder with: ${this.cancelCommand(id)}`,
+        `Cancel this reminder with: ${this.cancelCommand(id, body.agentId)}`,
       ].filter(Boolean).join('\n'),
       cron: body.cron ?? (body.everySeconds ? `every ${body.everySeconds}s` : ''), expiresIn: '', status: 'active', createdAt,
       mode, schedulingKind: mode, ...(targetAt ? { targetAt, nextRunAt: targetAt } : {}), ...(body.everySeconds ? { everySeconds: body.everySeconds } : {}),
@@ -705,7 +722,7 @@ export class CompanionService {
     const localId = randomUUID();
     const cron = cronForDelay(body.delaySeconds);
     const expiresIn = ttlForDelay(body.delaySeconds);
-    const ack = `curl -X DELETE ${this.endpointBase()}/reminders/${localId} -H 'content-type: application/json' -d '{"reason":"acknowledged"}'`;
+    const ack = this.actionCommand('reminder', localId, body.agentId);
     const reminderBody = [
       `type=reminder id=${localId} target=${body.agentId} event=${body.kind ?? 'generic'} criterion=wall-clock-delay:${body.delaySeconds}s triggeredAt=${new Date().toISOString()}`,
       body.message, body.context ? `Structured context: ${json(body.context)}` : 'Structured context: {}',
@@ -737,6 +754,17 @@ export class CompanionService {
       ...(body.watchKind ? { watchKind: body.watchKind } : {}),
     };
     await this.store.addReminder(pending);
+    if (this.arcpRecipient(body.agentId)) {
+      // Keep the special reminder's durable identity and audit fields, but use
+      // the local scheduler so delivery eventually crosses postMessage. This
+      // is deliberately not a generic reminder rewrite: watch/watchdog state
+      // and cancellation semantics remain the legacy record's own contract.
+      const repeating = body.maxRuns === undefined || body.maxRuns > 1;
+      const targetAt = new Date(Date.now() + body.delaySeconds * 1000).toISOString();
+      await this.store.updateReminder(localId, { status: 'active', alive: true, mode: repeating ? 'repeat' : 'once', schedulingKind: repeating ? 'repeat' : 'once', targetAt, nextRunAt: targetAt, ...(repeating ? { everySeconds: body.delaySeconds } : {}), runsCompleted: 0, delivery: 'on-idle' });
+      await this.reconcileReminders();
+      return this.store.findReminder(localId)!;
+    }
     try {
       const existing = await this.findExistingSchedule(pending.name, body.agentId);
       if (existing) {
@@ -804,8 +832,8 @@ export class CompanionService {
     return result.value;
   }
 
-  private cancelCommand(id: string): string {
-    return `curl -X DELETE ${this.endpointBase()}/reminders/${id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+  private cancelCommand(id: string, recipient: string): string {
+    return this.actionCommand('reminder', id, recipient);
   }
 
   /** context-percent's threshold is never pre-converted to tokens at registration time: max
@@ -910,7 +938,7 @@ export class CompanionService {
       current.message,
       current.once ? 'This reminder is one-shot and will self-delete after delivery.' : `This reminder repeats; after this delivery it will begin a new ${current.thresholdSeconds}s idle window.`,
     ].join('\n');
-    const actionCommand = `curl -X DELETE ${this.endpointBase()}/idle-reminders/${current.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    const actionCommand = this.actionCommand('idle-reminder', current.id, current.agentId);
     await this.postMessage({ to: current.agentId, from: 'companion', body, delivery: 'interrupt', mode: 'notify', promptKind: 'reminder', actionCommand });
     if (current.once) {
       await this.store.updateIdleReminder(current.id, { status: 'deleted', idleSince: undefined, lastTriggeredAt: new Date(now).toISOString() });
@@ -955,7 +983,7 @@ export class CompanionService {
       confirmed.message,
       confirmed.once ? 'This reminder is one-shot and will self-delete after delivery.' : 'This reminder repeats; it re-arms once the value crosses back and forth again.',
     ].join('\n');
-    const actionCommand = `curl -X DELETE ${this.endpointBase()}/idle-reminders/${confirmed.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`;
+    const actionCommand = this.actionCommand('idle-reminder', confirmed.id, confirmed.agentId);
     await this.postMessage({ to: confirmed.agentId, from: 'companion', body, delivery: 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
     if (confirmed.once) {
       await this.store.updateIdleReminder(confirmed.id, { status: 'deleted', crossedCount: 0, lastTriggeredAt: new Date(now).toISOString() });
@@ -992,7 +1020,7 @@ export class CompanionService {
       `Your context window is past the threshold you subscribed to. Nothing has been compacted -- this is a reminder only.`,
       `Compact yourself when convenient: /compact ${cw.compact}`,
       cw.wake ? `After compacting, resume with: ${cw.wake}` : 'No wake steps were registered with this subscription; nothing will resume you after compacting.',
-      `Unsubscribe: curl -X DELETE ${this.endpointBase()}/idle-reminders/${reminder.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`,
+      `Unsubscribe: ${this.actionCommand('idle-reminder', reminder.id, reminder.agentId)}`,
     ].join('\n');
     await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake' });
   }
@@ -1093,7 +1121,7 @@ export class CompanionService {
       detail,
       ephemeral ? 'This health alert is non-acknowledgement based; the alert ID remains cancellable.' : 'Acknowledge this completion alert after review; future matching transitions remain deduplicated by this ID.',
     ].join('\n');
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'on-idle', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: ephemeral ? 'urgent' : 'normal', delivery: 'on-idle', mode: 'notify', promptKind: 'watchdog', actionCommand: this.cancelCommand(reminder.id, managerId), ...(ephemeral ? { kind: 'heartbeat-recovery' as const } : {}) });
     snapshot.notified = [...notified, eventType];
     return true;
   }
@@ -1157,7 +1185,7 @@ export class CompanionService {
   /** Persist before handing a coalesced batch to its selected Paseo transport. */
   async postMessage(body: { to: string; from: string; body: string; urgency?: MessageUrgency; immediate?: boolean; delivery?: MessageDelivery; mode?: MessageMode; ackDeadlineAt?: string; ackDeadlineSeconds?: number; replyTo?: string; promptKind?: MessageRecord['promptKind']; actionCommand?: string; kind?: 'heartbeat-recovery'; recoveryManagerId?: string; recoveryCounts?: Record<string, number>; recoveryRunIds?: Record<string, string[]> }): Promise<Omit<MessageRecord, 'delivery'> & {
     schedule: null;
-    delivery: { id: string; transport: 'paseo-send' | 'heartbeat'; status: 'accepted' | 'pending'; acceptedAt: string | null; batchIds: string[] } | null;
+    delivery: { id: string; transport: 'paseo-send' | 'heartbeat' | 'arcp'; status: 'accepted' | 'pending' | 'held' | 'indeterminate'; acceptedAt: string | null; batchIds: string[] } | null;
   }> {
     if (!body.to?.trim()) missingField('to');
     if (!body.from?.trim()) missingField('from');
@@ -1192,6 +1220,12 @@ export class CompanionService {
     await this.store.addMessage(message);
     if (message.replyTo) await this.store.updateMessage(message.replyTo, { status: 'answered', replyMessageId: message.id, answeredAt: message.createdAt });
     await this.ensureMessageDelivery(message.to);
+    const owned = this.store.getMessages().find((item) => item.id === message.id);
+    if (owned?.transportOwner === 'arcp') {
+      const status = owned.ownerDeliveryState === 'delivered' || owned.ownerDeliveryState === 'running' || owned.ownerDeliveryState === 'processed' ? 'accepted' as const : owned.ownerDeliveryState?.startsWith('held') || owned.ownerDeliveryState === 'held' ? 'held' as const : owned.ownerDeliveryState === 'transport_indeterminate' ? 'indeterminate' as const : 'pending' as const;
+      const { delivery: _delivery, ...withoutDelivery } = { ...message, ...(status === 'accepted' ? { status: 'delivered' as const, deliveredAt: message.createdAt } : {}) };
+      return { ...withoutDelivery, schedule: null, delivery: { id: owned.ownerDeliveryId ?? message.id, transport: 'arcp', status, acceptedAt: status === 'accepted' ? message.createdAt : null, batchIds: [message.id] } };
+    }
     const audit = this.store.getMessageSchedules().find((item) => item.batchIds.includes(message.id)) ?? null;
     const receipt = audit ? {
       id: audit.id,
@@ -1280,7 +1314,7 @@ export class CompanionService {
       kind: message.promptKind ?? 'message',
       body: message.body,
       actionCommand: message.actionCommand ?? (message.kind !== 'heartbeat-recovery' && (message.mode ?? 'notify') === 'ack'
-        ? `curl -X DELETE ${this.endpointBase()}/messages/${message.id} -H 'content-type: application/json' -d '{"reason":"processed"}'`
+        ? this.actionCommand('message', message.id, recipient)
         : undefined),
     })));
   }
@@ -1485,6 +1519,17 @@ export class CompanionService {
   }
 
   private async ensureMessageDeliveryOnce(recipient: string): Promise<void> {
+    if (this.arcpRecipient(recipient)) {
+      for (const message of this.store.getMessages().filter((item) => item.to === recipient && item.status === 'pending')) {
+        // The callback's ARCP delivery ID is deterministic from this durable
+        // record. Re-entering after a crash only reads the same ARCP delivery;
+        // it never creates a second heartbeat or a second runtime send.
+        const result = await this.arcpDeliveryPolicy!.dispatch(message, this.messagePrompt(recipient, [message]));
+        const delivered = ['delivered', 'running', 'processed', 'acknowledged'].includes(result.state);
+        await this.store.updateMessage(message.id, { transportOwner: 'arcp', ownerDeliveryId: result.deliveryId, ownerDeliveryState: result.state, ...(delivered ? { status: 'delivered', deliveredAt: new Date().toISOString() } : {}) });
+      }
+      return;
+    }
     // A coordinator-driven compact is in flight for this recipient: hold
     // delivery (queued, not dropped -- messages stay 'pending' in the store
     // and the next reconcile after the window closes will pick them back up)
@@ -1661,7 +1706,7 @@ export class CompanionService {
     // human inspecting GET /reminders can see exactly what will wake the agent, and so the
     // eventual send reuses one fixed rendering rather than silently drifting.
     const wakePrompt = body.wake
-      ? this.deliveryPrompt(body.agentId, [{ id: localId, from: 'paseo-reminder', at: new Date().toISOString(), urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=status=idle and updatedAt unchanged for 60s after coordinator-issued /compact\n${body.wake}`, actionCommand: this.cancelCommand(localId) }])
+      ? this.deliveryPrompt(body.agentId, [{ id: localId, from: 'paseo-reminder', at: new Date().toISOString(), urgency: 'normal', mode: 'ack', kind: 'compact-wake', body: `type=compact-wake id=${localId} target=${body.agentId} event=compact-recovery criterion=status=idle and updatedAt unchanged for 60s after coordinator-issued /compact\n${body.wake}`, actionCommand: this.cancelCommand(localId, body.agentId) }])
       : '';
     const pending: ReminderRecord = {
       id: localId, agentId: body.agentId, name: `compact-wake-${localId.slice(0, 8)}`, prompt: wakePrompt,
@@ -1701,7 +1746,8 @@ export class CompanionService {
     this.quietUntil.set(agentId, Date.now() + 20 * 60 * 1000);
     try {
       try {
-        await this.cli.run(['send', agentId, `/compact ${compact}`], { agentId, signal });
+        if (this.arcpRecipient(agentId)) await this.postMessage({ to: agentId, from: 'companion', body: `/compact ${compact}`, delivery: 'on-idle', mode: 'notify', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
+        else await this.cli.run(['send', agentId, `/compact ${compact}`], { agentId, signal });
       } catch (error) {
         await this.store.updateReminder(localId, { status: 'dead' });
         console.warn(JSON.stringify({ type: 'compact-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) }));
@@ -1716,7 +1762,10 @@ export class CompanionService {
       }
       const armed = this.store.findReminder(localId);
       if (!armed || armed.status === 'deleted') return;
-      try { await this.cli.run(['send', agentId, armed.prompt], { agentId, signal }); }
+      try {
+        if (this.arcpRecipient(agentId)) await this.postMessage({ to: agentId, from: 'companion', body: wake, delivery: 'on-idle', mode: 'ack', promptKind: 'compact-wake', actionCommand: this.cancelCommand(localId, agentId) });
+        else await this.cli.run(['send', agentId, armed.prompt], { agentId, signal });
+      }
       catch (error) { console.warn(JSON.stringify({ type: 'compact-wake-send-failed', agentId, localId, error: error instanceof Error ? error.message : String(error) })); }
       await this.store.updateReminder(localId, { status: 'deleted' });
     } finally {
@@ -1868,7 +1917,7 @@ export class CompanionService {
     if (priorDelivery) return;
     const firedAt = new Date(now).toISOString();
     const deliveryPrompt = reminder.prompt.replace('triggeredAt=pending', `triggeredAt=${firedAt}`);
-    const actionCommand = this.cancelCommand(reminder.id);
+    const actionCommand = this.cancelCommand(reminder.id, reminder.agentId);
     const body = deliveryPrompt.replace(/\nCancel this reminder with: .*$/, '');
     const sent = await this.postMessage({ to: reminder.agentId, from: 'companion', body, delivery: reminder.delivery ?? 'on-idle', mode: 'notify', promptKind: 'reminder', actionCommand });
     const runsCompleted = (reminder.runsCompleted ?? 0) + 1;
@@ -1938,7 +1987,7 @@ export class CompanionService {
       // a prompt that may already be in flight.
       return;
     }
-    await this.postMessage({ to: managerId, from: 'companion', body, urgency: 'urgent', promptKind: 'watchdog', actionCommand: this.cancelCommand(recoveryReminderId), kind: 'heartbeat-recovery', recoveryManagerId: managerId, recoveryCounts: counts, recoveryRunIds: runIds });
+    await this.postMessage({ to: managerId, from: 'companion', body, urgency: 'urgent', promptKind: 'watchdog', actionCommand: this.cancelCommand(recoveryReminderId, managerId), kind: 'heartbeat-recovery', recoveryManagerId: managerId, recoveryCounts: counts, recoveryRunIds: runIds });
   }
 
   async listHeartbeats(includeDead = false): Promise<Array<Record<string, unknown>>> {

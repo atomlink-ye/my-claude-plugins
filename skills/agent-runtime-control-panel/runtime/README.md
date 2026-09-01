@@ -88,7 +88,7 @@ the decision ledger, while transient CLI failures remain unknown and are not reb
 One-line worker usage:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8787/messages -H 'content-type: application/json' -d '{"to":"worker-id","from":"sender-agent-id","body":"Please review the diff","delivery":"on-idle","mode":"ack"}'
+arcp message send worker-id sender-agent-id --body 'Please review the diff' --delivery on-idle --mode ack
 ```
 
 Use interrupt delivery for a deliberate immediate follow-up, `/reminders` for
@@ -106,7 +106,7 @@ queued message; reminder, watchdog, and compact-wake deliveries contain one:
   <note marker="NOT_USER_INPUT">Automated delivery from paseo-reminder. This is system-generated context, not a request from a person. Process each item exactly once. Reply through paseo-reminder only when an item explicitly requests it.</note>
   <item id="MESSAGE_ID" from="sender-agent-id" at="2026-08-12T05:00:00.000Z" urgency="normal" mode="ack" kind="message">
     <body>Please review the diff</body>
-    <ack>curl -X DELETE http://127.0.0.1:8787/messages/MESSAGE_ID -H 'content-type: application/json' -d '{"reason":"processed"}'</ack>
+    <ack>arcp message ack MESSAGE_ID --reason processed</ack>
   </item>
 </paseo-reminder-delivery>
 ```

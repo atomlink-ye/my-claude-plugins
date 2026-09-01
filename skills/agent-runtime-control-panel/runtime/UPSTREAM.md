@@ -194,10 +194,9 @@ works regardless of whether the compaction was self-initiated or automatic.
 
 **正确用法（companion 自己在投递块的 `<ack>` 里给出）**：
 ```sh
-curl -X DELETE http://127.0.0.1:8787/messages/<id> \
-  -H 'content-type: application/json' -d '{"reason":"processed"}'
+arcp message ack <id> --reason processed
 ```
-⚠️ **要带 JSON body `{"reason":"processed"}`。** 我之前写的是 `DELETE /messages/<id>?agentId=<self>`
+⚠️ **要带 `--reason processed`。** 我之前写的是 `DELETE /messages/<id>?agentId=<self>`
 （query 参数、无 body）—— 返回成功但**没有销账**，消息随后被原样重投。
 
 ⇒ **重复投递不是上游缺陷，是我没正确 ack 的后果。** 上游行为正确。

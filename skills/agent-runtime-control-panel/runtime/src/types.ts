@@ -226,6 +226,11 @@ export interface MessageRecord {
   recoveryManagerId?: string;
   recoveryCounts?: Record<string, number>;
   recoveryRunIds?: Record<string, string[]>;
+  /** Which runtime owns transport. Legacy audit remains in this store either way. */
+  transportOwner?: 'companion' | 'arcp';
+  /** Stable ARCP delivery projection; it prevents a retry after an uncertain handoff. */
+  ownerDeliveryId?: string;
+  ownerDeliveryState?: string;
 }
 
 /** Local index for one generation of a recipient's delivery transport. */

@@ -4,11 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { PaseoCli } from '../../../skills/paseo-companion/paseo-reminder/src/cli.js';
-import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
-import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
-import { createServer } from '../../../skills/paseo-companion/paseo-reminder/src/server.js';
-import { ProcessWaitSourceDetector } from '../../../skills/paseo-companion/paseo-reminder/src/wait-source.js';
+import { PaseoCli } from '../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
+import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
+import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
+import { createServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
+import { ProcessWaitSourceDetector } from '../../../skills/agent-runtime-control-panel/runtime/src/wait-source.js';
 
 let running: Awaited<ReturnType<typeof createServer>> | undefined;
 const paseoShim = fileURLToPath(new URL('../fixtures/paseo-shim.mjs', import.meta.url));

@@ -2,8 +2,8 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CompanionService } from '../../../skills/paseo-companion/paseo-reminder/src/service.js';
-import { Store } from '../../../skills/paseo-companion/paseo-reminder/src/store.js';
+import { CompanionService } from '../../../skills/agent-runtime-control-panel/runtime/src/service.js';
+import { Store } from '../../../skills/agent-runtime-control-panel/runtime/src/store.js';
 
 class DeliveryCli {
   calls: string[][] = [];
@@ -75,7 +75,7 @@ describe('round8 message transport', () => {
     expect(cli.prompts[0]).toContain('<note marker="NOT_USER_INPUT">');
     expect(cli.prompts[0]).toContain(`<item id="${posted.id}" from="worker"`);
     expect(cli.prompts[0]).toContain('<body>stable</body>');
-    expect(cli.prompts[0]).toContain(`<ack>curl -X DELETE http://127.0.0.1:8787/messages/${posted.id}`);
+    expect(cli.prompts[0]).toContain(`<ack>arcp message ack ${posted.id}`);
     expect(cli.prompts[0]).toContain('</paseo-reminder-delivery>');
     expect(store.getMessages().find((item) => item.id === posted.id)?.status).toBe('delivered');
     expect(cli.calls).toContainEqual(['heartbeat', 'delete', 'heartbeat-1', '--json']);

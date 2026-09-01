@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PaseoCli, asRecord } from './cli.js';
 import { CompanionService } from './service.js';
+import type { MessageRecord } from './types.js';
 import { createPaseoClient } from '@getpaseo/client';
 import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
@@ -17,7 +18,7 @@ export interface Actor { id: string; clientIdentity: string; label: string; crea
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; state: GoalState; createdAt: string; updatedAt: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; bindingId: string; generation: number; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; workspace?: string; externalId?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
-export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
+export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; state: DeliveryState; createdAt: string; sourceMessageId?: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; fence: number; createdAt: string; updatedAt: string; }
@@ -402,7 +403,7 @@ export class ArcpService {
     if (confirmation && await this.validateConfirmation('cache', confirmation, session, { actorId }, facts)) return { allow: true as const, cacheAuthorized: true as const };
     return this.confirmationReceipt('cache', session, { actorId }, facts, `Claude cache is ${facts.cache.state}; reuse requires confirmation`);
   }
-  async interrupt(input: { fromActorId: string; runtimeSessionId: string; body: string; reason: string; confirmation?: string }): Promise<Delivery | Record<string, unknown>> {
+  async interrupt(input: { fromActorId: string; runtimeSessionId: string; body: string; reason: string; confirmation?: string; sourceMessageId?: string }): Promise<Delivery | Record<string, unknown>> {
     if (!input.reason?.trim() || !input.body?.trim()) throw new ArcpError('invalid_request', 'interrupt reason and body are required');
     const session = this.store.snapshot().sessions.find((item) => item.id === input.runtimeSessionId); if (!session || !session.externalId || !this.store.snapshot().actors.some((item) => item.id === input.fromActorId)) throw new ArcpError('unknown_recipient', 'recipient is not registered');
     if (session.provider === 'claude') {
@@ -411,24 +412,51 @@ export class ArcpService {
         return this.confirmationReceipt('interrupt', session, { actorId: input.fromActorId, reason: input.reason.trim() }, facts, input.confirmation ? 'Claude interrupt confirmation is stale; no interrupt was sent' : 'Claude interrupt requires confirmation; no interrupt was sent');
       }
     }
-    const delivery: Delivery = { id: `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), state: 'queued', createdAt: now() };
+    const delivery: Delivery = { id: input.sourceMessageId ? idFor('delivery', `companion:${input.sourceMessageId}:${session.id}`) : `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), state: 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     try { await this.adapter.interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'delivered'; item.deliveredAt = now(); return item; }); }
     catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.state = 'transport_indeterminate'; return item; }); }
   }
-  async deliver(input: { fromActorId: string; runtimeSessionId: string; body: string; command?: 'normal' | 'interrupt'; reason?: string; cacheConfirmation?: string }): Promise<Delivery | Record<string, unknown>> {
+  async deliver(input: { fromActorId: string; runtimeSessionId: string; body: string; command?: 'normal' | 'interrupt'; reason?: string; cacheConfirmation?: string; sourceMessageId?: string }): Promise<Delivery | Record<string, unknown>> {
     if (!input.body?.trim()) throw new ArcpError('invalid_request', 'body is required');
     const snapshot = this.store.snapshot(); const session = snapshot.sessions.find((item) => item.id === input.runtimeSessionId);
     if (!snapshot.actors.some((item) => item.id === input.fromActorId) || !session || !session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
     const command = input.command ?? 'normal';
     if (!['normal', 'interrupt'].includes(command)) throw new ArcpError('invalid_request', 'command must be normal or interrupt');
-    if (command === 'interrupt') return this.interrupt({ fromActorId: input.fromActorId, runtimeSessionId: input.runtimeSessionId, body: input.body, reason: input.reason ?? '', confirmation: input.cacheConfirmation });
+    const existing = input.sourceMessageId ? snapshot.deliveries.find((item) => item.sourceMessageId === input.sourceMessageId && item.runtimeSessionId === session.id) : undefined;
+    if (existing) {
+      if (existing.body !== input.body.trim() || existing.command !== command || existing.generation !== session.generation || existing.fromActorId !== input.fromActorId) throw new ArcpError('invalid_request', 'companion delivery identity conflicts with its durable payload');
+      return existing;
+    }
+    if (command === 'interrupt') return this.interrupt({ fromActorId: input.fromActorId, runtimeSessionId: input.runtimeSessionId, body: input.body, reason: input.reason ?? '', confirmation: input.cacheConfirmation, sourceMessageId: input.sourceMessageId });
     const cache = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation); if (!('allow' in cache)) return cache;
-    const delivery: Delivery = { id: `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, ...(cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
+    const delivery: Delivery = { id: input.sourceMessageId ? idFor('delivery', `companion:${input.sourceMessageId}:${session.id}`) : `delivery_${randomUUID()}`, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}), ...(cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(input.reason ? { reason: input.reason.trim() } : {}), state: command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     await this.pump(); return this.store.snapshot().deliveries.find((item) => item.id === delivery.id)!;
   }
   async reuse(input: { fromActorId: string; runtimeSessionId: string; body: string; cacheConfirmation?: string }) { return this.deliver({ ...input, command: 'normal' }); }
+  /** Companion calls this after persisting its legacy audit record. The target
+   * session owner is the server-authenticated sender; untrusted legacy `from`
+   * never becomes an ARCP actor.  Normal Companion notifications deliberately
+   * use safe-point delivery: legacy urgency may request interrupt, but Claude's
+   * separate interrupt confirmation remains in force. */
+  async deliverCompanionMessage(message: MessageRecord, prompt: string): Promise<{ deliveryId: string; state: string }> {
+    const candidates = this.store.snapshot().sessions.filter((item) => item.externalId === message.to);
+    if (candidates.length !== 1) throw new ArcpError('unknown_recipient', candidates.length ? 'ARCP runtime recipient is ambiguous' : 'ARCP runtime recipient is unavailable');
+    const session = candidates[0];
+    if (session.state === 'terminal') return { deliveryId: idFor('delivery', `companion:${message.id}:${session.id}`), state: 'held_terminal' };
+    const requestedInterrupt = message.delivery === 'interrupt' && session.provider !== 'claude';
+    const result = await this.deliver({ fromActorId: session.actorId, runtimeSessionId: session.id, body: prompt, command: requestedInterrupt ? 'interrupt' : 'normal', reason: requestedInterrupt ? 'companion urgent delivery' : undefined, sourceMessageId: message.id });
+    if (!('id' in result) || !('state' in result)) {
+      // A held confirmation is not a transport failure. Preserve it as a
+      // durable ARCP-owned hold and never fall back to Companion transport.
+      return { deliveryId: idFor('delivery', `companion:${message.id}:${session.id}`), state: 'held' };
+    }
+    return { deliveryId: String(result.id), state: String(result.state) };
+  }
+  isRuntimeRecipient(recipient: string): boolean {
+    return this.store.snapshot().sessions.some((session) => session.externalId === recipient);
+  }
   private async pump(): Promise<void> {
     if (this.pumping) return this.pumping;
     this.pumping = (async () => {

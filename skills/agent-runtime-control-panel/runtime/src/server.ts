@@ -49,10 +49,14 @@ const ROUTES = [
 const ERROR_STATUS: Record<string, number> = { missing_field: 400, invalid_value: 400, not_found: 404, ambiguous_id: 409, state_corrupt: 503, cli_error: 502 };
 
 export async function createServer(service = new CompanionService(undefined, undefined, new PaseoScheduleObserver(), undefined, { contextUsageObserver: new PaseoContextUsageObserver() })): Promise<CompanionServer> {
-  await service.init();
   const arcp = new ArcpService(service);
   await arcp.init();
   service.setInterruptRecipientPolicy((recipient) => arcp.state().sessions.some((session) => session.provider === 'claude' && session.externalId === recipient));
+  service.setArcpDeliveryPolicy({ isRecipient: (recipient) => arcp.isRuntimeRecipient(recipient), dispatch: (message, prompt) => arcp.deliverCompanionMessage(message, prompt) });
+  // The policy must exist before Companion's startup reconciliation examines
+  // persisted records; otherwise it could re-create a heartbeat for an ARCP
+  // recipient during the first boot tick.
+  await service.init();
   const server = http.createServer(async (req, res) => {
     try {
       if (await handleArcp(req, res, arcp)) return;
@@ -60,8 +64,13 @@ export async function createServer(service = new CompanionService(undefined, und
       const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
       const pathname = url.pathname;
       const arcpKey = process.env.ARCP_API_KEY ?? process.env.PASEO_COMPANION_API_KEY;
-      const legacyAuthorized = String(req.headers['x-arcp-api-key'] ?? '') === arcpKey;
-      if (arcpKey && process.env.ARCP_ALLOW_LEGACY_UNAUTH !== '1' && pathname !== '/health' && !legacyAuthorized) { send(res, 401, { code: 'unauthorized' }); return; }
+      const legacyAuthorized = Boolean(arcpKey && String(req.headers['x-arcp-api-key'] ?? '') === arcpKey);
+      let authenticatedActor;
+      let authenticatedMember;
+      try { const key = String(req.headers['x-arcp-actor-key'] ?? ''); if (key) authenticatedActor = arcp.actorForCredential(key); } catch { /* authorization below */ }
+      try { const key = String(req.headers['x-arcp-member-key'] ?? ''); if (key) authenticatedMember = arcp.memberForCredential(key); } catch { /* authorization below */ }
+      const legacyCredential = legacyAuthorized || Boolean(authenticatedActor) || Boolean(authenticatedMember);
+      if (arcpKey && process.env.ARCP_ALLOW_LEGACY_UNAUTH !== '1' && pathname !== '/health' && !legacyCredential) { send(res, 401, { code: 'unauthorized' }); return; }
       if (method === 'GET' && pathname === '/health') { send(res, 200, service.health()); return; }
       if (method === 'GET' && pathname === '/self/runtime') { const runtime = service.runtime(); send(res, 200, arcpKey ? { pid: runtime.pid, port: runtime.port } : runtime); return; }
       if (method === 'GET' && pathname === '/heartbeats') { send(res, 200, await service.listHeartbeats(url.searchParams.get('includeDead') === '1')); return; }
@@ -132,6 +141,9 @@ export async function createServer(service = new CompanionService(undefined, und
       if (method === 'POST' && pathname === '/messages') {
         const body = await readBody(req);
         required(body.to, 'to'); required(body.from, 'from'); required(body.body, 'body');
+        if (arcp.isRuntimeRecipient(body.to) && !authenticatedActor) {
+          send(res, 409, { code: 'migration_auth_hold', message: 'an ARCP actor credential is required to address an ARCP Runtime; legacy from is not an authenticated sender' }); return;
+        }
         if (body.urgency !== undefined && body.urgency !== 'normal' && body.urgency !== 'urgent') invalidValue('urgency must be normal or urgent', 'urgency', ['normal', 'urgent']);
         const { promptKind: _internalPromptKind, actionCommand: _internalActionCommand, kind: _internalKind, recoveryManagerId: _internalRecoveryManagerId, recoveryCounts: _internalRecoveryCounts, recoveryRunIds: _internalRecoveryRunIds, ...publicBody } = body;
         send(res, 201, await service.postMessage(publicBody)); return;
