@@ -143,21 +143,48 @@ describe('SQLite StateStore', () => {
   });
 
   it('audits every durable field after reopening a realistic campaign state', async () => {
-    const sourceDir = path.resolve(import.meta.dirname, '../../../.local/arcp-campaign/data');
-    const source = JSON.parse(await readFile(path.join(sourceDir, 'arcp-state.json'), 'utf8')) as any;
+    // A self-contained state that exercises every redaction and every collection.
+    // It must never read the live campaign store: that would couple a committed
+    // test to machine-local data and make the assertion depend on unrelated
+    // campaign activity.
+    const source: any = {
+      actors: [{ id: 'actor-1', clientIdentity: 'owner', label: 'Owner', createdAt: '2026-01-01T00:00:00.000Z' }],
+      bindings: [{ id: 'binding-1', actorId: 'actor-1', channel: 'local', generation: 1, createdAt: '2026-01-01T00:00:00.000Z' }],
+      credentials: { 'actor-1': 'secret-actor-credential' },
+      workspaces: [{ id: 'workspace-1', purpose: 'audit', lifecycle: 'active', ownerActorId: 'actor-1', ownerMemberId: 'member-1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+      members: [{ id: 'member-1', workspaceId: 'workspace-1', actorId: 'actor-1', joinKind: 'native', label: 'Owner', role: 'owner', capabilities: ['read_context'], lifecycle: 'active', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+      memberCredentials: { 'member-1': 'secret-member-credential' },
+      tasks: [{ id: 'task-1', workspaceId: 'workspace-1', title: 'audit task', lifecycle: 'claimed', ownerMemberId: 'member-1', fence: 1, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+      knowledge: [{ id: 'knowledge-1', workspaceId: 'workspace-1', authorMemberId: 'member-1', kind: 'learning', text: 'tagged learning', tags: ['campaign', 'audit'], createdAt: '2026-01-01T00:00:00.000Z' }],
+      results: [{ id: 'result-1', workspaceId: 'workspace-1', taskId: 'task-1', memberId: 'member-1', fence: 1, status: 'candidate', summary: 'candidate summary', evidenceRefs: ['ref-1'], createdAt: '2026-01-01T00:00:00.000Z' }],
+      goals: [{ id: 'goal-1', actorId: 'actor-1', title: 'audit goal', workspaceId: 'workspace-1', state: 'active', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+      sessions: [{ id: 'runtime-1', actorId: 'actor-1', goalId: 'goal-1', taskId: 'task-1', bindingId: 'binding-1', generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: 'workspace-1', memberId: 'member-1', profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', workspace: '/private/local/path', state: 'idle', createdAt: '2026-01-01T00:00:00.000Z' }],
+      deliveries: [{ id: 'delivery-1', fromActorId: 'actor-1', runtimeSessionId: 'runtime-1', generation: 1, body: 'a prompt body that must never persist', command: 'normal', state: 'waiting_safe_point', createdAt: '2026-01-01T00:00:00.000Z' }],
+      channelEvents: [event('event-1', 'audit event')],
+      confirmations: [],
+    };
     const expected = structuredClone(source);
     expected.credentials = {};
     expected.memberCredentials = {};
     expected.sessions = expected.sessions.map(({ workspace, ...session }: any) => session);
     expected.deliveries = expected.deliveries.map((delivery: any) => ({ ...delivery, body: '' }));
 
+    const sourceDir = await root();
+    await writeFile(path.join(sourceDir, 'arcp-state.json'), JSON.stringify(source));
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
     const report = await store.importLegacy(sourceDir);
     expect(report.state.match).toBe(true);
     store.close();
     const reopened = new SQLiteStateStore(dir); await reopened.init();
-    expect(reopened.snapshot()).toEqual(expected);
-    expect(reopened.snapshot().knowledge.some((entry) => entry.tags.length > 0)).toBe(true);
+    const snapshot: any = reopened.snapshot();
+    // The store canonicalizes the content address on import, so the fixture's
+    // placeholder digest is expected to change. Assert it is a real digest and
+    // adopt it, then require every other durable field to match exactly.
+    const persistedHash = snapshot.channelEvents[0].content.contentHash;
+    expect(persistedHash).toMatch(/^[0-9a-f]{64}$/);
+    expected.channelEvents[0].content.contentHash = persistedHash;
+    expect(snapshot).toEqual(expected);
+    expect(snapshot.knowledge.some((entry: any) => entry.tags.length > 0)).toBe(true);
     reopened.close();
   });
 });
