@@ -97,5 +97,5 @@ else if (area === 'goal' && action === 'list') await call('GET','/v1/goals');
 else if (area === 'knowledge' && action === 'search') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=${encodeURIComponent(f.q ?? '')}&kind=${encodeURIComponent(f.kind||'')}&tag=${encodeURIComponent(f.tag||'')}`);
 else if (area === 'knowledge' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=&kind=&tag=`);
 else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(); if (s.workspaceId) await call('GET',`/v1/workspaces/${encodeURIComponent(s.workspaceId)}/context`); }
-else { console.error(`unknown command: ${argv.find((value) => !value.startsWith('--')) || area}\n\n${HELP}`); process.exitCode=2; }
+else { console.error(`unknown command: ${twoWord && action ? action : area}\n\n${HELP}`); process.exitCode=2; }
 }

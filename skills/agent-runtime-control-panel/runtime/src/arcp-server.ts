@@ -1,6 +1,7 @@
 import type http from 'node:http';
 import { URL } from 'node:url';
 import { ArcpError, ArcpService } from './arcp.js';
+import type { Member } from './arcp.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
@@ -24,7 +25,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
   const memberKey = String(req.headers['x-arcp-member-key'] ?? '');
   const admin = Boolean(configured && supplied === configured);
   let authenticatedActor;
-  let authenticatedMember;
+  let authenticatedMember: Member | undefined;
   try { if (actorKey) authenticatedActor = service.actorForCredential(actorKey); } catch { /* reported below */ }
   try { if (memberKey) authenticatedMember = service.memberForCredential(memberKey); } catch { /* reported below */ }
   if (!admin && !authenticatedActor && !authenticatedMember) { send(res, 401, { code: 'unauthorized', message: 'an ARCP API key, actor credential, or member credential is required' }); return true; }
@@ -63,11 +64,11 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'POST' && path === '/v1/actor-bindings') { send(res, 201, await service.bindActor(await body(req) as any)); return true; }
     if (method === 'GET' && path === '/v1/actor-bindings') { send(res, 200, service.state().bindings); return true; }
     if (method === 'POST' && path === '/v1/goals') { const input = await body(req); const actorId = authenticatedActor?.id ?? String(input.actorId ?? ''); send(res, 201, await service.createGoal({ ...input, actorId } as any)); return true; }
-    if (method === 'GET' && path === '/v1/goals') { send(res, 200, service.state().goals); return true; }
+    if (method === 'GET' && path === '/v1/goals') { const state = service.state(); const sessionIds = new Set(state.sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId).map((item) => item.goalId)); send(res, 200, authenticatedMember ? state.goals.filter((item) => sessionIds.has(item.id)) : state.goals); return true; }
     const goal = path.match(/^\/v1\/goals\/([^/]+)\/lifecycle$/);
     if (method === 'POST' && goal) { send(res, 200, await service.setGoalState(decodeURIComponent(goal[1]), String((await body(req)).state) as any)); return true; }
     if (method === 'POST' && path === '/v1/runtime-sessions') { const input = await body(req); const actorId = authenticatedActor?.id ?? String(input.actorId ?? ''); send(res, 201, publicSession(await service.launch({ ...input, actorId } as any))); return true; }
-    if (method === 'GET' && path === '/v1/runtime-sessions') { send(res, 200, service.state().sessions.map(publicSession)); return true; }
+    if (method === 'GET' && path === '/v1/runtime-sessions') { const sessions = service.state().sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId); send(res, 200, sessions.map(publicSession)); return true; }
     const observe = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/(observe|reconcile)$/);
     if (method === 'POST' && observe) { send(res, 200, publicSession(observe[2] === 'observe' ? await service.observe(decodeURIComponent(observe[1])) : await service.reconcile(decodeURIComponent(observe[1])))); return true; }
     const runtimeStatus = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/status$/);
