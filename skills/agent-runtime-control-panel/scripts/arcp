@@ -39,7 +39,7 @@ const HELP = `ARCP ControlWorkspace commands:
   panorama [--workspace WORKSPACE] [--temporal active|problems|task TASK_ID]
   status [--workspace WORKSPACE]
   tui [--workspace WORKSPACE] [--snapshot]
-  canary
+  canary [--workspace WORKSPACE]  discovery/context smoke probe; not a test suite
 
 Delivery and identity commands:
   send RUNTIME --body '...'          safe-point delivery
@@ -139,6 +139,6 @@ else if (area === 'member' && action === 'list') await call('GET',`/v1/workspace
 else if (area === 'goal' && action === 'list') await call('GET','/v1/goals');
 else if (area === 'knowledge' && action === 'search') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=${encodeURIComponent(f.q ?? '')}&kind=${encodeURIComponent(f.kind||'')}&tag=${encodeURIComponent(f.tag||'')}`);
 else if (area === 'knowledge' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge?q=&kind=&tag=`);
-else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(); if (s.workspaceId) await call('GET',`/v1/workspaces/${encodeURIComponent(s.workspaceId)}/context`); }
+else if (area === 'canary') { await call('GET','/v1/discovery'); const s=await load(), workspace=f.workspace||s.workspaceId; if (workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/context`); }
 else { console.error(`unknown command: ${twoWord && action ? action : area}\n\n${HELP}`); process.exitCode=2; }
 }

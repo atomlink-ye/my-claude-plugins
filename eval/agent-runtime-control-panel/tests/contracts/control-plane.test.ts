@@ -761,12 +761,14 @@ describe('ARCP CLI and TUI presentation', () => {
     expect(seen[5]).toMatchObject({ url: '/v1/workspaces/workspace-1/supervision', key: 'cli-key' });
     await execFileAsync(process.execPath, [script, 'result', 'submit', 'workspace-1', '--task', 'task-1', '--summary', 'steward finding', '--expected-fence', '1', '--evidence', 'task-1,review-1', '--evidence', 'knowledge-1'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
     expect(seen.at(-1)).toMatchObject({ url: '/v1/workspaces/workspace-1/results', body: { taskId: 'task-1', summary: 'steward finding', expectedFence: 1, evidenceRefs: ['task-1', 'review-1', 'knowledge-1'] } });
+    await execFileAsync(process.execPath, [script, 'canary', '--workspace', 'workspace-1'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } });
+    expect(seen.slice(-2)).toMatchObject([{ url: '/v1/discovery', key: 'cli-key' }, { url: '/v1/workspaces/workspace-1/context', key: 'cli-key' }]);
     // The retired 8787 verbs must be unknown commands, not silent no-ops.
     for (const argv of [['reminder', 'list'], ['message', 'send', 'a', 'b', 'c'], ['idle', 'add', 'agent-1', 'nudge'], ['correction', 'list'], ['gate', 'manager-1'], ['ledger', 'list'], ['compact', 'agent-1', 'focus'], ['child', 'list', 'agent-1'], ['wakeup', 'list', 'agent-1'], ['heartbeat', 'list'], ['context', 'usage']]) {
       await expect(execFileAsync(process.execPath, [script, ...argv], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_URL: `http://127.0.0.1:${port}`, ARCP_API_KEY: 'cli-key', ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } }))
         .rejects.toMatchObject({ code: 2, stderr: expect.stringContaining(`unknown command: ${argv[0]}`) });
     }
-    expect(seen).toHaveLength(7);
+    expect(seen).toHaveLength(9);
     await expect(execFileAsync(process.execPath, [script, 'workspace', 'frobnicate'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } })).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('unknown command: frobnicate') });
     await expect(execFileAsync(process.execPath, [script, 'mystery'], { cwd: path.join(process.cwd(), '..'), env: { ...process.env, ARCP_CLIENT_STATE: path.join(await mkdtemp(path.join(os.tmpdir(), 'arcp-cli-')), 'client.json') } })).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('unknown command: mystery') });
     await new Promise<void>((resolve) => server.close(() => resolve()));

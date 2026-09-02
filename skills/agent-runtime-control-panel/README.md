@@ -17,6 +17,36 @@ Default durable state is `${XDG_STATE_HOME:-$HOME/.local/state}/agent-runtime-co
 
 List commands use the same boundary as the existing context/panorama surface: a Member sees only its own Workspace, while an authenticated Actor or admin key is the deliberate discovery plane and may list all Workspaces.
 
+## Profiles and preflight
+
+The bundled `config/default.json` is the source of the named launch profiles.
+Their role describes the intended team responsibility; it is not a request to
+silently select a provider, model, or permission mode.
+
+| Profile | Intended role | Provider/model | Mode |
+| --- | --- | --- | --- |
+| `claude-manager` | Manager | Claude / `claude-opus-5` | `auto` |
+| `claude-bypass-permissions` | Manager with an explicit elevation | Claude / `claude-opus-5` | `bypassPermissions` |
+| `codex-worker` | Worker | Codex / `gpt-5.6-terra` | `auto` |
+| `codex-full-access` | Worker with an explicit elevation | Codex / `gpt-5.6-terra` | `full-access` |
+| `pi-grok-worker` | Worker | Pi / `grok-cli/grok-4.6` | no ARCP mode |
+
+Choose a named profile deliberately and run preflight before starting. ARCP
+validates the requested provider, model, thinking setting, and mode live; it
+never substitutes another profile, provider, paid model, or stronger mode.
+
+```sh
+arcp preflight --profile codex-worker
+arcp start --workspace WORKSPACE --profile codex-worker --title '<goal>'
+```
+
+For unattended editing work, use the exact elevated command returned by
+preflight only when the provider exposes that mode. For example:
+
+```sh
+arcp start --workspace WORKSPACE --profile codex-full-access --title '<goal>' --unattended
+```
+
 ## Provider budget MVE
 
 `arcp provider-budget refresh` is operator/member controlled; `read` shows the last validated, redacted envelope. The bundled local source calls CodexBar independently for Claude, Codex, and Grok with `--source auto`, so one provider failure cannot erase the others. Upstream CodexBar `grok` is projected as the mode-less ARCP runtime provider `pi`, with safe source label `codexbar:grok`; identity fields are never retained.
@@ -69,7 +99,36 @@ ARCP_API_KEY=test-key ARCP_RUNTIME_DIR="$root/run" ARCP_DATA="$root/data" PORT=1
 ARCP_API_KEY=test-key ARCP_URL=http://127.0.0.1:18787 skills/agent-runtime-control-panel/scripts/arcp actor register hermes-owner --label Hermes
 ```
 
-Then run the focused tests. For a real provider dogfood, run `arcp doctor`, then `arcp preflight --profile codex-worker`. Claude and Codex profiles deliberately resolve an omitted mode to `auto`; ARCP live-validates it and shows requested versus observed settings after launch. For unattended editing work, copy the exact elevation command from preflight, for example `arcp start --profile codex-full-access --title '<goal>' --unattended`; ARCP never upgrades a mode itself. `claude-bypass-permissions` is offered only when that live mode is available. Pi/Grok stays mode-less.
+For a real provider dogfood, run `arcp doctor`, then `arcp preflight --profile codex-worker`. Claude and Codex profiles deliberately resolve an omitted mode to `auto`; ARCP live-validates it and shows requested versus observed settings after launch. `claude-bypass-permissions` is offered only when that live mode is available. Pi/Grok stays mode-less.
+
+## Verification commands
+
+Build the runtime, then run the complete deterministic suite:
+
+```sh
+pnpm --dir skills/agent-runtime-control-panel/runtime build
+pnpm --dir skills/agent-runtime-control-panel/runtime test
+```
+
+`test` runs `test:deterministic`: it clears `ARCP_CAMPAIGN_STATE` and uses
+only controlled local fixtures. It does not start a real Paseo daemon or call
+a live provider. Run an individual layer with `test:domain`,
+`test:persistence`, `test:application`, `test:adapters`, or `test:contracts`.
+The [evaluation guide](../../eval/agent-runtime-control-panel/README.md) maps
+each layer to its command.
+
+The campaign-state canaries are deliberately separate and require an
+operator-supplied state directory:
+
+```sh
+ARCP_CAMPAIGN_STATE=/absolute/path/to/state \
+  pnpm --dir skills/agent-runtime-control-panel/runtime test:canary
+```
+
+That command is not live-provider coverage. Conversely, `arcp canary` is a
+small CLI smoke probe that reads discovery and, when a Workspace is selected,
+its context. It is not a replacement for either test command; pass
+`--workspace WORKSPACE` to make its target explicit.
 
 Use `arcp panorama --refresh` during work and `arcp runtime status RUNTIME --refresh` for the focused view. They project context/usage quality, attention, compaction only when observed, safe child descriptors, requested-vs-observed settings, a path-free commit/diffstat, and redacted legacy status counts. A launch timeout or absent handle is `transport_indeterminate`; call `runtime reconcile`, do not relaunch.
 

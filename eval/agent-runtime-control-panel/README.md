@@ -41,7 +41,8 @@ The adapter tests spawn only controlled local fixtures. The timeout test is
 slow by design but hermetic; it is not a live Paseo test. `test:canary` is
 explicitly external-state dependent and fails without `ARCP_CAMPAIGN_STATE`.
 It provides manual campaign-state confidence only and must not be described as
-live-provider coverage.
+live-provider coverage. `arcp canary` is a separate CLI discovery/context
+smoke probe, not an alias for `test:canary` or the deterministic suite.
 
 ## R0–R3 / A0–A3 assessment
 
