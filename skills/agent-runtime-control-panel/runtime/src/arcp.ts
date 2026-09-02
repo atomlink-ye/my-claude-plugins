@@ -75,7 +75,7 @@ export interface RuntimeLaunchContext { workspaceId?: string; paseoProjectId?: s
  * action; cc recipients observe and must never create a second obligation. */
 export interface ReportingRoute { launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds: string[]; escalationMemberIds: string[]; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; executionSurfaceId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
-export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; purpose?: DeliveryPurpose; subject?: DeliverySubject; notAfter?: string; refusedReason?: string; handedOffAfterWithdrawal?: boolean; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
+export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; purpose?: DeliveryPurpose; subject?: DeliverySubject; notAfter?: string; refusedReason?: string; handedOffAfterWithdrawal?: boolean; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; processedByMemberId?: string; processedReason?: string; acknowledgedAt?: string; acknowledgedByMemberId?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export type TaskScope = 'product' | 'steward_analysis';
@@ -169,7 +169,7 @@ function intendedTarget(event: ChannelEvent, member: Member, workspace: ControlW
 
 /** The durable records the one canonical projection builder is allowed to read. */
 function projectionFacts(state: State): ChannelProjectionFacts {
-  return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results, channelEvents: state.channelEvents };
+  return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results, channelEvents: state.channelEvents, deliveries: state.deliveries, sessions: state.sessions };
 }
 
 /**
@@ -1329,9 +1329,11 @@ export class ArcpService implements ExecutionPlacementPort {
         if (setting(observed.lastTurnState)) item.lastTurnState = normalizedTurnState(observed.lastTurnState);
         const requested = [item.provider, item.model, item.mode, item.thinking]; const actual = [item.observed.provider, item.observed.model, item.observed.mode, item.observed.thinking];
         item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : requested.every((value, index) => !value || sameSetting(value, actual[index])) ? sessionState(observed.status ?? observed.Status) : 'attention'; item.lastObservedAt = now();
+        // Runtime idleness is a safe point for a future turn, not evidence that
+        // the recipient processed the previous body. Processing is advanced only
+        // by an explicit recipient receipt (processDelivery/ACK) below.
         for (const delivery of state.deliveries.filter((value) => value.runtimeSessionId === id && value.generation === item.generation && ['delivered', 'running'].includes(value.state))) {
           if (item.state === 'running') delivery.state = 'running';
-          else if (item.state === 'idle' || item.state === 'terminal') { delivery.state = 'processed'; delivery.processedAt = now(); const event = delivery.eventId ? state.channelEvents.find((value) => value.id === delivery.eventId) : undefined; if (event) this.transitionEvent(event, 'processed', delivery.processedAt); }
         }
         return item;
       });
@@ -1547,12 +1549,37 @@ export class ArcpService implements ExecutionPlacementPort {
     })().finally(() => { this.pumping = undefined; if (this.pumpAgain) { this.pumpAgain = false; void this.pump(); } });
     return this.pumping;
   }
-  async acknowledge(id: string, generation?: number): Promise<Delivery> {
+  async processDelivery(id: string, memberId?: string, reason = 'recipient processed delivery'): Promise<Delivery> {
+    const snapshot = this.store.snapshot();
+    const delivery = snapshot.deliveries.find((item) => item.id === id);
+    if (!delivery) throw new ArcpError('not_found', 'delivery not found');
+    if (!['delivered', 'running'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivery has not been delivered');
+    const session = snapshot.sessions.find((item) => item.id === delivery.runtimeSessionId);
+    const recipientMemberId = session?.memberId;
+    if (memberId && recipientMemberId !== memberId) throw new ArcpError('unauthorized', 'delivery processing is not authorized');
+    const processedReason = boundedReason(reason);
+    return this.store.mutate((state) => {
+      const item = state.deliveries.find((value) => value.id === id)!;
+      if (!['delivered', 'running'].includes(item.state)) return item;
+      const at = now();
+      item.state = 'processed'; item.processedAt = at;
+      if (recipientMemberId) item.processedByMemberId = recipientMemberId;
+      item.processedReason = processedReason;
+      const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined;
+      if (event) this.transitionEvent(event, 'processed', at);
+      return item;
+    });
+  }
+  async acknowledge(id: string, generation?: number, memberId?: string): Promise<Delivery> {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (generation !== undefined && generation !== delivery.generation) throw new ArcpError('stale_generation', 'delivery generation is stale');
-    if (!['delivered', 'running', 'processed'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivery has not been processed');
-    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; item.state = 'acknowledged'; item.acknowledgedAt = now(); const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) { if (event.deliveryState === 'delivered') this.transitionEvent(event, 'processed', item.acknowledgedAt); this.transitionEvent(event, 'acknowledged', item.acknowledgedAt); } return item; });
+    if (memberId) {
+      const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
+      if (session?.memberId !== memberId) throw new ArcpError('unauthorized', 'delivery acknowledgement is not authorized');
+    }
+    if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery must be explicitly processed before acknowledgement');
+    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; if (item.state === 'acknowledged') return item; const at = now(); item.state = 'acknowledged'; item.acknowledgedAt = at; if (memberId) item.acknowledgedByMemberId = memberId; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', at); return item; });
   }
   /** Release a cache-held Companion delivery after a fresh observation or an
    * explicit one-use cache confirmation. */
@@ -1617,6 +1644,11 @@ export class ArcpService implements ExecutionPlacementPort {
     const decisionOptions = input.decisionOptions?.map((option) => option.trim()).filter((option) => option.length > 0);
     if (decisionOptions?.some((option) => prohibitedAssignment.test(option) || prohibitedPath.test(option) || prohibitedTranscript.test(option))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'decisionOptions');
     const taskNotification = ['task_candidate', 'task_failed', 'task_unknown', 'task_completed'].includes(input.kind);
+    if (input.kind === 'task_completed') {
+      const result = input.resultId ? state.results.find((item) => item.id === input.resultId) : undefined;
+      const task = input.taskId ? state.tasks.find((item) => item.id === input.taskId) : undefined;
+      if (!result || !task || result.workspaceId !== input.workspaceId || result.taskId !== task.id || result.fence !== task.fence || result.status !== 'candidate') throw new ArcpError('invalid_request', 'task completion requires a matching durable candidate Result', 'resultId');
+    }
     const targetRole = input.targetRole ?? (taskNotification ? 'manager' : undefined);
     const consumptionPolicy = input.consumptionPolicy ?? legacyPolicyFor(input);
     const priority = input.priority ?? priorityFor(input);
@@ -1748,6 +1780,17 @@ export class ArcpService implements ExecutionPlacementPort {
       if (event.consumptionState === 'consumed') return event;
       const targetGeneration = this.accountableGeneration(state, event, member.id);
       const receipt = this.appendDisposition(event, { kind: 'ack', reason: boundedReason(reason) }, member.id, targetGeneration, dispositionId);
+      // An event ACK is an explicit recipient receipt. It may settle the
+      // associated Delivery in one atomic mutation, but runtime idleness alone
+      // never does so.
+      const delivery = state.deliveries.find((item) => item.eventId === event.id && ['delivered', 'running', 'processed'].includes(item.state) && state.sessions.find((session) => session.id === item.runtimeSessionId)?.memberId === member.id);
+      if (delivery) {
+        if (delivery.state !== 'processed') { delivery.state = 'processed'; delivery.processedAt = receipt.at; }
+        delivery.processedByMemberId = member.id;
+        delivery.processedReason = receipt.reason;
+        delivery.state = 'acknowledged'; delivery.acknowledgedAt = receipt.at; delivery.acknowledgedByMemberId = member.id;
+        this.transitionEvent(event, 'processed', receipt.at);
+      }
       event.consumptionState = 'consumed'; event.consumedAt = receipt.at;
       this.transitionEvent(event, 'acknowledged', receipt.at); return event;
     });
