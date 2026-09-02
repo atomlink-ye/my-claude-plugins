@@ -12,7 +12,7 @@ import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, normalizeChannelEvent } from './content.js';
 import { projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
 import { renderChannelMarkdown, type ChannelMarkdownOptions } from './channel-markdown.js';
-import { projectTemporal, temporalReconciliationPreview, type TemporalFilter, type TemporalProjection } from './temporal-projection.js';
+import { projectTemporal, temporalReconciliationPreview, type TemporalFilter, type TemporalProjection, type TemporalProjectionFacts } from './temporal-projection.js';
 export { projectChannelEvent, renderChannelCard, channelCardFor } from './channel-projection.js';
 export { renderChannelMarkdown, escapeMarkdown, escapeCode } from './channel-markdown.js';
 export type { ChannelProjection, ChannelProjectionFacts, ChannelProjectionRef } from './channel-projection.js';
@@ -1333,16 +1333,22 @@ export class ArcpService {
     }
     return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
   }
+  /** The one read-only fact bundle the temporal projection consumes. Panorama
+   * and the reconcile preview must see identical facts, so they share it. */
+  private temporalFacts(workspaceId: string, state: ReturnType<StateStore['snapshot']>, sessions: RuntimeSession[]): TemporalProjectionFacts {
+    const owned = <T extends { workspaceId?: string }>(items: readonly T[]) => items.filter((item) => item.workspaceId === workspaceId);
+    return { channelEvents: owned(state.channelEvents), deliveries: state.deliveries, tasks: owned(state.tasks), results: owned(state.results), sessions, members: owned(state.members), goals: owned(state.goals), knowledge: owned(state.knowledge), nowMs: Date.now() };
+  }
   async panorama(workspaceId: string, refresh = false, temporalFilter: TemporalFilter = 'active') {
     const context = this.context(workspaceId); const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId); const runtime = await Promise.all(sessions.map((item) => this.runtimeStatus(item.id, refresh)));
     const goals = state.goals.filter((goal) => sessions.some((session) => session.goalId === goal.id));
     const placement = (context.workspace.paseoPlacements ?? []).map((item) => ({ controlWorkspaceId: workspaceId, projectId: item.projectId, workspaceId: item.workspaceId, checkout: item.checkout, tabs: sessions.filter((session) => session.placement?.requested.workspaceId === item.workspaceId).map((session) => ({ runtimeId: session.id, agentId: session.externalId, role: state.members.find((member) => member.id === session.memberId)?.role, goalId: session.goalId, goal: goals.find((goal) => goal.id === session.goalId)?.title, cwd: session.workspace, model: session.model, mode: session.mode, thinking: session.thinking })) }));
-    const temporal = projectTemporal({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() }, temporalFilter);
+    const temporal = projectTemporal(this.temporalFacts(workspaceId, state, sessions), temporalFilter);
     return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
   }
   temporalReconciliation(workspaceId: string) {
     const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);
-    return temporalReconciliationPreview({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() });
+    return temporalReconciliationPreview(this.temporalFacts(workspaceId, state, sessions));
   }
   state() { return this.store.snapshot(); }
 }

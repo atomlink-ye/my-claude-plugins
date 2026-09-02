@@ -100,15 +100,15 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     if (event.decisionRequired && disposition === 'active') problems.push('decision');
     if (disposition === 'stale_requires_review') problems.push('stale');
     if (disposition === 'superseded') problems.push('superseded');
-    if (task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst') problems.push('steward_recursion');
+    // Rule 5 / invariant 6: a Steward analysis subject is never a supervised
+    // subject, so one predicate decides both its problem card and its grouping.
+    const stewardSubject = task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst';
+    if (stewardSubject) problems.push('steward_recursion');
     if (event.kind === 'task_completed' && !results.some((result) => result.createdAt <= event.createdAt)) problems.push('completion_without_result');
     if (replacement) problems.push('generation_replaced');
     if (delivery && runtime && delivery.generation !== runtime.generation) problems.push('delivery_generation_mismatch');
     if (nonMonotonic(delivery)) problems.push('timestamp_nonmonotonic');
     if (delivery?.state === 'waiting_safe_point' && (!runtime || runtime.state === 'idle' || runtime.state === 'terminal' || runtime.state === 'transport_indeterminate' || runtime.lastTurnState !== 'running') && eventAge > BUDGET_MS) problems.push('safe_point_invalid');
-    // A Steward may report a supervision breach but must never become a
-    // supervised subject itself. Keep the anomalous evidence at workspace scope.
-    const stewardSubject = task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst';
     const subject = stewardSubject ? { kind: 'workspace' as const, id: event.workspaceId ?? 'workspace', label: 'Excluded Steward analysis' } : task ? { kind: 'task' as const, id: task.id, label: task.title } : runtime ? { kind: 'runtime' as const, id: `${runtime.id}:${runtime.generation}`, label: `${runtime.provider} generation ${runtime.generation}` } : { kind: 'workspace' as const, id: event.workspaceId ?? 'workspace', label: 'Workspace obligation' };
     const owner = event.targetRole ?? (event.targetMemberId ? members.get(event.targetMemberId)?.label ?? 'target member' : task?.ownerMemberId ? members.get(task.ownerMemberId)?.label ?? 'Task owner' : 'Manager/Deputy');
     const nextAction = disposition === 'active' ? (event.deliveryState === 'undeliverable' || event.deliveryState === 'transport_indeterminate' ? 'Deliver to a current reachable target; transport failure does not close this obligation.' : event.decisionRequired ? 'Current owner must record one semantic disposition.' : 'Continue the current obligation.') : disposition === 'stale_requires_review' ? 'Manager or Deputy must review and append a disposition in a later protected slice.' : 'Keep as causal history; no delivery-state rewrite is proposed.';
