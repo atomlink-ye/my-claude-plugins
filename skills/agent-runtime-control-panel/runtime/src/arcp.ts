@@ -1815,6 +1815,48 @@ export class ArcpService implements ExecutionPlacementPort {
     await this.pump(); return resolved;
   }
 
+  /** Manager ACK SLA defaults. Configurable rather than a hardcoded promise:
+   * these are the design's starting local targets, not a product guarantee. */
+  static readonly DEFAULT_ACK_SLA_MS = { urgent: 120_000, normal: 900_000 };
+
+  /** Turn an unhandled Manager obligation into an Owner escalation automatically.
+   *
+   * Two triggers, deliberately distinct. An obligation can be overdue because
+   * nobody acted on it within its SLA, or because the accountable Member is no
+   * longer reachable at all — a lapsed lease means the handler is gone, and
+   * waiting out the remaining SLA would only delay the escalation. Both funnel
+   * through the same exactly-once escalation, so a repeated sweep re-derives
+   * the same durable row instead of waking anyone twice. */
+  async escalateOverdueObligations(input: { nowMs?: number; slaMs?: { urgent: number; normal: number } } = {}): Promise<Array<{ eventId: string; reason: 'ack_sla_expired' | 'handler_lease_expired' }>> {
+    const now = input.nowMs ?? Date.now();
+    const sla = input.slaMs ?? ArcpService.DEFAULT_ACK_SLA_MS;
+    const state = this.store.snapshot();
+    const due: Array<{ eventId: string; reason: 'ack_sla_expired' | 'handler_lease_expired' }> = [];
+    for (const event of state.channelEvents) {
+      if (!['ack_required', 'decision_required'].includes(event.consumptionPolicy)) continue;
+      if (event.consumptionState !== 'open') continue;
+      // An escalation must never escalate itself into a loop.
+      if (event.id.endsWith(':owner-escalation')) continue;
+      if (state.channelEvents.some((item) => item.id === `${event.id}:owner-escalation`)) continue;
+      const handler = event.targetMemberId ? state.members.find((item) => item.id === event.targetMemberId) : undefined;
+      const leaseLapsed = Boolean(handler?.leaseExpiresAt && Date.parse(handler.leaseExpiresAt) < now);
+      const since = Date.parse(event.deliveredAt ?? event.createdAt);
+      const budget = event.urgency === 'urgent' ? sla.urgent : sla.normal;
+      const overdue = Number.isFinite(since) && now - since > budget;
+      if (!leaseLapsed && !overdue) continue;
+      due.push({ eventId: event.id, reason: leaseLapsed ? 'handler_lease_expired' : 'ack_sla_expired' });
+    }
+    const escalated: Array<{ eventId: string; reason: 'ack_sla_expired' | 'handler_lease_expired' }> = [];
+    for (const item of due) {
+      const reason = item.reason === 'handler_lease_expired'
+        ? `accountable handler lease expired with obligation ${item.eventId} still open`
+        : `Manager ACK SLA expired on obligation ${item.eventId}`;
+      try { const result = await this.escalateToOwnerActor({ eventId: item.eventId, reason }); if (!result.alreadyEscalated) escalated.push(item); }
+      catch { /* an obligation that cannot escalate stays visibly open rather than being dropped */ }
+    }
+    return escalated;
+  }
+
   /** Resolve the Owner Actor's CURRENT channel binding. Identity is the Actor;
    * the binding is replaceable, so the newest generation wins and the caller
    * always names an exact binding rather than scanning for a plausible one. */

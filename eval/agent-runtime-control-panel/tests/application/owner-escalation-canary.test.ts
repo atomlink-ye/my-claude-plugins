@@ -143,4 +143,48 @@ describe('owner escalation canary', () => {
     expect(view.observation.mismatch).toBe(false);
     service.close();
   });
+
+  it('escalates automatically on ACK SLA expiry and on a lapsed handler lease, exactly once each', async () => {
+    const { service, workspace, manager, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+
+    // Inside the SLA nothing escalates: an unhandled obligation is not yet a
+    // failure, and waking the Owner early would train them to ignore wakes.
+    expect(await service.escalateOverdueObligations({ nowMs: Date.parse(decision.createdAt) + 1_000 })).toHaveLength(0);
+    expect(channel.wakes).toHaveLength(0);
+
+    // Past the SLA it escalates without anyone asking.
+    const fired = await service.escalateOverdueObligations({ nowMs: Date.parse(decision.createdAt) + 20 * 60_000 });
+    expect(fired).toEqual([{ eventId: decision.id, reason: 'ack_sla_expired' }]);
+    expect(channel.wakes).toHaveLength(1);
+
+    // A repeated sweep must re-derive the same durable row, not wake again.
+    expect(await service.escalateOverdueObligations({ nowMs: Date.parse(decision.createdAt) + 40 * 60_000 })).toHaveLength(0);
+    expect(channel.wakes).toHaveLength(1);
+    service.close();
+  });
+
+  it('treats a lapsed handler lease as immediate unreachability rather than waiting out the SLA', async () => {
+    const { service, workspace, manager, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    // Address it explicitly at the Manager and expire that Manager's lease.
+    await service.store.mutate((state: any) => {
+      state.channelEvents.find((item: any) => item.id === decision.id).targetMemberId = manager.id;
+      state.members.find((item: any) => item.id === manager.id).leaseExpiresAt = new Date(Date.parse(decision.createdAt) - 1_000).toISOString();
+      return undefined;
+    });
+    // Well inside the ACK SLA, so only the lapsed lease can explain a wake.
+    const fired = await service.escalateOverdueObligations({ nowMs: Date.parse(decision.createdAt) + 1_000 });
+    expect(fired).toEqual([{ eventId: decision.id, reason: 'handler_lease_expired' }]);
+    expect(channel.wakes).toHaveLength(1);
+    service.close();
+  });
 });
