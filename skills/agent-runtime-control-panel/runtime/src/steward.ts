@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import type {
   ActionResult,
   ChannelEvent,
@@ -525,7 +526,12 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
   }
 }
 
-function analysisBrief(dossier: StewardDossier): string {
+export function analysisBrief(dossier: StewardDossier): string {
+  const arcpScript = fileURLToPath(new URL('../../scripts/arcp', import.meta.url));
+  const nodeArcp = (...args: string[]) => [process.execPath, arcpScript, ...args].map((value) => `'${value.replaceAll("'", "'\\''")}'`).join(' ');
+  const contextCommand = nodeArcp('workspace', 'context', dossier.workspace.id);
+  const claimCommand = nodeArcp('task', 'claim', '<analysis-task-id>', '--expected-fence', '0');
+  const resultCommand = nodeArcp('result', 'submit', dossier.workspace.id, '--task', '<analysis-task-id>', '--summary', '<analysis>', '--expected-fence', '1', '--evidence', dossier.evidenceRefs.join(','));
   return [
     `Workspace Steward analysis ${dossier.key}.`,
     `You are an ephemeral, read-only Steward. Do not claim, steer or mutate any product work; report only.`,
@@ -533,6 +539,10 @@ function analysisBrief(dossier: StewardDossier): string {
     `Runtime ${dossier.session?.id ?? 'none'} state=${dossier.session?.state ?? 'none'}.`,
     `Durable material progress ${dossier.materialProgress.latestAt ?? 'none'}, required since ${dossier.request.progressSince}.`,
     `ARCP already classified this ${dossier.classification} with recommendation ${dossier.recommendation} because ${dossier.why}.`,
-    `Read the Workspace with 'arcp workspace context ${dossier.workspace.id}' and submit one Result whose summary is the analysis narrative confirming or disputing that classification, citing ${dossier.evidenceRefs.join(' ')}.`,
+    'Read the Workspace with the packaged command "' + contextCommand + '". The runtime handoff supplies your own analysis Task id; claim it with "' + claimCommand + '". Submit one cited Result whose summary is the analysis narrative confirming or disputing that classification with "' + resultCommand + '" using evidence refs ' + dossier.evidenceRefs.join(' ') + '.',
   ].join(' ');
+  /*
+    `Read the Workspace with the packaged command \`${nodeArcp('workspace', 'context', dossier.workspace.id)}\`. The runtime handoff supplies your own analysis Task id; claim it with \`${nodeArcp('task', 'claim', '<analysis-task-id>', '--expected-fence', '0')}\`. Submit one cited Result whose summary is the analysis narrative confirming or disputing that classification with \`${nodeArcp('result', 'submit', dossier.workspace.id, '--task', '<analysis-task-id>', '--summary', '<analysis>', '--expected-fence', '1', '--evidence', dossier.evidenceRefs.join(',')}\` using evidence refs ${dossier.evidenceRefs.join(' ')}.`,
+  ].join(' ');
+  */
 }

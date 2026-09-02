@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ArcpService, ArcpStore, type State } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
+import { analysisBrief, WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
 import { evaluateSupervision, supervisionPolicyId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
 class DiscoveryCli {
@@ -112,13 +112,19 @@ describe('Round-3 convergence proofs', () => {
     await service.claimTask(task.id, worker.member.id, 0);
     const stale = '2026-01-01T00:00:00.000Z';
     await service.store.mutate((state: State) => { const item = state.tasks.find((value) => value.id === task.id)!; item.createdAt = stale; item.updatedAt = stale; });
-    const entered: string[] = [];
-    const analyst: StewardAnalyst = { profileId: 'codex-full-access', async analyze(dossier: StewardDossier) { entered.push(dossier.request.trigger); return { provider: 'codex', model: 'gpt-5.6-terra', narrative: 'stalled task is ready for steering', cited: true, evidenceRefs: [dossier.subject.id] }; } };
+    const entered: string[] = []; let brief = '';
+    const analyst: StewardAnalyst = { profileId: 'codex-full-access', async analyze(dossier: StewardDossier) { entered.push(dossier.request.trigger); brief = analysisBrief(dossier); return { provider: 'codex', model: 'gpt-5.6-terra', narrative: 'stalled task is ready for steering', cited: true, evidenceRefs: [dossier.subject.id] }; } };
     service.setStewardFactory(async (ownedService, workspaceId) => new WorkspaceSteward(stewardViewOf(ownedService), analyst, { workspaceId, stewardProfileId: 'codex-full-access', stewardMemberId: stewardMember.member.id, cooldownMs: 60_000, automatic: true, manualProgressWindowMs: 60_000 }));
     await service.configureSupervision({ workspaceId: workspace.id, inactivityAfterMs: 1_000, cooldownMs: 60_000 });
     const reviews = await service.evaluateSupervision(Date.now() + 3_600_000);
     expect(reviews).toHaveLength(1);
     expect(entered).toEqual(['automatic']);
+    expect(brief).toContain(process.execPath);
+    expect(brief).toContain('skills/agent-runtime-control-panel/scripts/arcp');
+    expect(brief).toContain('workspace');
+    expect(brief).toContain('task');
+    expect(brief).toContain('result');
+    expect(brief).toContain('--evidence');
     expect(service.state().knowledge.filter((entry) => entry.tags.includes('workspace-steward'))).toHaveLength(1);
     expect(service.state().knowledge.at(-1)?.text).toContain('stalled task is ready for steering');
     service.close();

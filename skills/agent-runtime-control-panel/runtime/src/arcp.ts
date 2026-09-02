@@ -80,6 +80,9 @@ export const DEFAULT_STEWARD_PROFILE_ID = 'codex-full-access';
 export const STEWARD_ANALYSIS_ROLE = 'steward-analyst';
 const idFor = (prefix: string, value: string) => `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 20)}`;
 const now = () => new Date().toISOString();
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+/** Resolve the packaged CLI from the runtime module, in both src and dist. */
+export const packagedArcpCommand = (...args: string[]): string => [process.execPath, fileURLToPath(new URL('../../scripts/arcp', import.meta.url)), ...args].map(shellQuote).join(' ');
 
 /**
  * Resolve whether a member is an intended event target. Owners can act on
@@ -220,7 +223,7 @@ export class PaseoAdapter implements RuntimeAdapter {
   models(provider: string) { return this.cli.run(['provider', 'models', provider, '--json'], { timeoutMs: 5_000 }); }
   launch(profile: Profile, goalTitle: string, workspace?: string, context?: RuntimeLaunchContext) {
     const handoff = context?.workspaceId && context.taskId && context.runtimeId
-      ? `\n\nARCP Worker handoff: workspace ${context.workspaceId}, task ${context.taskId}, runtime ${context.runtimeId}. Claim with \`arcp task claim ${context.taskId} --runtime ${context.runtimeId} --expected-fence 0\`. Report durable learning with \`arcp knowledge add ${context.workspaceId} --runtime ${context.runtimeId} --kind learning --text '<learning>'\` and submit the candidate with \`arcp result submit ${context.workspaceId} --runtime ${context.runtimeId} --task ${context.taskId} --summary '<summary>' --expected-fence 1\`.`
+      ? `\n\nARCP Worker handoff: workspace ${context.workspaceId}, task ${context.taskId}, runtime ${context.runtimeId}. Use the packaged CLI through Node. Claim with \`${packagedArcpCommand('task', 'claim', context.taskId, '--expected-fence', '0')}\`. Report durable learning with \`${packagedArcpCommand('knowledge', 'add', context.workspaceId, '--kind', 'learning', '--text', '<learning>')}\` and submit the candidate with \`${packagedArcpCommand('result', 'submit', context.workspaceId, '--task', context.taskId, '--summary', '<summary>', '--expected-fence', '1', '--evidence', '<evidence-ref[,evidence-ref...]>')}\`.`
       : '';
     return this.cli.run(['run', '-d', '--json', '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${handoff}`], { timeoutMs: 30_000 });
   }

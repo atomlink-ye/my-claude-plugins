@@ -8,7 +8,7 @@ const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   task create|claim|list WORKSPACE [--expected-fence N]
   knowledge add|search|list WORKSPACE
-  result submit|list WORKSPACE [--expected-fence N] [--source-id ID]
+  result submit|list WORKSPACE [--expected-fence N] [--source-id ID] [--evidence REF[,REF...]]
   channel list WORKSPACE [--kind K] [--state S] [--decision-required]
   channel ack EVENT
   channel resolve EVENT --summary '...' [--verdict accept|refuse]
@@ -50,7 +50,8 @@ const knownHelpAreas = ['doctor','ensure','preflight','actor','workspace','task'
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
-const f = {}, p = []; for (let i=0;i<args.length;i++) { if (args[i].startsWith('--')) { f[args[i].slice(2)] = i + 1 < args.length && !args[i+1].startsWith('--') ? args[++i] : true; } else p.push(args[i]); }
+const f = {}, p = []; for (let i=0;i<args.length;i++) { if (args[i].startsWith('--')) { const key = args[i].slice(2), value = i + 1 < args.length && !args[i+1].startsWith('--') ? args[++i] : true; f[key] = f[key] === undefined ? value : Array.isArray(f[key]) ? [...f[key], value] : [f[key], value]; } else p.push(args[i]); }
+const evidenceRefs = (value) => (Array.isArray(value) ? value : [value]).flatMap((item) => String(item).split(',')).map((item) => item.trim()).filter(Boolean);
 const bool = (name) => f[name] === true || f[name] === 'true';
 const call = async (method, path, body, memberOnly=false, redactCredential=false) => { const s = await load(); const memberCredential = f.runtime && s.runtimeMemberCredentials?.[f.runtime] ? s.runtimeMemberCredentials[f.runtime] : s.memberCredential; const h = { ...(!memberOnly && admin ? {'x-arcp-api-key':admin} : {}), ...(!memberOnly && s.actorCredential ? {'x-arcp-actor-key':s.actorCredential} : {}), ...(memberCredential ? {'x-arcp-member-key':memberCredential} : {}), ...(body ? {'content-type':'application/json'} : {}) }; const r = await fetch(base + path, {method,headers:h,...(body ? {body:JSON.stringify(body)} : {})}); const v = await r.json(); const output = redactCredential && v?.credential ? (() => { const {credential, ...safe}=v; return {...safe,credentialStored:true}; })() : v; console.log(JSON.stringify(output,null,2)); if (!r.ok) process.exitCode=1; return v; };
 const workspaceId = async () => { const s = await load(), value = f.workspace || s.workspaceId; if (!value) { console.error('no workspace selected; run arcp workspace create, arcp workspace join, or pass --workspace WORKSPACE'); process.exitCode = 2; return undefined; } return value; };
@@ -94,7 +95,7 @@ else if (area === 'send') await call('POST','/v1/deliveries',{runtimeSessionId:p
 else if (area === 'reuse') await call('POST','/v1/reuse',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),cacheConfirmation:f.confirm});
 else if (area === 'interrupt') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'interrupt',reason:f.reason,cacheConfirmation:f.confirm});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')},true);
-else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])}),...(f['source-id'] === undefined ? {} : {sourceId:String(f['source-id'])})},true);
+else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])}),...(f['source-id'] === undefined ? {} : {sourceId:String(f['source-id'])}),...(f.evidence === undefined ? {} : {evidenceRefs:evidenceRefs(f.evidence)})},true);
 else if (area === 'result' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/results`);
 else if (area === 'channel' && action === 'list') { const workspace=p[0]||await workspaceId(); if(workspace) { const decisionRequired = f['decision-required'] === true || f['decision-required'] === 'true' ? '1' : f['decision-required'] === false || f['decision-required'] === 'false' ? '0' : undefined; await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/events?${new URLSearchParams(Object.fromEntries(Object.entries({kind:f.kind,state:f.state,'decision-required':decisionRequired}).filter(([,v])=>v!==undefined))).toString()}`); } }
 else if (area === 'channel' && action === 'ask') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0]||f.runtime)}/decision`,{question:f.question||p.slice(1).join(' '),...(f.options?{options:String(f.options).split(',').map((v)=>v.trim()).filter(Boolean)}:{})});
