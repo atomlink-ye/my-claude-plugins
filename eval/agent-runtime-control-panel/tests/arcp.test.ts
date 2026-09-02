@@ -19,14 +19,14 @@ class FakeCli {
   sends = 0;
   lastLaunchArgs: string[] = [];
   lastEnv: Record<string, string> = {};
-  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown) {}
+  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
   async run(args: string[], options: { env?: Record<string, string> } = {}) {
     if (options.env) this.lastEnv = options.env;
     if (this.fail && args[0] === 'run') throw new Error('timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
     if (args[0] === 'run') { this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
-    if (args[0] === 'ls') return { value: [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
+    if (args[0] === 'ls') return { value: this.registryListing ?? [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
     if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
@@ -56,8 +56,8 @@ class FakeAcpProcess extends EventEmitter {
   update(sessionUpdate: string, extra: Record<string, unknown> = {}): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-session-1', update: { sessionUpdate, ...extra } } }) + '\n'); }
   permission(): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/request_permission', params: { sessionId: 'acp-session-1' } }) + '\n'); }
 }
-async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown) {
-  const service = new ArcpService(root, new FakeCli(fail, providers, inspectValue, modeListing) as any, undefined, modeClientFactory); await service.init(); return service;
+async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown, registryListing?: unknown) {
+  const service = new ArcpService(root, new FakeCli(fail, providers, inspectValue, modeListing, registryListing) as any, undefined, modeClientFactory); await service.init(); return service;
 }
 
 describe('ARCP MVE control core', () => {
@@ -101,6 +101,33 @@ describe('ARCP MVE control core', () => {
     expect(handoff).toContain(`'knowledge' 'add' '${workspace.workspace.id}'`);
     expect(handoff).toContain(`'result' 'submit' '${workspace.workspace.id}'`);
     const launchArgs = (service.cli as any).lastLaunchArgs as string[]; expect(launchArgs).toContain('--env'); expect(launchArgs.some((arg) => arg.startsWith('ARCP_RUNTIME_MEMBER_CREDENTIAL='))).toBe(false); expect(launchArgs.some((arg) => arg.startsWith('ARCP_CLIENT_STATE=') && arg.includes('/runtime-members/'))).toBe(true);
+  });
+  it('uses an explicit Paseo Workspace ID for placement while retaining the requested cwd', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-placement-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
+    const { actor } = await service.registerActor({ clientIdentity: 'placement-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'stable placement' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'placed task', profileId: 'codex-worker', paseoProjectId: 'prj_my-claude-plugins', paseoWorkspaceId: 'wks_0e6198d7efcef5a2', workspace: '/checkout/skills/agent-runtime-control-panel/runtime' }) as any;
+    const args = (service.cli as any).lastLaunchArgs as string[];
+    expect(args.slice(args.indexOf('--workspace'), args.indexOf('--workspace') + 2)).toEqual(['--workspace', 'wks_0e6198d7efcef5a2']);
+    expect(args.slice(args.indexOf('--cwd'), args.indexOf('--cwd') + 2)).toEqual(['--cwd', '/checkout/skills/agent-runtime-control-panel/runtime']);
+    expect(args).toEqual(expect.arrayContaining(['--title', 'WORKER · placed task', '--label', `arcp-runtime=${started.session.id}`, '--label', 'arcp-role=worker']));
+    expect(started.session.placement).toEqual({ requested: { projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'idle' }, status: 'PLACEMENT_MATCH' });
+    service.close();
+  });
+  it('reports a Paseo placement mismatch without calling it transport indeterminate', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-mismatch-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', workspaceId: 'wks_other' });
+    const { actor } = await service.registerActor({ clientIdentity: 'mismatch-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'mismatch' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'mismatch task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_expected' }) as any;
+    expect(started.session).toMatchObject({ state: 'placement_mismatch', placement: { status: 'PLACEMENT_MISMATCH', requested: { workspaceId: 'wks_expected', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_other', agentId: 'paseo-session-1' } } });
+    service.close();
+  });
+  it('reconciles an archived Paseo Agent to terminal while retaining its placement history', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-archived-')); const service = await control(root, false, ['codex'], {}, undefined, undefined, [{ id: 'paseo-session-1', status: 'archived', workspaceId: 'wks_0e6198d7efcef5a2' }]);
+    const { actor } = await service.registerActor({ clientIdentity: 'archive-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'archive' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_0e6198d7efcef5a2' }) as any;
+    const reconciled = await service.reconcile(started.session.id);
+    expect(reconciled).toMatchObject({ id: started.session.id, state: 'terminal', placement: { requested: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'archived' }, status: 'PLACEMENT_MATCH' } });
+    service.close();
   });
   it('maps Hermes ACP turn-end events to the existing idle observation and safe-point event', async () => {
     const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any); const launched = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'canary', '.');
