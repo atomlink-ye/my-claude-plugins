@@ -35,4 +35,16 @@ describe('TemporalProjection', () => {
     expect(projection.generatedAt).toBe('2026-09-02T02:00:01.000Z');
     expect(projection.cards[0].headline).not.toContain('task_opaque999');
   });
+
+  it('keeps a ready Task with a terminal Runtime as Manager-owned review debt, never completion', () => {
+    const stranded = facts([], {
+      tasks: [{ id: 'task-stranded', workspaceId: 'w', title: 'Stranded lane', lifecycle: 'ready', fence: 0, createdAt: at, updatedAt: at }],
+      results: [],
+      sessions: [{ id: 'runtime-old', actorId: 'a', goalId: 'g', taskId: 'task-stranded', bindingId: 'b', generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'terminal', createdAt: at }],
+    });
+    const card = projectTemporal(stranded, 'problems').cards[0];
+    expect(card).toMatchObject({ disposition: 'stale_requires_review', owner: 'Manager/Deputy', refs: { taskId: 'task-stranded' } });
+    expect(card.problems).toContain('terminal_runtime_without_completion');
+    expect(card.nextAction).toContain('do not infer completion');
+  });
 });

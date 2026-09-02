@@ -4,7 +4,7 @@ import { projectChannelEvent } from './channel-projection.js';
 /** Read-only causal view. These are deliberately not durable state fields. */
 export type TemporalDisposition = 'active' | 'resolved' | 'superseded' | 'invalidated' | 'expired_informational' | 'stale_requires_review';
 export type TemporalFilter = 'active' | 'problems' | { taskId: string };
-export type TemporalProblemReason = 'overdue' | 'stale' | 'superseded' | 'decision' | 'permission' | 'transport_uncertain' | 'duplicate' | 'completion_without_result' | 'generation_replaced' | 'steward_recursion';
+export type TemporalProblemReason = 'overdue' | 'stale' | 'superseded' | 'decision' | 'permission' | 'transport_uncertain' | 'duplicate' | 'completion_without_result' | 'generation_replaced' | 'steward_recursion' | 'delivery_generation_mismatch' | 'timestamp_nonmonotonic' | 'safe_point_invalid' | 'terminal_runtime_without_completion';
 
 export interface TemporalProjectionFacts {
   channelEvents: readonly ChannelEvent[];
@@ -47,6 +47,15 @@ const eventRuntime = (event: ChannelEvent, deliveries: readonly Delivery[], sess
   const delivery = deliveries.find((item) => item.eventId === event.id);
   return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : undefined;
 };
+const reachable = (event: ChannelEvent, delivery: Delivery | undefined, sessions: readonly RuntimeSession[]) => {
+  if (delivery) return sessions.some((session) => session.id === delivery.runtimeSessionId && session.generation === delivery.generation && !['terminal', 'transport_indeterminate'].includes(session.state));
+  return sessions.some((session) => (event.targetMemberId ? session.memberId === event.targetMemberId : event.targetRole ? false : true) && !['terminal', 'transport_indeterminate'].includes(session.state));
+};
+const nonMonotonic = (delivery: Delivery | undefined) => {
+  if (!delivery) return false;
+  const timestamps = [delivery.createdAt, delivery.safePointObservedAt, delivery.attemptedAt, delivery.deliveredAt, delivery.processedAt, delivery.acknowledgedAt].filter((item): item is string => Boolean(item)).map(Date.parse);
+  return timestamps.some((item, index) => index > 0 && item < timestamps[index - 1]);
+};
 const refs = (event: ChannelEvent) => ({ taskId: event.taskId, resultId: event.resultId, candidateSha: event.content.evidenceRefs.find((ref) => /^[0-9a-f]{7,40}$/i.test(ref)), knowledgeIds: event.content.evidenceRefs.filter((ref) => ref.startsWith('knowledge_')) });
 
 /**
@@ -81,7 +90,10 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     else if (task?.lifecycle === 'completed' && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'stale_requires_review'; dispositionReason = 'Task is complete but no matching durable Result proves how this authority event was resolved.'; }
     const problems: TemporalProblemReason[] = [];
     const eventAge = age(event.createdAt, now);
-    if ((event.deliveryState === 'queued' || delivery?.state === 'waiting_safe_point') && eventAge > BUDGET_MS) problems.push('overdue');
+    const targetReachable = reachable(event, delivery, facts.sessions);
+    // Age is a budget signal only after a durable reachability contradiction;
+    // it is never semantic staleness by itself.
+    if (event.deliveryState === 'queued' && !targetReachable && !event.undeliverableReason && eventAge > BUDGET_MS) problems.push('overdue');
     if (event.deliveryState === 'delivered' && !event.processedAt && eventAge > BUDGET_MS) problems.push('overdue');
     if (event.deliveryState === 'transport_indeterminate' || event.kind === 'transport_uncertainty') problems.push('transport_uncertain');
     if (event.kind === 'permission') problems.push('permission');
@@ -91,6 +103,9 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     if (task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst') problems.push('steward_recursion');
     if (event.kind === 'task_completed' && !results.some((result) => result.createdAt <= event.createdAt)) problems.push('completion_without_result');
     if (replacement) problems.push('generation_replaced');
+    if (delivery && runtime && delivery.generation !== runtime.generation) problems.push('delivery_generation_mismatch');
+    if (nonMonotonic(delivery)) problems.push('timestamp_nonmonotonic');
+    if (delivery?.state === 'waiting_safe_point' && (!runtime || runtime.state === 'idle' || runtime.state === 'terminal' || runtime.state === 'transport_indeterminate' || runtime.lastTurnState !== 'running') && eventAge > BUDGET_MS) problems.push('safe_point_invalid');
     // A Steward may report a supervision breach but must never become a
     // supervised subject itself. Keep the anomalous evidence at workspace scope.
     const stewardSubject = task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst';
@@ -99,6 +114,40 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     const nextAction = disposition === 'active' ? (event.deliveryState === 'undeliverable' || event.deliveryState === 'transport_indeterminate' ? 'Deliver to a current reachable target; transport failure does not close this obligation.' : event.decisionRequired ? 'Current owner must record one semantic disposition.' : 'Continue the current obligation.') : disposition === 'stale_requires_review' ? 'Manager or Deputy must review and append a disposition in a later protected slice.' : 'Keep as causal history; no delivery-state rewrite is proposed.';
     return { id: event.id, subject, eventId: event.id, eventTime: event.createdAt, ageMs: eventAge, sender: channel.sender, ...(channel.stage ? { stage: channel.stage } : {}), headline: channel.headline, summary: channel.summary.join(' '), transport: { state: event.deliveryState, queuedAt: event.createdAt, ...(event.deliveredAt ? { deliveredAt: event.deliveredAt } : {}), ...(event.processedAt ? { processedAt: event.processedAt } : {}), ...(delivery ? { targetGeneration: delivery.generation } : {}), ...(event.undeliverableReason ? { undeliverableReason: event.undeliverableReason } : {}) }, disposition, dispositionReason, causation, owner, nextAction, ...(problems.includes('overdue') ? { dueMs: BUDGET_MS } : {}), refs: refs(event), problems };
   });
+  // A terminal Runtime is transport history, never Task completion.  When its
+  // unowned ready Task has no durable Result, the causal gap is ambiguous: show
+  // it as Manager-owned review debt instead of inventing a completion or a
+  // deterministic disposition for an event that does not exist.
+  for (const runtime of facts.sessions.filter((item) => item.state === 'terminal' && item.taskId)) {
+    const task = tasks.get(runtime.taskId!);
+    if (!task || task.lifecycle !== 'ready' || task.ownerMemberId || (resultsByTask.get(task.id) ?? []).length) continue;
+    cards.push({
+      id: `temporal:${task.id}:${runtime.id}`,
+      subject: { kind: 'task', id: task.id, label: task.title },
+      eventTime: runtime.lastObservedAt ?? runtime.createdAt,
+      ageMs: age(runtime.lastObservedAt ?? runtime.createdAt, now),
+      sender: { label: 'ARCP temporal projection', role: 'system' },
+      headline: 'Terminal runtime left a ready Task without a durable Result',
+      summary: 'The Runtime ended, but its Task remains ready and unowned. Process exit is transport history, not Task completion.',
+      transport: { state: runtime.state, targetGeneration: runtime.generation },
+      disposition: 'stale_requires_review',
+      dispositionReason: 'A terminal Runtime and ready unowned Task do not prove whether work should be resumed, reassigned, or retired.',
+      causation: { causedBy: runtime.id },
+      owner: 'Manager/Deputy',
+      nextAction: 'Manager must decide whether to relaunch, reassign, or explicitly close the Task; do not infer completion from Runtime termination.',
+      refs: { taskId: task.id, knowledgeIds: [] },
+      problems: ['stale', 'terminal_runtime_without_completion'],
+    });
+  }
+  // Invariant 2: a task fence has one canonical completion. Later completions
+  // are duplicate evidence; they never introduce another transition.
+  const completed = new Map<string, TemporalCard[]>();
+  for (const card of cards.filter((card) => facts.channelEvents.find((event) => event.id === card.eventId)?.kind === 'task_completed' && card.refs.taskId)) {
+    const result = facts.results.find((item) => item.id === card.refs.resultId);
+    const task = tasks.get(card.refs.taskId!); const key = `${card.refs.taskId}:${result?.fence ?? task?.fence ?? 0}`;
+    completed.set(key, [...(completed.get(key) ?? []), card]);
+  }
+  for (const duplicates of completed.values()) for (const card of duplicates.sort((a, b) => a.eventTime.localeCompare(b.eventTime)).slice(1)) { card.problems.push('duplicate'); card.disposition = 'superseded'; card.dispositionReason = 'Repeated task completion for the same Task fence is duplicate evidence, not a new transition.'; card.causation.supersedes = duplicates[0].id; }
   // Rule 4: same sourceId is one semantic Result. Mark all but the earliest
   // corresponding candidate cards as duplicate evidence, never extra work.
   for (const result of facts.results.filter((item) => item.sourceId)) {
@@ -112,4 +161,4 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
   return { filter, generatedAt: nowText, groups: [...grouped.values()], cards: selected, problems: cards.filter((card) => card.problems.length > 0), reconciliation };
 }
 
-export const temporalReconciliationPreview = (facts: TemporalProjectionFacts) => projectTemporal(facts, 'active').reconciliation;
+export const temporalReconciliationPreview = (facts: TemporalProjectionFacts) => projectTemporal(facts).reconciliation;
