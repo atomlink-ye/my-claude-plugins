@@ -55,7 +55,11 @@ export class PaseoCli {
           reject(new Error(`paseo exited ${code}: ${stderr.trim() || stdout.trim()}`));
           return;
         }
-        resolve({ value: parseJson(stdout), stdout, stderr });
+        try {
+          const value = parseJson(stdout);
+          if (args.includes('--json') && typeof value === 'string') throw new Error(`paseo emitted malformed JSON: ${value}`);
+          resolve({ value, stdout, stderr });
+        } catch (error) { reject(error); }
       });
     });
   }
@@ -64,7 +68,15 @@ export class PaseoCli {
 export function parseJson(text: string): unknown {
   const trimmed = text.trim();
   if (!trimmed) return undefined;
-  try { return JSON.parse(trimmed); } catch { return trimmed; }
+  try { return JSON.parse(trimmed); }
+  catch {
+    const [prelude, ...payload] = trimmed.split(/\r?\n/);
+    if (prelude.startsWith('Using workspace ')) {
+      try { return JSON.parse(payload.join('\n')); }
+      catch { throw new Error('paseo emitted malformed JSON after workspace prelude'); }
+    }
+    return trimmed;
+  }
 }
 
 export function asRecord(value: unknown): Record<string, any> {

@@ -11,6 +11,7 @@ import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS } from '../../../skills/a
 import { createServer, resolveDataDir } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { renderTuiSnapshot, runTui } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
 import { HermesAcpAdapter } from '../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
+import { PaseoCli, parseJson } from '../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +62,18 @@ async function control(root: string, fail = false, providers = ['codex'], inspec
 }
 
 describe('ARCP MVE control core', () => {
+  it('parses Paseo’s documented workspace prelude followed by one JSON payload', async () => {
+    const output = 'Using workspace wks_0e6198d7efcef5a2\n{"id":"paseo-agent-1"}\n';
+    expect(parseJson(output)).toEqual({ id: 'paseo-agent-1' });
+    const cli = new PaseoCli(process.execPath);
+    await expect(cli.run(['-e', `process.stdout.write(${JSON.stringify(output)})`, '--', '--json'])).resolves.toMatchObject({ value: { id: 'paseo-agent-1' } });
+  });
+  it('rejects malformed mixed output for a Paseo JSON command', async () => {
+    const output = 'Using workspace wks_0e6198d7efcef5a2\n{"id":"paseo-agent-1"}\nnot-json\n';
+    expect(() => parseJson(output)).toThrow('malformed JSON after workspace prelude');
+    const cli = new PaseoCli(process.execPath);
+    await expect(cli.run(['-e', `process.stdout.write(${JSON.stringify(output)})`, '--', '--json'])).rejects.toThrow('malformed JSON after workspace prelude');
+  });
   it('keeps the shipped Claude cache thresholds at 55 and 60 minutes', () => {
     expect(CLAUDE_CACHE_DEFAULTS).toEqual({ expiringMinutes: 55, expiredMinutes: 60 });
   });
