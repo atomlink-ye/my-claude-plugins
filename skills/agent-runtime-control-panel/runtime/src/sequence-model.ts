@@ -229,16 +229,16 @@ export const SEQUENCE_REQUIRED_FACTS: Readonly<Partial<Record<SequenceEntryKind,
   task_claimed: ['taskId', 'fence', 'memberId'],
   task_fence_advanced: ['taskId', 'fence'],
   task_lifecycle_changed: ['taskId', 'lifecycle'],
-  runtime_launched: ['runtimeId', 'generation', 'provider', 'hasContract'],
-  runtime_generation_changed: ['runtimeId', 'generation'],
-  runtime_terminal: ['runtimeId', 'generation'],
-  delivery_queued: ['deliveryId', 'purpose', 'targetGeneration'],
-  delivery_safe_point: ['deliveryId', 'purpose', 'targetGeneration'],
-  delivery_delivered: ['deliveryId', 'purpose', 'targetGeneration'],
-  delivery_processed: ['deliveryId', 'purpose', 'targetGeneration'],
-  delivery_acknowledged: ['deliveryId', 'purpose', 'targetGeneration'],
-  delivery_withdrawn: ['deliveryId', 'purpose'],
-  delivery_undeliverable: ['deliveryId', 'purpose', 'undeliverableReason'],
+  runtime_launched: ['runtimeId', 'lineageId', 'generation', 'provider', 'hasContract'],
+  runtime_generation_changed: ['runtimeId', 'lineageId', 'generation'],
+  runtime_terminal: ['runtimeId', 'lineageId', 'generation'],
+  delivery_queued: ['deliveryId', 'lineageId', 'purpose', 'targetGeneration'],
+  delivery_safe_point: ['deliveryId', 'lineageId', 'purpose', 'targetGeneration'],
+  delivery_delivered: ['deliveryId', 'lineageId', 'purpose', 'targetGeneration'],
+  delivery_processed: ['deliveryId', 'lineageId', 'purpose', 'targetGeneration'],
+  delivery_acknowledged: ['deliveryId', 'lineageId', 'purpose', 'targetGeneration'],
+  delivery_withdrawn: ['deliveryId', 'lineageId', 'purpose'],
+  delivery_undeliverable: ['deliveryId', 'lineageId', 'purpose', 'undeliverableReason'],
   result_submitted: ['resultId', 'taskId', 'fence', 'memberId', 'status'],
   verdict_recorded: ['eventId', 'verdict'],
   surface_claimed: ['surfaceId', 'claimId', 'runtimeSessionId', 'active'],
@@ -249,6 +249,23 @@ export const SEQUENCE_REQUIRED_FACTS: Readonly<Partial<Record<SequenceEntryKind,
   route_handler_changed: ['routeId'],
   route_escalated: ['routeId'],
 });
+
+/**
+ * The generation-spanning identity of a runtime lineage.
+ *
+ * ARCP models an advanced RuntimeGeneration as a NEW RuntimeSession row that
+ * shares the previous row's `bindingId`. So `runtimeId` identifies one episode,
+ * never the continuing thing that episode belongs to. Any rule that asks "has
+ * this runtime moved on?" must join on the lineage, not the session id, or it
+ * silently compares an old episode only against itself and never fires.
+ *
+ * Producers set `lineageId` from `RuntimeSession.bindingId`. Consumers join on
+ * this and fall back to `runtimeId` only for records that predate the key.
+ */
+export const sequenceLineageOf = (entry: SequenceEntry): string | undefined => {
+  const lineage = entry.facts.lineageId ?? entry.facts.runtimeId;
+  return lineage === undefined ? entry.refs.find((ref) => ref.kind === 'runtime')?.id : String(lineage);
+};
 
 /** Which required `facts` keys an entry is missing. Empty means conformant. */
 export const missingSequenceFacts = (entry: SequenceEntry): string[] =>
