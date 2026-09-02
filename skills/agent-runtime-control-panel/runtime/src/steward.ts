@@ -112,6 +112,9 @@ export interface StewardDossier {
 
 export interface StewardNarrative {
   narrative?: string;
+  /** Production Codex analysts set this only after a cited Result is found. */
+  cited?: boolean;
+  evidenceRefs?: string[];
   provider: string;
   model: string;
   thinking?: string;
@@ -133,7 +136,7 @@ export interface StewardWorkspaceView {
   notifyManager(input: { id: string; workspaceId: string; taskId?: string; sourceMemberId: string; summary: string; evidenceRefs: string[]; urgency: 'normal' | 'urgent' }): Promise<ChannelEvent>;
 }
 
-export type StewardOutcomeStatus = 'analyzed' | 'deduplicated' | 'cooldown' | 'disabled';
+export type StewardOutcomeStatus = 'analyzed' | 'deduplicated' | 'cooldown' | 'disabled' | 'timeout';
 
 export interface StewardAnalysisOutcome {
   status: StewardOutcomeStatus;
@@ -285,8 +288,11 @@ export class WorkspaceSteward {
     // Owner-selected provider only. A failure here is loud and leaves the
     // dedupe slot unused, so the analysis can be retried once Codex returns.
     const narrative = await this.analyst.analyze(dossier);
+    // A production timeout or an uncited analysis is not a Steward report.
+    // Keep the dedupe slot free so a later bounded run can retry.
+    if (narrative.cited === false || !narrative.narrative) return { ...base, status: 'timeout', why: 'Steward analysis timed out or produced no cited Result' };
 
-    const analysisRefs = [...evidenceRefs, ...(narrative.runtimeSessionId ? [narrative.runtimeSessionId] : []), ...(narrative.analysisTaskId ? [narrative.analysisTaskId] : [])];
+    const analysisRefs = [...evidenceRefs, ...(narrative.evidenceRefs ?? []), ...(narrative.runtimeSessionId ? [narrative.runtimeSessionId] : []), ...(narrative.analysisTaskId ? [narrative.analysisTaskId] : [])];
     const text = renderReport(dossier, narrative, analysisRefs);
     const report = await this.view.recordReport({
       workspaceId: request.workspaceId,
@@ -461,7 +467,7 @@ export function stewardViewOf(service: {
 
 type StewardRuntimeService = {
   preflight(input: { profileId: string }): Promise<ActionResult>;
-  startManaged(input: { actorId: string; workspaceId: string; title: string; profileId: string }): Promise<ActionResult | { task: Task; session: RuntimeSession; member: Member }>;
+  startManaged(input: { actorId: string; workspaceId: string; title: string; profileId: string; role?: string; taskScope?: 'product' | 'steward_analysis' }): Promise<ActionResult | { task: Task; session: RuntimeSession; member: Member }>;
   stopRuntime(id: string): Promise<RuntimeSession>;
   state(): State;
 };
@@ -485,7 +491,7 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
     const substituted = (['provider', 'model', 'mode', 'thinking'] as const).find((field) => preflight.requested[field] !== preflight.effective[field]);
     if (substituted) throw new StewardProviderUnavailableError(`Steward provider substitution refused: ${substituted} ${String(preflight.requested[substituted])} would become ${String(preflight.effective[substituted])}`);
 
-    const started = await this.service.startManaged({ actorId: this.options.actorId, workspaceId: dossier.workspace.id, title: analysisBrief(dossier), profileId: this.options.profileId });
+    const started = await this.service.startManaged({ actorId: this.options.actorId, workspaceId: dossier.workspace.id, title: analysisBrief(dossier), profileId: this.options.profileId, role: 'steward-analyst', taskScope: 'steward_analysis' });
     if ('action' in started) throw new StewardProviderUnavailableError(`Steward runtime was held: ${started.why}`);
     const { session, task } = started;
     try {
@@ -494,7 +500,7 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
       }
       const narrative = await this.awaitNarrative(task.id);
       return {
-        ...(narrative ? { narrative } : {}),
+        ...(narrative ? { narrative: narrative.summary, cited: true, evidenceRefs: narrative.evidenceRefs } : { cited: false }),
         provider: session.provider,
         model: session.model,
         ...(session.thinking ? { thinking: session.thinking } : {}),
@@ -506,13 +512,13 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
     }
   }
 
-  private async awaitNarrative(taskId: string): Promise<string | undefined> {
+  private async awaitNarrative(taskId: string): Promise<{ summary: string; evidenceRefs: string[] } | undefined> {
     const pollMs = this.options.pollMs ?? 500;
     const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.()));
     const deadline = Date.now() + this.options.waitMs;
     for (;;) {
       const result = this.service.state().results.find((item) => item.taskId === taskId);
-      if (result) return result.summary;
+      if (result?.status === 'candidate' && result.evidenceRefs.length > 0) return { summary: result.summary, evidenceRefs: result.evidenceRefs };
       if (Date.now() >= deadline) return undefined;
       await sleep(pollMs);
     }

@@ -425,9 +425,10 @@ describe('Workspace Steward — member-facing API shares the automatic path', ()
 
       const steward = await stewardFor(service, seeded.workspaceId);
       const automatic = await steward.onSupervisionBreach(breachFor(seeded.workspaceId, seeded.task.id, seeded.task.fence));
-      expect(automatic.status).toBe('analyzed');
+      expect(automatic.status).toBe('timeout');
       const launchesAfterAutomatic = cli.launches;
       expect(launchesAfterAutomatic).toBe(launchesBeforeAutomatic + 1);
+      expect((await steward.reports(seeded.workspaceId))).toHaveLength(0);
 
       const manual = await fetch(`${base}/v1/workspaces/${seeded.workspaceId}/steward/analyses`, {
         method: 'POST',
@@ -437,15 +438,14 @@ describe('Workspace Steward — member-facing API shares the automatic path', ()
       expect(manual.status).toBe(200);
       const manualBody: any = await manual.json();
       expect(manualBody.trigger).toBe('manual');
-      expect(manualBody.status).toBe('deduplicated');
-      expect(manualBody.knowledgeId).toBe(automatic.knowledgeId);
-      expect(cli.launches).toBe(launchesAfterAutomatic);
+      expect(manualBody.status).toBe('timeout');
+      expect(cli.launches).toBe(launchesAfterAutomatic + 1);
+      expect(manualBody.knowledgeId).toBeUndefined();
 
       const reports = await fetch(`${base}/v1/workspaces/${seeded.workspaceId}/steward/reports`, { headers: { 'x-arcp-member-key': seeded.ownerCredential } });
       const reportBody: any = await reports.json();
       expect(reports.status).toBe(200);
-      expect(reportBody).toHaveLength(1);
-      expect(reportBody[0].id).toBe(automatic.knowledgeId);
+      expect(reportBody).toHaveLength(0);
 
       const unauthenticated = await fetch(`${base}/v1/workspaces/${seeded.workspaceId}/steward/analyses`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId: seeded.task.id }),

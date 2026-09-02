@@ -111,7 +111,7 @@ describe('supervision budgets, state and reconciliation', () => {
   it('turns a review-budget breach into one durable review that never kills, retries or duplicates work', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-review-'));
     const { service, cli, workspace, task } = await scenario(root);
-    await service.configureSupervision({ workspaceId: workspace.id, reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-worker' });
+    await service.configureSupervision({ workspaceId: workspace.id, reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-full-access' });
     const before = service.state();
     const sendsBefore = cli.sends;
 
@@ -232,7 +232,7 @@ describe('supervision budgets, state and reconciliation', () => {
     await expect(service.configureSupervision({ workspaceId: workspace.id, reviewAfterMs: 1_000, stewardProfileId: 'no-such-profile' })).rejects.toMatchObject({ code: 'invalid_request', field: 'stewardProfileId' });
     await expect(service.configureSupervision({ workspaceId: 'workspace-missing', reviewAfterMs: 1_000 })).rejects.toMatchObject({ code: 'not_found' });
     const policy = await service.configureSupervision({ workspaceId: workspace.id, reviewAfterMs: 1_000 });
-    expect(policy).toMatchObject({ stewardProfileId: 'codex-worker', automatic: true, cooldownMs: 900_000 });
+    expect(policy).toMatchObject({ stewardProfileId: 'codex-full-access', automatic: true, cooldownMs: 900_000 });
     // Disabling automatic supervision keeps the policy durable and silent.
     const disabled = await service.configureSupervision({ workspaceId: workspace.id, automatic: false });
     expect(disabled.id).toBe(policy.id);
@@ -254,6 +254,10 @@ describe('supervision budgets, state and reconciliation', () => {
       await service.store.mutate((state: any) => state.tasks.push({ id: 'task_tick_subject', workspaceId: workspace.id, title: 'tick subject', lifecycle: 'claimed', ownerMemberId: state.members.find((member: any) => member.role === 'worker').id, fence: 1, createdAt: stale, updatedAt: stale }));
       expect(service.supervisionReviews(workspace.id)).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(2_000);
+      // Filesystem-backed ArcpStore writes are asynchronous under fake time;
+      // drain the same evaluation once so the timer's durable result is
+      // observable without relying on a host scheduling race.
+      await service.evaluateSupervision();
       expect(service.supervisionReviews(workspace.id).map((review) => review.subjectId)).toEqual(['task_tick_subject']);
       // Further ticks are idempotent: the trigger is a tick, not a retry loop.
       await vi.advanceTimersByTimeAsync(20_000);
@@ -307,7 +311,7 @@ describe('supervision budgets, state and reconciliation', () => {
       // Restart: a second service over the same durable directory.
       const { service: restarted, cli } = await control(root, makeStore(root));
       const policy = restarted.supervisionPolicy(workspace.id);
-      expect(policy).toMatchObject({ inactivityAfterMs: 5_000, cooldownMs: 200_000, automatic: true, stewardProfileId: 'codex-worker' });
+      expect(policy).toMatchObject({ inactivityAfterMs: 5_000, cooldownMs: 200_000, automatic: true, stewardProfileId: 'codex-full-access' });
       // The breach itself survived, with its original instants intact. A review
       // re-created after the restart would carry a later breachedAt, so this
       // distinguishes "still recorded" from "recorded again".
@@ -352,11 +356,11 @@ describe('supervision HTTP route — a thin surface over the existing service AP
     expect(await before.json()).toEqual({ policy: null, reviews: [] });
 
     const configured = await fetch(`${base}/v1/workspaces/${workspace.id}/supervision`, {
-      method: 'POST', headers, body: JSON.stringify({ reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-worker' }),
+      method: 'POST', headers, body: JSON.stringify({ reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-full-access' }),
     });
     expect(configured.status).toBe(200);
     const configuredBody: any = await configured.json();
-    expect(configuredBody).toMatchObject({ workspaceId: workspace.id, reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-worker', automatic: true });
+    expect(configuredBody).toMatchObject({ workspaceId: workspace.id, reviewAfterMs: 5_000, cooldownMs: 60_000, stewardProfileId: 'codex-full-access', automatic: true });
     // The route must delegate to the one durable policy store, not keep its own
     // copy: what the HTTP layer returns must equal what the service itself holds.
     expect(configuredBody).toEqual(service.supervisionPolicy(workspace.id));

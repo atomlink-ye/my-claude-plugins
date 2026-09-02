@@ -31,14 +31,21 @@ export async function stewardFor(service: ArcpService, workspaceId: string): Pro
   // The Steward authors as itself, never as the Owner or Manager whose
   // credential happened to trigger it. R2-F21 was exactly that misattribution.
   const member = existing ?? (await service.joinWorkspace({ workspaceId, label: 'workspace-steward', role: 'steward', capabilities: ['read_context', 'write_knowledge'] })).member;
+  const configured = service.supervisionPolicy(workspaceId);
   const policy = {
     workspaceId,
-    stewardProfileId: process.env.ARCP_STEWARD_PROFILE ?? 'codex-worker',
+    // Supervision configuration is the owner-selected source of truth. The
+    // environment override remains useful for a fresh workspace, but never
+    // silently replaces a durable policy.
+    stewardProfileId: configured?.stewardProfileId ?? process.env.ARCP_STEWARD_PROFILE ?? 'codex-full-access',
     stewardMemberId: member.id,
     cooldownMs: Number(process.env.ARCP_STEWARD_COOLDOWN_MS ?? 900_000),
     automatic: process.env.ARCP_STEWARD_AUTOMATIC !== '0',
     manualProgressWindowMs: Number(process.env.ARCP_STEWARD_PROGRESS_WINDOW_MS ?? 1_800_000),
   };
+  const profile = service.profiles().find((item) => item.id === policy.stewardProfileId);
+  const modeToken = String(profile?.mode ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!profile || profile.provider !== 'codex' || modeToken !== 'fullaccess') throw new ArcpError('invalid_request', 'Steward profile must be Codex full-access (non-prompting)', 'stewardProfileId');
   const analyst = new CodexRuntimeAnalyst(service, { profileId: policy.stewardProfileId, actorId: workspace.ownerActorId, waitMs: Number(process.env.ARCP_STEWARD_WAIT_MS ?? 300_000) });
   return new WorkspaceSteward(stewardViewOf(service), analyst, policy);
 }

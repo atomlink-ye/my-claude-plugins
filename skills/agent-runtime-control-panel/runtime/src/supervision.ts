@@ -71,6 +71,8 @@ export interface SupervisedSubject {
   lifecycle: string;
   createdAt: string;
   updatedAt: string;
+  /** Role-keyed exclusion for ephemeral Steward bookkeeping Tasks. */
+  ownerRole?: string;
 }
 
 export interface SupervisionView {
@@ -224,7 +226,7 @@ export function evaluateSupervision(view: SupervisionView, nowMs: number): Super
     if (!policy.automatic) continue;
     if (policy.reviewAfterMs === undefined && policy.inactivityAfterMs === undefined) continue;
     const subjects = view.subjects
-      .filter((subject) => subject.workspaceId === policy.workspaceId && SUPERVISED_LIFECYCLES.has(subject.lifecycle))
+      .filter((subject) => subject.workspaceId === policy.workspaceId && SUPERVISED_LIFECYCLES.has(subject.lifecycle) && subject.ownerRole !== 'steward' && subject.ownerRole !== 'steward-analyst')
       .sort((a, b) => a.id.localeCompare(b.id));
     for (const subject of subjects) {
       if (breachedThisPass.has(subject.id)) continue;
