@@ -212,7 +212,7 @@ describe('Round-3 convergence proofs', () => {
       const authorMemberId = matching ? started.member.id : impostor.member.id;
       if (matching) {
         await service.claimTask(started.task.id, authorMemberId, 0);
-        await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 });
+        await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation });
       } else {
         await service.store.mutate((state: State) => { const task = state.tasks.find((item) => item.id === started.task.id)!; task.ownerMemberId = authorMemberId; task.fence = 1; task.lifecycle = 'claimed'; });
         await expect(service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 })).rejects.toMatchObject({ code: 'unauthorized' });

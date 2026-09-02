@@ -59,6 +59,32 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     service.close();
   });
 
+  it('requires managed runtime provenance for Result submission, including after replacement', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-runtime-result-provenance-'));
+    const { service } = await createControl(root, { cli: new FakePaseoCli({ inspectValue: { id: 'runtime-provenance-1' } }) });
+    const { actor } = await service.registerActor({ clientIdentity: 'result-provenance-owner' });
+    const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'result provenance' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'provenance result', profileId: 'codex-worker' }) as any;
+    await service.claimTask(started.task.id, started.member.id, 0);
+
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing provenance', expectedFence: 1 })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing generation', expectedFence: 1, runtimeSessionId: started.session.id })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeGeneration' });
+    expect(service.state().results).toHaveLength(0);
+    expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
+
+    await service.replaceRuntime({ runtimeSessionId: started.session.id, profileId: 'codex-worker' });
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing after replacement', expectedFence: 1 })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
+    expect(service.state().results).toHaveLength(0);
+    expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
+
+    await service.stopRuntime(started.session.id);
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing after stop', expectedFence: 1 })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'terminal provenance', expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation + 1 })).rejects.toMatchObject({ code: 'stale_generation' });
+    expect(service.state().results).toHaveLength(0);
+    expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
+    service.close();
+  });
+
   it('makes the runtime client state add immutable provenance to the real result CLI request', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-runtime-result-cli-'));
     const clientStatePath = path.join(root, 'client.json');
@@ -76,6 +102,31 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     expect(request?.headers['x-arcp-member-key']).toBe('member-secret');
     expect(request?.body).toMatchObject({ taskId: 'task-cli', runtimeSessionId: 'runtime-cli', runtimeGeneration: 4, summary: 'from runtime' });
+  });
+
+  it('rejects an HTTP Result omission for a managed runtime before creating Result state', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-runtime-result-http-provenance-'));
+    const app = await createServer(root);
+    await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { actor, binding } = await app.arcp.registerActor({ clientIdentity: 'http-result-provenance-owner' });
+      const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.id, purpose: 'HTTP result provenance' });
+      const joined = await app.arcp.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'managed-worker', role: 'worker', joinKind: 'managed', actorId: actor.id });
+      const goal = await app.arcp.createGoal({ actorId: actor.id, title: 'HTTP provenance goal', workspaceId: workspace.workspace.id });
+      const task = await app.arcp.createTask({ workspaceId: workspace.workspace.id, title: 'HTTP provenance task' });
+      await app.arcp.store.mutate((state: any) => state.sessions.push({ id: 'http-result-runtime', actorId: actor.id, goalId: goal.id, taskId: task.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: joined.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', createdAt: new Date().toISOString() }));
+      await app.arcp.claimTask(task.id, joined.member.id, 0);
+      const address = app.server.address();
+      const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+      const response = await fetch(`${base}/v1/workspaces/${workspace.workspace.id}/results`, { method: 'POST', headers: { 'x-arcp-member-key': joined.credential!, 'content-type': 'application/json' }, body: JSON.stringify({ taskId: task.id, status: 'candidate', summary: 'HTTP omission', expectedFence: 1 }) });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
+      expect(app.arcp.state().results).toHaveLength(0);
+      expect(app.arcp.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
+    } finally {
+      app.arcp.close();
+      await new Promise<void>((resolve) => app.server.close(() => resolve()));
+    }
   });
 
   it('serializes concurrent replacements so only one successor generation launches', async () => {

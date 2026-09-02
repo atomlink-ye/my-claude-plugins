@@ -100,7 +100,7 @@ describe('ARCP atomic contract binding', () => {
     // where a delayed delivery reawakens an already-stopped Worker — is only
     // withdrawn by submitResult itself, never by the pump.
     await service.store.mutate((state: any) => state.deliveries.push({ id: 'delivery-parked-contract', fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'stale contract', command: 'normal', purpose: 'contract', subject: { taskId: task.id, fence: 1 }, state: 'held', createdAt: new Date().toISOString() }));
-    await service.submitResult({ workspaceId: task.workspaceId, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'done', evidenceRefs: ['commit:abc'], expectedFence: 1 });
+    await service.submitResult({ workspaceId: task.workspaceId, taskId: task.id, memberId: worker.member.id, status: 'candidate', summary: 'done', evidenceRefs: ['commit:abc'], expectedFence: 1, runtimeSessionId: 'worker-runtime', runtimeGeneration: 1 });
     expect(service.state().deliveries.find((item) => item.id === 'delivery-parked-contract')!.state).toBe('withdrawn');
     expect(service.state().deliveries.find((item) => item.id === queued.id)!.state).toBe('withdrawn');
     const before = cli.sends;
@@ -274,7 +274,7 @@ describe('ARCP launched-runtime authority', () => {
     expect(reviewer.member.capabilities).toEqual(expect.arrayContaining(['claim_task', 'submit_result']));
     // A fresh Reviewer can claim its own Task and submit its own verdict.
     await service.claimTask(reviewer.task.id, reviewer.member.id, 0);
-    const verdict = await service.submitResult({ workspaceId: workspace.id, taskId: reviewer.task.id, memberId: reviewer.member.id, status: 'candidate', summary: 'REWORK', evidenceRefs: ['commit:abc'], expectedFence: 1 });
+    const verdict = await service.submitResult({ workspaceId: workspace.id, taskId: reviewer.task.id, memberId: reviewer.member.id, status: 'candidate', summary: 'REWORK', evidenceRefs: ['commit:abc'], expectedFence: 1, runtimeSessionId: reviewer.session.id, runtimeGeneration: reviewer.session.generation });
     expect(verdict.memberId).toBe(reviewer.member.id);
     expect(cli.launches.at(-1)!.at(-1)).toContain('ARCP Worker handoff');
     service.close();
@@ -341,7 +341,7 @@ describe('ARCP launched-runtime authority', () => {
     const started: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'reviewed round', role: 'reviewer', profileId: 'codex-worker', workspace: '/tmp', launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id } as any);
     expect(started.session.reportingRoute).toMatchObject({ launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id, ccMemberIds: [deputy.member.id] });
     await service.claimTask(started.task.id, started.member.id, 0);
-    const result = await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'verdict', evidenceRefs: ['commit:abc'], expectedFence: 1 });
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'verdict', evidenceRefs: ['commit:abc'], expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation });
     const decision = service.state().channelEvents.find((item) => item.kind === 'decision_required' && item.resultId === result.id)!;
     expect(decision.targetMemberId).toBe(manager.member.id);
     expect(decision.targetRole).toBeUndefined();
