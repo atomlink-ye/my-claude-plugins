@@ -233,6 +233,15 @@ describe('ARCP MVE control core', () => {
     expect(await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' })).toMatchObject({ mode: 'auto', observed: { mode: 'auto' } });
   });
 
+  it('falls back to CLI mode ids when SDK mode discovery returns an empty result', async () => {
+    const modeClient = () => ({ connect: async () => {}, close: async () => {}, providers: { listModes: async () => ({ provider: 'codex', modes: [] }) } });
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-sdk-empty-modes-')); const service = await control(root, false, ['codex'], {}, modeClient, 'Default Permissions, Auto-review, Full Access');
+    const preflight = await service.preflight({ profileId: 'codex-full-access' });
+    expect(preflight).toMatchObject({ action: 'launch', launchable: true, liveModes: ['auto', 'auto-review', 'full-access'] });
+    const { actor } = await service.registerActor({ clientIdentity: 'sdk-empty-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'SDK empty modes' });
+    expect(await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-full-access' })).toMatchObject({ mode: 'full-access', observed: { mode: 'full-access' } });
+  });
+
   it('allows only an explicit elevated profile and leaves Pi/Grok mode-less', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-elevated-')); const service = await control(root);
     const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'approved disposable' });

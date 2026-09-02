@@ -493,7 +493,8 @@ export class ArcpService {
       const profiles = await Promise.all(this.profiles().map(async (profile) => {
         const provider = providers.map(asRecord).find((item) => String(item.provider).toLowerCase() === profile.provider);
         const providerAvailable = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled';
-        const modes = (await this.adapter.modes(profile.provider)) ?? this.cliModeIds(provider?.modes);
+        const sdkModes = await this.adapter.modes(profile.provider);
+        const modes = sdkModes?.length ? sdkModes : this.cliModeIds(provider?.modes);
         try {
           const models = (await this.adapter.models(profile.provider)).value;
           const model = Array.isArray(models) ? models.map(asRecord).find((item) => String(item.id).toLowerCase() === profile.model.toLowerCase()) : undefined;
@@ -512,7 +513,8 @@ export class ArcpService {
       const token = capabilityToken(raw ?? '');
       // Paseo's public provider listing sometimes exposes human labels rather
       // than IDs. Canonicalize only exact known labels; never substring-match.
-      if (token === 'automode') return 'auto';
+      if (token === 'automode' || token === 'defaultpermissions') return 'auto';
+      if (token === 'autoreview') return 'auto-review';
       if (token === 'fullaccess') return 'full-access';
       if (token === 'bypass') return 'bypassPermissions';
       if (token === 'planmode') return 'plan';
@@ -538,7 +540,8 @@ export class ArcpService {
     let live = discovered.profiles.find((item) => item.id === profile.id)?.available === true;
     let liveModes: string[] = [];
     try {
-      const providers = (await this.adapter.discover()).value; const provider = Array.isArray(providers) ? providers.map(asRecord).find((item) => normalized(item.provider) === normalized(profile.provider)) : undefined; liveModes = (await this.adapter.modes(profile.provider)) ?? this.cliModeIds(provider?.modes);
+      const providers = (await this.adapter.discover()).value; const provider = Array.isArray(providers) ? providers.map(asRecord).find((item) => normalized(item.provider) === normalized(profile.provider)) : undefined;
+      const sdkModes = await this.adapter.modes(profile.provider); liveModes = sdkModes?.length ? sdkModes : this.cliModeIds(provider?.modes);
       if (profile.id === 'explicit') {
         const models = (await this.adapter.models(profile.provider)).value; const model = Array.isArray(models) ? models.map(asRecord).find((item) => sameSetting(item.id, profile.model)) : undefined;
         live = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled' && Boolean(model) && (!profile.mode || liveModes.some((mode) => sameSetting(mode, profile.mode))) && (!profile.thinking || (Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.some((value: unknown) => sameSetting(value, profile.thinking))));
