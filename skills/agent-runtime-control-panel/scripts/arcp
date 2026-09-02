@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
+const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','participant','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
 const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   surface archive|restore WORKSPACE SURFACE_ID (Owner actor only; never automatic)
@@ -33,6 +33,7 @@ const HELP = `ARCP ControlWorkspace commands:
         primary hands accountability to that member and demotes the launcher to an
         observe-only cc.
   external register WORKSPACE [--label LABEL] [--show-credential]
+  participant attach --adapter ID --external-id REF   bind a running participant to your Member
   external status|send|stop|reconcile RUNTIME
   reconcile RUNTIME
   inbox [--workspace WORKSPACE]
@@ -57,7 +58,7 @@ External Runtime note:
   Feishu Hermes conversation; that Hermes remains Owner and the human entry point.
   Runtime communication is a durable ChannelEvent; completion requires a Result,
   never an idle process.`;
-const knownHelpAreas = ['doctor','ensure','preflight','provider-budget','actor','workspace','surface','task','knowledge','result','member','goal','runtime','external','channel','steward','supervision','db','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack','release'];
+const knownHelpAreas = ['doctor','ensure','preflight','provider-budget','actor','workspace','surface','task','knowledge','result','member','goal','runtime','external','participant','channel','steward','supervision','db','reconcile','inbox','panorama','status','tui','canary','start','send','reuse','interrupt','ack','release'];
 const statePath = process.env.ARCP_CLIENT_STATE || join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'agent-runtime-control-panel/client.json');
 const load = async () => { try { return JSON.parse(await readFile(statePath, 'utf8')); } catch { return {}; } };
 const save = async (v) => { await mkdir(dirname(statePath), { recursive: true }); await writeFile(statePath, JSON.stringify(v, null, 2) + '\n', { mode: 0o600 }); await chmod(statePath, 0o600); };
@@ -96,6 +97,7 @@ else if (area === 'workspace' && action === 'join') { const s=await load(); cons
 else if (area === 'workspace' && action === 'context') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/context`);
 else if (area === 'surface' && action === 'archive') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/execution-surfaces/${encodeURIComponent(p[1])}/archive`,{});
 else if (area === 'surface' && action === 'restore') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/execution-surfaces/${encodeURIComponent(p[1])}/restore`,{});
+else if (area === 'participant' && action === 'attach') { await call('POST','/v1/participants/attach',{workspaceId:f.workspace,memberId:f.member,adapterId:f.adapter||'claude-code',externalId:f['external-id'],workspace:f.cwd||process.cwd()},true); }
 else if (area === 'external' && action === 'register') { const v=await call('POST','/v1/external',{workspaceId:p[0]||f.workspace,label:f.label,role:f.role,workspace:f.cwd||process.cwd()},false,!f['show-credential']); if(v.credential && v.session?.id) await save({...await load(),runtimeMemberCredentials:{...(await load()).runtimeMemberCredentials||{},[v.session.id]:v.credential}}); }
 else if (area === 'external' && action === 'status') await call('GET',`/v1/external/${encodeURIComponent(p[0]||f.runtime)}/status${f.refresh ? '?refresh=1' : ''}`);
 else if (area === 'external' && action === 'send') await call('POST',`/v1/external/${encodeURIComponent(p[0]||f.runtime)}/send`,{body:f.body||p.slice(1).join(' '),command:'normal'});

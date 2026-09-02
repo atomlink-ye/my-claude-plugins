@@ -22,6 +22,7 @@ export { projectTemporal, temporalReconciliationPreview } from './temporal-proje
 export type { TemporalFilter, TemporalProjection, TemporalProjectionFacts, TemporalCard, TemporalDisposition } from './temporal-projection.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
+import { ActorChannelRegistry, type ActorChannelAdapter, type ChannelBindingRef, type TransportReceipt } from './actor-channel.js';
 import { collectCodexbar, collectPiGrokCache, evaluateAdmission, matchesModel, runCommandCollector, translatePaseoProviderUsage, type AdmissionDecision, type ProviderBudgetConfig, type ProviderBudgetEnvelopeV1, type ProviderBudgetSource } from './provider-budget.js';
 import { RuntimeBudgetTracker, type RuntimeBudgetPolicy, type RuntimeBudgetSample, type RuntimeBudgetSignal, type RuntimeBudgetView } from './runtime-budget.js';
 import { checkoutIdentity, surfaceName, type CheckoutRef, type ExecutionPlacementPort, type ExecutionSurface, type ExecutionSurfaceBinding, type ExecutionSurfaceKind, type ExecutionSurfaceRef, type RepositoryLocator, type RepositoryRef, type RuntimeBinding, type RuntimeBindingReceipt, type RuntimeBindingRef, type RuntimeLaunchSpec, type SurfaceArchiveAuthorization, type SurfaceClaim, type SurfaceRestoreEvidence, type SurfaceRestoreReceipt, type SurfaceSpec } from './execution-placement.js';
@@ -555,6 +556,9 @@ export class ArcpService implements ExecutionPlacementPort {
   readonly store: StateStore;
   readonly adapter: RuntimeAdapter;
   private readonly adapters = new Map<string, RuntimeAdapter>();
+  /** Actor channels are a different seam from runtime hosts: they wake a
+   * conversation that already exists outside this Workspace. */
+  readonly channels = new ActorChannelRegistry();
   private profileData: Profile[] = [...DEFAULT_PROFILES];
   /** Operator-authored plain text: returned verbatim, never interpreted. */
   private routingGuidanceText = '';
@@ -997,6 +1001,63 @@ export class ArcpService implements ExecutionPlacementPort {
   /** Register one stable sibling Hermes ACP on-call Runtime. This is a new
    * external process sharing ARCP Workspace/Knowledge/Delivery; it does not
    * attach to the operator's Feishu Hermes conversation, which remains Owner. */
+  /** Attach an ALREADY-RUNNING participant to an existing Member.
+   *
+   * `registerExternal` mints a new Member and launches a Hermes ACP process,
+   * so it cannot represent a participant that is already alive and already
+   * accountable — the Claude Manager of this Workspace is exactly that case.
+   * Without an attach path such a participant has a Member but no
+   * RuntimeSession, and every obligation addressed to it dead-letters with
+   * "no live target runtime session" even though a human is sitting there.
+   *
+   * This never mints a Member, never launches anything, and never invents an
+   * adapter: the caller names the participant channel and an opaque external
+   * ref. Re-attaching is idempotent so a reconnect resumes one accountable
+   * session instead of forking a second one at a new generation. */
+  async attachParticipant(input: { workspaceId: string; memberId: string; adapterId: string; externalId: string; workspace?: string }): Promise<RuntimeSession> {
+    const trimmedExternal = input.externalId?.trim();
+    if (!trimmedExternal) throw new ArcpError('invalid_request', 'participant attach requires an external reference', 'externalId');
+    if (!input.adapterId?.trim()) throw new ArcpError('invalid_request', 'participant attach requires an adapter id', 'adapterId');
+    return this.store.mutate((state) => {
+      const workspace = state.workspaces.find((item) => item.id === input.workspaceId && item.lifecycle === 'active');
+      if (!workspace) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
+      const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId);
+      if (!member) throw new ArcpError('unknown_recipient', 'member is not in this workspace');
+      const existing = state.sessions.find((item) => item.memberId === member.id && item.runtimeKind === 'external' && item.state !== 'terminal');
+      if (existing) {
+        // An attach must be repeatable. Changing the adapter or the external
+        // ref under a live session would silently redirect delivery, so that
+        // is a conflict rather than an update.
+        if (existing.adapterId !== input.adapterId || existing.externalId !== trimmedExternal) throw new ArcpError('placement_conflict', `member ${member.id} is already attached to ${existing.adapterId} session ${existing.externalId ?? 'unknown'}`);
+        return existing;
+      }
+      const binding = member.actorId ? state.bindings.find((item) => item.actorId === member.actorId) : undefined;
+      const session: RuntimeSession = {
+        id: `runtime_${randomUUID()}`,
+        actorId: member.actorId ?? workspace.ownerActorId,
+        goalId: `goal_attached_${member.id}`,
+        bindingId: binding?.id ?? `binding_attached_${member.id}`,
+        generation: 1,
+        runtimeKind: 'external',
+        adapterId: input.adapterId,
+        workspaceId: input.workspaceId,
+        memberId: member.id,
+        profileId: 'attached-participant',
+        provider: input.adapterId,
+        model: 'attached',
+        externalId: trimmedExternal,
+        workspace: input.workspace,
+        // An attached participant is reachable but its safe points are only as
+        // good as its channel's observation; it starts idle and is corrected by
+        // whatever observation the adapter can actually provide.
+        state: 'idle',
+        lastTurnState: 'idle',
+        createdAt: now(),
+      };
+      state.sessions.push(session);
+      return session;
+    });
+  }
   async registerExternal(input: { actorId: string; workspaceId: string; label?: string; role?: string; workspace?: string }): Promise<{ member: Member; session: RuntimeSession; credential?: string }> {
     const state = this.store.snapshot();
     if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
@@ -1741,6 +1802,77 @@ export class ArcpService implements ExecutionPlacementPort {
       return this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: triggering.taskId, resultId: triggering.resultId, sourceMemberId, targetMemberId: triggering.sourceMemberId, targetActorId: triggering.sourceActorId, ...(triggering.sourceMemberId || triggering.sourceActorId ? {} : { targetRole: 'owner' }), kind: 'decision_resolved', urgency: 'normal', priority: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, verdict, summary: reason, evidenceRefs: [], relatedEventId: eventId });
     });
     await this.pump(); return resolved;
+  }
+
+  /** Resolve the Owner Actor's CURRENT channel binding. Identity is the Actor;
+   * the binding is replaceable, so the newest generation wins and the caller
+   * always names an exact binding rather than scanning for a plausible one. */
+  private currentOwnerBinding(state: State, ownerActorId: string): ChannelBindingRef | undefined {
+    const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel));
+    if (!bindings.length) return undefined;
+    const current = bindings.reduce((best, item) => (item.generation > best.generation ? item : best));
+    if (!current.conversationRef) return undefined;
+    return { actorId: ownerActorId, bindingId: current.id, generation: current.generation, adapterId: current.channel, recipientRef: current.conversationRef };
+  }
+
+  /** Escalate one unhandled Manager obligation to the Owner Deputy.
+   *
+   * Exactly-once is structural, not best-effort: the escalation event id is
+   * derived from the triggering event, so a retry, a restart, or a second SLA
+   * tick all resolve to the same durable row and the adapter sees the same
+   * idempotency key. A missing or superseded binding is a durable
+   * `undeliverable` escalation, never a silent drop. */
+  async escalateToOwnerActor(input: { eventId: string; reason: string }): Promise<{ event: ChannelEvent; receipt?: TransportReceipt; alreadyEscalated: boolean }> {
+    const escalationId = `${input.eventId}:owner-escalation`;
+    const prepared = await this.store.mutate((state) => {
+      const triggering = state.channelEvents.find((item) => item.id === input.eventId);
+      if (!triggering) throw new ArcpError('not_found', 'event not found');
+      if (triggering.consumptionState === 'resolved') throw new ArcpError('invalid_request', 'event is already resolved');
+      const workspace = state.workspaces.find((item) => item.id === triggering.workspaceId);
+      if (!workspace) throw new ArcpError('not_found', 'workspace not found');
+      const existing = state.channelEvents.find((item) => item.id === escalationId);
+      if (existing) return { event: existing, binding: undefined, alreadyEscalated: true };
+      const binding = this.currentOwnerBinding(state, workspace.ownerActorId);
+      const event = this.appendChannelEvent(state, {
+        id: escalationId,
+        workspaceId: triggering.workspaceId,
+        ...(triggering.goalId ? { goalId: triggering.goalId } : {}),
+        ...(triggering.taskId ? { taskId: triggering.taskId } : {}),
+        ...(triggering.resultId ? { resultId: triggering.resultId } : {}),
+        ...(triggering.sourceMemberId ? { sourceMemberId: triggering.sourceMemberId } : {}),
+        targetActorId: workspace.ownerActorId,
+        kind: 'decision_required',
+        urgency: 'urgent',
+        consumptionPolicy: 'decision_required',
+        decisionRequired: true,
+        summary: input.reason,
+        evidenceRefs: [input.eventId],
+        relatedEventId: input.eventId,
+        notify: false,
+      });
+      if (!binding) { this.transitionEvent(event, 'undeliverable'); event.undeliverableReason = 'owner actor has no current channel binding'; }
+      return { event, binding, alreadyEscalated: false };
+    });
+    if (prepared.alreadyEscalated || !prepared.binding) return { event: prepared.event, alreadyEscalated: prepared.alreadyEscalated };
+    const adapter = this.channels.get(prepared.binding.adapterId) as ActorChannelAdapter;
+    const receipt = await adapter.deliver(prepared.binding, {
+      idempotencyKey: escalationId,
+      recipientRef: prepared.binding.recipientRef,
+      kind: 'decision_required',
+      urgency: 'urgent',
+      summary: input.reason,
+      refs: [input.eventId],
+    });
+    await this.store.mutate((state) => {
+      const event = state.channelEvents.find((item) => item.id === escalationId);
+      if (!event) return undefined;
+      // A transport receipt says the wire accepted an envelope. It never says a
+      // human read it, so the obligation stays open until an explicit verdict.
+      if (receipt.state === 'refused') { this.transitionEvent(event, 'undeliverable'); event.undeliverableReason = 'owner channel refused the envelope'; }
+      else if (event.deliveryState !== 'delivered') this.transitionEvent(event, 'delivered');
+      return undefined;
+    });
+    return { event: prepared.event, receipt, alreadyEscalated: false };
   }
   /**
    * Raise a provider question as a durable `decision_required` event and record
