@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectTemporal } from '../../../skills/agent-runtime-control-panel/runtime/src/temporal-projection.js';
+import { projectTemporal } from '../../../../skills/agent-runtime-control-panel/runtime/src/temporal-projection.js';
 
 const at = '2026-09-02T00:00:00.000Z';
 const event = (id: string, kind: any, taskId?: string) => ({ id, workspaceId: 'w', taskId, kind, urgency: 'normal', decisionRequired: kind === 'decision_required', content: { summary: `${kind} fact`, evidenceRefs: [], contentHash: id, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at }], createdAt: at });

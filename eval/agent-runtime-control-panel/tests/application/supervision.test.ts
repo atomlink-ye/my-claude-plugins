@@ -3,10 +3,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { handleArcp } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
-import { SQLiteStateStore } from '../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
-import { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, evaluateSupervision, supervisionReviewId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { handleArcp } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
+import { SQLiteStateStore } from '../../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
+import { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, evaluateSupervision, supervisionReviewId, type SupervisionView } from '../../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
 // A supervision clock is a parameter, never a wall clock: every instant below is
 // derived from this base so a slow or loaded host cannot change an outcome. The

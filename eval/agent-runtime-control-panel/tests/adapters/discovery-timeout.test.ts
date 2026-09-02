@@ -2,8 +2,8 @@ import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { PaseoCli } from '../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { PaseoCli } from '../../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
 
 /**
  * R3-discover-timeout: the Paseo adapter's discovery-plane calls

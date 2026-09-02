@@ -3,9 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { handleArcp } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
-import { ArcpStartupOwnershipError, createServer, ownershipPaths, releaseOwnershipOnSignal, startServer } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { handleArcp } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
+import { ArcpStartupOwnershipError, createServer, ownershipPaths, releaseOwnershipOnSignal, startServer } from '../../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 
 const apps: Array<{ server: http.Server; arcp: ArcpService }> = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map(async (app) => { await new Promise<void>((resolve) => app.server.close(() => resolve())); app.arcp.close(); })); });

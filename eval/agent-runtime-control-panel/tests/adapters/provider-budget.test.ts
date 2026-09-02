@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { collectCodexbar, collectPiGrokCache, PROVIDER_BUDGET_SCHEMA, evaluateAdmission, translatePaseoProviderUsage, validateProviderBudgetEnvelope } from '../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
-import { providerBudgetEpisodeKey } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { collectCodexbar, collectPiGrokCache, PROVIDER_BUDGET_SCHEMA, evaluateAdmission, translatePaseoProviderUsage, validateProviderBudgetEnvelope } from '../../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
+import { providerBudgetEpisodeKey } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 
 const envelope = (remaining = 15, observedAt = new Date().toISOString()) => validateProviderBudgetEnvelope({
   schemaVersion: PROVIDER_BUDGET_SCHEMA, source: { id: 'local-codexbar', kind: 'command', observedAt, trust: 'authoritative', estimated: false, automaticAdmissionEligible: true }, providers: [
@@ -59,13 +59,13 @@ describe('provider budget MVE', () => {
   it('admits Grok from an authoritative operator command envelope', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'arcp-grok-command-')); const script = path.join(dir, 'collector');
     await writeFile(script, `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({schemaVersion:'arcp.provider-budget/v1',source:{id:'operator-grok',kind:'command',observedAt:new Date().toISOString(),trust:'authoritative',estimated:false,automaticAdmissionEligible:true},providers:[{providerId:'pi',status:'available',windows:[{id:'weekly',label:'weekly',remainingPct:75}]}]}));\n`); await chmod(script, 0o755);
-    const snapshot = await (await import('../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js')).runCommandCollector({ id: 'operator-grok', kind: 'command', trust: 'authoritative', estimated: false, automaticAdmissionEligible: true, command: [script] });
+    const snapshot = await (await import('../../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js')).runCommandCollector({ id: 'operator-grok', kind: 'command', trust: 'authoritative', estimated: false, automaticAdmissionEligible: true, command: [script] });
     expect(evaluateAdmission({ envelope: snapshot, bindings: [{ id: 'pi-grok', providerId: 'pi', sourceId: 'operator-grok', modelPatterns: ['grok-cli/grok-4.6'], windowIds: ['weekly'], admissionPolicyId: 'default' }], policies, providerId: 'pi', model: 'grok-cli/grok-4.6' }).action).toBe('launch');
   });
   it('rejects a command collector whose envelope tries to disagree with configured trust', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'arcp-grok-command-mismatch-')); const script = path.join(dir, 'collector');
     await writeFile(script, `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({schemaVersion:'arcp.provider-budget/v1',source:{id:'operator-grok',kind:'command',observedAt:new Date().toISOString(),trust:'advisory',estimated:true,automaticAdmissionEligible:false},providers:[{providerId:'pi',status:'available',windows:[{id:'weekly',label:'weekly',remainingPct:75}]}]}));\n`); await chmod(script, 0o755);
-    await expect((await import('../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js')).runCommandCollector({ id: 'operator-grok', kind: 'command', trust: 'authoritative', estimated: false, automaticAdmissionEligible: true, command: [script] })).rejects.toThrow(/disagrees/);
+    await expect((await import('../../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js')).runCommandCollector({ id: 'operator-grok', kind: 'command', trust: 'authoritative', estimated: false, automaticAdmissionEligible: true, command: [script] })).rejects.toThrow(/disagrees/);
   });
   it('keeps unavailable CodexBar Grok unknown instead of treating it as zero', () => {
     const snapshot = validateProviderBudgetEnvelope({ schemaVersion: PROVIDER_BUDGET_SCHEMA, source: { id: 'local-codexbar', kind: 'command', observedAt: new Date().toISOString(), trust: 'authoritative', estimated: false, automaticAdmissionEligible: true }, providers: [{ providerId: 'pi', status: 'unavailable', windows: [], error: 'provider collector failed' }] });

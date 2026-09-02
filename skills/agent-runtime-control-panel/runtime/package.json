@@ -7,7 +7,14 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/server.ts",
-    "test": "vitest run"
+    "test": "pnpm run test:deterministic",
+    "test:deterministic": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/domain ../../../eval/agent-runtime-control-panel/tests/persistence ../../../eval/agent-runtime-control-panel/tests/application ../../../eval/agent-runtime-control-panel/tests/adapters ../../../eval/agent-runtime-control-panel/tests/contracts",
+    "test:domain": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/domain",
+    "test:persistence": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/persistence",
+    "test:application": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/application",
+    "test:adapters": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/adapters",
+    "test:contracts": "ARCP_CAMPAIGN_STATE= vitest run ../../../eval/agent-runtime-control-panel/tests/contracts",
+    "test:canary": "vitest run ../../../eval/agent-runtime-control-panel/tests/canary"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

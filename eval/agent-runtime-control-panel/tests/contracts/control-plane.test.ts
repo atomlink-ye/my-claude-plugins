@@ -7,44 +7,16 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS, PASEO_TITLE_LIMIT, paseoTitle } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { createServer, resolveDataDir } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
-import { renderTuiSnapshot, runTui } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
-import { HermesAcpAdapter } from '../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
-import { PaseoCli, parseJson } from '../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
-import { surfaceName } from '../../../skills/agent-runtime-control-panel/runtime/src/execution-placement.js';
+import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS, PASEO_TITLE_LIMIT, paseoTitle } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { createServer, resolveDataDir } from '../../../../skills/agent-runtime-control-panel/runtime/src/server.js';
+import { renderTuiSnapshot, runTui } from '../../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
+import { HermesAcpAdapter } from '../../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
+import { PaseoCli, parseJson } from '../../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
+import { surfaceName } from '../../../../skills/agent-runtime-control-panel/runtime/src/execution-placement.js';
+import { createControl } from '../support/create-control.js';
+import { FakePaseoCli } from '../support/fake-paseo-cli.js';
 
 const execFileAsync = promisify(execFile);
-
-class FakeCli {
-  private lastMode = 'auto';
-  sends = 0;
-  launches = 0;
-  calls: string[][] = [];
-  lastLaunchArgs: string[] = [];
-  lastEnv: Record<string, string> = {};
-  private workspaces: Array<Record<string, unknown>> = [];
-  private laneCount = 0;
-  private localCount = 0;
-  constructor(private readonly fail: boolean | string = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
-  async run(args: string[], options: { env?: Record<string, string> } = {}) {
-    this.calls.push(args);
-    if (options.env) this.lastEnv = options.env;
-    if (this.fail && args[0] === 'run') throw new Error(typeof this.fail === 'string' ? this.fail : 'timed out');
-    if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
-    if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
-    if (args[0] === 'workspace' && args[1] === 'ls') return { value: this.workspaces, stdout: '', stderr: '' };
-    if (args[0] === 'project' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
-    if (args[0] === 'project' && args[1] === 'create') return { value: { projectId: 'prj_default' }, stdout: '', stderr: '' };
-    if (args[0] === 'workspace' && args[1] === 'create') { const worktree = args.includes('worktree'); const workspaceId = worktree ? `wks_lane_${++this.laneCount}` : this.localCount++ ? `wks_restore_${this.localCount - 1}` : 'wks_default'; const projectId = args[args.indexOf('--project') + 1] ?? 'prj_default'; const cwd = worktree ? path.dirname(process.cwd()) : String(args[args.indexOf('--path') + 1]); const row = { workspaceId, projectId, cwd }; this.workspaces = [...this.workspaces.filter((item) => item.workspaceId !== workspaceId), row]; return { value: row, stdout: '', stderr: '' }; }
-    if (args[0] === 'workspace' && args[1] === 'archive') { this.workspaces = this.workspaces.filter((item) => item.workspaceId !== args[2]); return { value: { workspaceId: args[2], status: 'archived' }, stdout: '', stderr: '' }; }
-    if (args[0] === 'run') { this.launches += 1; this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
-    if (args[0] === 'ls') return { value: this.registryListing ?? [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
-    if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
-    if (args[0] === 'inspect') return { value: { id: 'paseo-session-1', status: 'idle', provider: this.providers[0], model: this.providers[0] === 'claude' ? 'claude-opus-5' : this.providers[0] === 'pi' ? 'grok-cli/grok-4.6' : 'gpt-5.6-terra', ...(this.providers[0] === 'pi' ? {} : { mode: this.lastMode }), thinking: 'medium', ...this.inspectValue }, stdout: '', stderr: '' };
-    return { value: [], stdout: '', stderr: '' };
-  }
-}
 
 class FakeAcpProcess extends EventEmitter {
   readonly stdin = new PassThrough();
@@ -70,7 +42,8 @@ class FakeAcpProcess extends EventEmitter {
   permission(): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/request_permission', params: { sessionId: 'acp-session-1' } }) + '\n'); }
 }
 async function control(root: string, fail: boolean | string = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown, registryListing?: unknown) {
-  const service = new ArcpService(root, new FakeCli(fail, providers, inspectValue, modeListing, registryListing) as any, undefined, modeClientFactory); await service.init(); return service;
+  const { service } = await createControl(root, { cli: new FakePaseoCli({ fail, providers, inspectValue, modeListing, registryListing }), modeClientFactory });
+  return service;
 }
 
 describe('ARCP MVE control core', () => {
@@ -322,7 +295,7 @@ describe('ARCP MVE control core', () => {
   });
   it('persists an ACP-created Result and delivers its decision request to the manager channel', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-acp-result-')); const process = new FakeAcpProcess(); const adapter = new HermesAcpAdapter(() => process as any);
-    const service = new ArcpService(root, new FakeCli() as any, undefined, undefined, [adapter]); await service.init();
+    const service = new ArcpService(root, new FakePaseoCli() as any, undefined, undefined, [adapter]); await service.init();
     const { actor, binding } = await service.registerActor({ clientIdentity: 'acp-result-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'ACP result' }); const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'manager', role: 'manager' }); const worker = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'acp-worker', role: 'worker' }); const goal = await service.createGoal({ actorId: actor.id, title: 'ACP goal', workspaceId: workspace.workspace.id }); const task = await service.createTask({ workspaceId: workspace.workspace.id, title: 'ACP task' }); await service.claimTask(task.id, worker.member.id, 0);
     const acp = await adapter.launch({ id: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', role: 'worker' }, 'ACP result', '.'); const externalId = String((acp.value as any).id);
     await service.store.mutate((state: any) => { state.sessions.push({ id: 'manager-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'paseo-session-1', createdAt: new Date().toISOString() }); state.sessions.push({ id: 'worker-runtime', actorId: actor.id, goalId: goal.id, taskId: task.id, bindingId: binding.id, generation: 1, runtimeKind: 'external', adapterId: 'hermes-acp', workspaceId: workspace.workspace.id, memberId: worker.member.id, profileId: 'hermes-acp', provider: 'hermes', model: 'hermes-agent', state: 'idle', externalId, createdAt: new Date().toISOString() }); });

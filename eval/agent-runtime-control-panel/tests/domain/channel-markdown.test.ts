@@ -1,8 +1,7 @@
-import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import { escapeCode, escapeMarkdown, renderChannelMarkdown } from '../../../skills/agent-runtime-control-panel/runtime/src/channel-markdown.js';
-import { projectChannelEvent } from '../../../skills/agent-runtime-control-panel/runtime/src/channel-projection.js';
-import type { ChannelEvent, KnowledgeEntry, Member } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { escapeCode, escapeMarkdown, renderChannelMarkdown } from '../../../../skills/agent-runtime-control-panel/runtime/src/channel-markdown.js';
+import { projectChannelEvent } from '../../../../skills/agent-runtime-control-panel/runtime/src/channel-projection.js';
+import type { ChannelEvent, KnowledgeEntry, Member } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 
 const WORKSPACE = 'workspace_a3eef982-afab-47ac-b286-9749a3cce343';
 const OWNER_MEMBER = 'member_287ac3ec-9649-4cee-8a7a-f750a0ce0b75';
@@ -168,23 +167,4 @@ describe('bounded Markdown rendering of the Channel projection', () => {
     for (const paragraph of body) expect(paragraph.length).toBeLessThanOrEqual(200);
   });
 
-  /**
-   * The Owner's named example under the new rendering, reproducible read-only:
-   * `ARCP_CAMPAIGN_STATE=<state file> npx vitest run`.
-   */
-  it('renders the real campaign Lane C event as bounded Markdown, when a live state file is supplied', async () => {
-    const file = process.env.ARCP_CAMPAIGN_STATE;
-    if (!file) return;
-    const live = JSON.parse(await readFile(file, 'utf8'));
-    const target = live.channelEvents.find((item: any) => JSON.stringify(item).includes(LANE_C_KNOWLEDGE.slice(0, 20)));
-    expect(target, 'the live state file must still contain the named acceptance event').toBeDefined();
-    const card = renderChannelMarkdown(projectChannelEvent(target, { members: live.members, tasks: live.tasks, goals: live.goals, knowledge: live.knowledge, results: live.results }), {});
-    expect(card).toMatch(/^### Finding · Round-3 Lane C$/m);
-    expect(card).toContain('**From:** Hermes Owner Deputy `owner`');
-    expect(card).toContain('R2-REV-F17 is closed');
-    expect(card).toMatch(/Only accept completes the Task; a refuse .*stays open/);
-    expect(card).toContain(`- Knowledge: \`${LANE_C_KNOWLEDGE}\``);
-    expect(card).toContain('- Commit: `2acda1f`');
-    if (process.env.ARCP_PRINT_CARD === '1') process.stdout.write(`\n${card}\n\n`);
-  });
 });

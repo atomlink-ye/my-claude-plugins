@@ -4,7 +4,7 @@ import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { SQLiteStateStore } from '../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
+import { SQLiteStateStore } from '../../../../skills/agent-runtime-control-panel/runtime/src/state-store.js';
 
 const root = () => mkdtemp(path.join(os.tmpdir(), 'arcp-sqlite-'));
 const event = (id: string, summary = 'event') => ({ id, workspaceId: 'workspace-1', kind: 'finding' as const, urgency: 'normal' as const, decisionRequired: false, content: { summary, evidenceRefs: ['result-ref'], contentHash: `hash-${id}`, sensitivity: 'normal' as const, retention: 'bounded' as const }, deliveryState: 'queued' as const, transitions: [{ state: 'queued' as const, at: '2026-01-01T00:00:00.000Z' }], createdAt: '2026-01-01T00:00:00.000Z' });

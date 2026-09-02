@@ -2,7 +2,7 @@ import { mkdtemp, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 
 class FakeCli {
   sends = 0;

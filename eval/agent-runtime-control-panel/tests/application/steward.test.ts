@@ -3,16 +3,16 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import type { RuntimeSession, State } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { handleArcp, stewardFor } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import type { RuntimeSession, State } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { handleArcp, stewardFor } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
 import {
   CodexRuntimeAnalyst,
   WorkspaceSteward,
   analysisKeyOf,
   stewardViewOf,
   STEWARD_REPORT_TAG,
-} from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
+} from '../../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
 import type {
   StewardAnalysisRequest,
   StewardAnalyst,
@@ -20,7 +20,7 @@ import type {
   StewardNarrative,
   StewardPolicy,
   SupervisionBreach,
-} from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
+} from '../../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
 
 /**
  * A Paseo CLI that reports a live Codex provider and echoes back a runtime that

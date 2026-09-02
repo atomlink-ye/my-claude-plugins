@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { RuntimeBudgetTracker } from '../../../skills/agent-runtime-control-panel/runtime/src/runtime-budget.js';
-import { evaluateAdmission, PROVIDER_BUDGET_SCHEMA, validateProviderBudgetEnvelope } from '../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { RuntimeBudgetTracker } from '../../../../skills/agent-runtime-control-panel/runtime/src/runtime-budget.js';
+import { evaluateAdmission, PROVIDER_BUDGET_SCHEMA, validateProviderBudgetEnvelope } from '../../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
 
 describe('aggregate runtime burn MVE', () => {
   it('deduplicates native turns and identifies the aggregate Opus wake storm without a transcript', () => {

@@ -2,9 +2,9 @@ import { mkdir, mkdtemp, readdir, rename, rmdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ArcpService, ArcpStore, type State } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { analysisBrief, CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
-import { evaluateSupervision, supervisionPolicyId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
+import { ArcpService, ArcpStore, type State } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { analysisBrief, CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
+import { evaluateSupervision, supervisionPolicyId, type SupervisionView } from '../../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
 class DiscoveryCli {
   async run(args: string[]) {

@@ -2,21 +2,12 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-
-class FakeCli {
-  sends = 0;
-  async run(args: string[]) {
-    if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: true, modes: ['auto'] }], stdout: '', stderr: '' };
-    if (args[0] === 'provider' && args[1] === 'models') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
-    if (args[0] === 'inspect') return { value: { id: 'manager-live', status: 'idle', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' }, stdout: '', stderr: '' };
-    if (args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
-    return { value: [], stdout: '', stderr: '' };
-  }
-}
+import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { createControl } from '../support/create-control.js';
+import { FakePaseoCli } from '../support/fake-paseo-cli.js';
 
 async function fixture() {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-consumption-')); const cli = new FakeCli(); const service = new ArcpService(root, cli as any); await service.init();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-consumption-')); const cli = new FakePaseoCli({ inspectValue: { id: 'manager-live' } }); const { service } = await createControl(root, { cli });
   const { actor, binding } = await service.registerActor({ clientIdentity: 'channel-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'channel consumption' }); const manager = await service.joinWorkspace({ workspaceId: workspace.workspace.id, label: 'Manager', role: 'manager' }); const goal = await service.createGoal({ actorId: actor.id, title: 'channel goal', workspaceId: workspace.workspace.id });
   await service.store.mutate((state: any) => state.sessions.push({ id: 'manager-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'manager-live', createdAt: new Date().toISOString() }));
   return { root, service, cli, workspace, manager };
