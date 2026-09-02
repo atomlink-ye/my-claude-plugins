@@ -337,6 +337,29 @@ describe('Workspace Steward — read-only, ephemeral, and owner-selected provide
     service.close();
   });
 
+  it('binds a cited report and analysis Result to the launched Steward runtime member', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'steward-runtime-provenance-'));
+    const service = await control(root);
+    const { workspaceId, owner, stewardMember, worker, task, session } = await seed(service);
+    const analysisMember = await service.joinWorkspace({ workspaceId, label: 'steward analyst', role: 'steward-analyst', capabilities: ['claim_task', 'submit_result', 'read_context', 'write_knowledge'] });
+    const analysisTask = await service.createTask({ workspaceId, title: 'bounded Steward analysis', scope: 'steward_analysis' });
+    await service.claimTask(analysisTask.id, analysisMember.member.id, 0);
+    const result = await service.submitResult({ workspaceId, taskId: analysisTask.id, memberId: analysisMember.member.id, status: 'candidate', summary: 'cited runtime analysis', evidenceRefs: [task.id], expectedFence: 1 });
+    const analysisSession: RuntimeSession = { ...session, id: 'runtime_steward_analysis', taskId: analysisTask.id, memberId: analysisMember.member.id, externalId: 'paseo-steward-analysis' };
+    await service.store.mutate((state: State) => { state.sessions.push(analysisSession); });
+    const analyst = new RecordingAnalyst({ narrative: 'cited runtime analysis', cited: true, evidenceRefs: [task.id], provider: 'codex', model: 'gpt-5.6-terra', runtimeSessionId: analysisSession.id, analysisTaskId: analysisTask.id });
+    const steward = new WorkspaceSteward(stewardViewOf(service), analyst, policyFor(workspaceId, stewardMember.id));
+    const outcome = await steward.requestAnalysis({ workspaceId, subjectTaskId: task.id, requestedByMemberId: owner.id });
+    const report = service.state().knowledge.find((item) => item.id === outcome.knowledgeId)!;
+    expect(outcome.status).toBe('analyzed');
+    expect(report.authorMemberId).toBe(analysisSession.memberId);
+    expect(result.memberId).toBe(analysisSession.memberId);
+    expect(report.authorMemberId).not.toBe(owner.id);
+    expect(report.authorMemberId).not.toBe(stewardMember.id);
+    expect(report.text).toContain('analysis: cited runtime analysis');
+    service.close();
+  });
+
   it('refuses a manual analysis from a member without Steward authority', async () => {
     // Catches: dropping the authorization check, which would let any managed
     // Worker spend the Workspace's Steward budget.

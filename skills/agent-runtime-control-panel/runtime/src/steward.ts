@@ -294,10 +294,15 @@ export class WorkspaceSteward {
     if (narrative.cited === false || !narrative.narrative) return { ...base, status: 'timeout', why: 'Steward analysis timed out or produced no cited Result' };
 
     const analysisRefs = [...evidenceRefs, ...(narrative.evidenceRefs ?? []), ...(narrative.runtimeSessionId ? [narrative.runtimeSessionId] : []), ...(narrative.analysisTaskId ? [narrative.analysisTaskId] : [])];
+    const runtimeMemberId = narrative.runtimeSessionId
+      ? this.view.readState().sessions.find((item) => item.id === narrative.runtimeSessionId)?.memberId
+      : undefined;
+    if (narrative.runtimeSessionId && !runtimeMemberId) return { ...base, status: 'timeout', why: 'Steward runtime session provenance is missing' };
+    const reportMemberId = runtimeMemberId ?? this.policy.stewardMemberId;
     const text = renderReport(dossier, narrative, analysisRefs);
     const report = await this.view.recordReport({
       workspaceId: request.workspaceId,
-      authorMemberId: this.policy.stewardMemberId,
+      authorMemberId: reportMemberId,
       kind: verdict.classification === 'HEALTHY' ? 'learning' : 'problem',
       text,
       tags: [
@@ -317,7 +322,7 @@ export class WorkspaceSteward {
       id: eventIdFor(key),
       workspaceId: request.workspaceId,
       taskId: subject.id,
-      sourceMemberId: this.policy.stewardMemberId,
+      sourceMemberId: reportMemberId,
       summary: `Workspace Steward ${verdict.classification} on ${subject.id}: ${verdict.recommendation} (report ${report.id})`,
       evidenceRefs: [report.id, ...analysisRefs],
       urgency: verdict.recommendation === 'CONTINUE' ? 'normal' : 'urgent',
