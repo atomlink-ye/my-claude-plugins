@@ -1129,7 +1129,7 @@ export class ArcpService {
   }
   private supervisionView(state: State): SupervisionView {
     return {
-      subjects: state.tasks.map((task) => ({ id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) })),
+      subjects: state.tasks.map((task) => ({ id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.scope ? { scope: task.scope } : {}), ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) })),
       results: state.results.map((result) => ({ taskId: result.taskId, createdAt: result.createdAt })),
       knowledge: state.knowledge.map((entry) => ({ taskId: entry.taskId, createdAt: entry.createdAt })),
       events: state.channelEvents.map((event) => ({ taskId: event.taskId, kind: event.kind, createdAt: event.createdAt })),
@@ -1142,7 +1142,7 @@ export class ArcpService {
   supervisionProgress(taskId: string): { at: string; source: string } | undefined {
     const state = this.store.snapshot();
     const task = state.tasks.find((item) => item.id === taskId);
-    return task ? materialProgressAt(this.supervisionView(state), { id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) }) : undefined;
+    return task ? materialProgressAt(this.supervisionView(state), { id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.scope ? { scope: task.scope } : {}), ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) }) : undefined;
   }
   /**
    * Evaluate every automatic policy at `nowMs` and durably record any breach.
@@ -1231,12 +1231,12 @@ export class ArcpService {
   }
   async panorama(workspaceId: string, refresh = false, temporalFilter: TemporalFilter = 'active') {
     const context = this.context(workspaceId); const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId); const runtime = await Promise.all(sessions.map((item) => this.runtimeStatus(item.id, refresh)));
-    const temporal = projectTemporal({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId) }, temporalFilter);
+    const temporal = projectTemporal({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() }, temporalFilter);
     return { ...context, goals: state.goals.filter((goal) => sessions.some((session) => session.goalId === goal.id)), runtime, blocked: this.blockedRuntimes(workspaceId), latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
   }
   temporalReconciliation(workspaceId: string) {
     const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);
-    return temporalReconciliationPreview({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId) });
+    return temporalReconciliationPreview({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() });
   }
   state() { return this.store.snapshot(); }
 }
