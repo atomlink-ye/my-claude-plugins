@@ -74,7 +74,14 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const workspaceJoin = path.match(/^\/v1\/workspaces\/([^/]+)\/join$/);
     if (method === 'POST' && workspaceJoin) { const workspaceId = decodeURIComponent(workspaceJoin[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const result = await service.joinWorkspace({ ...(await body(req) as any), workspaceId, actorId: authenticatedActor?.id, ...(actorKey ? {} : memberKey ? { credential: memberKey } : {}) }); send(res, 201, result); return true; }
     const workspaceTasks = path.match(/^\/v1\/workspaces\/([^/]+)\/tasks$/);
-    if (method === 'POST' && workspaceTasks) { send(res, 201, await service.createTask({ ...(await body(req) as any), workspaceId: decodeURIComponent(workspaceTasks[1]) } as any)); return true; }
+    if (method === 'POST' && workspaceTasks) {
+      const workspaceId = decodeURIComponent(workspaceTasks[1]);
+      if (authenticatedMember && !admin) {
+        if (authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
+        if (authenticatedMember.role === 'steward' || authenticatedMember.role === 'steward-analyst') throw new ArcpError('unauthorized', 'Steward credentials cannot create product Tasks');
+      }
+      send(res, 201, await service.createTask({ ...(await body(req) as any), workspaceId } as any)); return true;
+    }
     if (method === 'GET' && workspaceTasks) { const workspaceId = decodeURIComponent(workspaceTasks[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, service.state().tasks.filter((item) => item.workspaceId === workspaceId)); return true; }
     const taskClaim = path.match(/^\/v1\/tasks\/([^/]+)\/claim$/);
     if (method === 'POST' && taskClaim) { const memberKey = String(req.headers['x-arcp-member-key'] ?? ''); const member = service.memberForCredential(memberKey); const input = await body(req); send(res, 200, await service.claimTask(decodeURIComponent(taskClaim[1]), member.id, typeof input.expectedFence === 'number' ? input.expectedFence : undefined)); return true; }

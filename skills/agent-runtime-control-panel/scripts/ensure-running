@@ -15,17 +15,32 @@ mkdir -p "$state_root" "$data_dir" "$(dirname "$log_file")"
 base="http://127.0.0.1:$PORT"
 healthy() { curl -fsS --max-time 1 "$base/health" >/dev/null 2>&1; }
 runtime() { if [[ -n "${ARCP_API_KEY:-}" ]]; then curl -fsS -H "x-arcp-api-key: $ARCP_API_KEY" "$base/self/runtime"; else curl -fsS "$base/self/runtime"; fi; }
-if healthy; then runtime; exit 0; fi
+owner_pid() { [[ -f "$pid_file" ]] || return 1; node -e 'const fs=require("fs"); const raw=fs.readFileSync(process.argv[1],"utf8").trim(); const value=raw.startsWith("{")?JSON.parse(raw).pid:raw; if (!/^\d+$/.test(String(value))) process.exit(1); process.stdout.write(String(value));' "$pid_file"; }
+adopt_healthy() {
+  local observed pid
+  observed=$(runtime) || return 1
+  pid=$(printf '%s' "$observed" | node -e 'let text="";process.stdin.on("data",x=>text+=x).on("end",()=>{try { const pid=JSON.parse(text).pid; if (!Number.isInteger(pid)||pid<1) process.exit(1); process.stdout.write(String(pid)); } catch { process.exit(1); }});') || { echo "ARCP health responded but runtime identity was invalid" >&2; return 1; }
+  printf '{"pid":%s,"port":%s,"dataDir":"%s"}\n' "$pid" "$PORT" "$data_dir" >"$pid_file"
+  printf '%s\n' "$observed"
+}
+if healthy; then adopt_healthy; exit $?; fi
+if stale_pid=$(owner_pid 2>/dev/null); then
+  if kill -0 "$stale_pid" 2>/dev/null; then
+    echo "ARCP owner pid $stale_pid is live but health is unavailable; refusing concurrent start" >&2; exit 1
+  fi
+  rm -f "$pid_file"
+fi
 lock="$state_root/start.lock"
 if ! mkdir "$lock" 2>/dev/null; then
-  for _ in {1..80}; do healthy && { runtime; exit 0; }; sleep .1; done
+  for _ in {1..80}; do healthy && { adopt_healthy; exit $?; }; sleep .1; done
   echo "timed out waiting for ARCP startup lock" >&2; exit 1
 fi
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT
-env -u PASEO_AGENT_ID PORT="$PORT" PASEO_COMPANION_DATA="$data_dir" ARCP_DATA="$data_dir" nohup node "$server" >"$log_file" 2>&1 </dev/null &
+if healthy; then adopt_healthy; exit $?; fi
+env -u PASEO_AGENT_ID PORT="$PORT" PASEO_COMPANION_DATA="$data_dir" ARCP_DATA="$data_dir" ARCP_RUNTIME_DIR="$state_root" ARCP_PID="$pid_file" nohup node "$server" >"$log_file" 2>&1 </dev/null &
 pid=$!
 for _ in {1..80}; do
-  if healthy; then printf '%s\n' "$pid" >"$pid_file"; runtime; exit 0; fi
+  if healthy; then adopt_healthy; exit $?; fi
   kill -0 "$pid" 2>/dev/null || { echo "ARCP failed to start; see $log_file" >&2; exit 1; }
   sleep .1
 done
