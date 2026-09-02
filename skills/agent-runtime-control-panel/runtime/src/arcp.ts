@@ -256,6 +256,7 @@ export const DEFAULT_PROFILES = [
   { id: 'codex-auto-review', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto-review', thinking: 'medium', role: 'worker' },
   { id: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
   { id: 'claude-sonnet-worker', provider: 'claude', model: 'claude-sonnet-5', mode: 'auto', thinking: 'medium', role: 'worker' },
+  { id: 'claude-sonnet-worker-bypass', provider: 'claude', model: 'claude-sonnet-5', mode: 'bypassPermissions', thinking: 'medium', role: 'worker' },
   { id: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', role: 'worker' },
 ] as const;
 
