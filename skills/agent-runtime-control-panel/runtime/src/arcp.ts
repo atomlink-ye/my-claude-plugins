@@ -751,7 +751,11 @@ export class ArcpService implements ExecutionPlacementPort {
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
     // The automatic supervision trigger rides the existing delivery pump rather
     // than introducing a scheduler. It is inert until a Workspace has a policy.
-    this.pumpTimer = setInterval(() => { void this.pump(); void this.evaluateSupervision(); }, 2_000); this.pumpTimer.unref();
+    // Escalation rides the existing control tick rather than owning a second
+    // loop. The clock only decides when the SLA is re-evaluated; the SLA and
+    // the lapsed-lease facts decide whether anyone is woken, so this stays a
+    // durable-obligation mechanism rather than a poller that invents events.
+    this.pumpTimer = setInterval(() => { void this.pump(); void this.evaluateSupervision(); void this.escalateOverdueObligations().catch(() => undefined); }, 2_000); this.pumpTimer.unref();
     // Startup is not complete until persisted safe-point deliveries have been
     // reconciled. Awaiting this makes restart behavior deterministic: delivered
     // rows are observed/processed, while waiting rows are eligible exactly once.
@@ -1880,6 +1884,38 @@ export class ArcpService implements ExecutionPlacementPort {
     await this.pump(); return resolved;
   }
 
+  /** Dispose an obligation that can never be delivered.
+   *
+   * A `consume_on_delivery` obligation consumes when it reaches someone. One
+   * that is durably undeliverable therefore has no path at all: `ack` requires
+   * delivery and `resolve` only accepts decision events, so the backlog could
+   * only ever be closed by an auto-close, which would erase the evidence that
+   * anyone was ever owed anything.
+   *
+   * This is the supported alternative. It is explicit, attributed to an
+   * accountable member, requires a reason, and refuses anything that still has
+   * a live delivery path — so it can retire dead history without becoming a way
+   * to make a real obligation disappear. */
+  async disposeUndeliverable(input: { eventId: string; memberId: string; reason: string }): Promise<ChannelEvent> {
+    const reason = input.reason?.trim();
+    if (!reason) throw new ArcpError('invalid_request', 'disposing an undeliverable obligation requires a reason', 'reason');
+    return this.store.mutate((state) => {
+      const event = state.channelEvents.find((item) => item.id === input.eventId);
+      if (!event) throw new ArcpError('not_found', 'event not found');
+      const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === event.workspaceId);
+      if (!member) throw new ArcpError('unknown_recipient', 'member is not in this workspace');
+      // Only a genuinely dead obligation may be retired this way. Anything that
+      // could still reach a recipient must go through its normal disposition.
+      if (event.deliveryState !== 'undeliverable') throw new ArcpError('invalid_request', 'only an undeliverable obligation can be disposed this way');
+      if (event.consumptionState !== 'open') return event;
+      if (event.consumptionPolicy === 'decision_required') throw new ArcpError('invalid_request', 'a decision obligation must be resolved with a verdict, not disposed');
+      this.appendDisposition(event, { kind: 'ack', reason: `undeliverable disposition: ${reason}` }, member.id);
+      event.consumptionState = 'consumed';
+      event.consumedAt = now();
+      return event;
+    });
+  }
+
   /** Manager ACK SLA defaults. Configurable rather than a hardcoded promise:
    * these are the design's starting local targets, not a product guarantee. */
   static readonly DEFAULT_ACK_SLA_MS = { urgent: 120_000, normal: 900_000 };
@@ -1926,11 +1962,17 @@ export class ArcpService implements ExecutionPlacementPort {
    * the binding is replaceable, so the newest generation wins and the caller
    * always names an exact binding rather than scanning for a plausible one. */
   private currentOwnerBinding(state: State, ownerActorId: string): ChannelBindingRef | undefined {
-    const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel) && this.bindingIsCurrent(item));
+    // A binding with no conversation reference is not an address at all, so it
+    // is not a candidate rather than a candidate that happens to fail later.
+    const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel) && this.bindingIsCurrent(item) && Boolean(item.conversationRef));
     if (!bindings.length) return undefined;
-    const current = bindings.reduce((best, item) => (item.generation > best.generation ? item : best));
-    if (!current.conversationRef) return undefined;
-    return { actorId: ownerActorId, bindingId: current.id, generation: current.generation, adapterId: current.channel, recipientRef: current.conversationRef };
+    const top = bindings.reduce((max, item) => Math.max(max, item.generation), 0);
+    const candidates = bindings.filter((item) => item.generation === top);
+    // Two live addresses at the same generation is an ambiguous identity, not a
+    // tie to break. Guessing one would silently pick which human gets woken.
+    if (candidates.length !== 1) return undefined;
+    const current = candidates[0];
+    return { actorId: ownerActorId, bindingId: current.id, generation: current.generation, adapterId: current.channel, recipientRef: current.conversationRef! };
   }
 
   /** Escalate one unhandled Manager obligation to the Owner Deputy.

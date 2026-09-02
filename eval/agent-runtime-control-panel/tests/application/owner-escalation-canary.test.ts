@@ -266,4 +266,48 @@ describe('owner escalation canary', () => {
     expect(() => register([{ id: 'hermes' }])).toThrow(/id and a provider/);
     service.close();
   });
+
+  it('refuses to guess between two live Owner addresses at the same generation', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    service.channels.register(new RecordingChannelAdapter('recording'));
+    // A second current binding at the same generation is an ambiguous identity.
+    await service.store.mutate((state: any) => {
+      const first = state.bindings.find((item: any) => item.actorId === workspace.ownerActorId);
+      state.bindings.push({ ...first, id: 'binding_rival', conversationRef: 'conversation-rival' });
+      return undefined;
+    });
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    const escalated = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+    // Picking one would silently choose which human gets woken.
+    expect(escalated.receipt).toBeUndefined();
+    expect(service.state().channelEvents.find((e) => e.id === escalated.event.id)!.deliveryState).toBe('undeliverable');
+    service.close();
+  });
+
+  it('offers an explicit, attributed disposition for a dead obligation and refuses live or decision ones', async () => {
+    const { service, workspace, manager, worker, task } = await platformWorkspace();
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
+    const candidate = service.state().channelEvents.find((e) => e.kind === 'task_candidate' && e.resultId === result.id)!;
+    const decision = service.state().channelEvents.find((e) => e.kind === 'decision_required' && e.resultId === result.id)!;
+
+    // A live obligation must keep its normal path: this disposition is only for
+    // history that can never reach anyone.
+    await service.store.mutate((state: any) => { state.channelEvents.find((e: any) => e.id === candidate.id).deliveryState = 'delivered'; return undefined; });
+    await expect(service.disposeUndeliverable({ eventId: candidate.id, memberId: manager.id, reason: 'x' })).rejects.toMatchObject({ code: 'invalid_request' });
+    await service.store.mutate((state: any) => { state.channelEvents.find((e: any) => e.id === candidate.id).deliveryState = 'undeliverable'; state.channelEvents.find((e: any) => e.id === decision.id).deliveryState = 'undeliverable'; return undefined; });
+    // A decision still needs a verdict; it must not be swept away as dead history.
+    await expect(service.disposeUndeliverable({ eventId: decision.id, memberId: manager.id, reason: 'x' })).rejects.toMatchObject({ code: 'invalid_request' });
+    // A reason is mandatory: an unexplained disposal is indistinguishable from an auto-close.
+    await expect(service.disposeUndeliverable({ eventId: candidate.id, memberId: manager.id, reason: '  ' })).rejects.toMatchObject({ code: 'invalid_request' });
+
+    const disposed = await service.disposeUndeliverable({ eventId: candidate.id, memberId: manager.id, reason: 'dead history from before a Manager session existed' });
+    expect(disposed.consumptionState).toBe('consumed');
+    expect(disposed.dispositions.at(-1)).toMatchObject({ actorMemberId: manager.id });
+    expect(disposed.dispositions.at(-1)!.reason).toContain('undeliverable disposition');
+    expect(disposed.deliveryState).toBe('undeliverable');
+    service.close();
+  });
 });
