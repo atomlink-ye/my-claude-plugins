@@ -462,6 +462,10 @@ export class ArcpService {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
     if (!preflight.launchable) return preflight;
+    if (input.paseoProjectId && input.paseoWorkspaceId && this.adapter instanceof PaseoAdapter) {
+      const placement = await this.adapter.workspacePlacement(input.paseoWorkspaceId).catch(() => undefined);
+      if (placement?.projectId && placement.projectId !== input.paseoProjectId) return { ...preflight, action: 'hold', launchable: false, why: 'PLACEMENT_MISMATCH: requested Paseo Project does not own the selected Workspace' };
+    }
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope });
     const profile = this.profileData.find((item) => item.id === preflight.profileId);
