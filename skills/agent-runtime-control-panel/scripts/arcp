@@ -10,6 +10,7 @@ const HELP = `ARCP ControlWorkspace commands:
   knowledge add|search|list WORKSPACE
   result submit|list WORKSPACE [--expected-fence N] [--source-id ID] [--evidence REF[,REF...]]
   channel list WORKSPACE [--kind K] [--state S] [--decision-required]
+  channel reconcile WORKSPACE --dry-run
   channel ack EVENT
   channel resolve EVENT --summary '...' [--verdict accept|refuse]
   channel ask RUNTIME --question '...' [--options 'a,b']
@@ -28,7 +29,7 @@ const HELP = `ARCP ControlWorkspace commands:
   external status|send|stop|reconcile RUNTIME
   reconcile RUNTIME
   inbox [--workspace WORKSPACE]
-  panorama [--workspace WORKSPACE]
+  panorama [--workspace WORKSPACE] [--temporal active|problems|task TASK_ID]
   status [--workspace WORKSPACE]
   tui [--workspace WORKSPACE] [--snapshot]
   canary
@@ -98,6 +99,7 @@ else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/worksp
 else if (area === 'result' && action === 'submit') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/results`,{taskId:f.task||p[1],status:f.status||'candidate',summary:f.summary||p.slice(2).join(' '),...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])}),...(f['source-id'] === undefined ? {} : {sourceId:String(f['source-id'])}),...(f.evidence === undefined ? {} : {evidenceRefs:evidenceRefs(f.evidence)})},true);
 else if (area === 'result' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/results`);
 else if (area === 'channel' && action === 'list') { const workspace=p[0]||await workspaceId(); if(workspace) { const decisionRequired = f['decision-required'] === true || f['decision-required'] === 'true' ? '1' : f['decision-required'] === false || f['decision-required'] === 'false' ? '0' : undefined; await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/events?${new URLSearchParams(Object.fromEntries(Object.entries({kind:f.kind,state:f.state,'decision-required':decisionRequired}).filter(([,v])=>v!==undefined))).toString()}`); } }
+else if (area === 'channel' && action === 'reconcile') { const workspace=p[0]||await workspaceId(); if (!bool('dry-run')) { console.error('channel reconcile requires --dry-run in Round 4; applying dispositions is refused'); process.exitCode=2; } else if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/channel/reconcile?dry-run=1`); }
 else if (area === 'channel' && action === 'ask') await call('POST',`/v1/runtime-sessions/${encodeURIComponent(p[0]||f.runtime)}/decision`,{question:f.question||p.slice(1).join(' '),...(f.options?{options:String(f.options).split(',').map((v)=>v.trim()).filter(Boolean)}:{})});
 else if (area === 'channel' && action === 'ack') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||'acknowledged'});
 else if (area === 'channel' && action === 'resolve') await call('POST',`/v1/events/${encodeURIComponent(p[0])}/resolve`,{summary:f.summary||p.slice(1).join(' ')||'Decision resolved',verdict:bool('refuse')?'refuse':(f.verdict?String(f.verdict):'accept')});
@@ -114,7 +116,7 @@ else if (area === 'reconcile') await call('POST',`/v1/runtime-sessions/${encodeU
 else if (area === 'ack') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/ack`,{reason:f.reason||p.slice(1).join(' ')||'processed',...(f.generation?{generation:Number(f.generation)}:{})});
 else if (area === 'release') await call('POST',`/v1/deliveries/${encodeURIComponent(p[0])}/release`,{...(f.confirm?{confirmation:f.confirm}:{})});
 else if (area === 'inbox') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/context`); }
-else if (area === 'panorama') { const workspace=await workspaceId(); if(workspace) await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama${f.refresh ? '?refresh=1' : ''}`); }
+else if (area === 'panorama') { const workspace=await workspaceId(); if(workspace) { const temporal = f.temporal; const query = new URLSearchParams({ ...(f.refresh?{refresh:'1'}:{}), ...(temporal === 'problems'?{temporal:'problems'}:{}), ...(temporal === 'task'?{temporal:'task',task:String(p[0]||f.task||'')}:{}) }); await call('GET',`/v1/workspaces/${encodeURIComponent(workspace)}/panorama${query.size?`?${query}`:''}`); } }
 else if (area === 'tui') { const workspace=await workspaceId(); if(workspace) { const s=await load(), headers={...(admin?{'x-arcp-api-key':admin}:{}),...(s.actorCredential?{'x-arcp-actor-key':s.actorCredential}:{}),...(s.memberCredential?{'x-arcp-member-key':s.memberCredential}:{})}, fetchPanorama=async(refresh=false)=>{const r=await fetch(`${base}/v1/workspaces/${encodeURIComponent(workspace)}/panorama${refresh?'?refresh=1':''}`,{headers}); const v=await r.json(); if(!r.ok) throw new Error(v.message||v.code||'panorama failed'); return v;}, tui=await import('../runtime/dist/tui.js'); if(f.snapshot){try{console.log(tui.renderTuiSnapshot(await fetchPanorama(false)));}catch(error){console.log(JSON.stringify({code:error instanceof Error?error.message:String(error)},null,2));process.exitCode=1;}} else await tui.runTui({fetchPanorama}); } }
 else if (area === 'member' && action === 'heartbeat') { const s=await load(); await call('POST',`/v1/members/${encodeURIComponent(s.memberId)}/heartbeat`,{presence:f.status||'idle'},true); }
 else if (area === 'member' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/members`);

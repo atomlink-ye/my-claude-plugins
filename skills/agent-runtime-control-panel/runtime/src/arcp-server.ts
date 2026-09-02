@@ -15,7 +15,7 @@ function publicContext(value: any) { return { ...value, roster: value.roster.map
 function publicPanorama(value: any) {
   return { workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
-    blocked: value.blocked ?? [],
+    blocked: value.blocked ?? [], temporal: value.temporal,
     events: value.events ?? [], latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef };
 }
 
@@ -58,7 +58,9 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const workspaceContext = path.match(/^\/v1\/workspaces\/([^/]+)\/context$/);
     if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }
     const panorama = path.match(/^\/v1\/workspaces\/([^/]+)\/panorama$/);
-    if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1'))); return true; }
+    if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const temporal = url.searchParams.get('temporal'); const filter = temporal === 'problems' ? 'problems' : temporal === 'task' && url.searchParams.get('task') ? { taskId: String(url.searchParams.get('task')) } : 'active'; send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1', filter))); return true; }
+    const channelReconcile = path.match(/^\/v1\/workspaces\/([^/]+)\/channel\/reconcile$/);
+    if (channelReconcile) { const workspaceId = decodeURIComponent(channelReconcile[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); if (method !== 'GET' || url.searchParams.get('dry-run') !== '1') throw new ArcpError('invalid_request', 'channel reconcile requires --dry-run in Round 4; applying dispositions is refused'); send(res, 200, { dryRun: true, proposals: service.temporalReconciliation(workspaceId) }); return true; }
     const runtimeDecision = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/decision$/);
     if (method === 'POST' && runtimeDecision) { const input = await body(req); send(res, 201, await service.raiseDecision({ runtimeSessionId: decodeURIComponent(runtimeDecision[1]), question: String(input.question ?? ''), ...(Array.isArray(input.options) ? { options: input.options.map(String) } : {}) }).then((raised) => ({ event: raised.event, session: publicSession(raised.session) }))); return true; }
     const workspaceJoin = path.match(/^\/v1\/workspaces\/([^/]+)\/join$/);
