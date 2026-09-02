@@ -24,12 +24,12 @@ import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisi
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
 import { collectCodexbar, collectPiGrokCache, evaluateAdmission, matchesModel, runCommandCollector, translatePaseoProviderUsage, type AdmissionDecision, type ProviderBudgetConfig, type ProviderBudgetEnvelopeV1, type ProviderBudgetSource } from './provider-budget.js';
 import { RuntimeBudgetTracker, type RuntimeBudgetPolicy, type RuntimeBudgetSample, type RuntimeBudgetSignal, type RuntimeBudgetView } from './runtime-budget.js';
-import { checkoutIdentity, surfaceName, type CheckoutRef, type ExecutionPlacementPort, type ExecutionSurface, type ExecutionSurfaceBinding, type ExecutionSurfaceKind, type ExecutionSurfaceRef, type RepositoryLocator, type RepositoryRef, type RuntimeBinding, type RuntimeBindingReceipt, type RuntimeBindingRef, type RuntimeLaunchSpec, type SurfaceArchiveAuthorization, type SurfaceClaim, type SurfaceSpec } from './execution-placement.js';
+import { checkoutIdentity, surfaceName, type CheckoutRef, type ExecutionPlacementPort, type ExecutionSurface, type ExecutionSurfaceBinding, type ExecutionSurfaceKind, type ExecutionSurfaceRef, type RepositoryLocator, type RepositoryRef, type RuntimeBinding, type RuntimeBindingReceipt, type RuntimeBindingRef, type RuntimeLaunchSpec, type SurfaceArchiveAuthorization, type SurfaceClaim, type SurfaceRestoreEvidence, type SurfaceRestoreReceipt, type SurfaceSpec } from './execution-placement.js';
 export { PROVIDER_BUDGET_SCHEMA, validateProviderBudgetEnvelope, evaluateAdmission, collectCodexbar, collectPiGrokCache, runCommandCollector, translatePaseoProviderUsage } from './provider-budget.js';
 export type { AdmissionDecision, ProviderBudgetBinding, ProviderBudgetConfig, ProviderBudgetEnvelopeV1, ProviderBudgetPolicy, ProviderBudgetSource, ProviderBudgetSourceTrust } from './provider-budget.js';
 export { RuntimeBudgetTracker, validateRuntimeBudgetSample } from './runtime-budget.js';
 export type { RuntimeBudgetPolicy, RuntimeBudgetSample, RuntimeBudgetSignal, RuntimeBudgetView, WakeCategory } from './runtime-budget.js';
-export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSurfaceBinding, ExecutionSurfaceKind, ExecutionSurfaceRef, RepositoryLocator, RepositoryRef, RuntimeBinding, RuntimeBindingReceipt, RuntimeBindingRef, SurfaceArchiveAuthorization, SurfaceClaim, SurfaceSpec } from './execution-placement.js';
+export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSurfaceBinding, ExecutionSurfaceKind, ExecutionSurfaceRef, RepositoryLocator, RepositoryRef, RuntimeBinding, RuntimeBindingReceipt, RuntimeBindingRef, SurfaceArchiveAuthorization, SurfaceClaim, SurfaceRestoreEvidence, SurfaceRestoreReceipt, SurfaceSpec } from './execution-placement.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
 export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
@@ -351,6 +351,20 @@ export class PaseoAdapter implements RuntimeAdapter {
     try { await client.connect(); return paseoPlacement(asRecord(await client.workspaces.ref(workspaceId).refresh())); }
     finally { await client.close().catch(() => undefined); }
   }
+  /** Resolve a stable Paseo Project without creating a repository-root
+   * Workspace. Lane materialization needs the Project identity, not another
+   * visible execution row for the source checkout. */
+  async projectForCheckout(checkout: string): Promise<{ root: string; projectId: string }> {
+    const repository = await repositoryIdentity(checkout);
+    const projects = (await this.cli.run(['project', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
+    const listed = Array.isArray(projects) ? projects.map(asRecord) : [];
+    const projectAtRoot = listed.find((item) => path.resolve(String(item.path ?? item.cwd ?? '')) === repository.root);
+    const projectByRemote = repository.projectId ? listed.find((item) => setting(item.projectId ?? item.id ?? asRecord(item.project).id) === repository.projectId) : undefined;
+    const existing = setting(projectAtRoot?.projectId ?? projectAtRoot?.id ?? asRecord(projectAtRoot?.project).id) ?? setting(projectByRemote?.projectId ?? projectByRemote?.id ?? asRecord(projectByRemote?.project).id);
+    const projectId = existing ?? setting(asRecord((await this.cli.run(['project', 'create', repository.root, '--json'], { timeoutMs: discoveryTimeoutMs() })).value).projectId);
+    if (!projectId) throw new ArcpError('placement_unresolved', 'Paseo did not materialize a Project identity');
+    return { root: repository.root, projectId };
+  }
   /** Resolve the repository root before asking Paseo to create anything.  This
    * prevents a runtime subdirectory from becoming a spurious Project. */
   async materializePlacement(input: { checkout: string; projectId?: string; workspaceId?: string; title: string }): Promise<CanonicalPaseoPlacement | undefined> {
@@ -406,6 +420,14 @@ export class PaseoAdapter implements RuntimeAdapter {
   }
   /** Paseo owns the sidebar row; archiving it never removes a Git worktree. */
   archiveWorkspace(workspaceId: string) { return this.cli.run(['workspace', 'archive', workspaceId, '--json'], { timeoutMs: 30_000 }); }
+  /** Paseo currently has no documented unarchive command. Re-materializing the
+   * same checkout under its existing Project is the provider-neutral fallback;
+   * a returned replacement ID is surfaced as restore evidence by the service. */
+  async restoreWorkspace(input: { checkout: string; binding: { projectId: string; workspaceId: string }; title: string }): Promise<{ binding: { projectId: string; workspaceId: string }; strategy: SurfaceRestoreEvidence['strategy'] }> {
+    const placement = await this.materializePlacement({ checkout: input.checkout, projectId: input.binding.projectId, title: input.title });
+    if (!placement || placement.projectId !== input.binding.projectId) throw new ArcpError('placement_unresolved', 'Paseo did not restore the archived surface under its original Project');
+    return { binding: { projectId: placement.projectId, workspaceId: placement.workspaceId }, strategy: placement.workspaceId === input.binding.workspaceId ? 'provider_restore' : 'rematerialized' };
+  }
   async providerSubagents(parentAgentId: string): Promise<ChildObservation> {
     if (!(this.cli instanceof PaseoCli)) return { source: 'unavailable', items: [] };
     const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws'; const url = raw.includes('://') ? raw : `ws://${raw}`;
@@ -596,10 +618,11 @@ export class ArcpService implements ExecutionPlacementPort {
     let placement: CanonicalPaseoPlacement | undefined;
     let checkout = requestedCheckout;
     if (input.kind === 'lane') {
-      const repositoryPlacement = await (this.adapter as PaseoAdapter).materializePlacement({ checkout: repository.root, title: surfaceName('working') });
-      if (!repositoryPlacement) throw new ArcpError('placement_unresolved', 'Paseo did not resolve the Repository binding for a lane');
+      const repositoryPlacement = await (this.adapter as PaseoAdapter).projectForCheckout(repository.root);
+      const baseBranch = (await git(repository.root, ['branch', '--show-current'])).trim();
+      if (!baseBranch) throw new ArcpError('placement_unresolved', 'Paseo lane creation requires a checked-out repository branch');
       const slug = `arcp-${randomUUID().slice(0, 8)}-${(input.slug ?? 'writer').replace(/[^a-z0-9]+/gi, '-').slice(0, 20)}`;
-      const created = asRecord((await this.cli.run(['workspace', 'create', '--isolation', 'worktree', '--path', repository.root, '--project', repositoryPlacement.projectId, '--mode', 'branch-off', '--new-branch', `arcp/${slug}`, '--base', 'HEAD', '--worktree-slug', slug, '--title', surfaceName('lane', input), '--json'], { timeoutMs: 30_000 })).value);
+      const created = asRecord((await this.cli.run(['workspace', 'create', '--isolation', 'worktree', '--path', repository.root, '--project', repositoryPlacement.projectId, '--mode', 'branch-off', '--new-branch', `arcp/${slug}`, '--base', baseBranch, '--worktree-slug', slug, '--title', surfaceName('lane', input), '--json'], { timeoutMs: 30_000 })).value);
       const workspaceId = setting(created.workspaceId ?? created.id);
       if (!workspaceId) throw new ArcpError('placement_unresolved', 'Paseo did not materialize a lane Workspace');
       const listed = (await this.cli.run(['workspace', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
@@ -671,6 +694,25 @@ export class ArcpService implements ExecutionPlacementPort {
       catch { throw new ArcpError('checkout_retention_failed', 'Paseo archived the surface but ARCP could not retain its Git worktree'); }
     }
     await this.store.mutate((state) => { const item = state.executionSurfaces.find((value) => value.id === surface.id)!; item.visibilityState = 'archived'; item.updatedAt = now(); for (const binding of state.runtimeBindings.filter((value) => value.executionSurfaceId === surface.id)) binding.visibilityState = 'archived'; });
+  }
+  /** Explicit Owner action only. Results and idle observations never restore
+   * an archived row. Provider binding replacement remains scoped to this one
+   * surface and is recorded with the returned evidence. */
+  async restoreSurface(surface: ExecutionSurfaceRef, authorization: SurfaceArchiveAuthorization): Promise<SurfaceRestoreReceipt> {
+    const state = this.store.snapshot(); const current = state.executionSurfaces.find((item) => item.id === surface.id); if (!current) throw new ArcpError('not_found', 'execution surface not found');
+    const workspace = state.workspaces.find((item) => item.id === authorization.controlWorkspaceId);
+    const associated = state.tasks.some((item) => item.workspaceId === authorization.controlWorkspaceId && item.executionSurfaceId === surface.id) || state.sessions.some((item) => item.workspaceId === authorization.controlWorkspaceId && item.executionSurfaceId === surface.id);
+    if (!workspace || workspace.ownerActorId !== authorization.actorId || !associated) throw new ArcpError('unauthorized', 'only the owning ControlWorkspace actor may restore its execution surface');
+    const previous = current.adapterBindings.paseo; if (!previous) throw new ArcpError('placement_unresolved', 'execution surface has no Paseo binding');
+    const restored = await (this.adapter as PaseoAdapter).restoreWorkspace({ checkout: current.checkout.path, binding: previous, title: surfaceName(current.kind) });
+    const evidence: SurfaceRestoreEvidence = { adapterId: 'paseo', strategy: restored.strategy, previous, current: restored.binding, observedAt: now() };
+    const restoredSurface = await this.store.mutate((next) => {
+      const item = next.executionSurfaces.find((value) => value.id === surface.id)!;
+      item.adapterBindings.paseo = restored.binding; item.restoreEvidence = { ...(item.restoreEvidence ?? {}), paseo: evidence }; item.visibilityState = 'visible'; item.updatedAt = now();
+      if (restored.strategy === 'provider_restore') for (const binding of next.runtimeBindings.filter((value) => value.executionSurfaceId === surface.id)) binding.visibilityState = 'visible';
+      return item;
+    });
+    return { surface: restoredSurface, evidence };
   }
   close(): void { if (this.pumpTimer) clearInterval(this.pumpTimer); }
   /** Daemon liveness and identity for the launcher; not a ControlWorkspace surface. */

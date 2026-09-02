@@ -25,6 +25,7 @@ class FakeCli {
   lastEnv: Record<string, string> = {};
   private workspaces: Array<Record<string, unknown>> = [];
   private laneCount = 0;
+  private localCount = 0;
   constructor(private readonly fail: boolean | string = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
   async run(args: string[], options: { env?: Record<string, string> } = {}) {
     this.calls.push(args);
@@ -35,7 +36,8 @@ class FakeCli {
     if (args[0] === 'workspace' && args[1] === 'ls') return { value: this.workspaces, stdout: '', stderr: '' };
     if (args[0] === 'project' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
     if (args[0] === 'project' && args[1] === 'create') return { value: { projectId: 'prj_default' }, stdout: '', stderr: '' };
-    if (args[0] === 'workspace' && args[1] === 'create') { const worktree = args.includes('worktree'); const workspaceId = worktree ? `wks_lane_${++this.laneCount}` : 'wks_default'; const projectId = args[args.indexOf('--project') + 1] ?? 'prj_default'; const cwd = worktree ? path.join(process.cwd(), '..', `arcp-disposable-lane-${this.laneCount}`) : String(args[args.indexOf('--path') + 1]); const row = { workspaceId, projectId, cwd }; this.workspaces = [...this.workspaces.filter((item) => item.workspaceId !== workspaceId), row]; return { value: row, stdout: '', stderr: '' }; }
+    if (args[0] === 'workspace' && args[1] === 'create') { const worktree = args.includes('worktree'); const workspaceId = worktree ? `wks_lane_${++this.laneCount}` : this.localCount++ ? `wks_restore_${this.localCount - 1}` : 'wks_default'; const projectId = args[args.indexOf('--project') + 1] ?? 'prj_default'; const cwd = worktree ? path.dirname(process.cwd()) : String(args[args.indexOf('--path') + 1]); const row = { workspaceId, projectId, cwd }; this.workspaces = [...this.workspaces.filter((item) => item.workspaceId !== workspaceId), row]; return { value: row, stdout: '', stderr: '' }; }
+    if (args[0] === 'workspace' && args[1] === 'archive') { this.workspaces = this.workspaces.filter((item) => item.workspaceId !== args[2]); return { value: { workspaceId: args[2], status: 'archived' }, stdout: '', stderr: '' }; }
     if (args[0] === 'run') { this.launches += 1; this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: this.registryListing ?? [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
@@ -82,6 +84,8 @@ describe('ARCP MVE control core', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-execution-surface-')); const service = await control(root);
     (service.adapter as any).workspacePlacement = async (workspaceId: string) => ({ projectId: 'prj_default', workspaceId });
     const materialized = await service.materializeSurface({ checkout: process.cwd(), kind: 'lane', slug: 'disposable' });
+    const laneCreate = (service.cli as any).calls.find((args: string[]) => args[0] === 'workspace' && args[1] === 'create' && args.includes('worktree')) as string[];
+    expect(laneCreate[laneCreate.indexOf('--base') + 1]).not.toBe('HEAD');
     const { actor } = await service.registerActor({ clientIdentity: 'surface-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'surface result' });
     const shared = { actorId: actor.id, workspaceId: workspace.workspace.id, profileId: 'codex-worker', executionSurfaceId: materialized.surface.id, workspace: materialized.surface.checkout.path };
     const manager = await service.startManaged({ ...shared, title: 'integration tab', role: 'manager' }) as any;
@@ -101,8 +105,12 @@ describe('ARCP MVE control core', () => {
     await service.archiveSurface(materialized.surface, { controlWorkspaceId: workspace.workspace.id, actorId: actor.id });
     expect(service.state().executionSurfaces[0].visibilityState).toBe('archived');
     expect(service.state().runtimeBindings.every((binding) => binding.visibilityState === 'archived')).toBe(true);
-    await expect(service.materializeSurface({ checkout: materialized.surface.checkout.path, kind: 'working' })).rejects.toMatchObject({ code: 'surface_archived' });
     expect((service.cli as any).calls).toContainEqual(['workspace', 'archive', 'wks_lane_1', '--json']);
+    const restored = await service.restoreSurface(materialized.surface, { controlWorkspaceId: workspace.workspace.id, actorId: actor.id });
+    expect(restored).toMatchObject({ evidence: { adapterId: 'paseo', strategy: 'rematerialized', previous: { workspaceId: 'wks_lane_1' }, current: { workspaceId: 'wks_default' } }, surface: { visibilityState: 'visible', adapterBindings: { paseo: { workspaceId: 'wks_default' } } } });
+    expect(service.state().runtimeBindings.every((binding) => binding.visibilityState === 'archived')).toBe(true);
+    await expect(service.claimSurface(materialized.surface, writer.session.id)).resolves.toMatchObject({ active: true, holder: writer.session.id });
+    expect(await service.materializeSurface({ checkout: materialized.surface.checkout.path, kind: 'working' })).toMatchObject({ surface: { id: materialized.surface.id, visibilityState: 'visible' } });
     service.close();
   });
   it('scopes Panorama execution facts to its ControlWorkspace compatibility scope', async () => {

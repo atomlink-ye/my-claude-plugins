@@ -13,8 +13,11 @@ export interface RuntimeBindingRef { id: string; }
 /** Provider-native handles are retained only in the adapter record selected by
  * `adapterId`; cooperation and placement callers never pass them around. */
 export interface AdapterSurfaceBinding { projectId: string; workspaceId: string; }
+/** The provider result that made an archived surface visible again. A
+ * replacement binding is deliberate evidence, never a hidden identity swap. */
+export interface SurfaceRestoreEvidence { adapterId: string; strategy: 'provider_restore' | 'rematerialized'; previous: AdapterSurfaceBinding; current: AdapterSurfaceBinding; observedAt: string; }
 export interface SurfaceSpec { checkout: string; kind: ExecutionSurfaceKind; slug?: string; revision?: string; }
-export interface ExecutionSurface { id: string; repositoryId: string; checkout: CheckoutRef; kind: ExecutionSurfaceKind; operationalState: OperationalState; visibilityState: VisibilityState; adapterBindings: Record<string, AdapterSurfaceBinding>; createdAt: string; updatedAt: string; }
+export interface ExecutionSurface { id: string; repositoryId: string; checkout: CheckoutRef; kind: ExecutionSurfaceKind; operationalState: OperationalState; visibilityState: VisibilityState; adapterBindings: Record<string, AdapterSurfaceBinding>; restoreEvidence?: Record<string, SurfaceRestoreEvidence>; createdAt: string; updatedAt: string; }
 export interface ExecutionSurfaceBinding { surface: ExecutionSurface; adapterId: string; }
 export interface RuntimeBinding { id: string; executionSurfaceId: string; runtimeSessionId: string; adapterId: string; nativeId?: string; generation: number; state: string; visibilityState: VisibilityState; createdAt: string; }
 export interface RuntimeBindingReceipt { binding: RuntimeBinding; }
@@ -25,7 +28,8 @@ export interface RuntimeLaunchSpec { executionSurfaceId: string; runtimeSessionI
 export interface RuntimeObservation { state: string; }
 export interface SurfaceClaim { id: string; executionSurfaceId: string; runtimeSessionId: string; holder: string; mode: 'writer'; active: boolean; createdAt: string; releasedAt?: string; }
 export interface SurfaceArchiveAuthorization { controlWorkspaceId: string; actorId: string; }
-export interface ExecutionPlacementPort { resolveRepository(input: RepositoryLocator): Promise<RepositoryRef>; materializeSurface(input: SurfaceSpec): Promise<ExecutionSurfaceBinding>; launchRuntime(input: RuntimeLaunchSpec): Promise<RuntimeBindingReceipt>; observeRuntime(binding: RuntimeBindingRef): Promise<RuntimeObservation>; retireRuntime(binding: RuntimeBindingRef): Promise<void>; archiveSurface(surface: ExecutionSurfaceRef, authorization: SurfaceArchiveAuthorization): Promise<void>; }
+export interface SurfaceRestoreReceipt { surface: ExecutionSurface; evidence: SurfaceRestoreEvidence; }
+export interface ExecutionPlacementPort { resolveRepository(input: RepositoryLocator): Promise<RepositoryRef>; materializeSurface(input: SurfaceSpec): Promise<ExecutionSurfaceBinding>; launchRuntime(input: RuntimeLaunchSpec): Promise<RuntimeBindingReceipt>; observeRuntime(binding: RuntimeBindingRef): Promise<RuntimeObservation>; retireRuntime(binding: RuntimeBindingRef): Promise<void>; archiveSurface(surface: ExecutionSurfaceRef, authorization: SurfaceArchiveAuthorization): Promise<void>; restoreSurface(surface: ExecutionSurfaceRef, authorization: SurfaceArchiveAuthorization): Promise<SurfaceRestoreReceipt>; }
 
 /** No Goal, Round, role, title, or emergency label participates in identity. */
 export const checkoutIdentity = (checkout: string) => path.resolve(checkout);
