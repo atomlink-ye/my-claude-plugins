@@ -37,7 +37,7 @@ An authoritative command collector must emit source-trust metadata with its enve
 {"schemaVersion":"arcp.provider-budget/v1","source":{"id":"operator-collector","kind":"command","observedAt":"2026-09-02T00:00:00Z","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},"providers":[{"providerId":"pi","status":"available","windows":[{"id":"weekly","label":"weekly","remainingPct":75}]}]}
 ```
 
-The source configuration kind `codexbar` is an ARCP adapter choice; its emitted envelope deliberately has `source.kind: "command"`, because the envelope records the bounded local command observation. Paseo emits `source.kind: "paseo"`. These identities remain separate from `source.id`, which policy bindings use.
+The source configuration kind `codexbar` is an ARCP adapter choice; its emitted envelope deliberately has `source.kind: "command"`, because the envelope records the bounded local command observation. The default local CodexBar source is authoritative for Claude and Codex. Default Paseo-native envelopes emit `source.kind: "paseo"` but are advisory/estimated and cannot admit launches until an operator configures authoritative provider-specific trust. These identities remain separate from `source.id`, which policy bindings use.
 
 Runtime status and Panorama also expose bounded aggregate burn samples: deduplicated native turn IDs, cache read/creation and output deltas, 5/10/60-minute velocity, turns/minute, stale retry wakes, context ratio, and `RATE_DRAIN`, `TURN_STORM`, `STALE_WAKE`, or `CONTEXT_DRAIN`. ARCP never reads or stores prompts or full transcripts.
 

@@ -25,7 +25,7 @@ function date(value: unknown, name: string, nullable = false): string | null | u
 function pct(value: unknown, name: string): number | null | undefined { if (value === undefined) return undefined; if (value === null) return null; if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) throw new Error(`${name} must be a percentage`); return value; }
 function number(value: unknown, name: string): number | null | undefined { if (value === undefined) return undefined; if (value === null) return null; if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be finite`); return value; }
 function defaultSourceMetadata(id: string): Pick<ProviderBudgetSource, 'trust' | 'estimated' | 'automaticAdmissionEligible'> {
-  if (id === 'pi-grok-cache') return { trust: 'advisory', estimated: true, automaticAdmissionEligible: false };
+  if (id === 'pi-grok-cache' || id === 'paseo-native') return { trust: 'advisory', estimated: true, automaticAdmissionEligible: false };
   return { trust: 'authoritative', estimated: false, automaticAdmissionEligible: true };
 }
 function sourceMetadata(source: Record<string, any>, allowDefaults = true): Pick<ProviderBudgetSource, 'trust' | 'estimated' | 'automaticAdmissionEligible'> {

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { collectCodexbar, collectPiGrokCache, PROVIDER_BUDGET_SCHEMA, evaluateAdmission, validateProviderBudgetEnvelope } from '../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
+import { collectCodexbar, collectPiGrokCache, PROVIDER_BUDGET_SCHEMA, evaluateAdmission, translatePaseoProviderUsage, validateProviderBudgetEnvelope } from '../../../skills/agent-runtime-control-panel/runtime/src/provider-budget.js';
 import { providerBudgetEpisodeKey } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { ArcpService } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 
@@ -64,6 +64,18 @@ describe('provider budget MVE', () => {
     const snapshot = validateProviderBudgetEnvelope({ schemaVersion: PROVIDER_BUDGET_SCHEMA, source: { id: 'local-codexbar', kind: 'command', observedAt: new Date().toISOString(), trust: 'authoritative', estimated: false, automaticAdmissionEligible: true }, providers: [{ providerId: 'pi', status: 'unavailable', windows: [], error: 'provider collector failed' }] });
     expect(evaluateAdmission({ envelope: snapshot, bindings: [{ id: 'pi-grok', providerId: 'pi', sourceId: 'local-codexbar', modelPatterns: ['grok-cli/grok-4.6'], windowIds: ['weekly'], admissionPolicyId: 'default' }], policies, providerId: 'pi', model: 'grok-cli/grok-4.6' })).toMatchObject({ action: 'hold_unknown', reasons: ['provider budget is unavailable'] });
     expect(snapshot.providers[0].windows).toHaveLength(0);
+  });
+  it('keeps default Paseo-native Pi data advisory and settles an unqualified refresh on CodexBar', async () => {
+    const native = translatePaseoProviderUsage('paseo-native', { fetchedAt: new Date().toISOString(), providers: [{ providerId: 'pi', status: 'available', windows: [{ id: 'weekly', label: 'weekly', remainingPct: 75 }] }] });
+    expect(native.source).toMatchObject({ trust: 'advisory', estimated: true, automaticAdmissionEligible: false });
+    expect(evaluateAdmission({ envelope: native, bindings: [{ id: 'pi-grok', providerId: 'pi', sourceId: 'paseo-native', modelPatterns: ['grok-cli/grok-4.6'], windowIds: ['weekly'], admissionPolicyId: 'default' }], policies, providerId: 'pi', model: 'grok-cli/grok-4.6' }).action).toBe('hold_unknown');
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'arcp-default-refresh-')); const config = path.join(dir, 'config.json'); const script = path.join(dir, 'codexbar');
+    await writeFile(script, `#!${process.execPath}\nprocess.stdout.write(JSON.stringify([{provider:process.argv.includes('claude')?'claude':'codex',usage:{updatedAt:new Date().toISOString(),primary:{usedPercent:15},secondary:{usedPercent:25}}}]));\n`); await chmod(script, 0o755);
+    await writeFile(config, JSON.stringify({ providerBudget: { sources: [{ id: 'paseo-native', kind: 'paseo', trust: 'advisory', estimated: true, automaticAdmissionEligible: false }, { id: 'local-codexbar', kind: 'codexbar', trust: 'authoritative', estimated: false, automaticAdmissionEligible: true }], policies, bindings } }));
+    const oldConfig = process.env.ARCP_CONFIG, oldBin = process.env.ARCP_CODEXBAR_BIN; process.env.ARCP_CONFIG = config; process.env.ARCP_CODEXBAR_BIN = script;
+    const service = new ArcpService(path.join(dir, 'state'), { run: async () => ({ value: [], stdout: '', stderr: '' }) } as any); await service.init();
+    try { await expect(service.refreshProviderBudget()).resolves.toMatchObject({ status: 'ok', snapshot: { source: { id: 'local-codexbar', trust: 'authoritative', automaticAdmissionEligible: true } } }); }
+    finally { service.close(); if (oldConfig === undefined) delete process.env.ARCP_CONFIG; else process.env.ARCP_CONFIG = oldConfig; if (oldBin === undefined) delete process.env.ARCP_CODEXBAR_BIN; else process.env.ARCP_CODEXBAR_BIN = oldBin; }
   });
   it('refuses stale or malformed Pi/Grok cache data', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'arcp-pi-cache-invalid-')); const cache = path.join(dir, 'quota-cache.json');

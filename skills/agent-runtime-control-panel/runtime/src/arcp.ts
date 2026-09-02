@@ -687,7 +687,7 @@ export class ArcpService {
   recordRuntimeBudgetSample(sample: RuntimeBudgetSample): boolean { return this.runtimeBudget.record(sample); }
   runtimeBudgetView(runtimeSessionId: string): RuntimeBudgetView { return this.runtimeBudget.view(runtimeSessionId, this.runtimeBudgetPolicy); }
   async refreshProviderBudget(sourceId?: string): Promise<{ snapshot?: ProviderBudgetEnvelopeV1; status: 'ok' | 'source_unavailable'; error?: string }> {
-    const configured = this.providerBudgetConfig.sources ?? []; const sources = sourceId ? configured.filter((item) => item.id === sourceId) : [...configured].sort((a, b) => Number(b.kind === 'paseo') - Number(a.kind === 'paseo'));
+    const configured = this.providerBudgetConfig.sources ?? []; const sources = sourceId ? configured.filter((item) => item.id === sourceId) : [...configured].sort((a, b) => Number(b.automaticAdmissionEligible) - Number(a.automaticAdmissionEligible));
     if (!sources.length) return { status: 'source_unavailable', error: 'no provider budget source is configured' };
     for (const source of sources) try { const snapshot = source.kind === 'codexbar' ? await collectCodexbar(source.id) : source.kind === 'command' ? await runCommandCollector(source) : source.kind === 'pi-grok-cache' ? await collectPiGrokCache(source) : source.kind === 'paseo' && this.adapter instanceof PaseoAdapter ? await this.adapter.providerUsage(source.id) : undefined; if (snapshot) { this.providerBudgetSnapshot = snapshot; return { status: 'ok', snapshot }; } } catch { /* try the next configured source without retaining diagnostics */ }
     return { status: 'source_unavailable', error: 'provider budget source failed without a safe snapshot' };
