@@ -45,7 +45,7 @@ const BUDGET_MS = 60 * 60 * 1000;
 const age = (at: string, now: number) => Math.max(0, now - Date.parse(at));
 const eventRuntime = (event: ChannelEvent, deliveries: readonly Delivery[], sessions: readonly RuntimeSession[]) => {
   const delivery = deliveries.find((item) => item.eventId === event.id);
-  return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : undefined;
+  return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : sessions.find((item) => item.memberId === event.sourceMemberId && (!event.taskId || item.taskId === event.taskId));
 };
 const reachable = (event: ChannelEvent, delivery: Delivery | undefined, sessions: readonly RuntimeSession[]) => {
   if (delivery) return sessions.some((session) => session.id === delivery.runtimeSessionId && session.generation === delivery.generation && !['terminal', 'transport_indeterminate'].includes(session.state));
@@ -86,7 +86,7 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     if (event.kind === 'decision_resolved') { disposition = 'resolved'; dispositionReason = 'Durable decision resolution is already recorded.'; if (event.relatedEventId) causation.resolvedBy = event.id; }
     else if (task?.lifecycle === 'completed' && completion && completion.createdAt <= task.updatedAt && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'superseded'; dispositionReason = 'Completed Task has a durable Result for this fence.'; causation.resolvedBy = completion.id; }
     else if (newerCandidate && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'superseded'; dispositionReason = 'A later Candidate for the same Task fence exists.'; causation.supersedes = newerCandidate.id; }
-    else if (replacement && ['runtime_health', 'permission', 'transport_uncertainty'].includes(event.kind)) { disposition = 'invalidated'; dispositionReason = 'This runtime generation was replaced; its health/transport fact belongs only to the older episode.'; causation.replacement = replacement.id; }
+    else if ((replacement || runtime?.state === 'terminal') && ['runtime_health', 'permission', 'transport_uncertainty'].includes(event.kind)) { disposition = 'invalidated'; dispositionReason = replacement ? 'This runtime generation was replaced; its health/transport fact belongs only to the older episode.' : 'This runtime generation is terminal; its health/transport fact belongs only to that ended episode.'; causation.replacement = replacement?.id ?? runtime!.id; }
     else if (task?.lifecycle === 'completed' && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'stale_requires_review'; dispositionReason = 'Task is complete but no matching durable Result proves how this authority event was resolved.'; }
     const problems: TemporalProblemReason[] = [];
     const eventAge = age(event.createdAt, now);
