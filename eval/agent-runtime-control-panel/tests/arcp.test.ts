@@ -482,8 +482,8 @@ describe('ARCP MVE control core', () => {
   it('uses the explicit profile resolution for a managed member role', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-explicit-managed-')); const service = await control(root);
     const { actor } = await service.registerActor({ clientIdentity: 'explicit-managed-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'explicit managed' });
-    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'explicit managed runtime', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium', role: 'on-call' }) as any;
-    expect(started).toMatchObject({ member: { role: 'on-call' }, session: { profileId: 'explicit', provider: 'codex', model: 'gpt-5.6-terra' } });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'explicit managed runtime', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' }) as any;
+    expect(started).toMatchObject({ member: { role: 'worker' }, session: { profileId: 'explicit', provider: 'codex', model: 'gpt-5.6-terra' } });
     service.close();
   });
 
@@ -509,14 +509,27 @@ describe('ARCP MVE control core', () => {
   it('treats a healthy mode-less Pi snapshot as matching and preserves transport uncertainty', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-pi-truth-')); const service = await control(root, false, ['pi']);
     const { actor, binding } = await service.registerActor({ clientIdentity: 'pi-truth-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'Pi truth' });
-    await service.store.mutate((state: any) => state.sessions.push({ id: 'pi-truth-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', placement: { requested: { agentId: 'paseo-session-1' } }, externalId: 'paseo-session-1', state: 'running', createdAt: new Date().toISOString() }));
+    await service.store.mutate((state: any) => { state.sessions.push({ id: 'pi-truth-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', placement: { requested: { agentId: 'paseo-session-1' } }, externalId: 'paseo-session-1', state: 'running', createdAt: new Date().toISOString() }); state.runtimeBindings.push({ id: 'pi-truth-binding', executionSurfaceId: 'pi-surface', runtimeSessionId: 'pi-truth-runtime', adapterId: 'paseo', nativeId: 'paseo-session-1', generation: 1, state: 'running', visibilityState: 'visible', createdAt: new Date().toISOString() }); });
     const observed = await service.observe('pi-truth-runtime'); const status = await service.runtimeStatus('pi-truth-runtime');
     expect(observed).toMatchObject({ state: 'idle', placement: { status: 'PLACEMENT_MATCH' } });
     expect(status.observation).toMatchObject({ health: 'healthy', mismatch: false, requested: { provider: 'pi', model: 'grok-cli/grok-4.6' }, observed: { provider: 'pi', model: 'grok-cli/grok-4.6' } });
     const unreachable = (service.adapter as any).snapshot; (service.adapter as any).snapshot = async () => { throw new Error('Paseo unreachable'); };
     const uncertain = await service.observe('pi-truth-runtime');
     expect(uncertain.state).toBe('transport_indeterminate');
+    const uncertainStatus = await service.runtimeStatus('pi-truth-runtime');
+    expect(uncertainStatus).toMatchObject({ session: { state: 'transport_indeterminate' }, observation: { status: 'transport_indeterminate', health: 'degraded' } });
+    expect(service.state().runtimeBindings.find((item) => item.id === 'pi-truth-binding')?.state).toBe('transport_indeterminate');
     (service.adapter as any).snapshot = unreachable;
+    service.close();
+  });
+
+  it('treats opaque Paseo placement IDs as exact values', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-opaque-placement-')); const service = await control(root, false, ['codex'], { id: 'agent_a' });
+    const launch = service.adapter.launch.bind(service.adapter);
+    (service.adapter as any).launch = async (...args: any[]) => { const result = await launch(...args); return { ...result, value: { ...(result.value as any), id: 'agent-a' } }; };
+    const { actor } = await service.registerActor({ clientIdentity: 'opaque-placement-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'opaque placement' });
+    const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    expect(runtime.placement).toMatchObject({ requested: { agentId: 'agent-a' }, observed: { agentId: 'agent_a' }, status: 'PLACEMENT_MISMATCH' });
     service.close();
   });
 

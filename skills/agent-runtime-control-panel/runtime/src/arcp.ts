@@ -263,7 +263,7 @@ function paseoPlacement(record: Record<string, any>): PaseoPlacement['observed']
 }
 function placementMatches(placement: PaseoPlacement): boolean {
   const observed = placement.observed;
-  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || sameSetting(placement.requested[key], observed[key]));
+  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || placement.requested[key] === observed[key]);
 }
 function normalizedTurnState(value: unknown): 'running' | 'requires_action' | 'idle' {
   const state = normalized(value);
@@ -851,7 +851,7 @@ export class ArcpService implements ExecutionPlacementPort {
     // Explicit provider/model requests intentionally do not become configured
     // profile entries, but they still carry the requested role into the member.
     const profile = this.requestedProfile(input);
-    const role = input.role?.trim() || profile.role || 'worker';
+    const role = input.role?.trim() || (profile.id === 'explicit' ? 'worker' : profile.role || 'worker');
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope, executionSurfaceId: input.executionSurfaceId });
     const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role, joinKind: 'managed', actorId: input.actorId, ...(input.taskScope === 'steward_analysis' ? { capabilities: ['claim_task', 'submit_result', 'read_context', 'write_knowledge'] } : {}) });
@@ -1742,10 +1742,20 @@ export class ArcpService implements ExecutionPlacementPort {
   }
   async runtimeStatus(id: string, refresh = false): Promise<{ session: RuntimeSession; observation: RuntimeObservation; children: ChildObservation; workSummary: WorkSummary }> {
     if (refresh) await this.observe(id);
-    const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
+    let session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
     const requested = this.requested(session); let agent: Record<string, any> | undefined; let timeline: unknown[] | undefined; let source: 'sdk' | 'cli' | undefined;
     const externalId = await this.canonicalRuntimeIdentity(session);
-    if (externalId) try { const snapshot = await this.adapterFor(session).snapshot(externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
+    if (externalId) try { const snapshot = await this.adapterFor(session).snapshot(externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch {
+      // A failed live read cannot be presented as the previous healthy state.
+      // Persist uncertainty so subsequent status reads and execution bindings
+      // agree that the runtime's transport is no longer proven live.
+      session = await this.store.mutate((state) => {
+        const item = state.sessions.find((value) => value.id === id)!;
+        item.state = 'transport_indeterminate';
+        for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = 'transport_indeterminate';
+        return item;
+      });
+    }
     const current = agent ?? {}; const usage = safeJson(current.lastUsage); const numeric = (value: unknown): number | 'unknown' => typeof value === 'number' && Number.isFinite(value) ? value : 'unknown';
     const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
     const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
