@@ -13,14 +13,13 @@
   ],
   "runtimeBudget": {"maxOutputTokensPerMinute":3000,"maxTurnsPerMinute":2,"maxRepeatedWakeCount":3,"contextRatio":0.85},
   "providerBudget": {
-    "sources": [{"id":"paseo-native","kind":"paseo"},{"id":"local-codexbar","kind":"codexbar"},{"id":"pi-grok-cache","kind":"pi-grok-cache","cachePath":"${ARCP_PI_GROK_CACHE}","maxOutputBytes":16384,"maxAgeMs":900000}],
+    "sources": [{"id":"paseo-native","kind":"paseo","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},{"id":"local-codexbar","kind":"codexbar","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},{"id":"pi-grok-cache","kind":"pi-grok-cache","trust":"advisory","estimated":true,"automaticAdmissionEligible":false,"cachePath":"${ARCP_PI_GROK_CACHE}","maxOutputBytes":16384,"maxAgeMs":900000}],
     "policies": [{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10,"requiredPaidUnattended":true}],
     "bindings": [
       {"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"},
       {"id":"codex-weekly","providerId":"codex","sourceId":"local-codexbar","modelPatterns":["gpt-5.6-terra"],"windowIds":["secondary"],"admissionPolicyId":"default"},
       {"id":"claude-5h-paseo","providerId":"claude","sourceId":"paseo-native","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"},
       {"id":"codex-weekly-paseo","providerId":"codex","sourceId":"paseo-native","modelPatterns":["gpt-5.6-terra"],"windowIds":["secondary"],"admissionPolicyId":"default"}
-      ,{"id":"pi-grok-weekly","providerId":"pi","sourceId":"pi-grok-cache","modelPatterns":["grok-cli/grok-4.6"],"windowIds":["weekly"],"admissionPolicyId":"default"}
     ]
   }
 }

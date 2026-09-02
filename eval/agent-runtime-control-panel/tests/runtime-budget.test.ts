@@ -16,7 +16,7 @@ describe('aggregate runtime burn MVE', () => {
     expect(view.signals).toEqual(expect.arrayContaining(['RATE_DRAIN', 'TURN_STORM', 'STALE_WAKE', 'CONTEXT_DRAIN']));
   });
   it('keeps routing a recommendation until preflight validates its target binding', () => {
-    const envelope = validateProviderBudgetEnvelope({ schemaVersion: PROVIDER_BUDGET_SCHEMA, source: { id: 'local', kind: 'command', observedAt: new Date().toISOString() }, providers: [{ providerId: 'claude', status: 'available', windows: [{ id: 'five-hour', label: '5h', usedPct: 85 }] }] });
+    const envelope = validateProviderBudgetEnvelope({ schemaVersion: PROVIDER_BUDGET_SCHEMA, source: { id: 'local', kind: 'command', observedAt: new Date().toISOString(), trust: 'authoritative', estimated: false, automaticAdmissionEligible: true }, providers: [{ providerId: 'claude', status: 'available', windows: [{ id: 'five-hour', label: '5h', usedPct: 85 }] }] });
     expect(evaluateAdmission({ envelope, providerId: 'claude', model: 'claude-opus-5', bindings: [{ id: 'claude', providerId: 'claude', sourceId: 'local', windowIds: ['five-hour'], admissionPolicyId: 'route' }], policies: [{ id: 'route', maxAgeMs: 300_000, drainRemainingPct: 20, hardDrainRemainingPct: 10, recommendedProviderProfile: 'codex-worker' }] })).toMatchObject({ action: 'drain', recommendedProviderProfile: 'codex-worker' });
   });
   it('holds a new provider launch when an active runtime has a burn signal', async () => {

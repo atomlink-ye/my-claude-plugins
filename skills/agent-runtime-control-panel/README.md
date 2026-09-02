@@ -22,20 +22,26 @@ List commands use the same boundary as the existing context/panorama surface: a 
 `arcp provider-budget refresh` is operator/member controlled; `read` shows the last validated, redacted envelope. The bundled local source calls codexbar independently for Claude and Codex, so one provider failure cannot erase the other snapshot.
 
 ```json
-{"providerBudget":{"sources":[{"id":"local-codexbar","kind":"codexbar"}],"policies":[{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10}],"bindings":[{"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"}]}}
+{"providerBudget":{"sources":[{"id":"local-codexbar","kind":"codexbar","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true}],"policies":[{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10}],"bindings":[{"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"}]}}
 ```
 
 An external collector is explicit argv-only configuration, never an HTTP-selected command. Its stdout must be exactly one `arcp.provider-budget/v1` JSON object; ARCP uses a clean environment limited to `envAllowlist`, bounds time/output, and never persists stderr.
 
 ```json
-{"id":"operator-collector","kind":"command","command":["/absolute/path/to/collector"],"timeoutMs":30000,"maxOutputBytes":262144,"envAllowlist":[]}
+{"id":"operator-collector","kind":"command","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true,"command":["/absolute/path/to/collector"],"timeoutMs":30000,"maxOutputBytes":262144,"envAllowlist":[]}
+```
+
+An authoritative command collector must emit source-trust metadata with its envelope. The command and values below are generic examples; an operator supplies the actual executable and observed provider windows.
+
+```json
+{"schemaVersion":"arcp.provider-budget/v1","source":{"id":"operator-collector","kind":"command","observedAt":"2026-09-02T00:00:00Z","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},"providers":[{"providerId":"pi","status":"available","windows":[{"id":"weekly","label":"weekly","remainingPct":75}]}]}
 ```
 
 The source configuration kind `codexbar` is an ARCP adapter choice; its emitted envelope deliberately has `source.kind: "command"`, because the envelope records the bounded local command observation. Paseo emits `source.kind: "paseo"`. These identities remain separate from `source.id`, which policy bindings use.
 
 Runtime status and Panorama also expose bounded aggregate burn samples: deduplicated native turn IDs, cache read/creation and output deltas, 5/10/60-minute velocity, turns/minute, stale retry wakes, context ratio, and `RATE_DRAIN`, `TURN_STORM`, `STALE_WAKE`, or `CONTEXT_DRAIN`. ARCP never reads or stores prompts or full transcripts.
 
-Pi/Grok is an operator-configured, read-only `pi-grok-cache` source. The bundled config uses `${ARCP_PI_GROK_CACHE}`; set it to an absolute cache path (or override with an absolute `cachePath`) before refresh. The cache is refreshed by a Paseo Pi Agent running `/grok-cli-usage`; ARCP never invokes Pi or parses a transcript. The frozen v1 envelope has only `paseo|command` kinds, so this cache emits `source.kind: "paseo"` to identify its required Paseo-refresh provenance, while `source.id` remains `pi-grok-cache`. It binds provider `pi` and `grok-cli/grok-4.6` without a mode. Pi permission handling remains provider-managed: quota admission neither invents a bypass mode nor approves a permission request.
+Pi/Grok is an operator-configured, read-only `pi-grok-cache` source. The bundled config uses `${ARCP_PI_GROK_CACHE}`; set it to an absolute cache path (or override with an absolute `cachePath`) before refresh. The cache is refreshed by a Paseo Pi Agent running `/grok-cli-usage`; ARCP never invokes Pi or parses a transcript. Its envelope is explicitly `trust: "advisory"`, `estimated: true`, and `automaticAdmissionEligible: false`: it can be displayed with its freshness window, but it can never admit an automatic launch. Grok remains `hold_unknown` until an authoritative CodexBar or operator command envelope is configured. The frozen v1 envelope has only `paseo|command` kinds, so this cache emits `source.kind: "paseo"` to identify its required Paseo-refresh provenance, while `source.id` remains `pi-grok-cache`. Pi permission handling remains provider-managed: quota admission neither invents a bypass mode nor approves a permission request.
 
 Native runtime burn attribution deduplicates observed turn IDs and always records turn/context facts. `wakeCategory` may remain `unknown`; ARCP does not claim live `STALE_WAKE` attribution until a provider-safe wake source is available. Paseo `lastUsage` is displayed as reported observation only: its per-turn semantics are not yet proven, so ARCP does not sum it as a token delta.
 

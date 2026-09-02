@@ -405,7 +405,7 @@ describe('ARCP MVE control core', () => {
     const elevated = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-full-access' });
     expect(elevated.mode).toBe('full-access'); expect(elevated.observed?.mode).toBe('full-access');
     const pi = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-pi-')), false, ['pi']);
-    expect(await pi.preflight({ profileId: 'pi-grok-worker' })).toMatchObject({ action: 'launch', requested: { provider: 'pi', model: 'grok-cli/grok-4.6' } });
+    expect(await pi.preflight({ profileId: 'pi-grok-worker' })).toMatchObject({ action: 'hold', launchable: false, requested: { provider: 'pi', model: 'grok-cli/grok-4.6' }, admission: { action: 'hold_unknown' } });
     await expect(pi.preflight({ provider: 'pi', model: 'grok-cli/grok-4.6', mode: 'auto' })).rejects.toMatchObject({ code: 'invalid_request' });
   });
 
