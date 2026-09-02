@@ -16,17 +16,27 @@ base="http://127.0.0.1:$PORT"
 healthy() { curl -fsS --max-time 1 "$base/health" >/dev/null 2>&1; }
 runtime() { if [[ -n "${ARCP_API_KEY:-}" ]]; then curl -fsS -H "x-arcp-api-key: $ARCP_API_KEY" "$base/self/runtime"; else curl -fsS "$base/self/runtime"; fi; }
 owner_pid() { [[ -f "$pid_file" ]] || return 1; node -e 'const fs=require("fs"); const raw=fs.readFileSync(process.argv[1],"utf8").trim(); const value=raw.startsWith("{")?JSON.parse(raw).pid:raw; if (!/^\d+$/.test(String(value))) process.exit(1); process.stdout.write(String(value));' "$pid_file"; }
+owner_start() { [[ -f "$pid_file" ]] || return 1; node -e 'const fs=require("fs"); const raw=fs.readFileSync(process.argv[1],"utf8").trim(); const value=raw.startsWith("{")?JSON.parse(raw).processStart:""; if (typeof value!=="string"||!value.trim()) process.exit(1); process.stdout.write(value.trim());' "$pid_file"; }
+process_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+root_fingerprint() { node -e 'const c=require("crypto"),p=require("path");process.stdout.write(c.createHash("sha256").update(p.resolve(process.argv[1])).digest("hex"));' "$data_dir"; }
 adopt_healthy() {
-  local observed pid
+  local observed pid expected_fingerprint process_start_value
   observed=$(runtime) || return 1
-  pid=$(printf '%s' "$observed" | node -e 'let text="";process.stdin.on("data",x=>text+=x).on("end",()=>{try { const pid=JSON.parse(text).pid; if (!Number.isInteger(pid)||pid<1) process.exit(1); process.stdout.write(String(pid)); } catch { process.exit(1); }});') || { echo "ARCP health responded but runtime identity was invalid" >&2; return 1; }
-  printf '{"pid":%s,"port":%s,"dataDir":"%s"}\n' "$pid" "$PORT" "$data_dir" >"$pid_file"
+  expected_fingerprint=$(root_fingerprint)
+  pid=$(printf '%s' "$observed" | node -e 'const expected=process.argv[1];let text="";process.stdin.on("data",x=>text+=x).on("end",()=>{try { const v=JSON.parse(text),pid=v.pid; if (!Number.isInteger(pid)||pid<1||v.dataRootFingerprint!==expected) process.exit(1); process.stdout.write(String(pid)); } catch { process.exit(1); }});' "$expected_fingerprint") || { echo "ARCP health responded for a different or unverifiable data root; refusing adoption" >&2; return 1; }
+  process_start_value=$(process_start "$pid") || { echo "ARCP health responded but runtime process identity was unavailable" >&2; return 1; }
+  node -e 'const fs=require("fs"),p=require("path"); fs.writeFileSync(process.argv[1],JSON.stringify({pid:Number(process.argv[2]),port:Number(process.argv[3]),dataDir:p.resolve(process.argv[4]),processStart:process.argv[5]})+"\n",{mode:0o600});' "$pid_file" "$pid" "$PORT" "$data_dir" "$process_start_value"
   printf '%s\n' "$observed"
 }
 if healthy; then adopt_healthy; exit $?; fi
 if stale_pid=$(owner_pid 2>/dev/null); then
   if kill -0 "$stale_pid" 2>/dev/null; then
-    echo "ARCP owner pid $stale_pid is live but health is unavailable; refusing concurrent start" >&2; exit 1
+    recorded_start=$(owner_start 2>/dev/null || true)
+    live_start=$(process_start "$stale_pid")
+    if [[ -z "$recorded_start" || -z "$live_start" || "$recorded_start" == "$live_start" ]]; then
+      echo "ARCP owner pid $stale_pid is live but health is unavailable; refusing concurrent start" >&2; exit 1
+    fi
+    echo "ARCP ownership pid $stale_pid was recycled; reclaiming stale record" >&2
   fi
   rm -f "$pid_file"
 fi

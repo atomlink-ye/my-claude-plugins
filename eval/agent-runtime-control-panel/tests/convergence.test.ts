@@ -11,6 +11,9 @@ class DiscoveryCli {
     if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: true, modes: ['auto', 'full-access'] }], stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
     if (args[0] === 'inspect') return { value: { id: args[1], status: 'idle', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium' }, stdout: '', stderr: '' };
+    // A launch must return the opaque Paseo receipt a real run emits: a managed
+    // start now refuses a session it could never address or reconcile.
+    if (args[0] === 'run') return { value: { id: 'convergence-live' }, stdout: '', stderr: '' };
     return { value: [], stdout: '', stderr: '' };
   }
 }
@@ -207,9 +210,13 @@ describe('Round-3 convergence proofs', () => {
     (service as any).startManaged = async (input: any) => {
       const started = await originalStartManaged(input);
       const authorMemberId = matching ? started.member.id : impostor.member.id;
-      if (matching) await service.claimTask(started.task.id, authorMemberId, 0);
-      else await service.store.mutate((state: State) => { const task = state.tasks.find((item) => item.id === started.task.id)!; task.ownerMemberId = authorMemberId; task.fence = 1; task.lifecycle = 'claimed'; });
-      await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 });
+      if (matching) {
+        await service.claimTask(started.task.id, authorMemberId, 0);
+        await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 });
+      } else {
+        await service.store.mutate((state: State) => { const task = state.tasks.find((item) => item.id === started.task.id)!; task.ownerMemberId = authorMemberId; task.fence = 1; task.lifecycle = 'claimed'; });
+        await expect(service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 })).rejects.toMatchObject({ code: 'unauthorized' });
+      }
       return started;
     };
     const analyst = new CodexRuntimeAnalyst(service, { profileId: 'codex-worker', actorId: actor.id, waitMs: 0, pollMs: 1 });

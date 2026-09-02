@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -9,12 +9,16 @@ class FakeCli {
   launches: string[][] = [];
   status = 'idle';
   failInspect = false;
+  failLaunch = false;
+  launchReceipt: Record<string, unknown> = { id: 'worker-live' };
+  onInspect?: () => Promise<void>;
+  onStartTurn?: () => Promise<void>;
   async run(args: string[]) {
     if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: true, modes: ['auto'] }], stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
-    if (args[0] === 'inspect') { if (this.failInspect) throw new Error('paseo inspect is unavailable'); return { value: { id: 'worker-live', status: this.status, provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' }, stdout: '', stderr: '' }; }
-    if (args[0] === 'run') { this.launches.push(args); return { value: { id: 'worker-live' }, stdout: '', stderr: '' }; }
-    if (args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
+    if (args[0] === 'inspect') { if (this.failInspect) throw new Error('paseo inspect is unavailable'); await this.onInspect?.(); return { value: { id: 'worker-live', status: this.status, provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' }, stdout: '', stderr: '' }; }
+    if (args[0] === 'run') { this.launches.push(args); if (this.failLaunch) throw new Error('paseo run failed to reach the daemon'); return { value: this.launchReceipt, stdout: '', stderr: '' }; }
+    if (args[0] === 'start-turn') { this.sends += 1; await this.onStartTurn?.(); return { value: {}, stdout: '', stderr: '' }; }
     return { value: [], stdout: '', stderr: '' };
   }
 }
@@ -109,6 +113,66 @@ describe('ARCP atomic contract binding', () => {
     service.close();
   });
 
+  it('B0-1 refuses a contract when the runtime\'s delivery state is merely indeterminate or in flight', async () => {
+    for (const state of ['attempting', 'transport_indeterminate'] as const) {
+      const { service, cli, actor, task } = await fixture();
+      await service.store.mutate((value: any) => value.deliveries.push({ id: `delivery-prior-${state}`, fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'earlier turn', command: 'normal', state, createdAt: new Date().toISOString() }));
+      const before = cli.sends;
+      const refused: any = await service.deliver({ fromActorId: actor.id, runtimeSessionId: 'worker-runtime', ...contract({ taskId: task.id, fence: 0 }) });
+      expect(refused.state).toBe('withdrawn');
+      expect(refused.refusedReason).toContain('indeterminate');
+      expect(cli.sends).toBe(before);
+      service.close();
+    }
+  });
+
+  it('B0-2 revalidates the contract adjacent to startTurn, not only before the observe await', async () => {
+    const { service, cli, actor, task, worker } = await fixture();
+    cli.status = 'running';
+    const queued: any = await service.deliver({ fromActorId: actor.id, runtimeSessionId: 'worker-runtime', ...contract({ taskId: task.id, fence: 0 }) });
+    expect(queued.state).toBe('waiting_safe_point');
+    const before = cli.sends;
+    // The claim lands inside the pump's own observe() await, after the first
+    // contractRefusal has already passed.
+    cli.status = 'idle';
+    cli.onInspect = async () => { cli.onInspect = undefined; await service.store.mutate((state: any) => { const value = state.tasks.find((item: any) => item.id === task.id); value.ownerMemberId = worker.member.id; value.fence = 1; value.lifecycle = 'claimed'; }); };
+    await (service as any).pump();
+    const settled = service.state().deliveries.find((item) => item.id === queued.id)!;
+    expect(settled.state).toBe('withdrawn');
+    expect(settled.refusedReason).toContain('no longer matches task fence');
+    expect(cli.sends).toBe(before);
+    expect(service.state().channelEvents.some((item) => item.content.summary.includes('Late Goal Contract') && item.taskId === task.id)).toBe(true);
+    service.close();
+  });
+
+  it('B0-3 keeps a withdrawal truthful when startTurn had already handed the contract over', async () => {
+    const { service, cli, actor, task } = await fixture();
+    cli.status = 'running';
+    const queued: any = await service.deliver({ fromActorId: actor.id, runtimeSessionId: 'worker-runtime', ...contract({ taskId: task.id, fence: 0 }) });
+    expect(queued.state).toBe('waiting_safe_point');
+    // submitResult's withdrawal lands while the turn is already in flight; it
+    // cannot cancel that turn, so the runtime really does receive the body.
+    cli.onStartTurn = async () => { await service.store.mutate((state: any) => { const item = state.deliveries.find((value: any) => value.id === queued.id); item.state = 'withdrawn'; item.refusedReason = 'task already has a submitted Result'; }); };
+    cli.status = 'idle';
+    await (service as any).pump();
+    const settled = service.state().deliveries.find((item) => item.id === queued.id)!;
+    expect(settled.state).toBe('withdrawn');
+    expect(settled.handedOffAfterWithdrawal).toBe(true);
+    expect(service.state().channelEvents.some((item) => item.content.summary.includes('had already been handed to runtime worker-runtime'))).toBe(true);
+    service.close();
+  });
+
+  it('B0-4 recovers an inherited attempting contract as transport-indeterminate after restart', async () => {
+    const { root, service, actor, task } = await fixture();
+    await service.store.mutate((state: any) => state.deliveries.push({ id: 'delivery-crashed-attempt', fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'contract', command: 'normal', purpose: 'contract', subject: { taskId: task.id, fence: 0 }, state: 'attempting', createdAt: new Date().toISOString() }));
+    service.close();
+    const restarted = new ArcpService(root, new FakeCli() as any);
+    await restarted.init();
+    expect(restarted.state().deliveries.find((item) => item.id === 'delivery-crashed-attempt')?.state).toBe('transport_indeterminate');
+    expect(restarted.state().channelEvents.some((item) => item.kind === 'transport_uncertainty' && item.content.summary.includes('delivery-crashed-attempt'))).toBe(true);
+    restarted.close();
+  });
+
   it('B0 refuses a contract whose notAfter has already passed', async () => {
     const { service, cli, actor, task } = await fixture();
     const before = cli.sends;
@@ -154,22 +218,136 @@ describe('ARCP runtime observation does not corrupt durable state', () => {
 });
 
 describe('ARCP managed launch credential lifecycle', () => {
-  it('F3 runs one preflight and leaves no orphan credential when the launch never happens', async () => {
-    const { service, cli, actor, workspace } = await fixture();
+  /** Assert the whole launch attempt was retired: credential destroyed, member
+   * retired, client-state file gone, and no orphan active Goal or open Task. */
+  async function expectNoOrphan(service: any, root: string, title: string) {
+    const state = service.state();
+    const managed = state.members.filter((item: any) => item.label.startsWith('managed-'));
+    expect(managed).toHaveLength(1);
+    expect(managed[0].lifecycle).toBe('retired');
+    expect(Object.values(state.memberCredentials)).not.toContain(managed[0].id);
+    expect(state.goals.filter((item: any) => item.title === title).map((item: any) => item.state)).toEqual(['cancelled']);
+    expect(state.tasks.filter((item: any) => item.title === title).map((item: any) => item.lifecycle)).toEqual(['cancelled']);
+    const files = await readdir(path.join(root, 'runtime-members')).catch(() => [] as string[]);
+    expect(files).toHaveLength(0);
+  }
+
+  it('F3 leaves no orphan credential, Goal or Task when a real adapter launch fails', async () => {
+    const { service, cli, actor, workspace, root } = await fixture();
     let preflights = 0;
     const preflight = service.preflight.bind(service);
     (service as any).preflight = (input: any) => { preflights += 1; return preflight(input); };
-    // A second runtime on a goal that already holds one is refused inside launch,
-    // after the managed credential has been issued.
-    const conflict = service.launch.bind(service);
-    (service as any).launch = async (input: any) => { await conflict({ ...input }); throw new Error('placement failed after the credential was issued'); };
-    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'orphan goal', profileId: 'codex-worker', workspace: '/tmp' } as any)).rejects.toThrow('placement failed');
+    // A real adapter failure, not a synthetic throw wrapped around a launch
+    // that actually happened: `paseo run` itself fails.
+    cli.failLaunch = true;
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'orphan goal', profileId: 'codex-worker', workspace: '/tmp' } as any)).rejects.toMatchObject({ code: 'launch_failed' });
     expect(preflights).toBe(1);
-    const managed = service.state().members.filter((item) => item.label.startsWith('managed-'));
-    expect(managed).toHaveLength(1);
-    expect(managed[0].lifecycle).toBe('retired');
-    expect(service.state().memberCredentials[managed[0].id]).toBeUndefined();
     expect(cli.launches).toHaveLength(1);
+    await expectNoOrphan(service, root, 'orphan goal');
+    service.close();
+  });
+
+  it('F3 refuses a launch that returns a session with no adapter receipt', async () => {
+    const { service, actor, workspace, root } = await fixture();
+    // launch() keeps this session in transport_indeterminate rather than
+    // throwing, which is exactly the failure the orphan guard used to miss.
+    (service as any).adapter.cli.launchReceipt = {};
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'receiptless goal', profileId: 'codex-worker', workspace: '/tmp' } as any)).rejects.toMatchObject({ code: 'launch_failed' });
+    expect((await service.launch({ actorId: actor.id, goalId: (await service.createGoal({ actorId: actor.id, title: 'direct' })).id, profileId: 'codex-worker' })).state).toBe('transport_indeterminate');
+    await expectNoOrphan(service, root, 'receiptless goal');
+    service.close();
+  });
+
+  it('F3 leaves no orphan credential when the client-state file cannot be written', async () => {
+    const { service, actor, workspace, root } = await fixture();
+    (service as any).prepareRuntimeClientState = async () => { throw new Error('runtime-members is not writable'); };
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'unwritable goal', profileId: 'codex-worker', workspace: '/tmp' } as any)).rejects.toThrow('not writable');
+    await expectNoOrphan(service, root, 'unwritable goal');
+    service.close();
+  });
+});
+
+describe('ARCP launched-runtime authority', () => {
+  it('P0-1 gives every launchable task-owning role the capabilities its handoff demands', async () => {
+    const { service, cli, actor, workspace } = await fixture();
+    const reviewer: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'review round', role: 'reviewer', profileId: 'codex-worker', workspace: '/tmp' } as any);
+    expect(reviewer.member.capabilities).toEqual(expect.arrayContaining(['claim_task', 'submit_result']));
+    // A fresh Reviewer can claim its own Task and submit its own verdict.
+    await service.claimTask(reviewer.task.id, reviewer.member.id, 0);
+    const verdict = await service.submitResult({ workspaceId: workspace.id, taskId: reviewer.task.id, memberId: reviewer.member.id, status: 'candidate', summary: 'REWORK', evidenceRefs: ['commit:abc'], expectedFence: 1 });
+    expect(verdict.memberId).toBe(reviewer.member.id);
+    expect(cli.launches.at(-1)!.at(-1)).toContain('ARCP Worker handoff');
+    service.close();
+  });
+
+  it('P0-1 never instructs an observer role to claim a Task it cannot claim', async () => {
+    const { service, cli, actor, workspace } = await fixture();
+    const steward: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'observer round', role: 'steward', profileId: 'codex-worker', workspace: '/tmp' } as any);
+    expect(steward.member.capabilities).not.toContain('claim_task');
+    const prompt = cli.launches.at(-1)!.at(-1)!;
+    expect(prompt).not.toContain('ARCP Worker handoff');
+    expect(prompt).toContain('joins as an observer');
+    service.close();
+  });
+
+  it('binds the acting credential to the acting runtime and records a borrowed-credential attempt', async () => {
+    const { service, actor, workspace } = await fixture();
+    const started: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'bound work', profileId: 'codex-worker', workspace: '/tmp' } as any);
+    const borrower = await service.joinWorkspace({ workspaceId: workspace.id, label: 'borrower', role: 'manager' });
+    await expect(service.claimTask(started.task.id, borrower.member.id, 0)).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(service.state().channelEvents.some((item) => item.content.summary.includes('Borrowed-credential claim refused') && item.taskId === started.task.id)).toBe(true);
+    // Even if an out-of-band corruption makes the borrower look like the Task
+    // holder, a valid credential issued to a different managed runtime cannot
+    // settle this runtime's Task.
+    await service.store.mutate((state: any) => { const value = state.tasks.find((item: any) => item.id === started.task.id); value.ownerMemberId = borrower.member.id; value.fence = 1; value.lifecycle = 'claimed'; });
+    await expect(service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: borrower.member.id, status: 'candidate', summary: 'borrowed', evidenceRefs: ['commit:abc'], expectedFence: 1 })).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(service.state().channelEvents.some((item) => item.content.summary.includes('Borrowed-credential result refused') && item.taskId === started.task.id)).toBe(true);
+    expect(service.state().results.some((item) => item.taskId === started.task.id)).toBe(false);
+    service.close();
+  });
+
+  it('P0-3 lets the accountable member discharge a role-targeted event that was never runtime-delivered', async () => {
+    const { service, actor, workspace } = await fixture();
+    const manager = await service.joinWorkspace({ workspaceId: workspace.id, label: 'manager', role: 'manager' });
+    const stranger = await service.joinWorkspace({ workspaceId: workspace.id, label: 'stranger', role: 'reviewer' });
+    // No managed manager runtime exists, so the pump never mints a Delivery and
+    // deliveryState stays queued forever.
+    const event = await service.publishChannelEvent({ workspaceId: workspace.id, sourceActorId: actor.id, targetRole: 'manager', kind: 'blocker', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'undeliverable obligation', evidenceRefs: [], notify: false } as any);
+    expect(event.deliveryState).toBe('queued');
+    expect(service.state().deliveries.filter((item) => item.eventId === event.id)).toHaveLength(0);
+    // Authorization is unchanged: a member who is not the accountable target is
+    // still refused.
+    await expect(service.acknowledgeEvent(event.id, stranger.member.id, 'not mine')).rejects.toMatchObject({ code: 'unauthorized' });
+    const acknowledged = await service.acknowledgeEvent(event.id, manager.member.id, 'read directly from the channel');
+    expect(acknowledged.consumptionState).toBe('consumed');
+    // The record stays truthful about never having been transported.
+    expect(acknowledged.transitions.map((item) => item.state)).toEqual(['queued', 'acknowledged']);
+    service.close();
+  });
+
+  it('P0-3 still refuses an acknowledgement while a Delivery for the event is in flight', async () => {
+    const { service, cli, actor, workspace, worker } = await fixture();
+    cli.status = 'running';
+    const event = await service.publishChannelEvent({ workspaceId: workspace.id, goalId: service.state().goals[0].id, sourceActorId: actor.id, targetActorId: actor.id, kind: 'attention', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'in flight obligation', evidenceRefs: [], notify: false } as any);
+    await service.store.mutate((state: any) => state.deliveries.push({ id: 'delivery-in-flight', fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'obligation', command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: new Date().toISOString() }));
+    await expect(service.acknowledgeEvent(event.id, worker.member.id, 'too early')).rejects.toMatchObject({ code: 'invalid_request' });
+    service.close();
+  });
+
+  it('routes a completed Result to its accountable primary handler with observe-only cc', async () => {
+    const { service, actor, workspace } = await fixture();
+    const deputy = await service.joinWorkspace({ workspaceId: workspace.id, label: 'deputy', role: 'owner' });
+    const manager = await service.joinWorkspace({ workspaceId: workspace.id, label: 'manager', role: 'manager' });
+    const started: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'reviewed round', role: 'reviewer', profileId: 'codex-worker', workspace: '/tmp', launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id } as any);
+    expect(started.session.reportingRoute).toMatchObject({ launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id, ccMemberIds: [deputy.member.id] });
+    await service.claimTask(started.task.id, started.member.id, 0);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'verdict', evidenceRefs: ['commit:abc'], expectedFence: 1 });
+    const decision = service.state().channelEvents.find((item) => item.kind === 'decision_required' && item.resultId === result.id)!;
+    expect(decision.targetMemberId).toBe(manager.member.id);
+    expect(decision.targetRole).toBeUndefined();
+    const cc = service.state().channelEvents.find((item) => item.targetMemberId === deputy.member.id && item.relatedEventId === decision.id)!;
+    expect(cc.decisionRequired).toBe(false);
+    expect(cc.consumptionPolicy).toBe('consume_on_delivery');
     service.close();
   });
 });
