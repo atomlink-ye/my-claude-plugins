@@ -221,12 +221,20 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const chatId = /(oc_[a-zA-Z0-9]+)/.exec(binding.recipientRef)?.[1];
       if (!chatId) return 'refused';
       const text = `[ARCP escalation] ${envelope.summary}\nrefs: ${envelope.refs.join(', ')}`;
+      // The channel caps its idempotency key well below what an ARCP event id
+      // needs, so derive a bounded deterministic key: same escalation still maps
+      // to the same transport key, which is what idempotency actually requires.
+      const transportKey = `arcp-${createHash('sha256').update(envelope.idempotencyKey).digest('hex').slice(0, 40)}`;
       return await new Promise((resolve) => {
-        const child = spawn(hermesBin, ['im', '+messages-send', '--chat-id', chatId, '--text', text, '--idempotency-key', envelope.idempotencyKey], { stdio: ['ignore', 'pipe', 'pipe'] });
+        // A supervisor-launched daemon does not inherit a login shell PATH, so the
+        // channel binary must be resolvable without one.
+        const child = spawn(hermesBin, ['im', '+messages-send', '--chat-id', chatId, '--text', text, '--idempotency-key', transportKey], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin` } });
         let out = '';
         child.stdout.on('data', (chunk) => { out += String(chunk); });
-        child.on('error', () => resolve('refused'));
-        child.on('close', (code) => resolve(code === 0 ? (/"duplicate"\s*:\s*true/.test(out) ? 'duplicate' : 'accepted') : 'refused'));
+        let err = '';
+        child.stderr.on('data', (chunk) => { err += String(chunk); });
+        child.on('error', (error) => { console.error(`[hermes-channel] spawn failed: ${error instanceof Error ? error.message : 'unknown'}`); resolve('refused'); });
+        child.on('close', (code) => { if (code !== 0) console.error(`[hermes-channel] exit ${code}: ${err.slice(0, 300)}`); resolve(code === 0 ? (/"duplicate"\s*:\s*true/.test(out) ? 'duplicate' : 'accepted') : 'refused'); });
       });
     });
     await startServer(app, port);

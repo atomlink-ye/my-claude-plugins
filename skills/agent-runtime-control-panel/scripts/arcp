@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','participant','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
+const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','participant','escalate','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
 const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   surface archive|restore WORKSPACE SURFACE_ID (Owner actor only; never automatic)
@@ -97,6 +97,7 @@ else if (area === 'workspace' && action === 'join') { const s=await load(); cons
 else if (area === 'workspace' && action === 'context') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/context`);
 else if (area === 'surface' && action === 'archive') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/execution-surfaces/${encodeURIComponent(p[1])}/archive`,{});
 else if (area === 'surface' && action === 'restore') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/execution-surfaces/${encodeURIComponent(p[1])}/restore`,{});
+else if (area === 'escalate') { await call('POST','/v1/escalations',{eventId:p[0]||f.event,reason:f.reason},true); }
 else if (area === 'participant' && action === 'attach') { await call('POST','/v1/participants/attach',{workspaceId:f.workspace,memberId:f.member,adapterId:f.adapter||'claude-code',externalId:f['external-id'],workspace:f.cwd||process.cwd()},true); }
 else if (area === 'external' && action === 'register') { const v=await call('POST','/v1/external',{workspaceId:p[0]||f.workspace,label:f.label,role:f.role,workspace:f.cwd||process.cwd()},false,!f['show-credential']); if(v.credential && v.session?.id) await save({...await load(),runtimeMemberCredentials:{...(await load()).runtimeMemberCredentials||{},[v.session.id]:v.credential}}); }
 else if (area === 'external' && action === 'status') await call('GET',`/v1/external/${encodeURIComponent(p[0]||f.runtime)}/status${f.refresh ? '?refresh=1' : ''}`);

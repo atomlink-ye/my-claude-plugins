@@ -2002,7 +2002,13 @@ export class ArcpService implements ExecutionPlacementPort {
       const workspace = state.workspaces.find((item) => item.id === triggering.workspaceId);
       if (!workspace) throw new ArcpError('not_found', 'workspace not found');
       const existing = state.channelEvents.find((item) => item.id === escalationId);
-      if (existing) return { event: existing, binding: undefined, alreadyEscalated: true };
+      // Exactly-once counts successful wakes, not attempts. An escalation that
+      // never reached anyone is still owed: treating undeliverable as done
+      // would let a transient channel outage silence an obligation forever.
+      // Unknown is not parity, so it is retried on the same durable row rather
+      // than duplicated into a second one.
+      if (existing && !(existing.deliveryState === 'undeliverable' && existing.consumptionState === 'open')) return { event: existing, binding: undefined, alreadyEscalated: true };
+      if (existing) { const retryBinding = this.currentOwnerBinding(state, workspace.ownerActorId); if (retryBinding) this.transitionEvent(existing, 'queued'); return { event: existing, binding: retryBinding, alreadyEscalated: false }; }
       const binding = this.currentOwnerBinding(state, workspace.ownerActorId);
       const event = this.appendChannelEvent(state, {
         id: escalationId,
