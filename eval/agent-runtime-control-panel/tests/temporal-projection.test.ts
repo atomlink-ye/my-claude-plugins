@@ -47,4 +47,41 @@ describe('TemporalProjection', () => {
     expect(card.problems).toContain('terminal_runtime_without_completion');
     expect(card.nextAction).toContain('do not infer completion');
   });
+
+  it('detects the delivery invariants: unreachable queued packets, generation mismatch, non-monotonic timestamps, and invalid safe points', () => {
+    const queued = event('queued', 'attention', 'task-live'); queued.targetMemberId = 'missing';
+    const waiting = event('waiting', 'attention', 'task-live'); waiting.deliveryState = 'queued';
+    const delivery = { id: 'd', fromActorId: 'a', runtimeSessionId: 'r', generation: 1, body: '', command: 'normal', state: 'waiting_safe_point', eventId: 'waiting', createdAt: at, attemptedAt: '2026-09-01T23:00:00.000Z' };
+    const projection = projectTemporal(facts([queued, waiting], { deliveries: [delivery], sessions: [{ id: 'r', actorId: 'a', goalId: 'g', bindingId: 'b', generation: 2, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'terminal', lastTurnState: 'idle', createdAt: at }] }), 'problems');
+    expect(projection.cards.find((card) => card.id === 'queued')?.problems).toContain('overdue');
+    expect(projection.cards.find((card) => card.id === 'waiting')?.problems).toEqual(expect.arrayContaining(['delivery_generation_mismatch', 'timestamp_nonmonotonic', 'safe_point_invalid']));
+  });
+
+  it('detects duplicate completions, source identity retries, and stewardship recursion without creating a new semantic completion', () => {
+    const first = event('completion-1', 'task_completed', 'task-done'); first.resultId = 'result-done';
+    const second = event('completion-2', 'task_completed', 'task-done'); second.resultId = 'result-done'; second.createdAt = '2026-09-02T00:01:00.000Z';
+    const candidate = event('candidate-retry', 'task_candidate', 'task-done'); candidate.resultId = 'result-retry';
+    const steward = event('steward', 'attention', 'task-steward');
+    const projection = projectTemporal(facts([first, second, candidate, steward], { tasks: [...facts([], {}).tasks, { id: 'task-steward', workspaceId: 'w', title: 'Steward analysis', lifecycle: 'claimed', fence: 1, scope: 'steward_analysis', createdAt: at, updatedAt: at }], results: [...facts([], {}).results, { id: 'result-retry', workspaceId: 'w', taskId: 'task-done', memberId: 'm', fence: 1, status: 'candidate', summary: 'retry', evidenceRefs: [], sourceId: 'same-source', createdAt: '2026-09-02T00:02:00.000Z' }, { id: 'result-retry-2', workspaceId: 'w', taskId: 'task-done', memberId: 'm', fence: 1, status: 'candidate', summary: 'retry', evidenceRefs: [], sourceId: 'same-source', createdAt: '2026-09-02T00:03:00.000Z' }] }), 'problems');
+    expect(projection.cards.find((card) => card.id === 'completion-2')).toMatchObject({ disposition: 'superseded' });
+    expect(projection.cards.find((card) => card.id === 'candidate-retry')?.problems).toContain('duplicate');
+    expect(projection.cards.find((card) => card.id === 'steward')).toMatchObject({ subject: { kind: 'workspace' } });
+    expect(projection.cards.find((card) => card.id === 'steward')?.problems).toContain('steward_recursion');
+  });
+
+  it('keeps transport-failed decisions actionable and marks completion with no Result as missing acceptance evidence', () => {
+    const decision = event('decision', 'decision_required', 'task-live'); decision.deliveryState = 'undeliverable'; decision.undeliverableReason = 'old runtime';
+    const completion = event('no-result', 'task_completed', 'task-live');
+    const projection = projectTemporal(facts([decision, completion], { results: [] }), 'problems');
+    expect(projection.cards.find((card) => card.id === 'decision')).toMatchObject({ disposition: 'active', owner: 'Manager/Deputy' });
+    expect(projection.cards.find((card) => card.id === 'decision')?.nextAction).toContain('transport failure does not close');
+    expect(projection.cards.find((card) => card.id === 'no-result')?.problems).toContain('completion_without_result');
+  });
+
+  it('keeps the frozen surface to active, problems, and one task causal chain', () => {
+    const input = facts([event('old', 'decision_required', 'task-done'), event('live', 'blocker', 'task-live')]);
+    expect(projectTemporal(input, 'active').cards.map((card) => card.id)).toEqual(['live']);
+    expect(projectTemporal(input, 'problems').cards.map((card) => card.id)).toContain('old');
+    expect(projectTemporal(input, { taskId: 'task-done' }).cards.map((card) => card.id)).toEqual(['old']);
+  });
 });
