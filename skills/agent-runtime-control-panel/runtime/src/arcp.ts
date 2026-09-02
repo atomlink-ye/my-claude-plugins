@@ -1393,12 +1393,15 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (!['delivered', 'running'].includes(delivery.state)) throw new ArcpError('invalid_request', 'delivery has not been delivered');
     const session = snapshot.sessions.find((item) => item.id === delivery.runtimeSessionId);
+    if (!session || session.generation !== delivery.generation || session.state === 'terminal') throw new ArcpError('stale_generation', 'delivery target generation is no longer accountable');
     const recipientMemberId = session?.memberId;
     if (memberId && recipientMemberId !== memberId) throw new ArcpError('unauthorized', 'delivery processing is not authorized');
     const processedReason = boundedReason(reason);
     return this.store.mutate((state) => {
       const item = state.deliveries.find((value) => value.id === id)!;
       if (!['delivered', 'running'].includes(item.state)) return item;
+      const currentSession = state.sessions.find((value) => value.id === item.runtimeSessionId);
+      if (!currentSession || currentSession.generation !== item.generation || currentSession.state === 'terminal') throw new ArcpError('stale_generation', 'delivery target generation is no longer accountable');
       const at = now();
       item.state = 'processed'; item.processedAt = at;
       if (recipientMemberId) item.processedByMemberId = recipientMemberId;
@@ -1412,12 +1415,13 @@ export class ArcpService implements ExecutionPlacementPort {
     const delivery = this.store.snapshot().deliveries.find((item) => item.id === id);
     if (!delivery) throw new ArcpError('not_found', 'delivery not found');
     if (generation !== undefined && generation !== delivery.generation) throw new ArcpError('stale_generation', 'delivery generation is stale');
+    const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
+    if (!session || session.generation !== delivery.generation || session.state === 'terminal') throw new ArcpError('stale_generation', 'delivery target generation is no longer accountable');
     if (memberId) {
-      const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
       if (session?.memberId !== memberId) throw new ArcpError('unauthorized', 'delivery acknowledgement is not authorized');
     }
     if (delivery.state !== 'processed') throw new ArcpError('invalid_request', 'delivery must be explicitly processed before acknowledgement');
-    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; if (item.state === 'acknowledged') return item; const at = now(); item.state = 'acknowledged'; item.acknowledgedAt = at; if (memberId) item.acknowledgedByMemberId = memberId; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', at); return item; });
+    return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === id)!; if (item.state === 'acknowledged') return item; const currentSession = state.sessions.find((value) => value.id === item.runtimeSessionId); if (!currentSession || currentSession.generation !== item.generation || currentSession.state === 'terminal') throw new ArcpError('stale_generation', 'delivery target generation is no longer accountable'); const at = now(); item.state = 'acknowledged'; item.acknowledgedAt = at; if (memberId) item.acknowledgedByMemberId = memberId; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (event) this.transitionEvent(event, 'acknowledged', at); return item; });
   }
   /** Release a cache-held Companion delivery after a fresh observation or an
    * explicit one-use cache confirmation. */
