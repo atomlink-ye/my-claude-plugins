@@ -81,13 +81,16 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     const results = task ? resultsByTask.get(task.id) ?? [] : [];
     const completion = results.find((result) => result.fence === task?.fence && result.status === 'candidate');
     const newerCandidate = results.filter((result) => result.fence === task?.fence && result.status === 'candidate' && result.createdAt > event.createdAt).at(-1);
-    const linkedDecision = facts.channelEvents.find((item) => item.kind === 'decision_required' && item.relatedEventId === event.id);
+    const linkedDecision = facts.channelEvents.find((item) => item.kind === 'decision_required' && (item.relatedEventId === event.id || (event.kind === 'task_candidate' && item.resultId === event.resultId)));
     const resolutionEvent = facts.channelEvents.find((item) => item.kind === 'decision_resolved' && (item.relatedEventId === event.id || item.relatedEventId === linkedDecision?.id));
     const resolution = event.verdict ?? resolutionEvent?.verdict;
+    const candidateResult = event.resultId ? facts.results.find((item) => item.id === event.resultId) : undefined;
     const replacement = runtime && facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation);
     let disposition: TemporalDisposition = 'active'; let dispositionReason = 'No machine-provable semantic replacement or resolution.'; const causation: TemporalCausation = event.relatedEventId ? { causedBy: event.relatedEventId } : {};
     if (event.kind === 'decision_resolved') { disposition = 'resolved'; dispositionReason = 'Durable decision resolution is already recorded.'; if (event.relatedEventId) causation.resolvedBy = event.id; }
     else if (resolution && (event.kind === 'decision_required' || event.kind === 'task_candidate')) { disposition = resolution === 'accept' ? 'resolved' : 'superseded'; dispositionReason = `Durable decision was ${resolution === 'accept' ? 'accepted' : 'refused'}; it is not an active obligation.`; if (resolutionEvent) causation.resolvedBy = resolutionEvent.id; }
+    else if (event.kind === 'task_candidate' && candidateResult && task && task.fence > candidateResult.fence) { disposition = 'superseded'; dispositionReason = 'Task fence advanced beyond this Candidate.'; causation.supersedes = task.id; }
+    else if (event.kind === 'blocker' && event.decisionRequired) { disposition = 'stale_requires_review'; dispositionReason = 'ARCP has no durable blocker-resolution mechanism; Manager or Deputy must review this historical blocker.'; }
     else if (task?.lifecycle === 'completed' && completion && completion.createdAt <= task.updatedAt && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'superseded'; dispositionReason = 'Completed Task has a durable Result for this fence.'; causation.resolvedBy = completion.id; }
     else if (newerCandidate && ['decision_required', 'task_candidate'].includes(event.kind)) { disposition = 'superseded'; dispositionReason = 'A later Candidate for the same Task fence exists.'; causation.supersedes = newerCandidate.id; }
     else if ((replacement || runtime?.state === 'terminal') && ['runtime_health', 'permission', 'transport_uncertainty'].includes(event.kind)) { disposition = 'invalidated'; dispositionReason = replacement ? 'This runtime generation was replaced; its health/transport fact belongs only to the older episode.' : 'This runtime generation is terminal; its health/transport fact belongs only to that ended episode.'; causation.replacement = replacement?.id ?? runtime!.id; }
@@ -101,7 +104,10 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     if (event.deliveryState === 'delivered' && !event.processedAt && eventAge > BUDGET_MS) problems.push('overdue');
     if (event.deliveryState === 'transport_indeterminate' || event.kind === 'transport_uncertainty') problems.push('transport_uncertain');
     if (event.kind === 'permission') problems.push('permission');
-    if (event.decisionRequired && disposition === 'active') problems.push('decision');
+    // Only the decision_required event owns a decision. Candidate, blocker,
+    // health, and transport records may request attention, but never become a
+    // phantom decision merely because they carry the legacy signalling bit.
+    if (event.kind === 'decision_required' && event.decisionRequired && disposition === 'active') problems.push('decision');
     if (disposition === 'stale_requires_review') problems.push('stale');
     if (disposition === 'superseded') problems.push('superseded');
     if (task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst') problems.push('steward_recursion');

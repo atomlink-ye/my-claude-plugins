@@ -88,6 +88,16 @@ describe('TemporalProjection', () => {
     expect(projection.problems.find((card) => card.id === 'refused')?.disposition).toBe('superseded');
   });
 
+  it('discharges a candidate through its paired decision Result and makes unresolved blockers review debt', () => {
+    const candidate = event('candidate', 'task_candidate', 'task-live'); candidate.resultId = 'candidate-result'; candidate.decisionRequired = true;
+    const decision = event('candidate-decision', 'decision_required', 'task-live'); decision.resultId = 'candidate-result'; decision.relatedEventId = 'candidate'; decision.decisionRequired = false;
+    const accepted = event('candidate-accepted', 'decision_resolved', 'task-live'); accepted.relatedEventId = 'candidate-decision'; accepted.verdict = 'accept';
+    const blocker = event('old-blocker', 'blocker'); blocker.decisionRequired = true;
+    const projection = projectTemporal(facts([candidate, decision, accepted, blocker], { results: [...facts([], {}).results, { id: 'candidate-result', workspaceId: 'w', taskId: 'task-live', memberId: 'm', fence: 1, status: 'candidate', summary: 'candidate', evidenceRefs: [], createdAt: at }] }));
+    expect(projection.cards.map((card) => card.id)).not.toEqual(expect.arrayContaining(['candidate', 'old-blocker']));
+    expect(projection.problems.find((card) => card.id === 'old-blocker')?.disposition).toBe('stale_requires_review');
+  });
+
   it('keeps the frozen surface to active, problems, and one task causal chain', () => {
     const input = facts([event('old', 'decision_required', 'task-done'), event('live', 'blocker', 'task-live')]);
     expect(projectTemporal(input, 'active').cards.map((card) => card.id)).toEqual(['live']);
