@@ -15,6 +15,7 @@ function publicContext(value: any) { return { ...value, roster: value.roster.map
 function publicPanorama(value: any) {
   return { workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
+    placement: value.placement ?? [],
     blocked: value.blocked ?? [],
     events: value.events ?? [], latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef };
 }

@@ -27,6 +27,10 @@ class FakeCli {
     if (this.fail && args[0] === 'run') throw new Error(typeof this.fail === 'string' ? this.fail : 'timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
+    if (args[0] === 'workspace' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
+    if (args[0] === 'project' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
+    if (args[0] === 'project' && args[1] === 'create') return { value: { projectId: 'prj_default' }, stdout: '', stderr: '' };
+    if (args[0] === 'workspace' && args[1] === 'create') return { value: { workspaceId: 'wks_default', projectId: args[args.indexOf('--project') + 1] }, stdout: '', stderr: '' };
     if (args[0] === 'run') { this.launches += 1; this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: this.registryListing ?? [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
@@ -147,6 +151,28 @@ describe('ARCP MVE control core', () => {
     const { actor } = await service.registerActor({ clientIdentity: 'project-conflict-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'project conflict' });
     await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'must not launch', profileId: 'codex-worker', paseoProjectId: 'remote:github.com/atomlink-ye/my-claude-plugins', paseoWorkspaceId: 'wks_0e6198d7efcef5a2' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: 'PLACEMENT_MISMATCH: requested Paseo Project does not own the selected Workspace' });
     expect((service.cli as any).launches).toBe(0); expect(service.state().goals).toHaveLength(0); expect(service.state().sessions).toHaveLength(0);
+    service.close();
+  });
+  it('persists one canonical Paseo placement per checkout and reuses it for related Tabs', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-canonical-placement-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_checkout' });
+    const { actor } = await service.registerActor({ clientIdentity: 'canonical-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'canonical placement' });
+    const first = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'writer lane', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_checkout', workspace: '/checkout' }) as any;
+    const second = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'review lane', profileId: 'codex-worker', role: 'reviewer', workspace: '/checkout' }) as any;
+    expect(service.state().workspaces[0].paseoPlacements).toEqual([{ checkout: '/checkout', projectId: 'prj_plugins', workspaceId: 'wks_checkout' }]);
+    expect((service.cli as any).launches).toBe(2);
+    expect((service.cli as any).lastLaunchArgs).toEqual(expect.arrayContaining(['--workspace', 'wks_checkout', '--cwd', '/checkout']));
+    const panorama: any = await service.panorama(workspace.workspace.id);
+    expect(panorama.placement).toEqual([expect.objectContaining({ controlWorkspaceId: workspace.workspace.id, projectId: 'prj_plugins', workspaceId: 'wks_checkout', checkout: '/checkout', tabs: expect.arrayContaining([expect.objectContaining({ runtimeId: first.session.id, role: 'worker', goal: 'writer lane' }), expect.objectContaining({ runtimeId: second.session.id, role: 'reviewer', goal: 'review lane' })]) })]);
+    service.close();
+  });
+  it('rejects a second requested Workspace for an already canonical checkout before launch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-conflict-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async (id: string) => ({ projectId: 'prj_plugins', workspaceId: id });
+    const { actor } = await service.registerActor({ clientIdentity: 'conflict-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'placement conflict' });
+    await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'first', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_canonical', workspace: '/checkout' });
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'duplicate', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_duplicate', workspace: '/checkout' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: expect.stringContaining('PLACEMENT_CONFLICT') });
+    expect((service.cli as any).launches).toBe(1);
     service.close();
   });
   it('reports a Paseo placement mismatch without calling it transport indeterminate', async () => {
