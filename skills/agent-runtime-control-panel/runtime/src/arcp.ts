@@ -755,7 +755,7 @@ export class ArcpService implements ExecutionPlacementPort {
     // loop. The clock only decides when the SLA is re-evaluated; the SLA and
     // the lapsed-lease facts decide whether anyone is woken, so this stays a
     // durable-obligation mechanism rather than a poller that invents events.
-    this.pumpTimer = setInterval(() => { void this.pump(); void this.evaluateSupervision(); void this.escalateOverdueObligations().catch(() => undefined); }, 2_000); this.pumpTimer.unref();
+    this.pumpTimer = setInterval(() => { void this.pump(); void this.evaluateSupervision(); }, 2_000); this.pumpTimer.unref();
     // Startup is not complete until persisted safe-point deliveries have been
     // reconciled. Awaiting this makes restart behavior deterministic: delivered
     // rows are observed/processed, while waiting rows are eligible exactly once.
@@ -915,7 +915,18 @@ export class ArcpService implements ExecutionPlacementPort {
 
   /** Install the real Hermes wire. Kept out of the constructor so the
    * deterministic suite can never reach a live conversation by accident. */
-  setHermesTransport(send: (binding: ChannelBindingRef, envelope: ActorDeliveryEnvelope) => Promise<'accepted' | 'duplicate' | 'refused'>): void { this.hermesTransport = send; }
+  setHermesTransport(send: (binding: ChannelBindingRef, envelope: ActorDeliveryEnvelope) => Promise<'accepted' | 'duplicate' | 'refused'>): void {
+    this.hermesTransport = send;
+    // Config is read during init, before an entrypoint can install a wire, so a
+    // channel recorded as configured-and-unavailable is upgraded here rather
+    // than staying permanently unavailable because of load order.
+    for (const status of this.channelStatus) {
+      if (status.available || this.channels.has(status.adapterId)) continue;
+      this.channels.register(new HermesChannelAdapter(send));
+      status.available = true;
+      delete status.detail;
+    }
+  }
 
   /** Sanitized channel discovery: ids, capability and availability only. */
   channelDiscovery(): Array<{ adapterId: string; configured: boolean; available: boolean; detail?: string }> { return [...this.channelStatus]; }
