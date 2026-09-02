@@ -233,6 +233,12 @@ describe('ARCP MVE control core', () => {
     expect(await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' })).toMatchObject({ mode: 'auto', observed: { mode: 'auto' } });
   });
 
+  it('keeps a nonempty SDK mode list authoritative over conflicting CLI labels', async () => {
+    const modeClient = () => ({ connect: async () => {}, close: async () => {}, providers: { listModes: async () => ({ provider: 'codex', modes: [{ id: 'auto' }] }) } });
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-sdk-authoritative-modes-')); const service = await control(root, false, ['codex'], {}, modeClient, 'Default Permissions, Auto-review, Full Access');
+    expect(await service.preflight({ profileId: 'codex-full-access' })).toMatchObject({ action: 'hold', launchable: false, liveModes: ['auto'] });
+  });
+
   it('falls back to CLI mode ids when SDK mode discovery returns an empty result', async () => {
     const modeClient = () => ({ connect: async () => {}, close: async () => {}, providers: { listModes: async () => ({ provider: 'codex', modes: [] }) } });
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-sdk-empty-modes-')); const service = await control(root, false, ['codex'], {}, modeClient, 'Default Permissions, Auto-review, Full Access');
