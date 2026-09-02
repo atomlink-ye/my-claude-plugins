@@ -81,7 +81,7 @@ export interface Member { id: string; workspaceId: string; actorId?: string; joi
 export type TaskScope = 'product' | 'steward_analysis';
 export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; executionSurfaceId?: string; fence: number; createdAt: string; updatedAt: string; scope?: TaskScope; }
 export interface KnowledgeEntry { id: string; workspaceId: string; authorMemberId: string; kind: 'problem' | 'learning' | 'decision' | 'evidence' | 'runbook' | 'blocker'; text: string; tags: string[]; taskId?: string; goalId?: string; createdAt: string; }
-export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; sourceId?: string; createdAt: string; }
+export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; sourceId?: string; runtimeSessionId?: string; runtimeGeneration?: number; createdAt: string; }
 export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
 export interface ActionResult { action: 'launch' | 'route' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; admission?: AdmissionDecision; runtimeSignals?: RuntimeBudgetSignal[]; }
 export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; attentionWhy?: string; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; cache: { activityAt?: string; ageMinutes: number | 'unknown'; state: 'fresh' | 'expiring' | 'expired' | 'unknown' }; burn: RuntimeBudgetView; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
@@ -528,7 +528,7 @@ export class PaseoAdapter implements RuntimeAdapter {
 }
 
 export type Profile = { id: string; provider: string; model: string; mode?: string; thinking?: string; role: string };
-export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; role?: string; unattended?: boolean; executionSurfaceId?: string };
+export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; role?: string; unattended?: boolean; executionSurfaceId?: string; workspace?: string; memberCredential?: string; clientStatePath?: string };
 
 export class ArcpService implements ExecutionPlacementPort {
   readonly store: StateStore;
@@ -555,8 +555,8 @@ export class ArcpService implements ExecutionPlacementPort {
     if (onSafePoint) onSafePoint.call(adapter, () => { void this.pump(); });
     const onFact = (adapter as RuntimeAdapter & { onFact?: (listener: (fact: { externalId: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; summary: string; sampleBucket?: number }) => void) => () => void }).onFact;
     if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ semanticKey: `observation:${fact.externalId}:${session.generation}:${fact.kind}:${session.workspaceId ?? ''}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`, workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, consumptionPolicy: fact.kind === 'permission' ? 'decision_required' : 'ack_required', decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }).catch(() => undefined); });
-    const onResult = (adapter as RuntimeAdapter & { onResult?: (listener: (fact: { externalId: string; taskId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string }) => void) => () => void }).onResult;
-    if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) { const submission = this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId }); this.pendingResultSubmissions.add(submission); void submission.finally(() => this.pendingResultSubmissions.delete(submission)).catch(() => undefined); } });
+    const onResult = (adapter as RuntimeAdapter & { onResult?: (listener: (fact: { externalId: string; taskId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string; runtimeGeneration?: number; generation?: number }) => void) => () => void }).onResult;
+    if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) { const submission = this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId, runtimeSessionId: session.id, runtimeGeneration: fact.runtimeGeneration ?? fact.generation ?? session.generation }); this.pendingResultSubmissions.add(submission); void submission.finally(() => this.pendingResultSubmissions.delete(submission)).catch(() => undefined); } });
   }
   /** Override the analyst only for deterministic local proof; production uses
    * the owner-selected Codex runtime through the same WorkspaceSteward object
@@ -793,9 +793,12 @@ export class ArcpService implements ExecutionPlacementPort {
       const nativeId = setting(session.externalId) ?? setting(state.runtimeBindings.find((item) => item.runtimeSessionId === session.id && item.nativeId)?.nativeId);
       if (existing) {
         if (nativeId) existing.nativeId = nativeId;
+        existing.generation = session.generation;
+        existing.state = 'launching';
+        existing.visibilityState = 'visible';
         return { binding: existing };
       }
-      const binding: RuntimeBinding = { id: `runtime_binding_${randomUUID()}`, executionSurfaceId: input.executionSurfaceId, runtimeSessionId: input.runtimeSessionId, adapterId: 'paseo', ...(nativeId ? { nativeId } : {}), generation: 1, state: 'launching', visibilityState: 'visible', createdAt: now() };
+      const binding: RuntimeBinding = { id: `runtime_binding_${randomUUID()}`, executionSurfaceId: input.executionSurfaceId, runtimeSessionId: input.runtimeSessionId, adapterId: 'paseo', ...(nativeId ? { nativeId } : {}), generation: session.generation, state: 'launching', visibilityState: 'visible', createdAt: now() };
       state.runtimeBindings.push(binding); return { binding };
     });
   }
@@ -1109,6 +1112,81 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!session.externalId) throw new ArcpError('launch_failed', `runtime launch returned no usable session (state ${session.state})`);
     return session;
   }
+  /**
+   * End the current runtime episode without deleting its logical session. A
+   * replacement keeps the opaque ARCP RuntimeSession id, while deliveries,
+   * confirmations, and result callbacks from the previous generation become
+   * non-authoritative before the new native runtime is launched.
+   */
+  private invalidateRuntimeGeneration(state: State, session: RuntimeSession, reason: string): void {
+    const oldGeneration = session.generation;
+    const eventIds = new Set<string>();
+    for (const delivery of state.deliveries.filter((item) => item.runtimeSessionId === session.id && item.generation === oldGeneration)) {
+      if (delivery.eventId) eventIds.add(delivery.eventId);
+      if (['queued', 'held', 'waiting_safe_point', 'attempting'].includes(delivery.state)) {
+        delivery.state = 'withdrawn';
+        delivery.reason = reason;
+        delivery.refusedReason = reason;
+      }
+    }
+    // A confirmation is an obligation tied to the exact runtime episode. It
+    // must not survive a replacement and later validate against fresh facts.
+    state.confirmations = state.confirmations.filter((item) => !(item.runtimeSessionId === session.id && item.generation === oldGeneration));
+    for (const event of state.channelEvents) {
+      if (!eventIds.has(event.id) || !['open', 'deferred'].includes(event.consumptionState)) continue;
+      event.consumptionState = 'invalidated';
+      this.transitionEvent(event, 'withdrawn');
+    }
+  }
+
+  /** Replace a runtime process while retaining the logical RuntimeSession id. */
+  async replaceRuntime(input: LaunchInput & { runtimeSessionId: string; actorId?: string; workspaceId?: string; memberId?: string; taskId?: string; executionSurfaceId?: string; contract?: string; reportingRoute?: ReportingRoute; expectedGeneration?: number; runtimeGeneration?: number; generation?: number }): Promise<RuntimeSession> {
+    const prior = this.store.snapshot().sessions.find((item) => item.id === input.runtimeSessionId);
+    if (!prior) throw new ArcpError('not_found', 'runtime session not found');
+    const actorId = input.actorId ?? prior.actorId;
+    if (actorId !== prior.actorId) throw new ArcpError('unauthorized', 'runtime replacement actor does not own the session');
+    const expectedGeneration = input.expectedGeneration ?? input.runtimeGeneration ?? input.generation;
+    if (expectedGeneration !== undefined && expectedGeneration !== prior.generation) throw new ArcpError('stale_generation', `runtime replacement generation ${expectedGeneration} is stale; current generation is ${prior.generation}`);
+    if (prior.externalId) await this.adapterFor(prior).stop(prior.externalId).catch(() => undefined);
+    await this.store.mutate((state) => {
+      const current = state.sessions.find((item) => item.id === prior.id);
+      if (!current) throw new ArcpError('not_found', 'runtime session not found');
+      if (current.generation !== prior.generation) throw new ArcpError('stale_generation', 'runtime replacement raced with a newer generation');
+      this.invalidateRuntimeGeneration(state, current, 'target runtime generation was replaced');
+      current.state = 'terminal';
+      current.lastTurnState = 'idle';
+      // Clearing the identity before launch prevents a late callback from the
+      // old native process being attributed to the new generation.
+      delete current.externalId;
+    });
+    const profileInput = [input.profileId, input.provider, input.model, input.mode, input.thinking].some((value) => value !== undefined)
+      ? input
+      : { ...input, profileId: prior.profileId };
+    let memberCredential = input.memberCredential;
+    let clientStatePath = input.clientStatePath;
+    if (!memberCredential && prior.memberId && prior.workspaceId) {
+      clientStatePath ??= path.join(path.dirname(this.store.file), 'runtime-members', `${prior.id}.json`);
+      try {
+        const persisted = JSON.parse(await readFile(clientStatePath, 'utf8')) as { memberCredential?: string; runtimeMemberCredentials?: Record<string, string> };
+        memberCredential = persisted.runtimeMemberCredentials?.[prior.id] ?? persisted.memberCredential;
+      } catch { /* replacement can still be used for runtimes without managed credentials */ }
+    }
+    return this.launch({
+      ...profileInput,
+      actorId,
+      goalId: prior.goalId,
+      runtimeId: prior.id,
+      ...(input.workspace ?? prior.workspace ? { workspace: input.workspace ?? prior.workspace } : {}),
+      ...(memberCredential ? { memberCredential } : {}),
+      ...(clientStatePath ? { clientStatePath } : {}),
+      ...(input.workspaceId ?? prior.workspaceId ? { workspaceId: input.workspaceId ?? prior.workspaceId } : {}),
+      ...(input.memberId ?? prior.memberId ? { memberId: input.memberId ?? prior.memberId } : {}),
+      ...(input.taskId ?? prior.taskId ? { taskId: input.taskId ?? prior.taskId } : {}),
+      ...(input.executionSurfaceId ?? prior.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId ?? prior.executionSurfaceId } : {}),
+      ...(input.reportingRoute ?? prior.reportingRoute ? { reportingRoute: input.reportingRoute ?? prior.reportingRoute } : {}),
+    } as Parameters<ArcpService['launch']>[0]);
+  }
+
   async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean }): Promise<RuntimeSession> {
     const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
@@ -1118,12 +1196,44 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!goal || !binding) throw new ArcpError('unknown_recipient', 'actor or goal is not registered');
     if (input.memberId && !state.members.some((item) => item.id === input.memberId && (!input.workspaceId || item.workspaceId === input.workspaceId))) throw new ArcpError('unknown_recipient', 'managed member is not in workspace');
     input = await this.resolvePaseoPlacement(input);
-    if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal')) {
+    const prior = input.runtimeId ? state.sessions.find((item) => item.id === input.runtimeId) : undefined;
+    if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal' && item.id !== prior?.id)) {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
     }
-    const generation = Math.max(0, ...state.sessions.filter((item) => item.goalId === goal.id).map((item) => item.generation)) + 1;
-    const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
-    await this.store.mutate((next) => { next.sessions.push(session); });
+    if (prior && prior.state !== 'terminal') throw new ArcpError('goal_held', 'runtime session is still active; stop it before replacement');
+    const generation = prior ? prior.generation + 1 : Math.max(0, ...state.sessions.filter((item) => item.goalId === goal.id).map((item) => item.generation)) + 1;
+    const { agentId: _oldAgentId, ...priorRequestedPlacement } = prior?.placement?.requested ?? {};
+    const requestedPlacement = { ...priorRequestedPlacement, ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) };
+    const session: RuntimeSession = {
+      id: prior?.id ?? input.runtimeId ?? `runtime_${randomUUID()}`,
+      actorId: input.actorId,
+      goalId: goal.id,
+      ...(input.taskId ?? prior?.taskId ? { taskId: input.taskId ?? prior?.taskId } : {}),
+      ...(input.reportingRoute ?? prior?.reportingRoute ? { reportingRoute: input.reportingRoute ?? prior?.reportingRoute } : {}),
+      ...(input.executionSurfaceId ?? prior?.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId ?? prior?.executionSurfaceId } : {}),
+      bindingId: binding.id,
+      generation,
+      runtimeKind: prior?.runtimeKind ?? 'paseo',
+      adapterId: prior?.adapterId ?? 'paseo',
+      ...(input.workspaceId ?? prior?.workspaceId ? { workspaceId: input.workspaceId ?? prior?.workspaceId } : {}),
+      ...(input.memberId ?? prior?.memberId ? { memberId: input.memberId ?? prior?.memberId } : {}),
+      profileId: profile.id,
+      provider: profile.provider,
+      model: profile.model,
+      ...(profile.mode ? { mode: profile.mode } : {}),
+      ...(profile.thinking ? { thinking: profile.thinking } : {}),
+      placement: { requested: requestedPlacement, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : prior?.placement?.unresolved ? { unresolved: prior.placement.unresolved } : {}) },
+      workspace: input.workspace ?? prior?.workspace,
+      state: 'launching',
+      createdAt: prior?.createdAt ?? now(),
+    };
+    await this.store.mutate((next) => {
+      if (prior) {
+        const current = next.sessions.find((item) => item.id === prior.id)!;
+        this.invalidateRuntimeGeneration(next, current, 'target runtime generation was replaced');
+        next.sessions[next.sessions.indexOf(current)] = session;
+      } else next.sessions.push(session);
+    });
     if (input.executionSurfaceId) await this.launchRuntime({ executionSurfaceId: input.executionSurfaceId, runtimeSessionId: session.id, writer: input.writer });
     try {
       const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace, { workspaceId: input.workspaceId, paseoProjectId: input.paseoProjectId, paseoWorkspaceId: input.paseoWorkspaceId, taskId: input.taskId, memberId: input.memberId, runtimeId: session.id, memberCredential: input.memberCredential, clientStatePath: input.clientStatePath, ...(input.taskHandoff === false ? { taskHandoff: false } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.contract ? { contract: input.contract } : {}) })).value);
@@ -1773,9 +1883,16 @@ export class ArcpService implements ExecutionPlacementPort {
    * refuses a different presenter and records the mismatch durably. A borrowed
    * but otherwise valid credential is therefore detectable and refusable
    * instead of silently accepted. */
-  private async enforceRuntimeIdentityBinding(taskId: string, memberId: string, action: 'claim' | 'result'): Promise<void> {
+  private async enforceRuntimeIdentityBinding(taskId: string, memberId: string, action: 'claim' | 'result', runtimeSessionId?: string, runtimeGeneration?: number): Promise<void> {
     const state = this.store.snapshot();
     const bound = state.sessions.filter((item) => item.taskId === taskId && item.memberId && item.state !== 'terminal' && state.members.some((member) => member.id === item.memberId && member.joinKind === 'managed'));
+    const suppliedRuntime = runtimeSessionId ? state.sessions.find((item) => item.id === runtimeSessionId) : undefined;
+    if (runtimeSessionId && (!suppliedRuntime || suppliedRuntime.taskId !== taskId || suppliedRuntime.memberId !== memberId)) throw new ArcpError('stale_generation', `runtime ${runtimeSessionId} is not the current runtime for task ${taskId}`);
+    if (runtimeSessionId && runtimeGeneration === undefined) throw new ArcpError('invalid_request', 'runtime generation is required when submitting from a runtime session', 'runtimeGeneration');
+    if (runtimeGeneration !== undefined) {
+      const current = bound.sort((a, b) => b.generation - a.generation)[0] ?? suppliedRuntime;
+      if (!current || current.generation !== runtimeGeneration || (suppliedRuntime && current.id !== suppliedRuntime.id)) throw new ArcpError('stale_generation', `runtime generation ${runtimeGeneration} is stale; current generation is ${current?.generation ?? 'unknown'}`);
+    }
     if (!bound.length || bound.some((item) => item.memberId === memberId)) return;
     const session = bound[0];
     const why = `member ${memberId} is not the runtime identity ARCP issued for task ${taskId} (runtime ${session.id} acts as ${session.memberId})`;
@@ -1788,7 +1905,7 @@ export class ArcpService implements ExecutionPlacementPort {
   }
   async claimTask(taskId: string, memberId: string, expectedFence?: number): Promise<Task> { await this.enforceRuntimeIdentityBinding(taskId, memberId, 'claim'); const claimed = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === taskId); const member = state.members.find((item) => item.id === memberId); if (!task || !member || task.workspaceId !== member.workspaceId) throw new ArcpError('unknown_recipient', 'task or member is unknown'); if (!member.capabilities.includes('claim_task')) throw new ArcpError('unauthorized', 'member lacks claim_task capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot claim product Tasks'); if (expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== expectedFence) throw new ArcpError('stale_generation', `task claim fence is stale; current fence is ${task.fence}`); if (task.ownerMemberId === memberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) return task; if (task.ownerMemberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) throw new ArcpError('task_held', 'task already has an active claim'); task.ownerMemberId = memberId; task.fence += 1; task.lifecycle = 'claimed'; task.updatedAt = now(); member.lifecycle = 'busy'; member.updatedAt = now(); return task; }); await this.publishChannelEvent({ workspaceId: claimed.workspaceId, taskId: claimed.id, sourceMemberId: claimed.ownerMemberId, targetRole: 'manager', kind: 'task_claimed', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Task ${claimed.id} claimed at fence ${claimed.fence}`, evidenceRefs: [] }); return claimed; }
   async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string; targetMemberId?: string }): Promise<KnowledgeEntry> { const entry = await this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); if (input.kind === 'blocker' || input.kind === 'evidence') await this.publishChannelEvent({ workspaceId: entry.workspaceId, taskId: entry.taskId, goalId: entry.goalId, sourceMemberId: entry.authorMemberId, ...(input.targetMemberId ? { targetMemberId: input.targetMemberId } : {}), ...(input.targetMemberId ? {} : { targetRole: 'manager' }), kind: input.kind === 'blocker' ? 'blocker' : 'finding', urgency: input.kind === 'blocker' ? 'urgent' : 'normal', consumptionPolicy: input.kind === 'blocker' ? 'ack_required' : 'consume_on_delivery', decisionRequired: input.kind === 'blocker', summary: `${input.kind} knowledge ${entry.id}`, evidenceRefs: [] }); return entry; }
-  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { await this.enforceRuntimeIdentityBinding(input.taskId, input.memberId, 'result'); const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); for (const pending of state.deliveries.filter((item) => item.purpose === 'contract' && item.subject?.taskId === task.id && ['queued', 'held', 'waiting_safe_point', 'attempting'].includes(item.state))) { pending.state = 'withdrawn'; pending.refusedReason = `task ${task.id} already submitted result ${result.id}`; pending.reason = pending.refusedReason; } if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); if (task.executionSurfaceId) { for (const claim of state.surfaceClaims.filter((claim) => claim.executionSurfaceId === task.executionSurfaceId && claim.active)) { claim.active = false; claim.releasedAt = now(); } const surface = state.executionSurfaces.find((surface) => surface.id === task.executionSurfaceId); if (surface) { surface.operationalState = input.status === 'candidate' ? 'accepted' : input.status === 'failed' ? 'abandoned' : 'parked'; surface.updatedAt = now(); } } const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') { const route = state.sessions.find((item) => item.taskId === result.taskId && item.reportingRoute)?.reportingRoute; const primary = route?.primaryHandlerMemberId; const decision = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, ...(primary ? { targetMemberId: primary } : { targetRole: 'manager' }), kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires ${primary ? `a decision from its accountable handler ${primary}` : 'Manager decision'}`, evidenceRefs: [], relatedEventId: candidate.id });
+  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string; runtimeSessionId?: string; runtimeGeneration?: number; generation?: number }): Promise<Result> { const runtimeGeneration = input.runtimeGeneration ?? input.generation; await this.enforceRuntimeIdentityBinding(input.taskId, input.memberId, 'result', input.runtimeSessionId, runtimeGeneration); const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? []) || existing.runtimeSessionId !== input.runtimeSessionId || existing.runtimeGeneration !== runtimeGeneration) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), ...(input.runtimeSessionId ? { runtimeSessionId: input.runtimeSessionId } : {}), ...(runtimeGeneration !== undefined ? { runtimeGeneration } : {}), createdAt: now() }; state.results.push(result); for (const pending of state.deliveries.filter((item) => item.purpose === 'contract' && item.subject?.taskId === task.id && ['queued', 'held', 'waiting_safe_point', 'attempting'].includes(item.state))) { pending.state = 'withdrawn'; pending.refusedReason = `task ${task.id} already submitted result ${result.id}`; pending.reason = pending.refusedReason; } if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); if (task.executionSurfaceId) { for (const claim of state.surfaceClaims.filter((claim) => claim.executionSurfaceId === task.executionSurfaceId && claim.active)) { claim.active = false; claim.releasedAt = now(); } const surface = state.executionSurfaces.find((surface) => surface.id === task.executionSurfaceId); if (surface) { surface.operationalState = input.status === 'candidate' ? 'accepted' : input.status === 'failed' ? 'abandoned' : 'parked'; surface.updatedAt = now(); } } const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') { const route = state.sessions.find((item) => item.taskId === result.taskId && item.reportingRoute)?.reportingRoute; const primary = route?.primaryHandlerMemberId; const decision = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, ...(primary ? { targetMemberId: primary } : { targetRole: 'manager' }), kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires ${primary ? `a decision from its accountable handler ${primary}` : 'Manager decision'}`, evidenceRefs: [], relatedEventId: candidate.id });
       // CC is observe-only: it references the same decision without minting a
       // second obligation, so a completed review is routed to the accountable
       // handler rather than broadcast.
