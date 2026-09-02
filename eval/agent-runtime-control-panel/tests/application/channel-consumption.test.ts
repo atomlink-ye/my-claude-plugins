@@ -49,6 +49,18 @@ describe('ARCP channel consumption MVE', () => {
     service.close();
   });
 
+  it('refuses processing or ACK receipts after the delivery generation is superseded', async () => {
+    const { service, workspace, manager } = await fixture();
+    const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetMemberId: manager.member.id, kind: 'finding', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'superseded delivery', evidenceRefs: [] });
+    const delivery = service.state().deliveries.find((item) => item.eventId === event.id)!;
+    await service.store.mutate((state: any) => { state.sessions.find((item: any) => item.id === 'manager-runtime').generation = 2; });
+    await expect(service.processDelivery(delivery.id, manager.member.id, 'too late')).rejects.toMatchObject({ code: 'stale_generation' });
+    await service.store.mutate((state: any) => { const item = state.deliveries.find((value: any) => value.id === delivery.id); item.state = 'processed'; item.processedAt = new Date().toISOString(); });
+    await expect(service.acknowledge(delivery.id, undefined, manager.member.id)).rejects.toMatchObject({ code: 'stale_generation' });
+    expect(service.state().deliveries.find((item) => item.id === delivery.id)?.state).toBe('processed');
+    service.close();
+  });
+
   it('defers the same event, then resumes one new consumption episode without duplicate wake', async () => {
     const { service, cli, workspace, manager } = await fixture();
     const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetMemberId: manager.member.id, kind: 'finding', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'wait for worker', evidenceRefs: [] });
