@@ -25,6 +25,7 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
   const goals = Array.isArray(view.goals) ? view.goals : [];
   const blocked = Array.isArray(view.blocked) ? view.blocked : [];
   const blockedByRuntime = new Map<string, any>(blocked.map((item: any) => [String(item.runtimeSessionId), item]));
+  const budget = view.providerBudget ?? { status: 'source_unavailable' };
   const minutes = (ms: unknown) => typeof ms === 'number' && Number.isFinite(ms) ? `${Math.floor(ms / 60000)}m` : 'unknown';
   const tabs = ['overview', 'runtimes', 'temporal'];
   const lines = [
@@ -32,6 +33,11 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     `tab=${tabs[tab]} selected=${selected + 1}/${Math.max(runtime.length, 1)} expanded=${expanded ? 'yes' : 'no'}`,
     `Workspace ${workspace.lifecycle ?? 'unknown'} · Goals ${goals.length} · Tasks ${tasks.length} · Members ${roster.length}`,
   ];
+  if (budget.snapshot) {
+    lines.push(`Provider budget ${budget.snapshot.source.id} observed=${budget.snapshot.source.observedAt}`);
+    for (const provider of budget.snapshot.providers ?? []) lines.push(`  ${provider.providerId} ${provider.status} ${provider.windows.map((window: any) => `${window.id}:${window.remainingPct ?? 'unknown'}%`).join(' ') || (provider.error ?? 'no windows')}`);
+    for (const decision of budget.admissions ?? []) lines.push(`  admission ${decision.providerId}/${decision.model}: ${decision.action} · ${decision.reasons?.[0] ?? ''}`);
+  } else lines.push(`Provider budget ${budget.status ?? 'source_unavailable'}`);
   if (tab === 2) {
     const temporal = view.temporal ?? {}; const groups = Array.isArray(temporal.groups) ? temporal.groups : [];
     lines.push(`Temporal ${groups.length} subject timelines · problems ${(temporal.problems ?? []).length}`);
@@ -53,6 +59,8 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
     // status as a healthy one, so the blocked record is the only thing that can
     // put it on screen. Round 2 lost over an hour to exactly this blind spot.
     if (parked) lines.push(`    BLOCKED on decision ${parked.eventId} age=${minutes(parked.ageMs)} options=${(parked.options ?? []).length}`);
+    const burn = observation.burn;
+    if (burn?.samples) lines.push(`    burn turns=${burn.turnCount} rate5m=${scalar(burn.velocities?.fiveMinute)} cacheRead=${scalar(burn.cacheReadTokens)} wakes=${burn.staleWakeCount} signals=${burn.signals?.join(',') || 'none'}`);
     if (expanded && index === selected) lines.push(`  SCM dirty=${scalar(work.dirty)} diff=${JSON.stringify(work.diffstat ?? 'unknown')} provider-children=${(children.items ?? []).map((child: any) => `${child.id}:${child.status}`).join(',') || 'none'} context=${scalar(observation.context?.used)}/${scalar(observation.context?.max)}`);
   }
   lines.push(`Blocked ${blocked.length}${blocked.length ? ` · oldest ${minutes(blocked[0]?.ageMs)}` : ''}`);

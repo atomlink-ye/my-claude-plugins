@@ -21,6 +21,12 @@ export { projectTemporal, temporalReconciliationPreview } from './temporal-proje
 export type { TemporalFilter, TemporalProjection, TemporalProjectionFacts, TemporalCard, TemporalDisposition } from './temporal-projection.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
+import { collectCodexbar, collectPiGrokCache, evaluateAdmission, matchesModel, runCommandCollector, translatePaseoProviderUsage, type AdmissionDecision, type ProviderBudgetConfig, type ProviderBudgetEnvelopeV1 } from './provider-budget.js';
+import { RuntimeBudgetTracker, type RuntimeBudgetPolicy, type RuntimeBudgetSample, type RuntimeBudgetSignal, type RuntimeBudgetView } from './runtime-budget.js';
+export { PROVIDER_BUDGET_SCHEMA, validateProviderBudgetEnvelope, evaluateAdmission, collectCodexbar, collectPiGrokCache, runCommandCollector, translatePaseoProviderUsage } from './provider-budget.js';
+export type { AdmissionDecision, ProviderBudgetBinding, ProviderBudgetConfig, ProviderBudgetEnvelopeV1, ProviderBudgetPolicy } from './provider-budget.js';
+export { RuntimeBudgetTracker, validateRuntimeBudgetSample } from './runtime-budget.js';
+export type { RuntimeBudgetPolicy, RuntimeBudgetSample, RuntimeBudgetSignal, RuntimeBudgetView, WakeCategory } from './runtime-budget.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
 export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
@@ -28,6 +34,18 @@ export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, Supervisi
 export type GoalState = 'active' | 'completed' | 'cancelled';
 export type SessionState = 'launching' | 'running' | 'idle' | 'terminal' | 'attention' | 'placement_mismatch' | 'transport_indeterminate';
 export type DeliveryState = 'queued' | 'held' | 'waiting_safe_point' | 'attempting' | 'delivered' | 'running' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'withdrawn';
+/** Urgency controls surfacing; it never changes what the recipient owes. */
+export type ChannelPriority = 'normal' | 'important' | 'critical';
+export type ConsumptionPolicy = 'consume_on_delivery' | 'ack_required' | 'decision_required';
+export type ConsumptionState = 'open' | 'deferred' | 'consumed' | 'resolved' | 'withdrawn' | 'invalidated';
+export interface ExpectedAction { kind: 'none' | 'ack' | 'resolve'; instruction: string; accountableRole?: string; deadlineAt?: string; }
+export type RecipientDisposition =
+  | { kind: 'ack'; reason: string }
+  | { kind: 'defer'; reason: string; resume: { kind: 'at'; at: string } | { kind: 'after'; delayMs: number } | { kind: 'event'; eventId: string } | { kind: 'manual' } }
+  | { kind: 'resolve'; verdict: DecisionVerdict; reason: string }
+  | { kind: 'reroute'; reason: string; toMemberId: string };
+export type RecipientDispositionReceipt = RecipientDisposition & { id: string; actorMemberId: string; targetGeneration?: number; at: string; nextVisibleAt?: string; };
+export interface ChannelDeferralPolicy { maxDeferrals: number; maxDeferredMs: number; allowCriticalDeferral?: boolean; }
 
 export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
 export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
@@ -36,24 +54,24 @@ export type DecisionVerdict = 'accept' | 'refuse';
 export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress' | 'workspace_analysis_required';
 export interface ChannelEventContent { summary: string; evidenceRefs: string[]; contentHash: string; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded'; }
 export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string; }
-export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; }
-type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; notify?: boolean };
+export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; reroutedToMemberId?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority: ChannelPriority; consumptionPolicy: ConsumptionPolicy; consumptionState: ConsumptionState; expectedAction: ExpectedAction; dispositions: RecipientDispositionReceipt[]; nextVisibleAt?: string; dependencyEventId?: string; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; consumedAt?: string; resolvedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; }
+type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority?: ChannelPriority; consumptionPolicy: ConsumptionPolicy; expectedAction?: ExpectedAction; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; notify?: boolean };
 export interface PaseoPlacement { requested: { projectId?: string; workspaceId?: string; agentId?: string }; observed?: { projectId?: string; workspaceId?: string; agentId?: string; lifecycle?: string }; status?: 'PLACEMENT_MATCH' | 'PLACEMENT_MISMATCH'; unresolved?: string; }
 /** A durable Paseo execution surface.  A ControlWorkspace may have one for
  * each checkout, while agents remain Tabs inside that surface. */
 export interface CanonicalPaseoPlacement { checkout: string; projectId: string; workspaceId: string; }
 export interface RuntimeLaunchContext { workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
-export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; eventId?: string; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
-export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; createdAt: string; updatedAt: string; }
+export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
+export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export type TaskScope = 'product' | 'steward_analysis';
 export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; fence: number; createdAt: string; updatedAt: string; scope?: TaskScope; }
 export interface KnowledgeEntry { id: string; workspaceId: string; authorMemberId: string; kind: 'problem' | 'learning' | 'decision' | 'evidence' | 'runbook' | 'blocker'; text: string; tags: string[]; taskId?: string; goalId?: string; createdAt: string; }
 export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; sourceId?: string; createdAt: string; }
 export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
-export interface ActionResult { action: 'launch' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; }
-export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; attentionWhy?: string; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; cache: { activityAt?: string; ageMinutes: number | 'unknown'; state: 'fresh' | 'expiring' | 'expired' | 'unknown' }; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
+export interface ActionResult { action: 'launch' | 'route' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; admission?: AdmissionDecision; runtimeSignals?: RuntimeBudgetSignal[]; }
+export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; attentionWhy?: string; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; cache: { activityAt?: string; ageMinutes: number | 'unknown'; state: 'fresh' | 'expiring' | 'expired' | 'unknown' }; burn: RuntimeBudgetView; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
 export interface ManagedChild { id: string; provider?: string; title?: string; status: string; createdAt?: string; updatedAt?: string; source: 'paseo_parent' | 'provider_subagents'; }
 export interface ChildObservation { source: 'provider_subagents' | 'paseo_parent' | 'unavailable' | 'none'; items: ManagedChild[]; }
 export interface WorkSummary { latestCommit?: { sha: string; subject: string; time: string }; dirty: boolean | 'unknown'; diffstat: { files: number; insertions: number; deletions: number } | 'unknown'; }
@@ -86,8 +104,27 @@ export const DEFAULT_STEWARD_PROFILE_ID = 'codex-full-access';
 // the Steward's own bookkeeping Task can never recurse into another breach.
 export const STEWARD_ANALYSIS_ROLE = 'steward-analyst';
 const idFor = (prefix: string, value: string) => `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 20)}`;
+export const providerBudgetEpisodeKey = (workspaceId: string, providerId: string, windowIds: readonly string[], resetsAt?: string) => `provider-budget:${workspaceId}:${providerId}:${[...windowIds].sort().join(',')}:${resetsAt ?? 'unknown'}`;
 const now = () => new Date().toISOString();
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+const DEFAULT_CHANNEL_DEFERRAL_POLICY: ChannelDeferralPolicy = { maxDeferrals: 3, maxDeferredMs: 24 * 60 * 60 * 1000 };
+/** Runtime compatibility only: typed producers must supply a policy, while
+ * pre-contract persisted/direct callers receive the conservative legacy map. */
+const legacyPolicyFor = (input: Pick<ChannelEventInput, 'kind' | 'decisionRequired'>): ConsumptionPolicy =>
+  input.kind === 'decision_required' || input.decisionRequired && input.kind === 'permission' ? 'decision_required'
+    : input.decisionRequired || ['blocker', 'attention', 'runtime_health', 'transport_uncertainty'].includes(input.kind) ? 'ack_required'
+      : 'consume_on_delivery';
+const priorityFor = (input: Pick<ChannelEventInput, 'urgency'>): ChannelPriority => input.urgency === 'urgent' ? 'important' : 'normal';
+const expectedActionFor = (policy: ConsumptionPolicy, targetRole?: string): ExpectedAction => policy === 'consume_on_delivery'
+  ? { kind: 'none', instruction: 'No reply required — this message is consumed when delivered.', ...(targetRole ? { accountableRole: targetRole } : {}) }
+  : policy === 'ack_required'
+    ? { kind: 'ack', instruction: 'ACK after handling, or defer with a reason if blocked.', ...(targetRole ? { accountableRole: targetRole } : {}) }
+    : { kind: 'resolve', instruction: 'Resolve with an accept or refuse verdict and a reason.', ...(targetRole ? { accountableRole: targetRole } : {}) };
+const boundedReason = (value: string, field = 'reason'): string => {
+  const result = value.trim();
+  if (!result || result.length > 240) throw new ArcpError('invalid_request', `${field} is required and must be at most 240 characters`, field);
+  return result;
+};
 export const PASEO_TITLE_LIMIT = 200;
 function unicodePrefix(value: string, limit: number): string { let result = ''; for (const character of value) { if (result.length + character.length > limit) break; result += character; } return result; }
 /** Paseo tabs need a concise human label; the full Goal remains durable ARCP state and prompt content. */
@@ -109,7 +146,8 @@ export const packagedArcpCommand = (...args: string[]): string => [process.execP
 function intendedTarget(event: ChannelEvent, member: Member, workspace: ControlWorkspace | undefined, visibilityOnly = false): boolean {
   if (workspace?.ownerMemberId === member.id) return true;
   if (visibilityOnly && (event.sourceMemberId === member.id || (event.sourceActorId !== undefined && event.sourceActorId === member.actorId))) return true;
-  return (!event.targetMemberId || event.targetMemberId === member.id)
+  return (!event.reroutedToMemberId || event.reroutedToMemberId === member.id)
+    && (!event.targetMemberId || event.targetMemberId === member.id)
     && (!event.targetActorId || event.targetActorId === member.actorId)
     && (!event.targetRole || event.targetRole === member.role)
     && (!event.targetSubscription || event.targetSubscription === '*' || event.targetSubscription === member.role || member.capabilities.includes(event.targetSubscription));
@@ -134,6 +172,18 @@ export type ProjectedChannelEvent = ChannelEvent & { projection: ChannelProjecti
 
 /** A queued delivery plus the projection of the event that produced it. */
 export type ProjectedDelivery = Delivery & { projection?: ChannelProjection; markdown?: string };
+export interface ProjectedInboxItem {
+  eventId: string;
+  consumptionState: Extract<ConsumptionState, 'open' | 'deferred'>;
+  facet: 'due' | 'deferred' | 'waiting_dependency' | 'manual';
+  nextVisibleAt?: string;
+  dependencyEventId?: string;
+  deliveries: ProjectedDelivery[];
+  projection: ChannelProjection;
+  markdown: string;
+  /** Compatibility convenience for delivery-oriented callers. */
+  body?: string;
+}
 
 /** A compact, independently durable ARCP state file. It intentionally stores public IDs and
  * metadata only: provider handles, prompts, credentials, and host paths never enter it. */
@@ -173,17 +223,8 @@ export class ArcpStore implements StateStore {
     await next;
     return result;
   }
-  /** Keep durable transport history bounded; actionable rows are retained up
-   * to the same cap so a permanently held legacy source cannot grow forever. */
-  async prune(maxRows = 200): Promise<void> {
-    await this.mutate((state) => {
-      const deliveries = [...state.deliveries].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
-      const keep = new Set(deliveries.slice(0, maxRows).map((item) => item.id));
-      const removedEvents = new Set(deliveries.slice(maxRows).map((item) => item.eventId).filter((id): id is string => Boolean(id)));
-      state.deliveries = deliveries.filter((item) => keep.has(item.id));
-      state.channelEvents = state.channelEvents.filter((event) => !removedEvents.has(event.id));
-    });
-  }
+  /** Channel history is append-only. Retention is a presentation concern, not deletion. */
+  async prune(_maxRows = 200): Promise<void> {}
 }
 
 export const DEFAULT_PROFILES = [
@@ -369,6 +410,16 @@ export class PaseoAdapter implements RuntimeAdapter {
       return payload.modes.map((mode) => setting(safeJson(mode).id)).filter((mode): mode is string => Boolean(mode));
     } catch { return undefined; } finally { await client.close().catch(() => undefined); }
   }
+  /** The server protocol exposes provider.usage.list. Use it only if this
+   * installed public SDK actually presents a callable method; no daemon internals
+   * or UI scraping are a fallback. */
+  async providerUsage(sourceId: string): Promise<ProviderBudgetEnvelopeV1 | undefined> {
+    if (!(this.cli instanceof PaseoCli)) return undefined;
+    const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws'; const url = raw.includes('://') ? raw : `ws://${raw}`;
+    const client: any = createPaseoClient({ url, clientId: `arcp-provider-usage-${process.pid}`, reconnect: { enabled: false }, webSocketFactory: (target: string, options: any) => new WebSocket(target, options) } as any);
+    try { await client.connect(); const list = typeof client.providerUsageList === 'function' ? client.providerUsageList.bind(client) : typeof client.providers?.listProviderUsage === 'function' ? client.providers.listProviderUsage.bind(client.providers) : undefined; return list ? translatePaseoProviderUsage(sourceId, await list()) : undefined; }
+    catch { return undefined; } finally { await client.close().catch(() => undefined); }
+  }
   /** Prefer the installed public SDK snapshot/timeline. CLI is retained for older
    * daemons and adapter facts which the public SDK cannot expose. */
   async snapshot(externalId: string): Promise<{ agent: Record<string, any>; timeline: unknown[]; source: 'sdk' | 'cli' }> {
@@ -413,6 +464,10 @@ export class ArcpService {
   readonly adapter: RuntimeAdapter;
   private readonly adapters = new Map<string, RuntimeAdapter>();
   private profileData: Profile[] = [...DEFAULT_PROFILES];
+  private providerBudgetConfig: ProviderBudgetConfig = {};
+  private providerBudgetSnapshot?: ProviderBudgetEnvelopeV1;
+  private readonly runtimeBudget = new RuntimeBudgetTracker();
+  private runtimeBudgetPolicy: RuntimeBudgetPolicy = { maxOutputTokensPerMinute: 3_000, maxTurnsPerMinute: 2, maxRepeatedWakeCount: 3, contextRatio: 0.85 };
   private pumpTimer?: NodeJS.Timeout;
   private pumping?: Promise<void>;
   private pumpAgain = false;
@@ -427,7 +482,7 @@ export class ArcpService {
     const onSafePoint = (adapter as RuntimeAdapter & { onSafePoint?: (listener: (event: SafePointEvent) => void) => () => void }).onSafePoint;
     if (onSafePoint) onSafePoint.call(adapter, () => { void this.pump(); });
     const onFact = (adapter as RuntimeAdapter & { onFact?: (listener: (fact: { externalId: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; summary: string; sampleBucket?: number }) => void) => () => void }).onFact;
-    if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ ...(fact.sampleBucket !== undefined ? { id: idFor('event', `observation:${fact.externalId}:${fact.kind}:${fact.sampleBucket}:${session.workspaceId ?? ''}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`) } : {}), workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }).catch(() => undefined); });
+    if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ semanticKey: `observation:${fact.externalId}:${session.generation}:${fact.kind}:${session.workspaceId ?? ''}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`, workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, consumptionPolicy: fact.kind === 'permission' ? 'decision_required' : 'ack_required', decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }).catch(() => undefined); });
     const onResult = (adapter as RuntimeAdapter & { onResult?: (listener: (fact: { externalId: string; taskId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string }) => void) => () => void }).onResult;
     if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) { const submission = this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId }); this.pendingResultSubmissions.add(submission); void submission.finally(() => this.pendingResultSubmissions.delete(submission)).catch(() => undefined); } });
   }
@@ -491,8 +546,10 @@ export class ArcpService {
     if (this.store.prune) await this.store.prune();
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
-      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[] };
+      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy> };
       if (Array.isArray(config.profiles) && config.profiles.every((item) => item?.id && item.provider && item.model && item.role)) this.profileData = config.profiles;
+      if (config.providerBudget && typeof config.providerBudget === 'object') this.providerBudgetConfig = config.providerBudget;
+      if (config.runtimeBudget && Object.values(config.runtimeBudget).every((value) => typeof value === 'number' && Number.isFinite(value) && value > 0)) this.runtimeBudgetPolicy = { ...this.runtimeBudgetPolicy, ...config.runtimeBudget };
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
     // The automatic supervision trigger rides the existing delivery pump rather
     // than introducing a scheduler. It is inert until a Workspace has a policy.
@@ -573,7 +630,7 @@ export class ArcpService {
   async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
-    if (!preflight.launchable) return preflight;
+    if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
     try { input = await this.resolvePaseoPlacement(input); }
     catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof ArcpError ? error.message : 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be resolved before launch' }; }
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
@@ -585,6 +642,12 @@ export class ArcpService {
     const runtimeId = `runtime_${randomUUID()}`; const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
     const session = await this.launch({ ...input, actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, runtimeId, memberCredential: joined.credential, clientStatePath } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string });
     return { goal, task, member: joined.member, session, credential: joined.credential };
+  }
+  private async recordProviderBudgetEpisode(workspaceId: string, admission?: AdmissionDecision): Promise<void> {
+    if (!admission || !['drain', 'hard_drain'].includes(admission.action)) return;
+    const snapshot = this.providerBudgetSnapshot; const provider = snapshot?.providers.find((item) => item.providerId === admission.providerId); const reset = provider?.windows.find((item) => admission.relevantWindows.includes(item.id))?.resetsAt ?? undefined; const id = idFor('event', providerBudgetEpisodeKey(workspaceId, admission.providerId, admission.relevantWindows, reset));
+    if (this.store.snapshot().channelEvents.some((event) => event.id === id)) return;
+    await this.publishChannelEvent({ id, workspaceId, targetRole: 'manager', kind: 'attention', urgency: admission.action === 'hard_drain' ? 'urgent' : 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: `Provider budget ${admission.providerId} is ${admission.action}`, evidenceRefs: [] });
   }
   /** Register one stable sibling Hermes ACP on-call Runtime. This is a new
    * external process sharing ARCP Workspace/Knowledge/Delivery; it does not
@@ -619,7 +682,16 @@ export class ArcpService {
     if (!['active', 'completed', 'cancelled'].includes(stateValue)) throw new ArcpError('invalid_request', 'invalid goal state');
     return this.store.mutate((state) => { const goal = state.goals.find((item) => item.id === id); if (!goal) throw new ArcpError('not_found', 'goal not found'); goal.state = stateValue; goal.updatedAt = now(); return goal; });
   }
-  profiles() { return this.profileData.map((profile) => ({ ...profile, paidModelAutoSelection: false })); }
+  profiles() { return this.profileData.map((profile) => ({ ...profile, paidModelAutoSelection: false, permissionStrategy: profile.provider === 'pi' ? 'provider-managed' : 'arcp-mode' })); }
+  providerBudget() { return this.providerBudgetSnapshot; }
+  recordRuntimeBudgetSample(sample: RuntimeBudgetSample): boolean { return this.runtimeBudget.record(sample); }
+  runtimeBudgetView(runtimeSessionId: string): RuntimeBudgetView { return this.runtimeBudget.view(runtimeSessionId, this.runtimeBudgetPolicy); }
+  async refreshProviderBudget(sourceId?: string): Promise<{ snapshot?: ProviderBudgetEnvelopeV1; status: 'ok' | 'source_unavailable'; error?: string }> {
+    const configured = this.providerBudgetConfig.sources ?? []; const sources = sourceId ? configured.filter((item) => item.id === sourceId) : [...configured].sort((a, b) => Number(b.kind === 'paseo') - Number(a.kind === 'paseo'));
+    if (!sources.length) return { status: 'source_unavailable', error: 'no provider budget source is configured' };
+    for (const source of sources) try { const snapshot = source.kind === 'codexbar' ? await collectCodexbar(source.id) : source.kind === 'command' ? await runCommandCollector(source) : source.kind === 'pi-grok-cache' ? await collectPiGrokCache(source) : source.kind === 'paseo' && this.adapter instanceof PaseoAdapter ? await this.adapter.providerUsage(source.id) : undefined; if (snapshot) { this.providerBudgetSnapshot = snapshot; return { status: 'ok', snapshot }; } } catch { /* try the next configured source without retaining diagnostics */ }
+    return { status: 'source_unavailable', error: 'provider budget source failed without a safe snapshot' };
+  }
   async discovery(): Promise<{ available: boolean; profiles: Array<Record<string, unknown>> }> {
     try {
       const providers = (await this.adapter.discover()).value;
@@ -661,6 +733,7 @@ export class ArcpService {
     if (input.profileId || !explicit) {
       const profile = this.profileData.find((item) => item.id === (input.profileId ?? 'codex-worker'));
       if (!profile) throw new ArcpError('invalid_request', 'unknown launch profile');
+      if (profile.provider === 'pi' && profile.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
       return profile;
     }
     if (!input.provider?.trim() || !input.model?.trim()) throw new ArcpError('invalid_request', 'explicit launch requires provider and model');
@@ -684,11 +757,20 @@ export class ArcpService {
     const stronger = profile.provider === 'codex' ? 'full-access' : profile.provider === 'claude' ? 'bypassPermissions' : undefined;
     const elevatedProfile = profile.provider === 'codex' ? 'codex-full-access' : profile.provider === 'claude' ? 'claude-bypass-permissions' : undefined;
     const recommendedCommands = stronger && liveModes.some((mode) => sameSetting(mode, stronger)) ? [`arcp start --profile ${elevatedProfile} --title '<goal>'${input.unattended ? ' --unattended' : ''}`] : [];
-    if (!live) return { action: 'hold', launchable: false, why: 'requested provider, model, thinking, or mode is not live-validated', requested, effective: requested, profileId: profile.id, recommendedCommands: profile.mode === 'auto' ? recommendedCommands : [], liveModes };
+    // An operator refresh makes quota admission authoritative. Until then,
+    // interactive launches remain governed by their normal live validation;
+    // unattended work still asks the fail-closed evaluator for a verdict.
+    const admission = this.providerBudgetSnapshot || input.unattended ? evaluateAdmission({ envelope: this.providerBudgetSnapshot, bindings: this.providerBudgetConfig.bindings ?? [], policies: this.providerBudgetConfig.policies ?? [], providerId: profile.provider, model: profile.model, unattended: input.unattended, activeRuntimeCount: this.store.snapshot().sessions.filter((session) => session.provider === profile.provider && session.state !== 'terminal').length }) : undefined;
+    const runtimeSignals = this.store.snapshot().sessions.filter((session) => session.provider === profile.provider && session.state !== 'terminal').flatMap((session) => this.runtimeBudget.view(session.id, this.runtimeBudgetPolicy).signals);
+    const admissionHold = admission ? ['drain', 'hard_drain', 'hold_stale', 'hold_unknown', 'route'].includes(admission.action) : false;
+    if (!live) return { action: 'hold', launchable: false, why: 'requested provider, model, thinking, or mode is not live-validated', requested, effective: requested, profileId: profile.id, recommendedCommands: profile.mode === 'auto' ? recommendedCommands : [], liveModes, admission };
+    if (runtimeSignals.length) return { action: 'hold', launchable: false, why: `runtime budget signals: ${[...new Set(runtimeSignals)].join(', ')}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission, runtimeSignals: [...new Set(runtimeSignals)] };
+    if (admission?.action === 'drain' && admission.recommendedProviderProfile) { const target = this.profileData.find((item) => item.id === admission.recommendedProviderProfile); const bound = target && this.providerBudgetConfig.bindings?.some((item) => item.providerId === target.provider && item.sourceId === this.providerBudgetSnapshot?.source.id && (!item.modelPatterns?.length || item.modelPatterns.some((pattern) => matchesModel(pattern, target.model)))); if (target && bound) return { action: 'route', launchable: false, why: 'provider budget requires explicit route approval', requested, effective: requested, profileId: profile.id, recommendedCommands: [`arcp start --profile ${target.id} --title '<goal>'`], liveModes, admission }; }
+    if (admission && admissionHold) return { action: admission.action === 'route' ? 'route' : 'hold', launchable: false, why: `provider budget admission is ${admission.action}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission };
     const needsElevation = ['claude', 'codex'].includes(profile.provider) && (safeModeRank(profile.mode) < safeModeRank('auto') || Boolean(input.unattended) && safeModeRank(profile.mode) < 2);
     if (needsElevation && recommendedCommands.length) return { action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
     if (needsElevation) return { action: 'warn', launchable: true, why: 'requested mode is weaker than auto and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
-    return { action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes };
+    return { action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission };
   }
   async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string }): Promise<RuntimeSession> {
     const preflight = await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
@@ -814,7 +896,7 @@ export class ArcpService {
       }
     }
     const deliveryId = `delivery_${randomUUID()}`;
-    const event = await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'attention', urgency: 'urgent', decisionRequired: false, summary: `Channel interrupt ${deliveryId} queued`, evidenceRefs: [], notify: false });
+    const event = await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'attention', urgency: 'urgent', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Channel interrupt ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), eventId: event.id, state: 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
     try { await this.adapterFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
@@ -829,7 +911,7 @@ export class ArcpService {
     if (command === 'interrupt') return this.interrupt({ fromActorId: input.fromActorId, runtimeSessionId: input.runtimeSessionId, body: input.body, reason: input.reason ?? '', confirmation: input.cacheConfirmation });
     const cache = await this.cacheGuard(session, input.fromActorId, input.cacheConfirmation);
     const deliveryId = `delivery_${randomUUID()}`;
-    const event = await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'material_progress', urgency: 'normal', decisionRequired: false, summary: `Channel delivery ${deliveryId} queued`, evidenceRefs: [], notify: false });
+    const event = await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'material_progress', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Channel delivery ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const held = !('allow' in cache);
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command, eventId: event.id, ...('allow' in cache && cache.cacheAuthorized ? { cacheAuthorized: true as const } : {}), ...(held ? { reason: cache.why } : input.reason ? { reason: input.reason.trim() } : {}), state: held ? 'held' : command === 'normal' ? 'waiting_safe_point' : 'queued', createdAt: now() };
     await this.store.mutate((state) => { state.deliveries.push(delivery); });
@@ -840,21 +922,33 @@ export class ArcpService {
   private async pump(): Promise<void> {
     if (this.pumping) { this.pumpAgain = true; return this.pumping; }
     this.pumping = (async () => {
+      await this.scheduleDueChannelEvents();
       // Reconcile accepted history before starting new safe-point work. A
       // delivery started in this pass must not be immediately turned into
       // `processed` merely because a later row observes the same idle runtime.
       const deliveries = this.store.snapshot().deliveries
-        .filter((item) => item.command === 'normal' && ['waiting_safe_point', 'delivered', 'running'].includes(item.state))
+        .filter((item) => item.command === 'normal' && ['waiting_safe_point', 'delivered', 'running', 'processed'].includes(item.state))
         .sort((a, b) => Number(a.state === 'waiting_safe_point') - Number(b.state === 'waiting_safe_point') || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
       for (const delivery of deliveries) {
         const session = this.store.snapshot().sessions.find((item) => item.id === delivery.runtimeSessionId);
-        if (!session?.externalId || session.state === 'terminal' || session.generation !== delivery.generation) continue;
+        if (!session?.externalId || session.state === 'terminal' || session.generation !== delivery.generation) {
+          await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id); const event = item?.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; if (item && ['waiting_safe_point', 'attempting'].includes(item.state)) { item.state = 'withdrawn'; item.reason = 'target generation ended'; } if (item && event) this.rerouteTerminalEvent(state, event, item); return undefined; });
+          continue;
+        }
         let observed: RuntimeSession;
         try { observed = await this.observe(session.id); } catch { continue; }
         // A post-dispatch observation advances delivered → running → processed in observe().
         // Only waiting_safe_point is eligible to begin a turn; indeterminate is deliberately excluded.
         const currentDelivery = this.store.snapshot().deliveries.find((item) => item.id === delivery.id);
         if (!currentDelivery || currentDelivery.state !== 'waiting_safe_point') continue;
+        // A competing target may have delivered this informational episode
+        // first. Re-read the event before every wake; a stale snapshot must
+        // never turn one consumed Event into several agent turns.
+        const currentEvent = currentDelivery.eventId ? this.store.snapshot().channelEvents.find((item) => item.id === currentDelivery.eventId) : undefined;
+        if (currentEvent && currentEvent.consumptionState !== 'open') {
+          await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id); if (item?.state === 'waiting_safe_point') item.state = 'withdrawn'; return undefined; });
+          continue;
+        }
         if (observed.state !== 'idle') continue;
         if (session.provider === 'claude') {
           const facts = await this.facts(session);
@@ -862,6 +956,8 @@ export class ArcpService {
         }
         await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'running'; return item; });
         try {
+          const eligible = this.store.snapshot().deliveries.find((item) => item.id === delivery.id)?.state === 'attempting' && (!currentDelivery.eventId || this.store.snapshot().channelEvents.find((item) => item.id === currentDelivery.eventId)?.consumptionState === 'open');
+          if (!eligible) continue;
           // Adapter rechecks immediately before its non-steering start-turn operation.
           await this.adapterFor(session).startTurn(session.externalId, delivery.body, delivery.id);
           await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; });
@@ -942,20 +1038,29 @@ export class ArcpService {
     if (decisionOptions?.some((option) => prohibitedAssignment.test(option) || prohibitedPath.test(option) || prohibitedTranscript.test(option))) throw new ArcpError('invalid_request', 'channel event content contains prohibited private data', 'decisionOptions');
     const taskNotification = ['task_candidate', 'task_failed', 'task_unknown', 'task_completed'].includes(input.kind);
     const targetRole = input.targetRole ?? (taskNotification ? 'manager' : undefined);
+    const consumptionPolicy = input.consumptionPolicy ?? legacyPolicyFor(input);
+    const priority = input.priority ?? priorityFor(input);
+    const expectedAction = input.expectedAction ?? expectedActionFor(consumptionPolicy, targetRole);
+    if ((consumptionPolicy === 'consume_on_delivery') !== (expectedAction.kind === 'none') || (consumptionPolicy === 'ack_required') !== (expectedAction.kind === 'ack') || (consumptionPolicy === 'decision_required') !== (expectedAction.kind === 'resolve')) throw new ArcpError('invalid_request', 'expected action does not match consumption policy', 'expectedAction');
     const notifying = input.notify !== false || taskNotification;
     if (notifying && !input.targetMemberId && !input.targetActorId && !targetRole && !input.targetSubscription) throw new ArcpError('invalid_request', 'notifying channel events require an explicit target', 'target');
     const contentHash = contentAddress(summary, evidenceRefs);
-    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole, targetSubscription: input.targetSubscription, kind: input.kind, urgency: input.urgency, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs, verdict: input.verdict, decisionOptions };
-    const id = input.id ?? `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`;
+    if (input.semanticKey) {
+      const open = state.channelEvents.find((item) => item.semanticKey === input.semanticKey && ['open', 'deferred'].includes(item.consumptionState));
+      if (open) return open;
+    }
+    const stablePayload = { workspaceId: input.workspaceId, goalId: input.goalId, taskId: input.taskId, resultId: input.resultId, sourceMemberId: input.sourceMemberId, sourceActorId: input.sourceActorId, targetMemberId: input.targetMemberId, targetActorId: input.targetActorId, targetRole, targetSubscription: input.targetSubscription, semanticKey: input.semanticKey, kind: input.kind, urgency: input.urgency, priority, consumptionPolicy, expectedAction, decisionRequired: input.decisionRequired, relatedEventId: input.relatedEventId, summary, evidenceRefs, verdict: input.verdict, decisionOptions };
+    const semanticEpisode = input.semanticKey ? state.channelEvents.filter((item) => item.semanticKey === input.semanticKey).length : 0;
+    const id = input.id ?? (input.semanticKey ? idFor('event', `${input.semanticKey}:${semanticEpisode}`) : `event_${createHash('sha256').update(JSON.stringify(stablePayload)).digest('hex').slice(0, 20)}`);
     const existing = state.channelEvents.find((item) => item.id === id);
     if (existing) {
-      const existingPayload = { workspaceId: existing.workspaceId, goalId: existing.goalId, taskId: existing.taskId, resultId: existing.resultId, sourceMemberId: existing.sourceMemberId, sourceActorId: existing.sourceActorId, targetMemberId: existing.targetMemberId, targetActorId: existing.targetActorId, targetRole: existing.targetRole, targetSubscription: existing.targetSubscription, kind: existing.kind, urgency: existing.urgency, decisionRequired: existing.decisionRequired, relatedEventId: existing.relatedEventId, summary: existing.content.summary, evidenceRefs: existing.content.evidenceRefs, verdict: existing.verdict, decisionOptions: existing.decisionOptions }; const conflict = JSON.stringify(existingPayload) !== JSON.stringify(stablePayload);
+      const existingPayload = { workspaceId: existing.workspaceId, goalId: existing.goalId, taskId: existing.taskId, resultId: existing.resultId, sourceMemberId: existing.sourceMemberId, sourceActorId: existing.sourceActorId, targetMemberId: existing.targetMemberId, targetActorId: existing.targetActorId, targetRole: existing.targetRole, targetSubscription: existing.targetSubscription, semanticKey: existing.semanticKey, kind: existing.kind, urgency: existing.urgency, priority: existing.priority, consumptionPolicy: existing.consumptionPolicy, expectedAction: existing.expectedAction, decisionRequired: existing.decisionRequired, relatedEventId: existing.relatedEventId, summary: existing.content.summary, evidenceRefs: existing.content.evidenceRefs, verdict: existing.verdict, decisionOptions: existing.decisionOptions }; const conflict = JSON.stringify(existingPayload) !== JSON.stringify(stablePayload);
       if (conflict) throw new ArcpError('invalid_request', 'channel event id conflicts with its durable payload', 'id');
       return existing;
     }
     const { notify: _notify, decisionOptions: _decisionOptions, ...publicInput } = { ...input, ...(targetRole ? { targetRole } : {}) };
     const { summary: _summary, evidenceRefs: _evidenceRefs, ...envelope } = publicInput;
-    const event: ChannelEvent = { ...envelope, ...(decisionOptions?.length ? { decisionOptions } : {}), id, content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at: now() }], createdAt: now() };
+    const event: ChannelEvent = { ...envelope, ...(decisionOptions?.length ? { decisionOptions } : {}), id, priority, consumptionPolicy, consumptionState: 'open', expectedAction, dispositions: [], content: { summary, evidenceRefs, contentHash, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at: now() }], createdAt: now() };
     state.channelEvents.push(event);
     if (notifying && event.workspaceId) {
       const targetMembers = state.members.filter((member) => member.workspaceId === event.workspaceId && (!event.targetMemberId || member.id === event.targetMemberId) && (!event.targetActorId || member.actorId === event.targetActorId) && (!event.targetRole || member.role === event.targetRole) && (!event.targetSubscription || event.targetSubscription === '*' || member.role === event.targetSubscription || member.capabilities.includes(event.targetSubscription)));
@@ -965,21 +1070,57 @@ export class ArcpService {
         event.undeliverableReason = targetMembers.length === 0 ? 'no matching target member' : 'no live target runtime session';
         this.transitionEvent(event, 'undeliverable');
       }
-      for (const session of targetSessions) {
-        const deliveryId = idFor('delivery', `event:${event.id}:${session.id}`);
-        if (state.deliveries.some((delivery) => delivery.id === deliveryId)) continue;
-        state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: renderChannelMarkdown(projectChannelEvent(event, projectionFacts(state)), markdownOptions()), command: 'normal', eventId: event.id, state: 'waiting_safe_point', createdAt: now() });
-      }
+      for (const session of targetSessions.sort((a, b) => a.id.localeCompare(b.id)).slice(0, 1)) this.queueEventDelivery(state, event, session, 0);
     }
     return event;
   }
   private transitionEvent(event: ChannelEvent, state: ChannelTransition['state'], at = now()): void {
     if (event.transitions.at(-1)?.state === state) return;
     event.transitions.push({ state, at }); event.deliveryState = state;
-    if (state === 'delivered') event.deliveredAt = at; else if (state === 'processed') event.processedAt = at; else if (state === 'acknowledged') event.acknowledgedAt = at;
+    if (state === 'delivered') {
+      event.deliveredAt = at;
+      // A successful informational transport closes the semantic obligation in
+      // the same durable mutation. Delivery retry must never resurrect it.
+      if (event.consumptionPolicy === 'consume_on_delivery' && event.consumptionState === 'open') { event.consumptionState = 'consumed'; event.consumedAt = at; }
+    } else if (state === 'processed') event.processedAt = at; else if (state === 'acknowledged') event.acknowledgedAt = at;
+  }
+  /** The Inbox is derived from ChannelEvent state. This is the one place an
+   * open episode may gain a safe-point delivery, which prevents duplicate wakes. */
+  private queueEventDelivery(state: State, event: ChannelEvent, session: RuntimeSession, episode: number): void {
+    if (event.consumptionState !== 'open' || session.state === 'terminal' || !session.externalId) return;
+    const deliveryId = idFor('delivery', `event:${event.id}:${session.id}:episode:${episode}`);
+    if (state.deliveries.some((delivery) => delivery.id === deliveryId || delivery.eventId === event.id && delivery.runtimeSessionId === session.id && delivery.generation === session.generation && delivery.consumptionEpisode === episode && ['waiting_safe_point', 'attempting', 'delivered', 'running'].includes(delivery.state))) return;
+    state.deliveries.push({ id: deliveryId, fromActorId: event.sourceActorId ?? session.actorId, runtimeSessionId: session.id, generation: session.generation, body: renderChannelMarkdown(projectChannelEvent(event, projectionFacts(state)), markdownOptions()), command: 'normal', eventId: event.id, consumptionEpisode: episode, state: 'waiting_safe_point', createdAt: now() });
+  }
+  private rerouteTerminalEvent(state: State, event: ChannelEvent, delivery: Delivery): void {
+    if (event.consumptionState !== 'open') return;
+    const workspace = state.workspaces.find((item) => item.id === event.workspaceId);
+    const owner = workspace?.ownerMemberId ? state.members.find((item) => item.id === workspace.ownerMemberId) : undefined;
+    if (!owner) { event.consumptionState = 'invalidated'; return; }
+    event.reroutedToMemberId = owner.id;
+    this.appendDisposition(event, { kind: 'reroute', reason: `Target generation ${delivery.generation} ended before this obligation closed`, toMemberId: owner.id }, owner.id);
+    const episode = Math.max(-1, ...state.deliveries.filter((item) => item.eventId === event.id).map((item) => item.consumptionEpisode ?? 0)) + 1;
+    const target = state.sessions.filter((session) => session.workspaceId === event.workspaceId && session.memberId === owner.id && session.externalId && ['launching', 'running', 'idle', 'attention'].includes(session.state)).sort((a, b) => a.id.localeCompare(b.id))[0];
+    if (target) this.queueEventDelivery(state, event, target, episode);
+  }
+  private async scheduleDueChannelEvents(): Promise<void> {
+    await this.store.mutate((state) => {
+      const current = Date.now();
+      for (const event of state.channelEvents) {
+        if (event.consumptionState !== 'deferred') continue;
+        const dependency = event.dependencyEventId ? state.channelEvents.find((item) => item.id === event.dependencyEventId) : undefined;
+        const due = Boolean(event.nextVisibleAt && Date.parse(event.nextVisibleAt) <= current);
+        const dependencyResolved = Boolean(dependency && ['consumed', 'resolved', 'invalidated'].includes(dependency.consumptionState));
+        if (!due && !dependencyResolved) continue;
+        event.consumptionState = 'open'; delete event.nextVisibleAt; delete event.dependencyEventId;
+        const episode = Math.max(-1, ...state.deliveries.filter((item) => item.eventId === event.id).map((item) => item.consumptionEpisode ?? 0)) + 1;
+        const targetSessions = state.sessions.filter((session) => session.workspaceId === event.workspaceId && session.memberId && session.memberId !== event.sourceMemberId && (!(event.reroutedToMemberId ?? event.targetMemberId) || session.memberId === (event.reroutedToMemberId ?? event.targetMemberId)) && (!event.reroutedToMemberId && (!event.targetActorId || session.actorId === event.targetActorId)) && (!event.reroutedToMemberId && (!event.targetRole || state.members.find((member) => member.id === session.memberId)?.role === event.targetRole) || Boolean(event.reroutedToMemberId)) && ['launching', 'running', 'idle', 'attention'].includes(session.state)).sort((a, b) => a.id.localeCompare(b.id));
+        if (targetSessions[0]) this.queueEventDelivery(state, event, targetSessions[0], episode);
+      }
+    });
   }
   private async emitTransportUncertainty(session: RuntimeSession): Promise<void> {
-    await this.store.mutate((state) => { this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} health is uncertain`, evidenceRefs: [] }); this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', decisionRequired: true, summary: `Runtime ${session.id} transport is uncertain`, evidenceRefs: [] }); });
+    await this.store.mutate((state) => { this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${session.id} health is uncertain`, evidenceRefs: [] }); this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${session.id} transport is uncertain`, evidenceRefs: [] }); });
     if (!this.pumping) await this.pump();
   }
   async publishChannelEvent(input: ChannelEventInput): Promise<ChannelEvent> {
@@ -987,7 +1128,26 @@ export class ArcpService {
     const event = await this.store.mutate((state) => this.appendChannelEvent(state, input));
     await this.pump(); return event;
   }
-  async acknowledgeEvent(eventId: string, memberId: string, _reason = 'acknowledged'): Promise<ChannelEvent> {
+  private accountableGeneration(state: State, event: ChannelEvent, memberId: string): number | undefined {
+    const delivery = state.deliveries.find((item) => item.eventId === event.id && ['delivered', 'running', 'processed', 'acknowledged'].includes(item.state));
+    if (!delivery) return undefined;
+    const session = state.sessions.find((item) => item.id === delivery.runtimeSessionId);
+    // Workspace Owners may discharge an obligation without impersonating the
+    // target runtime. Generation fencing applies when the accountable member
+    // is the delivered-to member.
+    if (session?.memberId !== memberId) return undefined;
+    if (session.generation !== delivery.generation || session.state === 'terminal') throw new ArcpError('stale_generation', 'event target runtime generation is no longer accountable');
+    return delivery.generation;
+  }
+  private appendDisposition(event: ChannelEvent, input: RecipientDisposition, memberId: string, targetGeneration?: number, id?: string): RecipientDispositionReceipt {
+    const receiptId = id ?? idFor('disposition', JSON.stringify({ eventId: event.id, memberId, input, targetGeneration }));
+    const existing = event.dispositions.find((item) => item.id === receiptId);
+    if (existing) return existing;
+    const receipt: RecipientDispositionReceipt = { ...input, id: receiptId, actorMemberId: memberId, ...(targetGeneration === undefined ? {} : { targetGeneration }), at: now() };
+    event.dispositions.push(receipt);
+    return receipt;
+  }
+  async acknowledgeEvent(eventId: string, memberId: string, reason = 'acknowledged', dispositionId?: string): Promise<ChannelEvent> {
     return this.store.mutate((state) => {
       const event = state.channelEvents.find((item) => item.id === eventId);
       const member = state.members.find((item) => item.id === memberId);
@@ -995,9 +1155,55 @@ export class ArcpService {
       if (!member || member.workspaceId !== event.workspaceId) throw new ArcpError('unauthorized', 'event acknowledgement is not authorized');
       const workspace = state.workspaces.find((item) => item.id === event.workspaceId);
       if (!intendedTarget(event, member, workspace)) throw new ArcpError('unauthorized', 'event acknowledgement is not authorized');
-      if (!['delivered', 'processed'].includes(event.deliveryState)) throw new ArcpError('invalid_request', 'channel event has not been delivered');
-      this.transitionEvent(event, 'acknowledged'); return event;
+      if (event.consumptionPolicy !== 'ack_required') throw new ArcpError('invalid_request', 'decision-required events must be resolved, not acknowledged');
+      if (!['delivered', 'processed', 'acknowledged'].includes(event.deliveryState)) throw new ArcpError('invalid_request', 'channel event has not been delivered');
+      if (event.consumptionState === 'consumed') return event;
+      const targetGeneration = this.accountableGeneration(state, event, member.id);
+      const receipt = this.appendDisposition(event, { kind: 'ack', reason: boundedReason(reason) }, member.id, targetGeneration, dispositionId);
+      event.consumptionState = 'consumed'; event.consumedAt = receipt.at;
+      this.transitionEvent(event, 'acknowledged', receipt.at); return event;
     });
+  }
+  async deferEvent(eventId: string, memberId: string, input: Extract<RecipientDisposition, { kind: 'defer' }> & { id?: string }): Promise<ChannelEvent> {
+    return this.store.mutate((state) => {
+      const event = state.channelEvents.find((item) => item.id === eventId); const member = state.members.find((item) => item.id === memberId);
+      if (!event) throw new ArcpError('not_found', 'channel event not found');
+      if (!member || member.workspaceId !== event.workspaceId) throw new ArcpError('unauthorized', 'event defer is not authorized');
+      const workspace = state.workspaces.find((item) => item.id === event.workspaceId);
+      if (!intendedTarget(event, member, workspace)) throw new ArcpError('unauthorized', 'event defer is not authorized');
+      if (['consumed', 'resolved', 'invalidated'].includes(event.consumptionState)) throw new ArcpError('invalid_request', 'closed channel obligations cannot be deferred');
+      const policy = workspace?.channelDeferralPolicy ?? DEFAULT_CHANNEL_DEFERRAL_POLICY;
+      if (event.priority === 'critical' && !policy.allowCriticalDeferral) throw new ArcpError('invalid_request', 'critical events require explicit Owner deferral policy');
+      const reason = boundedReason(input.reason);
+      const targetGeneration = this.accountableGeneration(state, event, member.id);
+      const receiptId = input.id ?? idFor('disposition', JSON.stringify({ eventId: event.id, memberId: member.id, input: { kind: 'defer', reason, resume: input.resume }, targetGeneration }));
+      if (event.dispositions.some((item) => item.id === receiptId)) return event;
+      const priorDeferrals = event.dispositions.filter((item) => item.kind === 'defer');
+      if (priorDeferrals.length >= policy.maxDeferrals) throw new ArcpError('invalid_request', 'channel deferral limit reached');
+      let nextVisibleAt: string | undefined; let dependencyEventId: string | undefined; const resume = input.resume;
+      if (resume.kind === 'at') { if (!Number.isFinite(Date.parse(resume.at))) throw new ArcpError('invalid_request', 'defer until must be an ISO time', 'until'); nextVisibleAt = new Date(Date.parse(resume.at)).toISOString(); }
+      else if (resume.kind === 'after') { if (!Number.isFinite(resume.delayMs) || resume.delayMs <= 0) throw new ArcpError('invalid_request', 'defer delay must be positive', 'for'); nextVisibleAt = new Date(Date.now() + resume.delayMs).toISOString(); }
+      else if (resume.kind === 'event') { if (!state.channelEvents.some((item) => item.id === resume.eventId)) throw new ArcpError('not_found', 'defer dependency event not found'); dependencyEventId = resume.eventId; }
+      if (nextVisibleAt && Date.parse(nextVisibleAt) - Date.now() > policy.maxDeferredMs) throw new ArcpError('invalid_request', 'channel deferral exceeds workspace limit');
+      const receipt = this.appendDisposition(event, { kind: 'defer', reason, resume }, member.id, targetGeneration, receiptId);
+      if (receipt.nextVisibleAt) return event;
+      if (nextVisibleAt) receipt.nextVisibleAt = nextVisibleAt;
+      for (const delivery of state.deliveries) if (delivery.eventId === event.id && ['waiting_safe_point', 'attempting'].includes(delivery.state)) { delivery.state = 'withdrawn'; delivery.reason = 'event deferred'; }
+      event.consumptionState = 'deferred'; event.nextVisibleAt = nextVisibleAt; event.dependencyEventId = dependencyEventId;
+      return event;
+    });
+  }
+  async resumeEvent(eventId: string, memberId: string, dispositionId?: string): Promise<ChannelEvent> {
+    const event = await this.store.mutate((state) => {
+      const item = state.channelEvents.find((value) => value.id === eventId); const member = state.members.find((value) => value.id === memberId);
+      if (!item) throw new ArcpError('not_found', 'channel event not found'); const workspace = state.workspaces.find((value) => value.id === item.workspaceId);
+      if (!member || !intendedTarget(item, member, workspace)) throw new ArcpError('unauthorized', 'event resume is not authorized');
+      if (item.consumptionState !== 'deferred') return item;
+      // Route explicit resume through the same due scheduler as elapsed and
+      // dependency deferrals, so it gets exactly one fresh episode.
+      item.nextVisibleAt = now(); delete item.dependencyEventId; return item;
+    });
+    await this.scheduleDueChannelEvents(); await this.pump(); return event;
   }
   /**
    * Channel events for a workspace, each carrying its canonical human
@@ -1024,8 +1230,9 @@ export class ArcpService {
    * Before this existed, resolving any decision completed its Task
    * unconditionally, so "resolved" meant "marked complete" rather than "judged".
    */
-  async resolveDecision(eventId: string, sourceMemberId: string, summary = 'Decision resolved', verdict: DecisionVerdict = 'accept'): Promise<ChannelEvent> {
+  async resolveDecision(eventId: string, sourceMemberId: string, summary: string, verdict: DecisionVerdict, dispositionId?: string): Promise<ChannelEvent> {
     if (verdict !== 'accept' && verdict !== 'refuse') throw new ArcpError('invalid_request', 'decision verdict must be accept or refuse', 'verdict');
+    const reason = boundedReason(summary, 'summary');
     const resolved = await this.store.mutate((state) => {
       const triggering = state.channelEvents.find((event) => event.id === eventId && event.kind === 'decision_required');
       const resolver = state.members.find((member) => member.id === sourceMemberId);
@@ -1033,17 +1240,23 @@ export class ArcpService {
       if (!resolver || resolver.workspaceId !== triggering.workspaceId) throw new ArcpError('unauthorized', 'decision resolver is not in the event workspace');
       const workspace = state.workspaces.find((item) => item.id === triggering.workspaceId);
       if (!intendedTarget(triggering, resolver, workspace)) throw new ArcpError('unauthorized', 'decision resolver is not an intended target');
+      if (triggering.consumptionPolicy !== 'decision_required') throw new ArcpError('invalid_request', 'event does not require a decision');
+      const existing = state.channelEvents.find((event) => event.kind === 'decision_resolved' && event.relatedEventId === eventId);
+      if (existing) return existing;
+      const targetGeneration = this.accountableGeneration(state, triggering, resolver.id);
+      const receipt = this.appendDisposition(triggering, { kind: 'resolve', verdict, reason }, resolver.id, targetGeneration, dispositionId);
       triggering.decisionRequired = false;
       triggering.verdict = verdict;
+      triggering.consumptionState = 'resolved'; triggering.resolvedAt = receipt.at;
       if (verdict === 'accept' && triggering.taskId) {
         const task = state.tasks.find((item) => item.id === triggering.taskId);
         if (task) {
           task.lifecycle = 'completed'; task.updatedAt = now();
-          this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: task.id, resultId: triggering.resultId, sourceMemberId, targetRole: 'manager', kind: 'task_completed', urgency: 'normal', decisionRequired: false, summary: `Task ${task.id} completed by durable Result`, evidenceRefs: [], notify: false });
+          this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: task.id, resultId: triggering.resultId, sourceMemberId, targetRole: 'manager', kind: 'task_completed', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Task ${task.id} completed by durable Result`, evidenceRefs: [], notify: false });
         }
       }
       this.releaseBlockedRuntimes(state, eventId);
-      return this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: triggering.taskId, resultId: triggering.resultId, sourceMemberId, targetMemberId: triggering.sourceMemberId, targetActorId: triggering.sourceActorId, ...(triggering.sourceMemberId || triggering.sourceActorId ? {} : { targetRole: 'owner' }), kind: 'decision_resolved', urgency: 'normal', decisionRequired: false, verdict, summary, evidenceRefs: [], relatedEventId: eventId });
+      return this.appendChannelEvent(state, { workspaceId: triggering.workspaceId, goalId: triggering.goalId, taskId: triggering.taskId, resultId: triggering.resultId, sourceMemberId, targetMemberId: triggering.sourceMemberId, targetActorId: triggering.sourceActorId, ...(triggering.sourceMemberId || triggering.sourceActorId ? {} : { targetRole: 'owner' }), kind: 'decision_resolved', urgency: 'normal', priority: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, verdict, summary: reason, evidenceRefs: [], relatedEventId: eventId });
     });
     await this.pump(); return resolved;
   }
@@ -1075,7 +1288,7 @@ export class ArcpService {
         if (pending && session.blockedQuestion !== question) throw new ArcpError('invalid_request', 'runtime is already blocked on an unanswered decision');
         if (pending) return { event: pending, session };
       }
-      const event = this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'owner', kind: 'decision_required', urgency: 'urgent', decisionRequired: true, summary: question, evidenceRefs: input.evidenceRefs ?? [], ...(input.options?.length ? { decisionOptions: input.options } : {}) });
+      const event = this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'owner', kind: 'decision_required', urgency: 'urgent', consumptionPolicy: 'decision_required', decisionRequired: true, summary: question, evidenceRefs: input.evidenceRefs ?? [], ...(input.options?.length ? { decisionOptions: input.options } : {}) });
       session.blockedOnEventId = event.id; session.blockedSince = now(); session.blockedQuestion = question;
       return { event, session };
     });
@@ -1128,18 +1341,18 @@ export class ArcpService {
   memberForCredential(credential: string): Member { const state = this.store.snapshot(); const id = state.memberCredentials[createHash('sha256').update(credential).digest('hex')]; const member = state.members.find((item) => item.id === id); if (!member) throw new ArcpError('unknown_sender', 'member credential is unknown'); return member; }
   async createTask(input: { workspaceId: string; title: string; scope?: TaskScope }): Promise<Task> { return this.store.mutate((state) => { if (!state.workspaces.some((item) => item.id === input.workspaceId)) throw new ArcpError('not_found', 'workspace not found'); if (!input.title?.trim()) throw new ArcpError('invalid_request', 'task title is required'); const at = now(); const task = { id: `task_${randomUUID()}`, workspaceId: input.workspaceId, title: input.title.trim(), lifecycle: 'ready' as const, fence: 0, createdAt: at, updatedAt: at, ...(input.scope ? { scope: input.scope } : {}) }; state.tasks.push(task); return task; }); }
   async heartbeat(memberId: string, presence: 'idle' | 'busy' | 'attention' = 'idle'): Promise<Member> { return this.store.mutate((state) => { const member = state.members.find((item) => item.id === memberId); if (!member) throw new ArcpError('unknown_sender', 'member is unknown'); const at = now(); member.lifecycle = presence; member.lastHeartbeatAt = at; member.leaseExpiresAt = new Date(Date.now() + 300_000).toISOString(); member.updatedAt = at; return member; }); }
-  async claimTask(taskId: string, memberId: string, expectedFence?: number): Promise<Task> { const claimed = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === taskId); const member = state.members.find((item) => item.id === memberId); if (!task || !member || task.workspaceId !== member.workspaceId) throw new ArcpError('unknown_recipient', 'task or member is unknown'); if (!member.capabilities.includes('claim_task')) throw new ArcpError('unauthorized', 'member lacks claim_task capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot claim product Tasks'); if (expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== expectedFence) throw new ArcpError('stale_generation', `task claim fence is stale; current fence is ${task.fence}`); if (task.ownerMemberId === memberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) return task; if (task.ownerMemberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) throw new ArcpError('task_held', 'task already has an active claim'); task.ownerMemberId = memberId; task.fence += 1; task.lifecycle = 'claimed'; task.updatedAt = now(); member.lifecycle = 'busy'; member.updatedAt = now(); return task; }); await this.publishChannelEvent({ workspaceId: claimed.workspaceId, taskId: claimed.id, sourceMemberId: claimed.ownerMemberId, targetRole: 'manager', kind: 'task_claimed', urgency: 'normal', decisionRequired: false, summary: `Task ${claimed.id} claimed at fence ${claimed.fence}`, evidenceRefs: [] }); return claimed; }
-  async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string; targetMemberId?: string }): Promise<KnowledgeEntry> { const entry = await this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); if (input.kind === 'blocker' || input.kind === 'evidence') await this.publishChannelEvent({ workspaceId: entry.workspaceId, taskId: entry.taskId, goalId: entry.goalId, sourceMemberId: entry.authorMemberId, ...(input.targetMemberId ? { targetMemberId: input.targetMemberId } : {}), ...(input.targetMemberId ? {} : { targetRole: 'manager' }), kind: input.kind === 'blocker' ? 'blocker' : 'finding', urgency: input.kind === 'blocker' ? 'urgent' : 'normal', decisionRequired: input.kind === 'blocker', summary: `${input.kind} knowledge ${entry.id}`, evidenceRefs: [] }); return entry; }
-  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, targetRole: 'manager', kind: 'decision_required', urgency: 'normal', decisionRequired: true, summary: `Result ${result.id} requires Manager decision`, evidenceRefs: [], relatedEventId: candidate.id }); return result; }); await this.pump(); return submitted; }
-  context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const memberSessions = new Set(state.sessions.filter((session) => session.workspaceId === workspaceId && (!memberId || session.memberId === memberId)).map((session) => session.id)); return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), events: this.channelEvents(workspaceId, memberId), inbox: memberId ? this.projectedInbox(state, memberSessions) : [] }; }
+  async claimTask(taskId: string, memberId: string, expectedFence?: number): Promise<Task> { const claimed = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === taskId); const member = state.members.find((item) => item.id === memberId); if (!task || !member || task.workspaceId !== member.workspaceId) throw new ArcpError('unknown_recipient', 'task or member is unknown'); if (!member.capabilities.includes('claim_task')) throw new ArcpError('unauthorized', 'member lacks claim_task capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot claim product Tasks'); if (expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== expectedFence) throw new ArcpError('stale_generation', `task claim fence is stale; current fence is ${task.fence}`); if (task.ownerMemberId === memberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) return task; if (task.ownerMemberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) throw new ArcpError('task_held', 'task already has an active claim'); task.ownerMemberId = memberId; task.fence += 1; task.lifecycle = 'claimed'; task.updatedAt = now(); member.lifecycle = 'busy'; member.updatedAt = now(); return task; }); await this.publishChannelEvent({ workspaceId: claimed.workspaceId, taskId: claimed.id, sourceMemberId: claimed.ownerMemberId, targetRole: 'manager', kind: 'task_claimed', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Task ${claimed.id} claimed at fence ${claimed.fence}`, evidenceRefs: [] }); return claimed; }
+  async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string; targetMemberId?: string }): Promise<KnowledgeEntry> { const entry = await this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); if (input.kind === 'blocker' || input.kind === 'evidence') await this.publishChannelEvent({ workspaceId: entry.workspaceId, taskId: entry.taskId, goalId: entry.goalId, sourceMemberId: entry.authorMemberId, ...(input.targetMemberId ? { targetMemberId: input.targetMemberId } : {}), ...(input.targetMemberId ? {} : { targetRole: 'manager' }), kind: input.kind === 'blocker' ? 'blocker' : 'finding', urgency: input.kind === 'blocker' ? 'urgent' : 'normal', consumptionPolicy: input.kind === 'blocker' ? 'ack_required' : 'consume_on_delivery', decisionRequired: input.kind === 'blocker', summary: `${input.kind} knowledge ${entry.id}`, evidenceRefs: [] }); return entry; }
+  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, targetRole: 'manager', kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires Manager decision`, evidenceRefs: [], relatedEventId: candidate.id }); return result; }); await this.pump(); return submitted; }
+  context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const member = memberId ? state.members.find((item) => item.id === memberId) : undefined; return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), events: this.channelEvents(workspaceId, memberId), inbox: member ? this.projectedInbox(state, member, workspace) : [] }; }
   /** The member inbox renders the same canonical projection as `channel list`. */
-  private projectedInbox(state: State, memberSessions: Set<string>): ProjectedDelivery[] {
+  private projectedInbox(state: State, member: Member, workspace: ControlWorkspace): ProjectedInboxItem[] {
     const facts = projectionFacts(state);
-    return state.deliveries.filter((item) => memberSessions.has(item.runtimeSessionId) && item.state !== 'acknowledged').map((item) => {
-      const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined;
-      if (!event) return item;
+    return state.channelEvents.filter((event): event is ChannelEvent & { consumptionState: 'open' | 'deferred' } => event.workspaceId === workspace.id && ['open', 'deferred'].includes(event.consumptionState) && intendedTarget(event, member, workspace)).map((event) => {
       const projection = projectChannelEvent(event, facts);
-      return { ...item, projection, markdown: renderChannelMarkdown(projection, markdownOptions()) };
+      const deliveries = state.deliveries.filter((item) => item.eventId === event.id).map((item) => ({ ...item, projection, markdown: renderChannelMarkdown(projection, markdownOptions()) }));
+      const facet = event.consumptionState === 'open' ? 'due' : event.dependencyEventId ? 'waiting_dependency' : event.nextVisibleAt ? 'deferred' : 'manual';
+      return { eventId: event.id, consumptionState: event.consumptionState, facet, ...(event.nextVisibleAt ? { nextVisibleAt: event.nextVisibleAt } : {}), ...(event.dependencyEventId ? { dependencyEventId: event.dependencyEventId } : {}), deliveries, projection, markdown: renderChannelMarkdown(projection, markdownOptions()), ...(deliveries[0]?.body ? { body: deliveries[0].body } : {}) };
     });
   }
   private requested(session: RuntimeSession): RuntimeSettings { return { provider: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}) }; }
@@ -1267,6 +1480,7 @@ export class ArcpService {
           targetRole: 'manager',
           kind: 'workspace_analysis_required',
           urgency: 'urgent',
+          consumptionPolicy: 'ack_required',
           decisionRequired: false,
           summary: `Workspace analysis required for ${breach.subjectKind} ${breach.subjectId} at generation ${breach.generation}; the ${breach.reason === 'review_budget' ? 'review budget' : 'inactivity budget'} elapsed`,
           evidenceRefs: [breach.subjectId, breach.policyId],
@@ -1325,13 +1539,18 @@ export class ArcpService {
     const pending = agent ? (Array.isArray(current.pendingPermissions) ? current.pendingPermissions.length : 'unknown') : 'unknown'; const attention = agent ? pending === 'unknown' ? (current.attentionReason === 'permission' || current.status === 'permission' || session.lastTurnState === 'requires_action' ? true : 'unknown') : pending !== 0 || current.attentionReason === 'permission' || current.status === 'permission' : 'unknown'; const attentionWhy = attention === true ? String(current.attentionReason ?? (pending !== 'unknown' && pending > 0 ? 'pending permission' : session.lastTurnState === 'requires_action' ? 'runtime requires action' : 'runtime attention')) : undefined;
     const health: RuntimeObservation['health'] = attention === true || mismatch || session.state === 'attention' ? 'attention' : !agent && !session.externalId ? 'unavailable' : freshness === 'stale' || session.state === 'transport_indeterminate' ? 'degraded' : agent ? 'healthy' : 'unknown';
     if ((session.adapterId === 'paseo' || session.runtimeKind === 'paseo') && session.workspaceId && (pending !== 'unknown' && pending > 0 || attention === true)) {
-      const sampleBucket = Math.floor(Date.now() / 60_000);
       const facts: Array<{ kind: 'permission' | 'attention'; summary: string }> = [];
       if (pending !== 'unknown' && pending > 0) facts.push({ kind: 'permission', summary: `Runtime ${session.id} has pending permission requests` });
       if (attention === true) facts.push({ kind: 'attention', summary: `Runtime ${session.id} requires attention` });
-      await Promise.all(facts.map((fact) => this.publishChannelEvent({ id: idFor('event', `observation:${session.externalId ?? session.id}:${fact.kind}:${sampleBucket}:${session.workspaceId}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`), workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: 'urgent', decisionRequired: true, summary: fact.summary, evidenceRefs: [] })));
+      await Promise.all(facts.map((fact) => this.publishChannelEvent({ semanticKey: `observation:${session.externalId ?? session.id}:${session.generation}:${fact.kind}:${session.workspaceId}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`, workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: 'urgent', consumptionPolicy: fact.kind === 'permission' ? 'decision_required' : 'ack_required', decisionRequired: true, summary: fact.summary, evidenceRefs: [] })));
     }
-    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
+    const nativeTurnId = setting(current.activeTurn?.turnId ?? current.activeTurn?.id ?? agent?.lastTurnId ?? agent?.lastMessageId);
+    // Paseo does not document whether `lastUsage` is per-turn or cumulative for
+    // this native turn id. Keep its displayed observation reported, but never
+    // sum it into burn deltas until that provenance is proven.
+    if (agent && nativeTurnId) this.runtimeBudget.record({ runtimeSessionId: session.id, providerId: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}), sampledAt: observedAt ?? now(), turnCountDelta: 1, ...(typeof used === 'number' ? { contextUsed: used } : {}), ...(typeof max === 'number' ? { contextMax: max } : {}), wakeCategory: 'unknown', sourceEventId: nativeTurnId });
+    const burn = this.runtimeBudget.view(session.id, this.runtimeBudgetPolicy);
+    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, burn, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
   }
   /** The one read-only fact bundle the temporal projection consumes. Panorama
    * and the reconcile preview must see identical facts, so they share it. */
@@ -1344,7 +1563,8 @@ export class ArcpService {
     const goals = state.goals.filter((goal) => sessions.some((session) => session.goalId === goal.id));
     const placement = (context.workspace.paseoPlacements ?? []).map((item) => ({ controlWorkspaceId: workspaceId, projectId: item.projectId, workspaceId: item.workspaceId, checkout: item.checkout, tabs: sessions.filter((session) => session.placement?.requested.workspaceId === item.workspaceId).map((session) => ({ runtimeId: session.id, agentId: session.externalId, role: state.members.find((member) => member.id === session.memberId)?.role, goalId: session.goalId, goal: goals.find((goal) => goal.id === session.goalId)?.title, cwd: session.workspace, model: session.model, mode: session.mode, thinking: session.thinking })) }));
     const temporal = projectTemporal(this.temporalFacts(workspaceId, state, sessions), temporalFilter);
-    return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
+    const budgets = this.providerBudgetSnapshot ? { snapshot: this.providerBudgetSnapshot, admissions: [...new Map(sessions.map((session) => { const key = `${session.provider}:${session.model}`; return [key, evaluateAdmission({ envelope: this.providerBudgetSnapshot, bindings: this.providerBudgetConfig.bindings ?? [], policies: this.providerBudgetConfig.policies ?? [], providerId: session.provider, model: session.model, activeRuntimeCount: sessions.filter((other) => other.provider === session.provider && other.state !== 'terminal').length })] as const; })).values()] } : { status: 'source_unavailable' as const };
+    return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), providerBudget: budgets, latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
   }
   temporalReconciliation(workspaceId: string) {
     const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);

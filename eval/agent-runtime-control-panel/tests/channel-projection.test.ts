@@ -184,7 +184,7 @@ describe('canonical human-readable Channel projection', () => {
     const worker = await service.joinWorkspace({ workspaceId, label: 'Codex Worker', role: 'worker' });
     const task = await service.createTask({ workspaceId, title: 'Round-3 Lane E: human-readable Channel projection' });
     await service.store.mutate((state: any) => state.sessions.push({ id: 'live-manager', actorId: actor.id, goalId: 'goal-manager', bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId, memberId: manager.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'idle', externalId: 'live-manager', createdAt: new Date().toISOString() }));
-    const event = await service.publishChannelEvent({ workspaceId, taskId: task.id, sourceMemberId: worker.member.id, targetMemberId: manager.member.id, kind: 'task_completed', urgency: 'normal', decisionRequired: false, summary: `Task ${task.id} completed by durable Result`, evidenceRefs: [] });
+    const event = await service.publishChannelEvent({ workspaceId, taskId: task.id, sourceMemberId: worker.member.id, targetMemberId: manager.member.id, kind: 'task_completed', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: `Task ${task.id} completed by durable Result`, evidenceRefs: [] });
 
     const listed = service.channelEvents(workspaceId).find((item) => item.id === event.id)!;
     const card = renderChannelCard(listed.projection);

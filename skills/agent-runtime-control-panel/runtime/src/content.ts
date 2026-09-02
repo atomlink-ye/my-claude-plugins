@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ChannelEvent, ChannelEventKind, ChannelTransition } from './arcp.js';
+import type { ChannelEvent, ChannelEventKind, ChannelTransition, ConsumptionPolicy, ConsumptionState, ExpectedAction } from './arcp.js';
 
 const TRANSITION_STATES: ChannelTransition['state'][] = [
   'queued', 'delivered', 'processed', 'acknowledged',
@@ -46,11 +46,29 @@ export function normalizeChannelEvent(value: Record<string, unknown>): ChannelEv
   }
   const { summary: _summary, evidenceRefs: _evidenceRefs, content: _content, transitions: _transitions,
     deliveryState: _deliveryState, createdAt: _createdAt, ...envelope } = value;
+  const kind = String(value.kind ?? 'finding') as ChannelEventKind;
+  const decisionRequired = Boolean(value.decisionRequired);
+  const consumptionPolicy: ConsumptionPolicy = value.consumptionPolicy === 'consume_on_delivery' || value.consumptionPolicy === 'ack_required' || value.consumptionPolicy === 'decision_required'
+    ? value.consumptionPolicy
+    : kind === 'decision_required' || decisionRequired && kind === 'permission' ? 'decision_required'
+      : decisionRequired || ['blocker', 'attention', 'runtime_health', 'transport_uncertainty'].includes(kind) ? 'ack_required' : 'consume_on_delivery';
+  const expectedAction = value.expectedAction && typeof value.expectedAction === 'object' ? value.expectedAction as ExpectedAction
+    : consumptionPolicy === 'consume_on_delivery' ? { kind: 'none', instruction: 'No reply required — this message is consumed when delivered.' }
+      : consumptionPolicy === 'ack_required' ? { kind: 'ack', instruction: 'ACK after handling, or defer with a reason if blocked.' }
+        : { kind: 'resolve', instruction: 'Resolve with an accept or refuse verdict and a reason.' };
+  const consumptionState: ConsumptionState = value.consumptionState === 'deferred' || value.consumptionState === 'consumed' || value.consumptionState === 'resolved' || value.consumptionState === 'withdrawn' || value.consumptionState === 'invalidated' || value.consumptionState === 'open'
+    ? value.consumptionState
+    : consumptionPolicy === 'consume_on_delivery' && final === 'delivered' ? 'consumed' : 'open';
   return {
     ...envelope,
-    kind: String(value.kind ?? 'finding') as ChannelEventKind,
+    kind,
     urgency: value.urgency === 'urgent' ? 'urgent' : 'normal',
-    decisionRequired: Boolean(value.decisionRequired),
+    priority: value.priority === 'critical' || value.priority === 'important' ? value.priority : value.urgency === 'urgent' ? 'important' : 'normal',
+    consumptionPolicy,
+    consumptionState,
+    expectedAction,
+    dispositions: Array.isArray(value.dispositions) ? value.dispositions as ChannelEvent['dispositions'] : [],
+    decisionRequired,
     content: {
       summary,
       evidenceRefs,

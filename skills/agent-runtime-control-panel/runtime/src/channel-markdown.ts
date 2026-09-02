@@ -127,14 +127,20 @@ export function renderChannelMarkdown(projection: ChannelProjection, options: Ch
   const heading = ['###', icon, kindLabel, projection.stage ? `· ${escapeMarkdown(projection.stage)}` : undefined]
     .filter(Boolean).join(' ');
 
-  // Two trailing spaces keep the sender and subject in one block with a hard
-  // line break, which Feishu renders without turning them into paragraphs.
+  const paragraphs = projection.summary.map((line) => escapeMarkdown(line)).filter(Boolean);
+  const priority = projection.priority[0].toUpperCase() + projection.priority.slice(1);
+  const action = projection.expectedAction.kind === 'none'
+    ? 'No reply required — this message is consumed when delivered.'
+    : projection.expectedAction.kind === 'ack'
+      ? `ACK after handling: ${code(`arcp channel ack ${projection.eventId} --reason '<what you did>'`)}; or defer: ${code(`arcp channel defer ${projection.eventId} --for 30m --reason '<why and what unblocks it>'`)}`
+      : `Resolve with a verdict: ${code(`arcp channel resolve ${projection.eventId} --verdict accept|refuse --summary '<reason>'`)}`;
+  // Two trailing spaces keep every header field in one block; the three-line
+  // summary budget therefore remains a projection invariant.
   const fields = [
+    `**Priority:** ${priority}\n**Expected action:** ${action}`,
     `**${words.from}:** ${escapeMarkdown(projection.sender.label)} ${code(projection.sender.role)}`.trim(),
     ...(projection.subject ? [`**${words.subject}:** ${escapeMarkdown(projection.subject)}`] : []),
   ];
-
-  const paragraphs = projection.summary.map((line) => escapeMarkdown(line)).filter(Boolean);
   const next = projection.options.length
     ? `**${words.next}:** ${projection.options.map((option) => code(option)).filter(Boolean).join(' · ')}`
     : undefined;

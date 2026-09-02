@@ -72,10 +72,10 @@ describe('SQLite StateStore', () => {
     const db = new DatabaseSync(store.file); expect((db.prepare('SELECT runtime_id, count(*) AS count FROM runtime_observations GROUP BY runtime_id ORDER BY runtime_id').all() as any[])).toEqual([{ runtime_id: 'runtime-a', count: 100 }, { runtime_id: 'runtime-b', count: 100 }]); db.close(); store.close();
   });
 
-  it('prunes SQLite delivery projections while retaining the append-only journal', async () => {
+  it('retains SQLite delivery projections and the append-only journal', async () => {
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
     await store.mutate((state: any) => { for (let i = 0; i < 4; i += 1) { const id = `delivery-${i}`; state.deliveries.push({ id, fromActorId: 'actor', runtimeSessionId: 'runtime', generation: 1, body: `body-${i}`, command: 'normal', state: 'withdrawn', eventId: `event-${i}`, createdAt: `2026-01-0${i + 1}T00:00:00.000Z` }); state.channelEvents.push(event(`event-${i}`)); } });
-    await store.prune!(2); const db = new DatabaseSync(store.file); expect((db.prepare('SELECT count(*) AS count FROM deliveries').get() as any).count).toBe(2); expect((db.prepare('SELECT count(*) AS count FROM channel_events').get() as any).count).toBe(2); expect((db.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(4); db.close(); store.close();
+    await store.prune!(2); const db = new DatabaseSync(store.file); expect((db.prepare('SELECT count(*) AS count FROM deliveries').get() as any).count).toBe(4); expect((db.prepare('SELECT count(*) AS count FROM channel_events').get() as any).count).toBe(4); expect((db.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(4); db.close(); store.close();
   });
 
   it('backs up, exports and idempotently imports copied legacy sources without changing them', async () => {
@@ -171,6 +171,7 @@ describe('SQLite StateStore', () => {
     expected.memberCredentials = {};
     expected.sessions = expected.sessions.map(({ workspace, ...session }: any) => session);
     expected.deliveries = expected.deliveries.map((delivery: any) => ({ ...delivery, body: '' }));
+    Object.assign(expected.channelEvents[0], { priority: 'normal', consumptionPolicy: 'consume_on_delivery', consumptionState: 'open', expectedAction: { kind: 'none', instruction: 'No reply required — this message is consumed when delivered.' }, dispositions: [] });
 
     const sourceDir = await root();
     await writeFile(path.join(sourceDir, 'arcp-state.json'), JSON.stringify(source));

@@ -17,7 +17,7 @@ function publicPanorama(value: any) {
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
     placement: value.placement ?? [],
     blocked: value.blocked ?? [], temporal: value.temporal,
-    events: value.events ?? [], latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef };
+    events: value.events ?? [], providerBudget: value.providerBudget ?? { status: 'source_unavailable' }, latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef };
 }
 
 /**
@@ -48,6 +48,8 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && path === '/v1/discovery') { send(res, 200, await service.discovery()); return true; }
     if (method === 'GET' && path === '/v1/doctor') { const discovery = await service.discovery(); send(res, 200, { daemon: 'reachable', provider: discovery.available ? 'available' : 'unavailable', profiles: discovery.profiles.map(({ id, available }) => ({ id, available })), }); return true; }
     if (method === 'POST' && path === '/v1/preflight') { send(res, 200, await service.preflight(await body(req) as any)); return true; }
+    if (method === 'GET' && path === '/v1/provider-budgets') { send(res, 200, service.providerBudget() ?? { status: 'source_unavailable' }); return true; }
+    if (method === 'POST' && path === '/v1/provider-budgets/refresh') { if (!admin && !authenticatedMember) throw new ArcpError('unauthorized', 'operator or member credential is required'); const input = await body(req); send(res, 200, await service.refreshProviderBudget(typeof input.sourceId === 'string' ? input.sourceId : undefined)); return true; }
     if (method === 'POST' && path === '/v1/actors') { if (!admin) throw new ArcpError('unauthorized', 'admin key is required'); const result = await service.registerActor(await body(req) as any); send(res, 201, { actor: publicActor(result.actor), binding: result.binding, ...(result.credential ? { credential: result.credential } : {}) }); return true; }
     if (method === 'GET' && path === '/v1/actors') { send(res, 200, service.state().actors.map(publicActor)); return true; }
     if (method === 'POST' && path === '/v1/workspaces') { const input = await body(req); const ownerActorId = authenticatedActor?.id ?? String(input.ownerActorId ?? ''); const created = await service.createWorkspace({ ...input, ownerActorId } as any); send(res, 201, created); return true; }
@@ -123,10 +125,12 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const workspaceEvents = path.match(/^\/v1\/workspaces\/([^/]+)\/events$/);
     if (method === 'GET' && workspaceEvents) {
       const workspaceId = decodeURIComponent(workspaceEvents[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found');
-      const kind = url.searchParams.get('kind'); const state = url.searchParams.get('state'); const decisionRequired = url.searchParams.get('decision-required');
+      const kind = url.searchParams.get('kind'); const state = url.searchParams.get('state'); const consumption = url.searchParams.get('consumption'); const policy = url.searchParams.get('policy'); const decisionRequired = url.searchParams.get('decision-required');
       let events = service.channelEvents(workspaceId, authenticatedMember?.id);
       if (kind) events = events.filter((event) => event.kind === kind);
       if (state) events = events.filter((event) => event.deliveryState === state);
+      if (consumption) events = events.filter((event) => event.consumptionState === consumption);
+      if (policy) events = events.filter((event) => event.consumptionPolicy === policy);
       // Only decision_required events are accepted by resolveDecision. Other
       // urgent facts may carry decisionRequired for attention signalling, but
       // they are not resolvable through this endpoint.
@@ -135,9 +139,13 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
       send(res, 200, events); return true;
     }
     const eventResolve = path.match(/^\/v1\/events\/([^/]+)\/resolve$/);
-    if (method === 'POST' && eventResolve) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.resolveDecision(decodeURIComponent(eventResolve[1]), authenticatedMember.id, typeof input.summary === 'string' ? input.summary : 'Decision resolved', input.verdict === undefined ? 'accept' : input.verdict as DecisionVerdict)); return true; }
+    if (method === 'POST' && eventResolve) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); if (input.verdict !== 'accept' && input.verdict !== 'refuse') throw new ArcpError('invalid_request', 'decision verdict must be accept or refuse', 'verdict'); send(res, 200, await service.resolveDecision(decodeURIComponent(eventResolve[1]), authenticatedMember.id, typeof input.summary === 'string' ? input.summary : '', input.verdict, typeof input.dispositionId === 'string' ? input.dispositionId : undefined)); return true; }
     const eventAck = path.match(/^\/v1\/events\/([^/]+)\/ack$/);
-    if (method === 'POST' && eventAck) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.acknowledgeEvent(decodeURIComponent(eventAck[1]), authenticatedMember.id, typeof input.reason === 'string' ? input.reason : 'acknowledged')); return true; }
+    if (method === 'POST' && eventAck) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.acknowledgeEvent(decodeURIComponent(eventAck[1]), authenticatedMember.id, typeof input.reason === 'string' ? input.reason : '', typeof input.dispositionId === 'string' ? input.dispositionId : undefined)); return true; }
+    const eventDefer = path.match(/^\/v1\/events\/([^/]+)\/defer$/);
+    if (method === 'POST' && eventDefer) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); const resume = input.resume as any; if (!resume || typeof resume !== 'object') throw new ArcpError('invalid_request', 'defer resume is required'); send(res, 200, await service.deferEvent(decodeURIComponent(eventDefer[1]), authenticatedMember.id, { kind: 'defer', reason: typeof input.reason === 'string' ? input.reason : '', resume, ...(typeof input.dispositionId === 'string' ? { id: input.dispositionId } : {}) })); return true; }
+    const eventResume = path.match(/^\/v1\/events\/([^/]+)\/resume$/);
+    if (method === 'POST' && eventResume) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); send(res, 200, await service.resumeEvent(decodeURIComponent(eventResume[1]), authenticatedMember.id, typeof input.dispositionId === 'string' ? input.dispositionId : undefined)); return true; }
     const heartbeat = path.match(/^\/v1\/members\/([^/]+)\/heartbeat$/);
     if (method === 'POST' && heartbeat) { if (!authenticatedMember || authenticatedMember.id !== decodeURIComponent(heartbeat[1])) throw new ArcpError('not_found', 'member not found'); const input = await body(req); send(res, 200, await service.heartbeat(authenticatedMember.id, input.presence as any)); return true; }
     if (method === 'POST' && path === '/v1/actor-bindings') { send(res, 201, await service.bindActor(await body(req) as any)); return true; }

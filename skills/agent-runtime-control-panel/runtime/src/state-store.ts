@@ -251,15 +251,8 @@ export class SQLiteStateStore implements StateStore {
     return operation;
   }
 
-  async prune(maxRows = 200): Promise<void> {
-    if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error('prune maxRows must be a positive integer');
-    await this.mutate((state) => {
-      const deliveries = [...state.deliveries].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
-      const removedEvents = new Set(deliveries.slice(maxRows).map((item) => item.eventId).filter((id): id is string => Boolean(id)));
-      state.deliveries = deliveries.slice(0, maxRows);
-      state.channelEvents = state.channelEvents.filter((event) => !removedEvents.has(event.id));
-    });
-  }
+  /** Channel and delivery history is immutable; callers may bound views, never rows. */
+  async prune(_maxRows = 200): Promise<void> {}
 
   close(): void { this.db?.close(); this.db = undefined; }
 

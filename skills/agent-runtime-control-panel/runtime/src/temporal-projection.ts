@@ -2,7 +2,7 @@ import type { ChannelEvent, Delivery, Goal, KnowledgeEntry, Member, Result, Runt
 import { projectChannelEvent } from './channel-projection.js';
 
 /** Read-only causal view. These are deliberately not durable state fields. */
-export type TemporalDisposition = 'active' | 'resolved' | 'superseded' | 'invalidated' | 'expired_informational' | 'stale_requires_review';
+export type TemporalDisposition = 'active' | 'consumed' | 'resolved' | 'superseded' | 'invalidated' | 'expired_informational' | 'stale_requires_review';
 export type TemporalFilter = 'active' | 'problems' | { taskId: string };
 export type TemporalProblemReason = 'overdue' | 'stale' | 'superseded' | 'decision' | 'permission' | 'transport_uncertain' | 'duplicate' | 'completion_without_result' | 'generation_replaced' | 'steward_recursion' | 'delivery_generation_mismatch' | 'timestamp_nonmonotonic' | 'safe_point_invalid' | 'terminal_runtime_without_completion';
 
@@ -87,7 +87,10 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     const candidateResult = event.resultId ? facts.results.find((item) => item.id === event.resultId) : undefined;
     const replacement = runtime && facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation);
     let disposition: TemporalDisposition = 'active'; let dispositionReason = 'No machine-provable semantic replacement or resolution.'; const causation: TemporalCausation = event.relatedEventId ? { causedBy: event.relatedEventId } : {};
-    if (event.kind === 'decision_resolved') { disposition = 'resolved'; dispositionReason = 'Durable decision resolution is already recorded.'; if (event.relatedEventId) causation.resolvedBy = event.id; }
+    if (event.consumptionState === 'consumed') { disposition = 'consumed'; dispositionReason = 'The informational or acknowledged obligation is durably consumed.'; }
+    else if (event.consumptionState === 'resolved') { disposition = 'resolved'; dispositionReason = 'A durable decision verdict already closes this obligation.'; }
+    else if (event.consumptionState === 'invalidated') { disposition = 'invalidated'; dispositionReason = 'The target generation ended or was replaced; this obligation must not wake it.'; }
+    else if (event.kind === 'decision_resolved') { disposition = 'resolved'; dispositionReason = 'Durable decision resolution is already recorded.'; if (event.relatedEventId) causation.resolvedBy = event.id; }
     else if (resolution && (event.kind === 'decision_required' || event.kind === 'task_candidate')) { disposition = resolution === 'accept' ? 'resolved' : 'superseded'; dispositionReason = `Durable decision was ${resolution === 'accept' ? 'accepted' : 'refused'}; it is not an active obligation.`; if (resolutionEvent) causation.resolvedBy = resolutionEvent.id; }
     else if (event.kind === 'task_candidate' && candidateResult && task && task.fence > candidateResult.fence) { disposition = 'superseded'; dispositionReason = 'Task fence advanced beyond this Candidate.'; causation.supersedes = task.id; }
     else if (event.kind === 'blocker' && event.decisionRequired) { disposition = 'stale_requires_review'; dispositionReason = 'ARCP has no durable blocker-resolution mechanism; Manager or Deputy must review this historical blocker.'; }

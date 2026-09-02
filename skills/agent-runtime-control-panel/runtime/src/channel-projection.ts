@@ -1,4 +1,4 @@
-import type { ChannelEvent, ChannelEventKind, Goal, KnowledgeEntry, Member, Result, Task } from './arcp.js';
+import type { ChannelEvent, ChannelEventKind, ConsumptionPolicy, ConsumptionState, ExpectedAction, Goal, KnowledgeEntry, Member, Result, Task } from './arcp.js';
 
 /**
  * The one human-readable projection of a durable ChannelEvent.
@@ -43,6 +43,10 @@ export interface ChannelProjection {
   /** True when the first line states a problem to act on, not an outcome. */
   issue: boolean;
   urgency: ChannelEvent['urgency'];
+  priority: ChannelEvent['priority'];
+  consumptionPolicy: ConsumptionPolicy;
+  consumptionState: ConsumptionState;
+  expectedAction: ExpectedAction;
   decisionRequired: boolean;
   verdict?: ChannelEvent['verdict'];
   deliveryState: ChannelEvent['deliveryState'];
@@ -286,6 +290,10 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
     options: (event.decisionOptions ?? []).map((option) => bound(withoutIds(scrub(option)), SUBJECT_MAX)),
     issue: event.decisionRequired || ISSUE_KINDS.has(event.kind),
     urgency: event.urgency,
+    priority: event.priority ?? (event.urgency === 'urgent' ? 'important' : 'normal'),
+    consumptionPolicy: event.consumptionPolicy ?? (event.kind === 'decision_required' ? 'decision_required' : event.decisionRequired ? 'ack_required' : 'consume_on_delivery'),
+    consumptionState: event.consumptionState ?? 'open',
+    expectedAction: event.expectedAction ?? (event.kind === 'decision_required' ? { kind: 'resolve', instruction: 'Resolve with an accept or refuse verdict and a reason.' } : event.decisionRequired ? { kind: 'ack', instruction: 'ACK after handling, or defer with a reason if blocked.' } : { kind: 'none', instruction: 'No reply required — this message is consumed when delivered.' }),
     decisionRequired: event.decisionRequired,
     ...(event.verdict ? { verdict: event.verdict } : {}),
     deliveryState: event.deliveryState,
