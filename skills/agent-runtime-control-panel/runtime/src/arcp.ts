@@ -82,6 +82,16 @@ export const STEWARD_ANALYSIS_ROLE = 'steward-analyst';
 const idFor = (prefix: string, value: string) => `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 20)}`;
 const now = () => new Date().toISOString();
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+export const PASEO_TITLE_LIMIT = 200;
+function unicodePrefix(value: string, limit: number): string { let result = ''; for (const character of value) { if (result.length + character.length > limit) break; result += character; } return result; }
+/** Paseo tabs need a concise human label; the full Goal remains durable ARCP state and prompt content. */
+export function paseoTitle(role: string, goalTitle: string): string {
+  const roleLabel = unicodePrefix(role.trim().toUpperCase() || 'AGENT', 40);
+  const prefix = `${roleLabel} · `;
+  const goalLabel = goalTitle.trim().replace(/\s+/g, ' ') || 'Untitled goal';
+  return `${prefix}${unicodePrefix(goalLabel, PASEO_TITLE_LIMIT - prefix.length)}`;
+}
+function isPaseoTitleRejected(error: unknown): boolean { const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase(); return message.includes('agent_create_failed') && (message.includes('too_big') || message.includes('maximum 200') || message.includes('config.title')); }
 /** Resolve the packaged CLI from the runtime module, in both src and dist. */
 export const packagedArcpCommand = (...args: string[]): string => [process.execPath, fileURLToPath(new URL('../../scripts/arcp', import.meta.url)), ...args].map(shellQuote).join(' ');
 
@@ -252,7 +262,7 @@ export class PaseoAdapter implements RuntimeAdapter {
     const handoff = context?.workspaceId && context.taskId && context.runtimeId
       ? `\n\nARCP Worker handoff: workspace ${context.workspaceId}, task ${context.taskId}, runtime ${context.runtimeId}. Use the packaged CLI through Node. Claim with \`${packagedArcpCommand('task', 'claim', context.taskId, '--expected-fence', '0')}\`. Report durable learning with \`${packagedArcpCommand('knowledge', 'add', context.workspaceId, '--kind', 'learning', '--text', '<learning>')}\` and submit the candidate with \`${packagedArcpCommand('result', 'submit', context.workspaceId, '--task', context.taskId, '--summary', '<summary>', '--expected-fence', '1', '--evidence', '<evidence-ref[,evidence-ref...]>')}\`.`
       : '';
-    const title = `${profile.role.toUpperCase()} · ${goalTitle}`;
+    const title = paseoTitle(profile.role, goalTitle);
     return this.cli.run(['run', '-d', '--json', '--title', title, '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(context?.paseoWorkspaceId ? ['--workspace', context.paseoWorkspaceId] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.runtimeId ? ['--label', `arcp-runtime=${context.runtimeId}`, '--label', `arcp-role=${profile.role}`] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${handoff}`], { timeoutMs: 30_000 });
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: discoveryTimeoutMs() }); }
@@ -610,8 +620,8 @@ export class ArcpService {
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
       const matchesPlan = expected.every((expectedValue, index) => !expectedValue || (typeof observed[index] === 'string' && capabilityToken(String(observed[index])) === capabilityToken(expectedValue)));
       return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementMatches(stored.placement!) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); return stored; });
-    } catch {
-      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = 'transport_indeterminate'; return stored; });
+    } catch (error) {
+      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = isPaseoTitleRejected(error) ? 'attention' : 'transport_indeterminate'; return stored; });
     }
   }
   async observe(id: string): Promise<RuntimeSession> {

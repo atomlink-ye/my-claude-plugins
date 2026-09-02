@@ -7,7 +7,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS, PASEO_TITLE_LIMIT, paseoTitle } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { createServer, resolveDataDir } from '../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { renderTuiSnapshot, runTui } from '../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
 import { HermesAcpAdapter } from '../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
@@ -21,10 +21,10 @@ class FakeCli {
   launches = 0;
   lastLaunchArgs: string[] = [];
   lastEnv: Record<string, string> = {};
-  constructor(private readonly fail = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
+  constructor(private readonly fail: boolean | string = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
   async run(args: string[], options: { env?: Record<string, string> } = {}) {
     if (options.env) this.lastEnv = options.env;
-    if (this.fail && args[0] === 'run') throw new Error('timed out');
+    if (this.fail && args[0] === 'run') throw new Error(typeof this.fail === 'string' ? this.fail : 'timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
     if (args[0] === 'run') { this.launches += 1; this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
@@ -58,11 +58,23 @@ class FakeAcpProcess extends EventEmitter {
   update(sessionUpdate: string, extra: Record<string, unknown> = {}): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'acp-session-1', update: { sessionUpdate, ...extra } } }) + '\n'); }
   permission(): void { this.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/request_permission', params: { sessionId: 'acp-session-1' } }) + '\n'); }
 }
-async function control(root: string, fail = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown, registryListing?: unknown) {
+async function control(root: string, fail: boolean | string = false, providers = ['codex'], inspectValue: Record<string, unknown> = {}, modeClientFactory?: any, modeListing?: unknown, registryListing?: unknown) {
   const service = new ArcpService(root, new FakeCli(fail, providers, inspectValue, modeListing, registryListing) as any, undefined, modeClientFactory); await service.init(); return service;
 }
 
 describe('ARCP MVE control core', () => {
+  it('keeps semantic Paseo tab titles at the 200-character boundary without splitting Unicode', () => {
+    expect(paseoTitle('manager', 'x'.repeat(190))).toBe(`MANAGER · ${'x'.repeat(190)}`);
+    const long = paseoTitle('manager', `${'x'.repeat(189)}😀follow-up`);
+    expect(long.length).toBeLessThanOrEqual(PASEO_TITLE_LIMIT); expect(long.startsWith('MANAGER · ')).toBe(true); expect(long).not.toMatch(/[\uD800-\uDBFF]$/);
+  });
+  it('classifies a deterministic Paseo title rejection without calling transport uncertain', async () => {
+    const service = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-title-rejected-')), 'AGENT_CREATE_FAILED too_big config.title maximum 200');
+    const { actor } = await service.registerActor({ clientIdentity: 'title-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'x'.repeat(400) });
+    const runtime = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    expect(runtime.state).toBe('attention'); expect(runtime.externalId).toBeUndefined();
+    service.close();
+  });
   it('parses Paseo’s documented workspace prelude followed by one JSON payload', async () => {
     const output = 'Using workspace wks_0e6198d7efcef5a2\n{"id":"paseo-agent-1"}\n';
     expect(parseJson(output)).toEqual({ id: 'paseo-agent-1' });
