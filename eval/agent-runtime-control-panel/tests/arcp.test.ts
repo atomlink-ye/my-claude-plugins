@@ -19,10 +19,12 @@ class FakeCli {
   private lastMode = 'auto';
   sends = 0;
   launches = 0;
+  calls: string[][] = [];
   lastLaunchArgs: string[] = [];
   lastEnv: Record<string, string> = {};
   constructor(private readonly fail: boolean | string = false, private readonly providers = ['codex'], private readonly inspectValue: Record<string, unknown> = {}, private readonly modeListing?: unknown, private readonly registryListing?: unknown) {}
   async run(args: string[], options: { env?: Record<string, string> } = {}) {
+    this.calls.push(args);
     if (options.env) this.lastEnv = options.env;
     if (this.fail && args[0] === 'run') throw new Error(typeof this.fail === 'string' ? this.fail : 'timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
@@ -175,19 +177,62 @@ describe('ARCP MVE control core', () => {
     expect((service.cli as any).launches).toBe(1);
     service.close();
   });
+  it('holds a managed launch when Paseo cannot resolve a canonical Project identity', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-unresolved-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async () => ({ workspaceId: 'wks_unresolved' });
+    const { actor } = await service.registerActor({ clientIdentity: 'unresolved-placement-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'unresolved placement' });
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'must hold', profileId: 'codex-worker', paseoWorkspaceId: 'wks_unresolved' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: expect.stringContaining('PLACEMENT_UNRESOLVED') });
+    expect((service.cli as any).launches).toBe(0); expect(service.state().goals).toHaveLength(0); expect(service.state().sessions).toHaveLength(0);
+    service.close();
+  });
+  it('resolves a nested checkout to the repository root before creating a Paseo Project', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-root-')); const service = await control(root);
+    const nested = process.cwd(); const repositoryRoot = path.dirname((await execFileAsync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: nested })).stdout.trim());
+    await (service.adapter as any).materializePlacement({ checkout: nested, title: 'root project' });
+    const create = (service.cli as any).calls.find((args: string[]) => args[0] === 'project' && args[1] === 'create') as string[] | undefined;
+    expect(create).toEqual(['project', 'create', repositoryRoot, '--json']);
+    service.close();
+  });
+  it('rejects an ID-less managed launch before it can materialize a duplicate Paseo Workspace', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-idless-placement-')); const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'idless-placement-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'idless placement' });
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'must not mint', profileId: 'codex-worker' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: expect.stringContaining('explicit canonical Paseo Project and Workspace IDs') });
+    expect((service.cli as any).calls.some((args: string[]) => args[0] === 'workspace' && args[1] === 'create')).toBe(false); expect((service.cli as any).launches).toBe(0);
+    service.close();
+  });
+  it('launches without placement when implicit canonical materialization is unavailable', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-unavailable-')); const service = await control(root);
+    (service.adapter as any).materializePlacement = async () => { throw new Error('Paseo unavailable'); };
+    const { actor } = await service.registerActor({ clientIdentity: 'placement-unavailable-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'placement unavailable' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'steward fallback', profileId: 'codex-worker' }) as any;
+    expect(started.session).toMatchObject({ placement: { unresolved: 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be materialized before launch', requested: {} } });
+    expect((service.cli as any).launches).toBe(1);
+    service.close();
+  });
   it('reports a Paseo placement mismatch without calling it transport indeterminate', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-mismatch-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', workspaceId: 'wks_other' });
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_expected' });
     const { actor } = await service.registerActor({ clientIdentity: 'mismatch-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'mismatch' });
     const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'mismatch task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_expected' }) as any;
     expect(started.session).toMatchObject({ state: 'placement_mismatch', placement: { status: 'PLACEMENT_MISMATCH', requested: { workspaceId: 'wks_expected', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_other', agentId: 'paseo-session-1' } } });
     service.close();
   });
   it('reconciles an archived Paseo Agent to terminal while retaining its placement history', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-archived-')); const service = await control(root, false, ['codex'], {}, undefined, undefined, [{ id: 'paseo-session-1', status: 'archived', workspaceId: 'wks_0e6198d7efcef5a2' }]);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-archived-')); const service = await control(root, false, ['codex'], {}, undefined, undefined, [{ id: 'paseo-session-1', status: 'archived', projectId: 'prj_plugins', workspaceId: 'wks_0e6198d7efcef5a2' }]);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
     const { actor } = await service.registerActor({ clientIdentity: 'archive-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'archive' });
     const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_0e6198d7efcef5a2' }) as any;
     const reconciled = await service.reconcile(started.session.id);
-    expect(reconciled).toMatchObject({ id: started.session.id, state: 'terminal', placement: { requested: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'archived' }, status: 'PLACEMENT_MATCH' } });
+    expect(reconciled).toMatchObject({ id: started.session.id, state: 'terminal', placement: { requested: { projectId: 'prj_plugins', workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { projectId: 'prj_plugins', workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'archived' }, status: 'PLACEMENT_MATCH' } });
+    service.close();
+  });
+  it('treats a Paseo Agent absent from the active registry as terminal without uncertainty events', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-parked-')); const service = await control(root, false, ['codex'], {}, undefined, undefined, []);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_parked' });
+    const { actor } = await service.registerActor({ clientIdentity: 'parked-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'parked' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'parked task', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_parked' }) as any;
+    const reconciled = await service.reconcile(started.session.id);
+    expect(reconciled.state).toBe('terminal'); expect(service.state().sessions).toHaveLength(1); expect(service.channelEvents(workspace.workspace.id).map((event) => event.kind)).not.toEqual(expect.arrayContaining(['runtime_health', 'transport_uncertainty']));
     service.close();
   });
   it('reconciles an archived Agent missing from the active registry as terminal, not transport indeterminate', async () => {
