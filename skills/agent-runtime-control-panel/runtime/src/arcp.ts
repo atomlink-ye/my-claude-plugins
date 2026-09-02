@@ -1146,7 +1146,12 @@ export class ArcpService implements ExecutionPlacementPort {
     const requiredRank = Boolean(input.unattended) ? 2 : 1;
     const needsElevation = ['claude', 'codex'].includes(profile.provider) && safeModeRank(profile.provider, profile.mode) < requiredRank;
     const recommendationRank = input.unattended ? requiredRank : profile.provider === 'codex' ? 3 : 2;
-    const providerRecommendations = this.profileData.filter((item) => item.provider === profile.provider && item.id !== profile.id && safeModeRank(item.provider, item.mode) >= recommendationRank && liveModes.some((mode) => sameSetting(mode, item.mode))).sort((a, b) => safeModeRank(a.provider, a.mode) - safeModeRank(b.provider, b.mode)).map((item) => `arcp start --profile ${item.id} --title '<goal>'${input.unattended ? ' --unattended' : ''}`);
+    // An elevation recommendation may change the permission mode and nothing
+    // else. Offering a different role or model would push the caller across a
+    // role boundary or a price tier to satisfy a permission requirement, which
+    // is the coupling that role-as-intent exists to break. An explicit
+    // provider/model request declares no role intent, so only its model binds.
+    const providerRecommendations = this.profileData.filter((item) => item.provider === profile.provider && item.id !== profile.id && sameSetting(item.model, profile.model) && (profile.role === 'explicit' || sameSetting(item.role, profile.role)) && safeModeRank(item.provider, item.mode) >= recommendationRank && liveModes.some((mode) => sameSetting(mode, item.mode))).sort((a, b) => safeModeRank(a.provider, a.mode) - safeModeRank(b.provider, b.mode)).map((item) => `arcp start --profile ${item.id} --title '<goal>'${input.unattended ? ' --unattended' : ''}`);
     if (needsElevation && providerRecommendations.length) return action({ action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
     if (needsElevation) return action({ action: 'warn', launchable: true, why: 'requested mode is weaker than the provider default and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
     return action({ action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });

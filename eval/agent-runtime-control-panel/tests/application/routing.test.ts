@@ -55,9 +55,9 @@ describe('routing guidance and provider selection receipts', () => {
   it('uses the distinct Claude permission vocabulary for its ladder', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-routing-claude-ladder-')); const { service } = await createControl(root, { cli: new FakePaseoCli({ providers: ['claude'], modeListing: ['auto', 'bypassPermissions'] }) }); (service as any).providerBudgetSnapshot = freshBudget();
     const claudeLadder = await service.preflight({ profileId: 'claude-manager', unattended: true });
-    expect(claudeLadder).toMatchObject({ action: 'hold', launchable: false });
-    expect(claudeLadder.recommendedCommands).toContainEqual(expect.stringContaining('--profile claude-bypass-permissions'));
-    // Claude's ladder is bypassPermissions; Codex vocabulary must never appear.
+    // The complete list matters: an extra entry here is how a cross-role or
+    // cross-price suggestion sneaks in unnoticed.
+    expect(claudeLadder).toMatchObject({ action: 'hold', launchable: false, recommendedCommands: [expect.stringContaining('--profile claude-bypass-permissions')] });
     for (const command of claudeLadder.recommendedCommands) expect(command).not.toMatch(/auto-review|full-access|codex/);
     service.close();
   });
@@ -68,8 +68,9 @@ describe('routing guidance and provider selection receipts', () => {
     // Opus manager profile would push the caller across both a role boundary
     // and a price tier to satisfy a permission requirement.
     const preflight = await service.preflight({ profileId: 'claude-sonnet-worker', unattended: true });
-    expect(preflight).toMatchObject({ action: 'hold', launchable: false });
-    expect(preflight.recommendedCommands).toContainEqual(expect.stringContaining('--profile claude-sonnet-worker-bypass'));
+    // Exactly one offer, and it changes only the permission mode: same role,
+    // same model, never the Opus manager profile.
+    expect(preflight).toMatchObject({ action: 'hold', launchable: false, recommendedCommands: [expect.stringContaining('--profile claude-sonnet-worker-bypass')] });
     expect(preflight.selectionReceipt.model).toBe('claude-sonnet-5');
     service.close();
   });
