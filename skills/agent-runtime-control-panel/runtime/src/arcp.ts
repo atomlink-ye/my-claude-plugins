@@ -17,6 +17,7 @@ export { renderChannelMarkdown, escapeMarkdown, escapeCode } from './channel-mar
 export type { ChannelProjection, ChannelProjectionFacts, ChannelProjectionRef } from './channel-projection.js';
 export type { ChannelMarkdownOptions } from './channel-markdown.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
+import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
 export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
@@ -293,6 +294,8 @@ export class ArcpService {
   private pumping?: Promise<void>;
   private pumpAgain = false;
   private readonly pendingResultSubmissions = new Set<Promise<unknown>>();
+  private readonly stewardCache = new Map<string, WorkspaceSteward>();
+  private stewardFactory?: (service: ArcpService, workspaceId: string) => Promise<WorkspaceSteward>;
   private readonly startedAt = new Date().toISOString();
   private port = 0;
   constructor(readonly dataDir: string, readonly cli = new PaseoCli(), store?: StateStore, modeClientFactory?: () => PaseoModeClient, adapters: RuntimeAdapter[] = []) { this.store = store ?? (process.env.ARCP_STATE_STORE === 'sqlite' ? new SQLiteStateStore(dataDir) : new ArcpStore(dataDir)); this.adapter = new PaseoAdapter(cli, modeClientFactory); this.registerAdapter(this.adapter); this.registerAdapter(new HermesAcpAdapter()); for (const adapter of adapters) this.registerAdapter(adapter); }
@@ -304,6 +307,43 @@ export class ArcpService {
     if (onFact) onFact.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session) void this.publishChannelEvent({ ...(fact.sampleBucket !== undefined ? { id: idFor('event', `observation:${fact.externalId}:${fact.kind}:${fact.sampleBucket}:${session.workspaceId ?? ''}:${session.goalId}:${session.taskId ?? ''}:${session.memberId ?? ''}`) } : {}), workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: fact.kind, urgency: fact.urgency, decisionRequired: fact.kind === 'permission' || fact.kind === 'attention', summary: fact.summary, evidenceRefs: [] }).catch(() => undefined); });
     const onResult = (adapter as RuntimeAdapter & { onResult?: (listener: (fact: { externalId: string; taskId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId: string }) => void) => () => void }).onResult;
     if (onResult) onResult.call(adapter, (fact) => { const session = this.store.snapshot().sessions.find((item) => item.externalId === fact.externalId); if (session?.memberId && fact.expectedFence !== undefined) { const submission = this.submitResult({ workspaceId: session.workspaceId!, taskId: fact.taskId, memberId: session.memberId, status: fact.status, summary: fact.summary, evidenceRefs: fact.evidenceRefs, expectedFence: fact.expectedFence, sourceId: fact.sourceId }); this.pendingResultSubmissions.add(submission); void submission.finally(() => this.pendingResultSubmissions.delete(submission)).catch(() => undefined); } });
+  }
+  /** Override the analyst only for deterministic local proof; production uses
+   * the owner-selected Codex runtime through the same WorkspaceSteward object
+   * used by manual requests. */
+  setStewardFactory(factory: (service: ArcpService, workspaceId: string) => Promise<WorkspaceSteward>): void {
+    this.stewardFactory = factory;
+    this.stewardCache.clear();
+  }
+  async workspaceSteward(workspaceId: string): Promise<WorkspaceSteward> {
+    const cached = this.stewardCache.get(workspaceId);
+    if (cached) return cached;
+    if (this.stewardFactory) {
+      const steward = await this.stewardFactory(this, workspaceId);
+      this.stewardCache.set(workspaceId, steward);
+      return steward;
+    }
+    const state = this.store.snapshot();
+    const workspace = state.workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) throw new ArcpError('not_found', 'workspace not found');
+    const existing = state.members.find((item) => item.workspaceId === workspaceId && item.role === 'steward');
+    const member = existing ?? (await this.joinWorkspace({ workspaceId, label: 'workspace-steward', role: 'steward', capabilities: ['read_context', 'write_knowledge'] })).member;
+    const configured = this.supervisionPolicy(workspaceId);
+    const profileId = configured?.stewardProfileId ?? process.env.ARCP_STEWARD_PROFILE ?? DEFAULT_STEWARD_PROFILE_ID;
+    const profile = this.profileData.find((item) => item.id === profileId);
+    if (!profile || profile.provider !== 'codex' || capabilityToken(profile.mode ?? '') !== 'fullaccess') throw new ArcpError('invalid_request', 'Steward profile must be Codex full-access (non-prompting)', 'stewardProfileId');
+    const policy = {
+      workspaceId,
+      stewardProfileId: profileId,
+      stewardMemberId: member.id,
+      cooldownMs: configured?.cooldownMs ?? Number(process.env.ARCP_STEWARD_COOLDOWN_MS ?? 900_000),
+      automatic: configured?.automatic ?? process.env.ARCP_STEWARD_AUTOMATIC !== '0',
+      manualProgressWindowMs: Number(process.env.ARCP_STEWARD_PROGRESS_WINDOW_MS ?? 1_800_000),
+    };
+    const analyst = new CodexRuntimeAnalyst(this, { profileId, actorId: workspace.ownerActorId, waitMs: Number(process.env.ARCP_STEWARD_WAIT_MS ?? 300_000) });
+    const steward = new WorkspaceSteward(stewardViewOf(this), analyst, policy);
+    this.stewardCache.set(workspaceId, steward);
+    return steward;
   }
   /** Await ACP result ingestion and the pump it triggers. Intended for deterministic callers/tests. */
   async flushResultSubmissions(): Promise<void> {
@@ -1075,7 +1115,19 @@ export class ArcpService {
       }
       return reviews;
     });
-    if (created.length > 0) await this.pump();
+    if (created.length > 0) {
+      await this.pump();
+      // A newly-recorded breach is the automatic Steward trigger. The
+      // WorkspaceSteward accessor is also used by the manual HTTP/CLI route,
+      // so both triggers enter one execution path. Provider/timeout failures
+      // leave the review durable and simply produce no report.
+      for (const review of created) {
+        try {
+          const steward = await this.workspaceSteward(review.workspaceId);
+          await steward.onSupervisionBreach({ workspaceId: review.workspaceId, subjectTaskId: review.subjectId, generation: review.generation, reason: review.reason, progressSince: review.lastProgressAt, observedAt: review.breachedAt, breachEventId: review.eventId } as any);
+        } catch { /* review reconciliation remains durable when Codex is unavailable */ }
+      }
+    }
     return created;
   }
   /** Reconciliation: a Manager or Owner closes the review loop for one breach. */

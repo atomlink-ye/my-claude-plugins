@@ -103,6 +103,27 @@ describe('Round-3 convergence proofs', () => {
     service.close();
   });
 
+  it('runs the automatic breach through WorkspaceSteward and persists one cited report', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-convergence-automatic-steward-'));
+    const service = await serviceAt(root); const { workspace } = await workspaceAt(service);
+    const worker = await service.joinWorkspace({ workspaceId: workspace.id, label: 'worker', role: 'worker' });
+    const stewardMember = await service.joinWorkspace({ workspaceId: workspace.id, label: 'steward', role: 'steward', capabilities: ['read_context', 'write_knowledge'] });
+    const task = await service.createTask({ workspaceId: workspace.id, title: 'stalled product task' });
+    await service.claimTask(task.id, worker.member.id, 0);
+    const stale = '2026-01-01T00:00:00.000Z';
+    await service.store.mutate((state: State) => { const item = state.tasks.find((value) => value.id === task.id)!; item.createdAt = stale; item.updatedAt = stale; });
+    const entered: string[] = [];
+    const analyst: StewardAnalyst = { profileId: 'codex-full-access', async analyze(dossier: StewardDossier) { entered.push(dossier.request.trigger); return { provider: 'codex', model: 'gpt-5.6-terra', narrative: 'stalled task is ready for steering', cited: true, evidenceRefs: [dossier.subject.id] }; } };
+    service.setStewardFactory(async (ownedService, workspaceId) => new WorkspaceSteward(stewardViewOf(ownedService), analyst, { workspaceId, stewardProfileId: 'codex-full-access', stewardMemberId: stewardMember.member.id, cooldownMs: 60_000, automatic: true, manualProgressWindowMs: 60_000 }));
+    await service.configureSupervision({ workspaceId: workspace.id, inactivityAfterMs: 1_000, cooldownMs: 60_000 });
+    const reviews = await service.evaluateSupervision(Date.now() + 3_600_000);
+    expect(reviews).toHaveLength(1);
+    expect(entered).toEqual(['automatic']);
+    expect(service.state().knowledge.filter((entry) => entry.tags.includes('workspace-steward'))).toHaveLength(1);
+    expect(service.state().knowledge.at(-1)?.text).toContain('stalled task is ready for steering');
+    service.close();
+  });
+
   it('refuses Steward credentials on product Tasks but permits a bounded analysis Task', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-convergence-scope-'));
     const service = await serviceAt(root); const { workspace } = await workspaceAt(service);

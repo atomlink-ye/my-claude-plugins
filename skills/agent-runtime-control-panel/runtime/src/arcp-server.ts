@@ -2,7 +2,8 @@ import type http from 'node:http';
 import { URL } from 'node:url';
 import { ArcpError, ArcpService } from './arcp.js';
 import type { DecisionVerdict, Member } from './arcp.js';
-import { CodexRuntimeAnalyst, StewardError, WorkspaceSteward, stewardViewOf } from './steward.js';
+import { StewardError } from './steward.js';
+import type { WorkspaceSteward } from './steward.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
@@ -24,30 +25,7 @@ function publicPanorama(value: any) {
  * Steward here, so neither can quietly acquire a different execution path.
  */
 export async function stewardFor(service: ArcpService, workspaceId: string): Promise<WorkspaceSteward> {
-  const state = service.state();
-  const workspace = state.workspaces.find((item) => item.id === workspaceId);
-  if (!workspace) throw new ArcpError('not_found', 'workspace not found');
-  const existing = state.members.find((item) => item.workspaceId === workspaceId && item.role === 'steward');
-  // The Steward authors as itself, never as the Owner or Manager whose
-  // credential happened to trigger it. R2-F21 was exactly that misattribution.
-  const member = existing ?? (await service.joinWorkspace({ workspaceId, label: 'workspace-steward', role: 'steward', capabilities: ['read_context', 'write_knowledge'] })).member;
-  const configured = service.supervisionPolicy(workspaceId);
-  const policy = {
-    workspaceId,
-    // Supervision configuration is the owner-selected source of truth. The
-    // environment override remains useful for a fresh workspace, but never
-    // silently replaces a durable policy.
-    stewardProfileId: configured?.stewardProfileId ?? process.env.ARCP_STEWARD_PROFILE ?? 'codex-full-access',
-    stewardMemberId: member.id,
-    cooldownMs: Number(process.env.ARCP_STEWARD_COOLDOWN_MS ?? 900_000),
-    automatic: process.env.ARCP_STEWARD_AUTOMATIC !== '0',
-    manualProgressWindowMs: Number(process.env.ARCP_STEWARD_PROGRESS_WINDOW_MS ?? 1_800_000),
-  };
-  const profile = service.profiles().find((item) => item.id === policy.stewardProfileId);
-  const modeToken = String(profile?.mode ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!profile || profile.provider !== 'codex' || modeToken !== 'fullaccess') throw new ArcpError('invalid_request', 'Steward profile must be Codex full-access (non-prompting)', 'stewardProfileId');
-  const analyst = new CodexRuntimeAnalyst(service, { profileId: policy.stewardProfileId, actorId: workspace.ownerActorId, waitMs: Number(process.env.ARCP_STEWARD_WAIT_MS ?? 300_000) });
-  return new WorkspaceSteward(stewardViewOf(service), analyst, policy);
+  return service.workspaceSteward(workspaceId);
 }
 
 /** Returns true when an ARCP request was handled. All v1 routes require the local API key. */
