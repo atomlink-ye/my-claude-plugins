@@ -17,7 +17,8 @@
     "policies": [{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10,"requiredPaidUnattended":true}],
     "bindings": [
       {"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"},
-      {"id":"codex-weekly","providerId":"codex","sourceId":"local-codexbar","modelPatterns":["gpt-5.6-terra"],"windowIds":["secondary"],"admissionPolicyId":"default"}
+      {"id":"codex-weekly","providerId":"codex","sourceId":"local-codexbar","modelPatterns":["gpt-5.6-terra"],"windowIds":["secondary"],"admissionPolicyId":"default"},
+      {"id":"grok-primary","providerId":"pi","sourceId":"local-codexbar","modelPatterns":["grok-cli/grok-4.6"],"windowIds":["primary"],"admissionPolicyId":"default"}
     ]
   }
 }

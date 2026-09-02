@@ -19,7 +19,7 @@ List commands use the same boundary as the existing context/panorama surface: a 
 
 ## Provider budget MVE
 
-`arcp provider-budget refresh` is operator/member controlled; `read` shows the last validated, redacted envelope. The bundled local source calls codexbar independently for Claude and Codex, so one provider failure cannot erase the other snapshot.
+`arcp provider-budget refresh` is operator/member controlled; `read` shows the last validated, redacted envelope. The bundled local source calls CodexBar independently for Claude, Codex, and Grok with `--source auto`, so one provider failure cannot erase the others. Upstream CodexBar `grok` is projected as the mode-less ARCP runtime provider `pi`, with safe source label `codexbar:grok`; identity fields are never retained.
 
 ```json
 {"providerBudget":{"sources":[{"id":"local-codexbar","kind":"codexbar","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true}],"policies":[{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10}],"bindings":[{"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"}]}}
@@ -37,7 +37,7 @@ An authoritative command collector must emit source-trust metadata with its enve
 {"schemaVersion":"arcp.provider-budget/v1","source":{"id":"operator-collector","kind":"command","observedAt":"2026-09-02T00:00:00Z","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},"providers":[{"providerId":"pi","status":"available","windows":[{"id":"weekly","label":"weekly","remainingPct":75}]}]}
 ```
 
-The source configuration kind `codexbar` is an ARCP adapter choice; its emitted envelope deliberately has `source.kind: "command"`, because the envelope records the bounded local command observation. The default local CodexBar source is authoritative for Claude and Codex. Default Paseo-native envelopes emit `source.kind: "paseo"` but are advisory/estimated and cannot admit launches until an operator configures authoritative provider-specific trust. These identities remain separate from `source.id`, which policy bindings use.
+The source configuration kind `codexbar` is an ARCP adapter choice; its emitted envelope deliberately has `source.kind: "command"`, because the envelope records the bounded local command observation. The default local CodexBar source is authoritative for Claude, Codex, and its mapped Grok/Pi observation. Default Paseo-native envelopes emit `source.kind: "paseo"` but are advisory/estimated and cannot admit launches until an operator configures authoritative provider-specific trust. These identities remain separate from `source.id`, which policy bindings use.
 
 Runtime status and Panorama also expose bounded aggregate burn samples: deduplicated native turn IDs, cache read/creation and output deltas, 5/10/60-minute velocity, turns/minute, stale retry wakes, context ratio, and `RATE_DRAIN`, `TURN_STORM`, `STALE_WAKE`, or `CONTEXT_DRAIN`. ARCP never reads or stores prompts or full transcripts.
 
