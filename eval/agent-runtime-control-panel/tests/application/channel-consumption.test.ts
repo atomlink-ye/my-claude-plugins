@@ -32,6 +32,23 @@ describe('ARCP channel consumption MVE', () => {
     const stored = service.state().channelEvents.find((item) => item.id === decision.id)!; expect(stored).toMatchObject({ consumptionState: 'resolved', verdict: 'accept' }); service.close();
   });
 
+  it('does not infer recipient processing from an idle runtime; processing and ACK are explicit receipts', async () => {
+    const { service, workspace, manager } = await fixture();
+    const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetMemberId: manager.member.id, kind: 'finding', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'must be handled', evidenceRefs: [] });
+    const delivery = service.state().deliveries.find((item) => item.eventId === event.id)!;
+    expect(delivery.state).toBe('delivered');
+    expect(delivery.processedAt).toBeUndefined();
+    await service.observe('manager-runtime');
+    expect(service.state().deliveries.find((item) => item.id === delivery.id)).toMatchObject({ state: 'delivered' });
+    const projection = service.channelEvents(workspace.workspace.id, manager.member.id).find((item) => item.id === event.id)!.projection;
+    expect(projection.recipientProcessing.state).toBe('unobserved');
+    await service.processDelivery(delivery.id, manager.member.id, 'read and handled');
+    expect(service.channelEvents(workspace.workspace.id, manager.member.id).find((item) => item.id === event.id)!.projection.recipientProcessing.state).toBe('processed');
+    await service.acknowledge(delivery.id, undefined, manager.member.id);
+    expect(service.state().deliveries.find((item) => item.id === delivery.id)).toMatchObject({ state: 'acknowledged', processedByMemberId: manager.member.id, acknowledgedByMemberId: manager.member.id });
+    service.close();
+  });
+
   it('defers the same event, then resumes one new consumption episode without duplicate wake', async () => {
     const { service, cli, workspace, manager } = await fixture();
     const event = await service.publishChannelEvent({ workspaceId: workspace.workspace.id, targetMemberId: manager.member.id, kind: 'finding', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: false, summary: 'wait for worker', evidenceRefs: [] });
