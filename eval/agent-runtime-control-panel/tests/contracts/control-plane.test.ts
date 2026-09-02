@@ -407,14 +407,14 @@ describe('ARCP MVE control core', () => {
   it('uses a role as routing intent and explains the fixed provider selection without fallback', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-role-routing-')); const service = await control(root, false, ['codex', 'claude', 'pi']);
     const worker = await service.preflight({ role: 'worker' });
-    expect(worker).toMatchObject({ action: 'launch', profileId: 'codex-worker', routing: { roleIntent: 'worker', selection: 'role-intent', selectedProfile: { id: 'codex-worker', provider: 'codex', role: 'worker' } } });
-    expect(worker.routing.alternatives).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'pi-grok-worker', provider: 'pi', reason: expect.stringContaining('select it explicitly') })]));
+    expect(worker).toMatchObject({ action: 'launch', profileId: 'codex-worker', selection: { roleIntent: 'worker', selection: 'role-intent', selectedProfile: { id: 'codex-worker', provider: 'codex', role: 'worker' } } });
+    expect(worker.selection.alternatives).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'pi-grok-worker', provider: 'pi', reason: expect.stringContaining('select it explicitly') })]));
     const manager = await service.preflight({ role: 'manager' });
-    expect(manager).toMatchObject({ action: 'launch', profileId: 'claude-manager', routing: { roleIntent: 'manager', selection: 'role-intent', selectedProfile: { provider: 'claude', role: 'manager' } } });
+    expect(manager).toMatchObject({ action: 'launch', profileId: 'claude-manager', selection: { roleIntent: 'manager', selection: 'role-intent', selectedProfile: { provider: 'claude', role: 'manager' } } });
     const explicit = await service.preflight({ role: 'manager', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' });
-    expect(explicit).toMatchObject({ action: 'launch', profileId: 'explicit', routing: { roleIntent: 'manager', selection: 'explicit-settings', selectedProfile: { provider: 'codex', role: 'explicit' }, alternatives: [] } });
+    expect(explicit).toMatchObject({ action: 'launch', profileId: 'explicit', selection: { roleIntent: 'manager', selection: 'explicit-settings', selectedProfile: { provider: 'codex', role: 'explicit' }, alternatives: [] } });
     const unavailable = await control(await mkdtemp(path.join(os.tmpdir(), 'arcp-role-no-fallback-')), false, ['pi']);
-    await expect(unavailable.preflight({ role: 'worker' })).resolves.toMatchObject({ action: 'hold', profileId: 'codex-worker', routing: { selection: 'role-intent' } });
+    await expect(unavailable.preflight({ role: 'worker' })).resolves.toMatchObject({ action: 'hold', profileId: 'codex-worker', selection: { selection: 'role-intent' } });
     service.close(); unavailable.close();
   });
 

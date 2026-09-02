@@ -252,10 +252,10 @@ export class ArcpStore implements StateStore {
 export const DEFAULT_PROFILES = [
   { id: 'claude-manager', provider: 'claude', model: 'claude-opus-5', mode: 'auto', thinking: 'medium', role: 'manager' },
   { id: 'claude-bypass-permissions', provider: 'claude', model: 'claude-opus-5', mode: 'bypassPermissions', thinking: 'medium', role: 'manager' },
-  { id: 'claude-sonnet-worker', provider: 'claude', model: 'claude-sonnet-5', mode: 'auto', thinking: 'medium', role: 'worker' },
   { id: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium', role: 'worker' },
   { id: 'codex-auto-review', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto-review', thinking: 'medium', role: 'worker' },
   { id: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
+  { id: 'claude-sonnet-worker', provider: 'claude', model: 'claude-sonnet-5', mode: 'auto', thinking: 'medium', role: 'worker' },
   { id: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', role: 'worker' },
 ] as const;
 
@@ -1144,7 +1144,8 @@ export class ArcpService implements ExecutionPlacementPort {
     if (admission && admissionHold) return action({ action: admission.action === 'route' ? 'route' : 'hold', launchable: false, why: `provider budget admission is ${admission.action}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });
     const requiredRank = Boolean(input.unattended) ? 2 : 1;
     const needsElevation = ['claude', 'codex'].includes(profile.provider) && safeModeRank(profile.provider, profile.mode) < requiredRank;
-    const providerRecommendations = this.profileData.filter((item) => item.provider === profile.provider && item.id !== profile.id && safeModeRank(item.provider, item.mode) >= requiredRank && liveModes.some((mode) => sameSetting(mode, item.mode))).sort((a, b) => safeModeRank(a.provider, a.mode) - safeModeRank(b.provider, b.mode)).map((item) => `arcp start --profile ${item.id} --title '<goal>'${input.unattended ? ' --unattended' : ''}`);
+    const recommendationRank = input.unattended ? requiredRank : profile.provider === 'codex' ? 3 : 2;
+    const providerRecommendations = this.profileData.filter((item) => item.provider === profile.provider && item.id !== profile.id && safeModeRank(item.provider, item.mode) >= recommendationRank && liveModes.some((mode) => sameSetting(mode, item.mode))).sort((a, b) => safeModeRank(a.provider, a.mode) - safeModeRank(b.provider, b.mode)).map((item) => `arcp start --profile ${item.id} --title '<goal>'${input.unattended ? ' --unattended' : ''}`);
     if (needsElevation && providerRecommendations.length) return action({ action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
     if (needsElevation) return action({ action: 'warn', launchable: true, why: 'requested mode is weaker than the provider default and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
     return action({ action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });
