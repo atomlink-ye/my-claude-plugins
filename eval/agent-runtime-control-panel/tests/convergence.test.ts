@@ -57,6 +57,11 @@ describe('Round-3 convergence proofs', () => {
     expect(evaluateSupervision(view, Date.parse('2026-01-01T00:00:01.000Z'))).toHaveLength(expected);
   });
 
+  it('excludes a Steward analysis Task by scope even when the owner is an owner', () => {
+    const view: SupervisionView = { subjects: [{ id: 'analysis', workspaceId: 'workspace-1', ownerRole: 'owner', scope: 'steward_analysis', generation: 1, lifecycle: 'claimed', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }], results: [], knowledge: [], events: [], signals: [], policies: [{ id: supervisionPolicyId('workspace-1'), workspaceId: 'workspace-1', inactivityAfterMs: 1, cooldownMs: 100, stewardProfileId: 'codex-full-access', automatic: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }], reviews: [] };
+    expect(evaluateSupervision(view, Date.parse('2026-01-01T00:00:01.000Z'))).toEqual([]);
+  });
+
   it.each([
     'reason: delayed dependency',
     'reason=delayed dependency',
