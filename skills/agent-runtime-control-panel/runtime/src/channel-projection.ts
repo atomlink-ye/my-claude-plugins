@@ -56,6 +56,8 @@ export interface ChannelProjectionFacts {
   goals: readonly Goal[];
   knowledge: readonly KnowledgeEntry[];
   results: readonly Result[];
+  /** Resolution is durable event state, not a delivery outcome. */
+  channelEvents?: readonly ChannelEvent[];
 }
 
 export const HEADLINE_MAX = 120;
@@ -227,8 +229,11 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
   // the event summary is usually only its machine-addressable stub.
   const detail = knowledge?.text || result?.summary || eventSummary;
 
-  const label = event.kind === 'decision_resolved' && event.verdict
-    ? event.verdict === 'refuse' ? 'Refused' : 'Accepted'
+  const resolution = event.verdict
+    ? event.verdict
+    : facts.channelEvents?.find((item) => item.kind === 'decision_resolved' && item.relatedEventId === event.id)?.verdict;
+  const label = resolution && (event.kind === 'decision_required' || event.kind === 'decision_resolved')
+    ? resolution === 'refuse' ? 'Refused' : 'Accepted'
     : KIND_LABELS[event.kind] ?? 'Event';
 
   const subjectSource = task?.title ?? goal?.title;
