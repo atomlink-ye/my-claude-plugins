@@ -263,7 +263,7 @@ function paseoPlacement(record: Record<string, any>): PaseoPlacement['observed']
 }
 function placementMatches(placement: PaseoPlacement): boolean {
   const observed = placement.observed;
-  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || placement.requested[key] === observed[key]);
+  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || sameSetting(placement.requested[key], observed[key]));
 }
 function normalizedTurnState(value: unknown): 'running' | 'requires_action' | 'idle' {
   const state = normalized(value);
@@ -273,6 +273,10 @@ function normalizedTurnState(value: unknown): 'running' | 'requires_action' | 'i
 }
 const setting = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined;
 const sameSetting = (a: unknown, b: unknown) => !a || !b ? false : capabilityToken(String(a)) === capabilityToken(String(b));
+function launchReceiptIdentity(value: Record<string, any>): string | undefined {
+  const nested = asRecord(value.agent ?? value.runtime ?? value.result);
+  return setting(value.id ?? value.agentId ?? value.sessionId ?? value.externalId ?? nested.id ?? nested.agentId ?? nested.sessionId);
+}
 const safeModeRank = (value: unknown) => {
   const mode = capabilityToken(String(value ?? ''));
   if (['plan', 'readonly', 'read', 'ask'].includes(mode)) return 0;
@@ -572,6 +576,23 @@ export class ArcpService implements ExecutionPlacementPort {
     }
   }
   private adapterFor(session: RuntimeSession): RuntimeAdapter { return this.adapters.get(session.adapterId || (session.runtimeKind === 'external' ? 'hermes-acp' : 'paseo')) ?? this.adapter; }
+  /** The launch receipt is the sole native identity for a runtime. Keep the
+   * session, placement, and all bindings converged even when older durable
+   * state only recorded it in one of those records. */
+  private async canonicalRuntimeIdentity(session: RuntimeSession): Promise<string | undefined> {
+    const state = this.store.snapshot();
+    const current = state.sessions.find((item) => item.id === session.id) ?? session;
+    const identity = setting(current.externalId) ?? setting(state.runtimeBindings.find((item) => item.runtimeSessionId === current.id && item.nativeId)?.nativeId);
+    if (!identity) return undefined;
+    await this.store.mutate((next) => {
+      const item = next.sessions.find((value) => value.id === current.id);
+      if (!item) return;
+      item.externalId = identity;
+      if (item.placement) item.placement.requested.agentId = identity;
+      for (const binding of next.runtimeBindings.filter((value) => value.runtimeSessionId === item.id)) binding.nativeId = identity;
+    });
+    return identity;
+  }
   private async prepareRuntimeClientState(sessionId: string, workspaceId: string, memberId: string, credential: string): Promise<string> {
     const root = path.join(path.dirname(this.store.file), 'runtime-members'); const file = path.join(root, `${sessionId}.json`);
     // `arcp message ack …` is emitted inside the runtime's delivery envelope.
@@ -583,6 +604,17 @@ export class ArcpService implements ExecutionPlacementPort {
   async init(): Promise<void> {
     await this.store.init();
     if (this.store.prune) await this.store.prune();
+    // Repair pre-R5 rows once at startup so every persisted reference points at
+    // the same opaque Paseo launch receipt before any observation is attempted.
+    await this.store.mutate((state) => {
+      for (const session of state.sessions) {
+        const identity = setting(session.externalId) ?? setting(state.runtimeBindings.find((binding) => binding.runtimeSessionId === session.id && binding.nativeId)?.nativeId);
+        if (!identity) continue;
+        session.externalId = identity;
+        if (session.placement) session.placement.requested.agentId = identity;
+        for (const binding of state.runtimeBindings.filter((item) => item.runtimeSessionId === session.id)) binding.nativeId = identity;
+      }
+    });
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
       const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy> };
@@ -668,10 +700,15 @@ export class ArcpService implements ExecutionPlacementPort {
     if (input.writer) await this.claimSurface({ id: input.executionSurfaceId }, input.runtimeSessionId);
     return this.store.mutate((state) => {
       if (!state.executionSurfaces.some((item) => item.id === input.executionSurfaceId && item.visibilityState === 'visible')) throw new ArcpError('not_found', 'execution surface not found');
-      if (!state.sessions.some((item) => item.id === input.runtimeSessionId)) throw new ArcpError('unknown_recipient', 'runtime binding requires a persisted runtimeSessionId');
+      const session = state.sessions.find((item) => item.id === input.runtimeSessionId);
+      if (!session) throw new ArcpError('unknown_recipient', 'runtime binding requires a persisted runtimeSessionId');
       const existing = state.runtimeBindings.find((item) => item.executionSurfaceId === input.executionSurfaceId && item.runtimeSessionId === input.runtimeSessionId);
-      if (existing) return { binding: existing };
-      const binding: RuntimeBinding = { id: `runtime_binding_${randomUUID()}`, executionSurfaceId: input.executionSurfaceId, runtimeSessionId: input.runtimeSessionId, adapterId: 'paseo', generation: 1, state: 'launching', visibilityState: 'visible', createdAt: now() };
+      const nativeId = setting(session.externalId) ?? setting(state.runtimeBindings.find((item) => item.runtimeSessionId === session.id && item.nativeId)?.nativeId);
+      if (existing) {
+        if (nativeId) existing.nativeId = nativeId;
+        return { binding: existing };
+      }
+      const binding: RuntimeBinding = { id: `runtime_binding_${randomUUID()}`, executionSurfaceId: input.executionSurfaceId, runtimeSessionId: input.runtimeSessionId, adapterId: 'paseo', ...(nativeId ? { nativeId } : {}), generation: 1, state: 'launching', visibilityState: 'visible', createdAt: now() };
       state.runtimeBindings.push(binding); return { binding };
     });
   }
@@ -810,8 +847,11 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
     try { input = await this.resolvePaseoPlacement(input); }
     catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof ArcpError ? error.message : 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be resolved before launch' }; }
-    const profile = this.profileData.find((item) => item.id === preflight.profileId);
-    const role = input.role?.trim() || profile?.role || 'worker';
+    // Resolve the profile through the same path used by preflight and launch.
+    // Explicit provider/model requests intentionally do not become configured
+    // profile entries, but they still carry the requested role into the member.
+    const profile = this.requestedProfile(input);
+    const role = input.role?.trim() || profile.role || 'worker';
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope, executionSurfaceId: input.executionSurfaceId });
     const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role, joinKind: 'managed', actorId: input.actorId, ...(input.taskScope === 'steward_analysis' ? { capabilities: ['claim_task', 'submit_result', 'read_context', 'write_knowledge'] } : {}) });
@@ -910,11 +950,11 @@ export class ArcpService implements ExecutionPlacementPort {
     if (input.profileId || !explicit) {
       const profile = this.profileData.find((item) => item.id === (input.profileId ?? 'codex-worker'));
       if (!profile) throw new ArcpError('invalid_request', 'unknown launch profile');
-      if (profile.provider === 'pi' && profile.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
+      if (capabilityToken(profile.provider) === 'pi' && profile.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
       return profile;
     }
     if (!input.provider?.trim() || !input.model?.trim()) throw new ArcpError('invalid_request', 'explicit launch requires provider and model');
-    if (input.provider === 'pi' && input.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
+    if (capabilityToken(input.provider) === 'pi' && input.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
     const mode = setting(input.mode); const thinking = setting(input.thinking);
     return { id: 'explicit', provider: input.provider.trim(), model: input.model.trim(), ...(mode ? { mode } : {}), ...(thinking ? { thinking } : {}), role: 'explicit' };
   }
@@ -962,16 +1002,13 @@ export class ArcpService implements ExecutionPlacementPort {
     if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal')) {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
     }
-    const discovered = await this.discovery();
-    const available = discovered.profiles.find((item) => item.id === profile.id)?.available;
-    if (!available) throw new ArcpError('profile_unavailable', 'requested provider, model, or mode is unavailable');
     const generation = Math.max(0, ...state.sessions.filter((item) => item.goalId === goal.id).map((item) => item.generation)) + 1;
     const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
     await this.store.mutate((next) => { next.sessions.push(session); });
     if (input.executionSurfaceId) await this.launchRuntime({ executionSurfaceId: input.executionSurfaceId, runtimeSessionId: session.id, writer: input.writer });
     try {
       const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace, { workspaceId: input.workspaceId, paseoProjectId: input.paseoProjectId, paseoWorkspaceId: input.paseoWorkspaceId, taskId: input.taskId, memberId: input.memberId, runtimeId: session.id, memberCredential: input.memberCredential, clientStatePath: input.clientStatePath })).value);
-      const externalId = String(result.id ?? result.agentId ?? '');
+      const externalId = launchReceiptIdentity(result);
       if (!externalId) throw new Error('Paseo did not return a runtime identity');
       // Persist the opaque handle before postflight: reconcile must remain possible
       // when launch succeeded but the immediate observation timed out.
@@ -980,7 +1017,7 @@ export class ArcpService implements ExecutionPlacementPort {
       const workspacePlacement = input.paseoWorkspaceId && this.adapter instanceof PaseoAdapter ? await this.adapter.workspacePlacement(input.paseoWorkspaceId) : undefined;
       const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.currentModeId ?? inspected.mode ?? inspected.Mode, inspected.effectiveThinkingOptionId ?? inspected.thinkingOptionId ?? inspected.thinking ?? inspected.Thinking];
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
-      const matchesPlan = expected.every((expectedValue, index) => !expectedValue || (typeof observed[index] === 'string' && capabilityToken(String(observed[index])) === capabilityToken(expectedValue)));
+      const matchesPlan = expected.every((expectedValue, index) => !expectedValue || sameSetting(expectedValue, observed[index]));
       return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementMatches(stored.placement!) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
     } catch (error) {
       return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = isPaseoTitleRejected(error) ? 'attention' : 'transport_indeterminate'; for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
@@ -989,9 +1026,10 @@ export class ArcpService implements ExecutionPlacementPort {
   async observe(id: string): Promise<RuntimeSession> {
     const prior = this.store.snapshot().sessions.find((item) => item.id === id);
     if (!prior) throw new ArcpError('not_found', 'runtime session not found');
-    if (!prior.externalId) return prior;
+    const externalId = await this.canonicalRuntimeIdentity(prior);
+    if (!externalId) return this.store.snapshot().sessions.find((item) => item.id === id)!;
     try {
-      const snapshot = await this.adapterFor(prior).snapshot(prior.externalId); const observed = snapshot.agent;
+      const snapshot = await this.adapterFor(prior).snapshot(externalId); const observed = snapshot.agent;
       const updated = await this.store.mutate((state) => {
         const item = state.sessions.find((value) => value.id === id)!;
         item.observed = { ...(setting(observed.provider ?? observed.Provider) ? { provider: String(observed.provider ?? observed.Provider) } : {}), ...(setting(observed.model ?? observed.Model) ? { model: String(observed.model ?? observed.Model) } : {}), ...(setting(observed.currentModeId ?? observed.mode ?? observed.Mode) ? { mode: String(observed.currentModeId ?? observed.mode ?? observed.Mode) } : {}), ...(setting(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) ? { thinking: String(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) } : {}) };
@@ -1012,19 +1050,20 @@ export class ArcpService implements ExecutionPlacementPort {
   async reconcile(id: string): Promise<RuntimeSession> {
     const prior = this.store.snapshot().sessions.find((item) => item.id === id);
     if (!prior) throw new ArcpError('not_found', 'runtime session not found');
+    const externalId = await this.canonicalRuntimeIdentity(prior);
     try {
       if (prior.runtimeKind === 'external') {
         const adapter = this.adapterFor(prior) as RuntimeAdapter & { reconcileExternal?: (externalId: string) => Promise<boolean> };
-        const valid = adapter.reconcileExternal ? await adapter.reconcileExternal(prior.externalId ?? '') : false;
+        const valid = adapter.reconcileExternal ? await adapter.reconcileExternal(externalId ?? '') : false;
         if (!valid) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
       }
       const agents = (await this.adapterFor(prior).registry()).value;
-      const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => String(item.id ?? item.agentId) === prior.externalId) : undefined;
+      const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => launchReceiptIdentity(item) === externalId) : undefined;
       if (!match) {
         // The registry is Paseo's active-membership source. A known Agent ID
         // absent from that registry is parked/archived, not an indeterminate
         // transport; retain the durable ARCP row and placement history.
-        if (prior.externalId) return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); return item; });
+        if (externalId) return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); return item; });
         const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain;
       }
       return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.placement) { item.placement.observed = paseoPlacement(match); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(match.status ?? match.Status ?? match.lifecycle); item.lastObservedAt = now(); return item; });
@@ -1039,8 +1078,9 @@ export class ArcpService implements ExecutionPlacementPort {
     return { activityAt, ageMinutes, state };
   }
   private async facts(session: RuntimeSession) {
-    if (!session.externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
-    const adapter = this.adapterFor(session); const snapshot = await adapter.snapshot(session.externalId); const children = await this.children(session.externalId, adapter); const turn = safeJson(snapshot.agent.activeTurn);
+    const externalId = await this.canonicalRuntimeIdentity(session);
+    if (!externalId) throw new ArcpError('unknown_recipient', 'recipient is not registered');
+    const adapter = this.adapterFor(session); const snapshot = await adapter.snapshot(externalId); const children = await this.children(externalId, adapter); const turn = safeJson(snapshot.agent.activeTurn);
     return { agent: snapshot.agent, activeTurn: `${turn.turnId ?? turn.id ?? ''}:${turn.startedAt ?? ''}:${Boolean(turn.turnId ?? turn.id)}`, childSet: `${children.source}:${children.items.map((child) => `${child.id}:${child.status}`).sort().join(',')}`, cache: this.cacheState(snapshot.agent, snapshot.timeline) };
   }
   private async confirmationReceipt(kind: Confirmation['kind'], session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>, why: string) {
@@ -1704,7 +1744,8 @@ export class ArcpService implements ExecutionPlacementPort {
     if (refresh) await this.observe(id);
     const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
     const requested = this.requested(session); let agent: Record<string, any> | undefined; let timeline: unknown[] | undefined; let source: 'sdk' | 'cli' | undefined;
-    if (session.externalId) try { const snapshot = await this.adapterFor(session).snapshot(session.externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
+    const externalId = await this.canonicalRuntimeIdentity(session);
+    if (externalId) try { const snapshot = await this.adapterFor(session).snapshot(externalId); agent = snapshot.agent; timeline = snapshot.timeline; source = snapshot.source; } catch { /* persisted last observation remains useful but stale */ }
     const current = agent ?? {}; const usage = safeJson(current.lastUsage); const numeric = (value: unknown): number | 'unknown' => typeof value === 'number' && Number.isFinite(value) ? value : 'unknown';
     const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
     const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
@@ -1716,7 +1757,7 @@ export class ArcpService implements ExecutionPlacementPort {
     // Paseo marks a completed turn as requiring acknowledgement too; that is not
     // an actionable permission/attention condition for ARCP supervision.
     const pending = agent ? (Array.isArray(current.pendingPermissions) ? current.pendingPermissions.length : 'unknown') : 'unknown'; const attention = agent ? pending === 'unknown' ? (current.attentionReason === 'permission' || current.status === 'permission' || session.lastTurnState === 'requires_action' ? true : 'unknown') : pending !== 0 || current.attentionReason === 'permission' || current.status === 'permission' : 'unknown'; const attentionWhy = attention === true ? String(current.attentionReason ?? (pending !== 'unknown' && pending > 0 ? 'pending permission' : session.lastTurnState === 'requires_action' ? 'runtime requires action' : 'runtime attention')) : undefined;
-    const health: RuntimeObservation['health'] = attention === true || mismatch || session.state === 'attention' ? 'attention' : !agent && !session.externalId ? 'unavailable' : freshness === 'stale' || session.state === 'transport_indeterminate' ? 'degraded' : agent ? 'healthy' : 'unknown';
+    const health: RuntimeObservation['health'] = attention === true || mismatch || session.state === 'attention' ? 'attention' : !agent && !externalId ? 'unavailable' : freshness === 'stale' || session.state === 'transport_indeterminate' ? 'degraded' : agent ? 'healthy' : 'unknown';
     if ((session.adapterId === 'paseo' || session.runtimeKind === 'paseo') && session.workspaceId && (pending !== 'unknown' && pending > 0 || attention === true)) {
       const facts: Array<{ kind: 'permission' | 'attention'; summary: string }> = [];
       if (pending !== 'unknown' && pending > 0) facts.push({ kind: 'permission', summary: `Runtime ${session.id} has pending permission requests` });
@@ -1729,7 +1770,7 @@ export class ArcpService implements ExecutionPlacementPort {
     // sum it into burn deltas until that provenance is proven.
     if (agent && nativeTurnId) this.runtimeBudget.record({ runtimeSessionId: session.id, providerId: session.provider, model: session.model, ...(session.mode ? { mode: session.mode } : {}), ...(session.thinking ? { thinking: session.thinking } : {}), sampledAt: observedAt ?? now(), turnCountDelta: 1, ...(typeof used === 'number' ? { contextUsed: used } : {}), ...(typeof max === 'number' ? { contextMax: max } : {}), wakeCategory: 'unknown', sourceEventId: nativeTurnId });
     const burn = this.runtimeBudget.view(session.id, this.runtimeBudgetPolicy);
-    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, burn, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
+    return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, burn, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
   }
   /** The one read-only fact bundle the temporal projection consumes. Panorama
    * and the reconcile preview must see identical facts, so they share it. */

@@ -464,6 +464,62 @@ describe('ARCP MVE control core', () => {
     await expect(pi.preflight({ provider: 'pi', model: 'grok-cli/grok-4.6', mode: 'auto' })).rejects.toMatchObject({ code: 'invalid_request' });
   });
 
+  it('launches an explicitly admitted provider/model request and refuses non-live settings', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-explicit-parity-')); const service = await control(root);
+    const admitted = await service.preflight({ provider: 'codex', model: 'GPT-5.6_TERRA', mode: 'AUTO', thinking: 'MEDIUM' });
+    expect(admitted).toMatchObject({ action: 'launch', launchable: true, profileId: 'explicit', requested: { provider: 'codex', model: 'GPT-5.6_TERRA', mode: 'AUTO', thinking: 'MEDIUM' } });
+    const { actor } = await service.registerActor({ clientIdentity: 'explicit-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'explicit parity' });
+    const launched = await service.launch({ actorId: actor.id, goalId: goal.id, provider: 'codex', model: 'GPT-5.6_TERRA', mode: 'AUTO', thinking: 'MEDIUM' });
+    expect(launched).toMatchObject({ profileId: 'explicit', provider: 'codex', model: 'GPT-5.6_TERRA', mode: 'AUTO', thinking: 'MEDIUM', state: 'idle' });
+    expect((service.cli as any).lastLaunchArgs).toEqual(expect.arrayContaining(['--provider', 'codex', '--model', 'GPT-5.6_TERRA', '--mode', 'AUTO', '--thinking', 'MEDIUM']));
+    const refused = await service.preflight({ provider: 'codex', model: 'not-a-live-model', mode: 'auto', thinking: 'medium' });
+    expect(refused).toMatchObject({ action: 'hold', launchable: false, profileId: 'explicit' });
+    const refusedGoal = await service.createGoal({ actorId: actor.id, title: 'refused explicit' });
+    await expect(service.launch({ actorId: actor.id, goalId: refusedGoal.id, provider: 'codex', model: 'not-a-live-model', mode: 'auto', thinking: 'medium' })).rejects.toMatchObject({ code: 'profile_unavailable' });
+    service.close();
+  });
+
+  it('uses the explicit profile resolution for a managed member role', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-explicit-managed-')); const service = await control(root);
+    const { actor } = await service.registerActor({ clientIdentity: 'explicit-managed-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'explicit managed' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'explicit managed runtime', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium', role: 'on-call' }) as any;
+    expect(started).toMatchObject({ member: { role: 'on-call' }, session: { profileId: 'explicit', provider: 'codex', model: 'gpt-5.6-terra' } });
+    service.close();
+  });
+
+  it('keeps one launch receipt identity across bindings, observation, reconciliation, and facts', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-launch-receipt-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async (workspaceId: string) => ({ projectId: 'prj_default', workspaceId });
+    const surface = await service.materializeSurface({ checkout: process.cwd(), kind: 'working' });
+    const { actor } = await service.registerActor({ clientIdentity: 'receipt-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'receipt identity' });
+    const launched = await service.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker', executionSurfaceId: surface.surface.id });
+    const receipt = launched.externalId!;
+    expect(service.state().runtimeBindings).toEqual(expect.arrayContaining([expect.objectContaining({ runtimeSessionId: launched.id, nativeId: receipt })]));
+    expect(launched.placement).toMatchObject({ requested: { agentId: receipt } });
+    await (service as any).facts(launched);
+    await service.store.mutate((state: any) => { const session = state.sessions.find((item: any) => item.id === launched.id); delete session.externalId; delete session.placement.requested.agentId; });
+    const observed = await service.observe(launched.id);
+    expect(observed.externalId).toBe(receipt);
+    expect(observed.placement?.requested.agentId).toBe(receipt);
+    expect(service.state().runtimeBindings.filter((binding) => binding.runtimeSessionId === launched.id).every((binding) => binding.nativeId === receipt)).toBe(true);
+    expect((await service.reconcile(launched.id)).state).toBe('idle');
+    service.close();
+  });
+
+  it('treats a healthy mode-less Pi snapshot as matching and preserves transport uncertainty', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-pi-truth-')); const service = await control(root, false, ['pi']);
+    const { actor, binding } = await service.registerActor({ clientIdentity: 'pi-truth-owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'Pi truth' });
+    await service.store.mutate((state: any) => state.sessions.push({ id: 'pi-truth-runtime', actorId: actor.id, goalId: goal.id, bindingId: binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', placement: { requested: { agentId: 'paseo-session-1' } }, externalId: 'paseo-session-1', state: 'running', createdAt: new Date().toISOString() }));
+    const observed = await service.observe('pi-truth-runtime'); const status = await service.runtimeStatus('pi-truth-runtime');
+    expect(observed).toMatchObject({ state: 'idle', placement: { status: 'PLACEMENT_MATCH' } });
+    expect(status.observation).toMatchObject({ health: 'healthy', mismatch: false, requested: { provider: 'pi', model: 'grok-cli/grok-4.6' }, observed: { provider: 'pi', model: 'grok-cli/grok-4.6' } });
+    const unreachable = (service.adapter as any).snapshot; (service.adapter as any).snapshot = async () => { throw new Error('Paseo unreachable'); };
+    const uncertain = await service.observe('pi-truth-runtime');
+    expect(uncertain.state).toBe('transport_indeterminate');
+    (service.adapter as any).snapshot = unreachable;
+    service.close();
+  });
+
   it('projects quality-labelled telemetry and retains requested/observed mismatch', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-observation-')); const service = await control(root, false, ['codex'], { status: 'permission', mode: 'full-access', pendingPermissions: [{ id: 'permission-private' }], activeTurn: { id: 'turn-1' }, lastUsage: { inputTokens: 12, cachedInputTokens: 4, outputTokens: 8, contextWindowUsedTokens: 50, contextWindowMaxTokens: 100 }, timeline: [{ type: 'compaction', status: 'completed', timestamp: '2026-01-01T00:00:00.000Z' }] });
     const { actor } = await service.registerActor({ clientIdentity: 'owner' }); const goal = await service.createGoal({ actorId: actor.id, title: 'observe' });
