@@ -27,6 +27,10 @@ class FakeCli {
     if (this.fail && args[0] === 'run') throw new Error(typeof this.fail === 'string' ? this.fail : 'timed out');
     if (args[0] === 'provider' && args[1] === 'ls') return { value: this.providers.map((provider) => ({ provider, status: 'available', enabled: true, modes: this.modeListing ?? (provider === 'pi' ? [] : ['auto', 'plan', provider === 'claude' ? 'bypassPermissions' : 'full-access']) })), stdout: '', stderr: '' };
     if (args[0] === 'provider' && args[1] === 'models') return { value: args[2] === 'codex' ? [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }] : args[2] === 'claude' ? [{ id: 'claude-opus-5', thinkingOptionIds: ['medium'] }] : [{ id: 'grok-cli/grok-4.6', thinkingOptionIds: [] }], stdout: '', stderr: '' };
+    if (args[0] === 'workspace' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
+    if (args[0] === 'project' && args[1] === 'ls') return { value: [], stdout: '', stderr: '' };
+    if (args[0] === 'project' && args[1] === 'create') return { value: { projectId: 'prj_default' }, stdout: '', stderr: '' };
+    if (args[0] === 'workspace' && args[1] === 'create') return { value: { workspaceId: 'wks_default', projectId: args[args.indexOf('--project') + 1] }, stdout: '', stderr: '' };
     if (args[0] === 'run') { this.launches += 1; this.lastLaunchArgs = args; this.lastMode = args[args.indexOf('--mode') + 1] ?? ''; return { value: { id: 'paseo-session-1' }, stdout: '', stderr: '' }; }
     if (args[0] === 'ls') return { value: this.registryListing ?? [{ id: 'paseo-session-1', status: 'idle' }], stdout: '', stderr: '' };
     if (args[0] === 'send' || args[0] === 'start-turn') { this.sends += 1; return { value: {}, stdout: '', stderr: '' }; }
@@ -128,7 +132,7 @@ describe('ARCP MVE control core', () => {
     expect(handoff).toContain(`'result' 'submit' '${workspace.workspace.id}'`);
     const launchArgs = (service.cli as any).lastLaunchArgs as string[]; expect(launchArgs).toContain('--env'); expect(launchArgs.some((arg) => arg.startsWith('ARCP_RUNTIME_MEMBER_CREDENTIAL='))).toBe(false); expect(launchArgs.some((arg) => arg.startsWith('ARCP_CLIENT_STATE=') && arg.includes('/runtime-members/'))).toBe(true);
   });
-  it('uses an explicit Paseo Workspace ID for placement while retaining the requested cwd', async () => {
+  it('round-trips requested Paseo Project, Workspace, and Agent identities while retaining the requested cwd', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-placement-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
     (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
     const { actor } = await service.registerActor({ clientIdentity: 'placement-owner' });
@@ -149,6 +153,28 @@ describe('ARCP MVE control core', () => {
     expect((service.cli as any).launches).toBe(0); expect(service.state().goals).toHaveLength(0); expect(service.state().sessions).toHaveLength(0);
     service.close();
   });
+  it('persists one canonical Paseo placement per checkout and reuses it for related Tabs', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-canonical-placement-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_checkout' });
+    const { actor } = await service.registerActor({ clientIdentity: 'canonical-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'canonical placement' });
+    const first = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'writer lane', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_checkout', workspace: '/checkout' }) as any;
+    const second = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'review lane', profileId: 'codex-worker', role: 'reviewer', workspace: '/checkout' }) as any;
+    expect(service.state().workspaces[0].paseoPlacements).toEqual([{ checkout: '/checkout', projectId: 'prj_plugins', workspaceId: 'wks_checkout' }]);
+    expect((service.cli as any).launches).toBe(2);
+    expect((service.cli as any).lastLaunchArgs).toEqual(expect.arrayContaining(['--workspace', 'wks_checkout', '--cwd', '/checkout']));
+    const panorama: any = await service.panorama(workspace.workspace.id);
+    expect(panorama.placement).toEqual([expect.objectContaining({ controlWorkspaceId: workspace.workspace.id, projectId: 'prj_plugins', workspaceId: 'wks_checkout', checkout: '/checkout', tabs: expect.arrayContaining([expect.objectContaining({ runtimeId: first.session.id, role: 'worker', goal: 'writer lane' }), expect.objectContaining({ runtimeId: second.session.id, role: 'reviewer', goal: 'review lane' })]) })]);
+    service.close();
+  });
+  it('rejects a second requested Workspace for an already canonical checkout before launch', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-conflict-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async (id: string) => ({ projectId: 'prj_plugins', workspaceId: id });
+    const { actor } = await service.registerActor({ clientIdentity: 'conflict-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'placement conflict' });
+    await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'first', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_canonical', workspace: '/checkout' });
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'duplicate', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_duplicate', workspace: '/checkout' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: expect.stringContaining('PLACEMENT_CONFLICT') });
+    expect((service.cli as any).launches).toBe(1);
+    service.close();
+  });
   it('reports a Paseo placement mismatch without calling it transport indeterminate', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-mismatch-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', workspaceId: 'wks_other' });
     const { actor } = await service.registerActor({ clientIdentity: 'mismatch-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'mismatch' });
@@ -162,6 +188,14 @@ describe('ARCP MVE control core', () => {
     const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_0e6198d7efcef5a2' }) as any;
     const reconciled = await service.reconcile(started.session.id);
     expect(reconciled).toMatchObject({ id: started.session.id, state: 'terminal', placement: { requested: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'archived' }, status: 'PLACEMENT_MATCH' } });
+    service.close();
+  });
+  it('reconciles an archived Agent missing from the active registry as terminal, not transport indeterminate', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-archived-missing-')); const service = await control(root, false, ['codex'], { status: 'archived', projectId: 'prj_plugins', workspaceId: 'wks_checkout' }, undefined, undefined, []);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_checkout' });
+    const { actor } = await service.registerActor({ clientIdentity: 'archive-missing-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'archive missing' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived missing task', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_checkout' }) as any;
+    expect(await service.reconcile(started.session.id)).toMatchObject({ id: started.session.id, state: 'terminal', placement: { status: 'PLACEMENT_MATCH', observed: { projectId: 'prj_plugins', workspaceId: 'wks_checkout', agentId: 'paseo-session-1', lifecycle: 'archived' } } });
     service.close();
   });
   it('maps Hermes ACP turn-end events to the existing idle observation and safe-point event', async () => {
