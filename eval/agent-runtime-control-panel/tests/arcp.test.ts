@@ -177,6 +177,16 @@ describe('ARCP MVE control core', () => {
     expect((service.cli as any).launches).toBe(1);
     service.close();
   });
+  it('applies the canonical placement conflict gate to direct runtime launches', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-direct-placement-conflict-')); const service = await control(root);
+    (service.adapter as any).workspacePlacement = async (id: string) => ({ projectId: 'prj_plugins', workspaceId: id });
+    const { actor } = await service.registerActor({ clientIdentity: 'direct-conflict-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'direct placement conflict' });
+    await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'canonical launch', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_canonical', workspace: '/checkout' });
+    const goal = await service.createGoal({ actorId: actor.id, title: 'alternate entry', workspaceId: workspace.workspace.id });
+    await expect(service.launch({ actorId: actor.id, goalId: goal.id, workspaceId: workspace.workspace.id, profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_duplicate', workspace: '/checkout' })).rejects.toMatchObject({ code: 'placement_conflict', message: expect.stringContaining('PLACEMENT_CONFLICT') });
+    expect((service.cli as any).launches).toBe(1);
+    service.close();
+  });
   it('holds a managed launch when Paseo cannot resolve a canonical Project identity', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-placement-unresolved-')); const service = await control(root);
     (service.adapter as any).workspacePlacement = async () => ({ workspaceId: 'wks_unresolved' });

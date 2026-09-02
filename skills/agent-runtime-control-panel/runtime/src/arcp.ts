@@ -219,7 +219,7 @@ function paseoPlacement(record: Record<string, any>): PaseoPlacement['observed']
 }
 function placementMatches(placement: PaseoPlacement): boolean {
   const observed = placement.observed;
-  return (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || Boolean(observed?.[key]) && placement.requested[key] === observed?.[key]);
+  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || placement.requested[key] === observed[key]);
 }
 function normalizedTurnState(value: unknown): 'running' | 'requires_action' | 'idle' {
   const state = normalized(value);
@@ -543,37 +543,39 @@ export class ArcpService {
       state.goals.push(goal); return goal;
     });
   }
+  /** One placement gate for every Paseo launch entry point.  A caller without
+   * an explicit placement may continue when discovery is unavailable; an
+   * explicit or already-canonical placement never silently degrades. */
+  private async resolvePaseoPlacement<T extends { workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; title?: string }>(input: T): Promise<T> {
+    if (!(this.adapter instanceof PaseoAdapter) || !input.workspaceId) return input;
+    const checkout = path.resolve(input.workspace ?? process.cwd()); const state = this.store.snapshot();
+    const controlWorkspace = state.workspaces.find((item) => item.id === input.workspaceId);
+    const persisted = controlWorkspace?.paseoPlacements?.find((item) => item.checkout === checkout);
+    if (input.paseoProjectId && input.paseoWorkspaceId) {
+      const observed = await this.adapter.workspacePlacement(input.paseoWorkspaceId).catch(() => undefined);
+      if (observed?.projectId && observed.projectId !== input.paseoProjectId) throw new ArcpError('placement_mismatch', 'PLACEMENT_MISMATCH: requested Paseo Project does not own the selected Workspace');
+    }
+    if (persisted && ((input.paseoProjectId && input.paseoProjectId !== persisted.projectId) || (input.paseoWorkspaceId && input.paseoWorkspaceId !== persisted.workspaceId))) throw new ArcpError('placement_conflict', `PLACEMENT_CONFLICT: checkout already uses Paseo Project ${persisted.projectId} and Workspace ${persisted.workspaceId}; reuse that canonical placement`);
+    let canonical = persisted; let unresolved: string | undefined;
+    if (!canonical) try { canonical = await this.adapter.materializePlacement({ checkout, projectId: input.paseoProjectId, workspaceId: input.paseoWorkspaceId, title: `ARCP · ${input.title?.trim() || 'runtime'}` }); }
+    catch (error) {
+      if (error instanceof PlacementConflict) throw new ArcpError('placement_conflict', error.message.startsWith('PLACEMENT_CONFLICT:') ? error.message : `PLACEMENT_CONFLICT: ${error.message}`);
+      unresolved = 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be materialized before launch';
+    }
+    if (canonical) {
+      if ((input.paseoProjectId && canonical.projectId !== input.paseoProjectId) || (input.paseoWorkspaceId && canonical.workspaceId !== input.paseoWorkspaceId)) throw new ArcpError('placement_conflict', `PLACEMENT_CONFLICT: requested placement differs from canonical Paseo Project ${canonical.projectId} and Workspace ${canonical.workspaceId}`);
+      if (!persisted && controlWorkspace) await this.store.mutate((next) => { const workspace = next.workspaces.find((item) => item.id === input.workspaceId)!; workspace.paseoPlacements = [...(workspace.paseoPlacements ?? []), canonical!]; workspace.updatedAt = now(); });
+      return { ...input, paseoProjectId: canonical.projectId, paseoWorkspaceId: canonical.workspaceId, workspace: checkout };
+    }
+    if (input.paseoProjectId || input.paseoWorkspaceId || persisted) throw new ArcpError('placement_unresolved', unresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch');
+    return { ...input, workspace: checkout, ...(unresolved ? { placementUnresolved: unresolved } : {}) };
+  }
   async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
     if (!preflight.launchable) return preflight;
-    if (input.paseoProjectId && input.paseoWorkspaceId && this.adapter instanceof PaseoAdapter) {
-      const placement = await this.adapter.workspacePlacement(input.paseoWorkspaceId).catch(() => undefined);
-      if (placement?.projectId && placement.projectId !== input.paseoProjectId) return { ...preflight, action: 'hold', launchable: false, why: 'PLACEMENT_MISMATCH: requested Paseo Project does not own the selected Workspace' };
-    }
-    const checkout = path.resolve(input.workspace ?? process.cwd());
-    const controlWorkspace = state.workspaces.find((item) => item.id === input.workspaceId)!;
-    const persisted = controlWorkspace.paseoPlacements?.find((item) => item.checkout === checkout);
-    if (persisted && ((input.paseoProjectId && input.paseoProjectId !== persisted.projectId) || (input.paseoWorkspaceId && input.paseoWorkspaceId !== persisted.workspaceId))) {
-      return { ...preflight, action: 'hold', launchable: false, why: `PLACEMENT_CONFLICT: checkout already uses Paseo Project ${persisted.projectId} and Workspace ${persisted.workspaceId}; reuse that canonical placement` };
-    }
-    let canonical = persisted;
-    let placementUnresolved: string | undefined;
-    if (!canonical && this.adapter instanceof PaseoAdapter) {
-      try { canonical = await this.adapter.materializePlacement({ checkout, projectId: input.paseoProjectId, workspaceId: input.paseoWorkspaceId, title: `ARCP · ${input.title.trim()}` }); }
-      catch (error) {
-        if (error instanceof PlacementConflict) return { ...preflight, action: 'hold', launchable: false, why: error.message };
-        placementUnresolved = 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be materialized before launch';
-      }
-      if (canonical) {
-        if ((input.paseoProjectId && canonical.projectId !== input.paseoProjectId) || (input.paseoWorkspaceId && canonical.workspaceId !== input.paseoWorkspaceId)) return { ...preflight, action: 'hold', launchable: false, why: `PLACEMENT_CONFLICT: requested placement differs from canonical Paseo Project ${canonical.projectId} and Workspace ${canonical.workspaceId}` };
-        await this.store.mutate((next) => { const workspace = next.workspaces.find((item) => item.id === input.workspaceId)!; workspace.paseoPlacements = [...(workspace.paseoPlacements ?? []), canonical!]; workspace.updatedAt = now(); });
-      }
-    }
-    if (!canonical?.projectId || !canonical.workspaceId) {
-      if (input.paseoProjectId || input.paseoWorkspaceId) return { ...preflight, action: 'hold', launchable: false, why: placementUnresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch' };
-      input = { ...input, workspace: checkout, ...(placementUnresolved ? { placementUnresolved } : {}) };
-    } else input = { ...input, paseoProjectId: canonical.projectId, paseoWorkspaceId: canonical.workspaceId, workspace: checkout };
+    try { input = await this.resolvePaseoPlacement(input); }
+    catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof ArcpError ? error.message : 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be resolved before launch' }; }
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope });
     const profile = this.profileData.find((item) => item.id === preflight.profileId);
@@ -696,6 +698,7 @@ export class ArcpService {
     const binding = state.bindings.find((item) => item.actorId === input.actorId);
     if (!goal || !binding) throw new ArcpError('unknown_recipient', 'actor or goal is not registered');
     if (input.memberId && !state.members.some((item) => item.id === input.memberId && (!input.workspaceId || item.workspaceId === input.workspaceId))) throw new ArcpError('unknown_recipient', 'managed member is not in workspace');
+    input = await this.resolvePaseoPlacement(input);
     if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal')) {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
     }
