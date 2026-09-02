@@ -26,12 +26,24 @@ export function renderTuiSnapshot(view: Panorama, selected = 0, tab = 0, expande
   const blocked = Array.isArray(view.blocked) ? view.blocked : [];
   const blockedByRuntime = new Map<string, any>(blocked.map((item: any) => [String(item.runtimeSessionId), item]));
   const minutes = (ms: unknown) => typeof ms === 'number' && Number.isFinite(ms) ? `${Math.floor(ms / 60000)}m` : 'unknown';
-  const tabs = ['overview', 'runtimes'];
+  const tabs = ['overview', 'runtimes', 'temporal'];
   const lines = [
     `ARCP TUI · ${workspace.purpose ?? workspace.id ?? 'workspace'}`,
     `tab=${tabs[tab]} selected=${selected + 1}/${Math.max(runtime.length, 1)} expanded=${expanded ? 'yes' : 'no'}`,
     `Workspace ${workspace.lifecycle ?? 'unknown'} · Goals ${goals.length} · Tasks ${tasks.length} · Members ${roster.length}`,
   ];
+  if (tab === 2) {
+    const temporal = view.temporal ?? {}; const groups = Array.isArray(temporal.groups) ? temporal.groups : [];
+    lines.push(`Temporal ${groups.length} subject timelines · problems ${(temporal.problems ?? []).length}`);
+    for (const group of groups) {
+      const card = group.active ?? group.history?.[0]; if (!card) continue;
+      lines.push(`  ${group.subject?.label ?? 'Workspace'} · ${card.disposition} · ${card.transport?.state}`);
+      lines.push(`    ${card.headline} · next: ${card.nextAction}`);
+      if (card.problems?.length) lines.push(`    problems: ${card.problems.join(', ')}`);
+    }
+    lines.push('Keys: arrows select · tab view · enter details · r refresh · q quit');
+    return lines.join('\n');
+  }
   for (const [index, item] of runtime.entries()) {
     const session = item.session ?? {}, observation = item.observation ?? {}, children = item.children ?? {}, work = item.workSummary ?? {};
     const prefix = index === selected ? '>' : ' ';

@@ -12,10 +12,13 @@ import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, normalizeChannelEvent } from './content.js';
 import { projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
 import { renderChannelMarkdown, type ChannelMarkdownOptions } from './channel-markdown.js';
+import { projectTemporal, temporalReconciliationPreview, type TemporalFilter, type TemporalProjection } from './temporal-projection.js';
 export { projectChannelEvent, renderChannelCard, channelCardFor } from './channel-projection.js';
 export { renderChannelMarkdown, escapeMarkdown, escapeCode } from './channel-markdown.js';
 export type { ChannelProjection, ChannelProjectionFacts, ChannelProjectionRef } from './channel-projection.js';
 export type { ChannelMarkdownOptions } from './channel-markdown.js';
+export { projectTemporal, temporalReconciliationPreview } from './temporal-projection.js';
+export type { TemporalFilter, TemporalProjection, TemporalProjectionFacts, TemporalCard, TemporalDisposition } from './temporal-projection.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
 export type { StateStore } from './state-store.js';
@@ -1205,7 +1208,7 @@ export class ArcpService {
   }
   private supervisionView(state: State): SupervisionView {
     return {
-      subjects: state.tasks.map((task) => ({ id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) })),
+      subjects: state.tasks.map((task) => ({ id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.scope ? { scope: task.scope } : {}), ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) })),
       results: state.results.map((result) => ({ taskId: result.taskId, createdAt: result.createdAt })),
       knowledge: state.knowledge.map((entry) => ({ taskId: entry.taskId, createdAt: entry.createdAt })),
       events: state.channelEvents.map((event) => ({ taskId: event.taskId, kind: event.kind, createdAt: event.createdAt })),
@@ -1218,7 +1221,7 @@ export class ArcpService {
   supervisionProgress(taskId: string): { at: string; source: string } | undefined {
     const state = this.store.snapshot();
     const task = state.tasks.find((item) => item.id === taskId);
-    return task ? materialProgressAt(this.supervisionView(state), { id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) }) : undefined;
+    return task ? materialProgressAt(this.supervisionView(state), { id: task.id, workspaceId: task.workspaceId, generation: task.fence, lifecycle: task.lifecycle, createdAt: task.createdAt, updatedAt: task.updatedAt, ...(task.scope ? { scope: task.scope } : {}), ...(task.ownerMemberId && state.members.find((member) => member.id === task.ownerMemberId)?.role ? { ownerRole: state.members.find((member) => member.id === task.ownerMemberId)!.role } : {}) }) : undefined;
   }
   /**
    * Evaluate every automatic policy at `nowMs` and durably record any breach.
@@ -1305,11 +1308,16 @@ export class ArcpService {
     }
     return { session, observation: { status: session.state, activeTurn: agent ? Boolean(current.activeTurn) : 'unknown', usage: { input: numeric(usage.inputTokens), cached: numeric(usage.cachedInputTokens), output: numeric(usage.outputTokens) }, context: { used, max, ratio, quality: agent && typeof used === 'number' ? source === 'sdk' ? 'observed' : 'reported' : 'unavailable' }, pendingPermissions: pending, attention, ...(attentionWhy ? { attentionWhy } : {}), compaction: { count: Array.isArray(timeline) ? compactions.length : 'unknown', status: !Array.isArray(timeline) ? 'unavailable' : !compactions.length ? 'none' : lastCompaction?.status === 'loading' ? 'loading' : 'completed', ...(setting(lastCompaction?.timestamp ?? lastCompaction?.createdAt) ? { lastAt: String(lastCompaction?.timestamp ?? lastCompaction?.createdAt) } : {}) }, cache: { ...(cacheInfo.activityAt ? { activityAt: cacheInfo.activityAt } : {}), ageMinutes: cacheInfo.ageMinutes ?? 'unknown', state: cacheInfo.state }, ...(observedAt ? { lastObservedAt: observedAt } : {}), freshness, health, requested, observed, mismatch }, children: await this.children(session.externalId, this.adapterFor(session)), workSummary: await this.workSummary(session.workspace) };
   }
-  async panorama(workspaceId: string, refresh = false) {
+  async panorama(workspaceId: string, refresh = false, temporalFilter: TemporalFilter = 'active') {
     const context = this.context(workspaceId); const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId); const runtime = await Promise.all(sessions.map((item) => this.runtimeStatus(item.id, refresh)));
     const goals = state.goals.filter((goal) => sessions.some((session) => session.goalId === goal.id));
     const placement = (context.workspace.paseoPlacements ?? []).map((item) => ({ controlWorkspaceId: workspaceId, projectId: item.projectId, workspaceId: item.workspaceId, checkout: item.checkout, tabs: sessions.filter((session) => session.placement?.requested.workspaceId === item.workspaceId).map((session) => ({ runtimeId: session.id, agentId: session.externalId, role: state.members.find((member) => member.id === session.memberId)?.role, goalId: session.goalId, goal: goals.find((goal) => goal.id === session.goalId)?.title, cwd: session.workspace, model: session.model, mode: session.mode, thinking: session.thinking })) }));
-    return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id };
+    const temporal = projectTemporal({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() }, temporalFilter);
+    return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
+  }
+  temporalReconciliation(workspaceId: string) {
+    const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);
+    return temporalReconciliationPreview({ channelEvents: state.channelEvents.filter((item) => item.workspaceId === workspaceId), deliveries: state.deliveries, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), sessions, members: state.members.filter((item) => item.workspaceId === workspaceId), goals: state.goals.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), nowMs: Date.now() });
   }
   state() { return this.store.snapshot(); }
 }
