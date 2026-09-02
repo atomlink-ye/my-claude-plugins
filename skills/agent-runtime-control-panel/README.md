@@ -27,9 +27,19 @@ silently select a provider, model, or permission mode.
 | --- | --- | --- | --- |
 | `claude-manager` | Manager | Claude / `claude-opus-5` | `auto` |
 | `claude-bypass-permissions` | Manager with an explicit elevation | Claude / `claude-opus-5` | `bypassPermissions` |
+| `claude-sonnet-worker` | Worker | Claude / `claude-sonnet-5` | `auto` |
+| `claude-sonnet-worker-bypass` | Worker with an explicit elevation | Claude / `claude-sonnet-5` | `bypassPermissions` |
 | `codex-worker` | Worker | Codex / `gpt-5.6-terra` | `auto` |
-| `codex-full-access` | Worker with an explicit elevation | Codex / `gpt-5.6-terra` | `full-access` |
+| `codex-auto-review` | Worker with an explicit elevation | Codex / `gpt-5.6-terra` | `auto-review` |
+| `codex-full-access` | Worker with a full local execution surface | Codex / `gpt-5.6-terra` | `full-access` |
 | `pi-grok-worker` | Worker | Pi / `grok-cli/grok-4.6` | no ARCP mode |
+
+Modes are provider vocabulary, not a shared scale: Codex ranks
+`auto` below `auto-review` below `full-access`, Claude ranks `auto` below
+`bypassPermissions`, and the two ladders are never compared with each other.
+Unattended work needs an explicit stronger mode on its own provider, so an
+unattended Codex profile is `auto-review` or `full-access` by execution need
+and never `auto`.
 
 Choose a named profile deliberately and run preflight before starting. ARCP
 validates the requested provider, model, thinking setting, and mode live; it

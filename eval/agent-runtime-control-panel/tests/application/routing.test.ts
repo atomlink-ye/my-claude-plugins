@@ -74,6 +74,16 @@ describe('routing guidance and provider selection receipts', () => {
     service.close();
   });
 
+  it('documents every configured launch profile in the skill README', async () => {
+    // The README presents its table as the source of the named profiles, so a
+    // profile added to config without a row there is a documentation lie.
+    const readmePath = fileURLToPath(new URL('../../../../skills/agent-runtime-control-panel/README.md', import.meta.url));
+    const config = JSON.parse(await readFile(configPath, 'utf8'));
+    const readme = await readFile(readmePath, 'utf8');
+    const documented = new Set([...readme.matchAll(/^\| `([a-z0-9-]+)`/gm)].map((match) => match[1]));
+    expect(config.profiles.map((profile: any) => profile.id).filter((id: string) => !documented.has(id))).toEqual([]);
+  });
+
   it('binds every configured profile model to a provider-budget rule', async () => {
     const config = JSON.parse(await readFile(configPath, 'utf8'));
     for (const profile of config.profiles) expect(config.providerBudget.bindings.some((binding: any) => binding.providerId === profile.provider && binding.modelPatterns.includes(profile.model))).toBe(true);
