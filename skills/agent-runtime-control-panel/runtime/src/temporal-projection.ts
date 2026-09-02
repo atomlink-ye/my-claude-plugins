@@ -1,4 +1,5 @@
 import type { ChannelEvent, Delivery, Goal, KnowledgeEntry, Member, Result, RuntimeSession, Task } from './arcp.js';
+import { projectChannelEvent } from './channel-projection.js';
 
 /** Read-only causal view. These are deliberately not durable state fields. */
 export type TemporalDisposition = 'active' | 'resolved' | 'superseded' | 'invalidated' | 'expired_informational' | 'stale_requires_review';
@@ -14,7 +15,8 @@ export interface TemporalProjectionFacts {
   members: readonly Member[];
   goals: readonly Goal[];
   knowledge: readonly KnowledgeEntry[];
-  now?: string;
+  /** Injected by the caller: builders never read the clock. */
+  nowMs?: number;
 }
 export interface TemporalCausation { causedBy?: string; supersedes?: string; resolvedBy?: string; replacement?: string; }
 export interface TemporalCard {
@@ -40,9 +42,7 @@ export interface TemporalCard {
 export interface TemporalProjection { filter: TemporalFilter; generatedAt: string; groups: Array<{ subject: TemporalCard['subject']; active?: TemporalCard; history: TemporalCard[] }>; cards: TemporalCard[]; problems: TemporalCard[]; reconciliation: Array<{ eventId: string; disposition: TemporalDisposition; reason: string; deterministic: boolean; nextAction: string }>; }
 
 const BUDGET_MS = 60 * 60 * 1000;
-const stage = (text: string) => text.match(/\b(?:R(?:ound)?[- ]?)(\d)(?:[- ·:]*(?:lane )?([A-Z]))?/i)?.slice(1).filter(Boolean).map((v, i) => i ? `Lane ${v.toUpperCase()}` : `Round-${v}`).join(' ');
 const age = (at: string, now: number) => Math.max(0, now - Date.parse(at));
-const short = (text: string, max = 160) => text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 const eventRuntime = (event: ChannelEvent, deliveries: readonly Delivery[], sessions: readonly RuntimeSession[]) => {
   const delivery = deliveries.find((item) => item.eventId === event.id);
   return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : undefined;
@@ -55,12 +55,16 @@ const refs = (event: ChannelEvent) => ({ taskId: event.taskId, resultId: event.r
  * reconciliation proposals, but a later Protect slice owns any append.
  */
 export function projectTemporal(facts: TemporalProjectionFacts, filter: TemporalFilter = 'active'): TemporalProjection {
-  const nowText = facts.now ?? new Date().toISOString(); const now = Date.parse(nowText);
+  // A deterministic fallback keeps direct/unit callers pure. Production callers
+  // inject `nowMs`; no builder observes wall-clock time itself.
+  const now = facts.nowMs ?? Math.max(0, ...facts.channelEvents.map((event) => Date.parse(event.createdAt)));
+  const nowText = new Date(now).toISOString();
   const tasks = new Map(facts.tasks.map((item) => [item.id, item]));
   const members = new Map(facts.members.map((item) => [item.id, item]));
   const resultsByTask = new Map<string, Result[]>();
   for (const result of facts.results) resultsByTask.set(result.taskId, [...(resultsByTask.get(result.taskId) ?? []), result].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
   const cards: TemporalCard[] = facts.channelEvents.map((event) => {
+    const channel = projectChannelEvent(event, facts);
     const task = event.taskId ? tasks.get(event.taskId) : undefined;
     const delivery = facts.deliveries.find((item) => item.eventId === event.id);
     const runtime = eventRuntime(event, facts.deliveries, facts.sessions);
@@ -87,10 +91,13 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     if (task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst') problems.push('steward_recursion');
     if (event.kind === 'task_completed' && !results.some((result) => result.createdAt <= event.createdAt)) problems.push('completion_without_result');
     if (replacement) problems.push('generation_replaced');
-    const subject = task ? { kind: 'task' as const, id: task.id, label: task.title } : runtime ? { kind: 'runtime' as const, id: `${runtime.id}:${runtime.generation}`, label: `${runtime.provider} generation ${runtime.generation}` } : { kind: 'workspace' as const, id: event.workspaceId ?? 'workspace', label: 'Workspace obligation' };
+    // A Steward may report a supervision breach but must never become a
+    // supervised subject itself. Keep the anomalous evidence at workspace scope.
+    const stewardSubject = task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst';
+    const subject = stewardSubject ? { kind: 'workspace' as const, id: event.workspaceId ?? 'workspace', label: 'Excluded Steward analysis' } : task ? { kind: 'task' as const, id: task.id, label: task.title } : runtime ? { kind: 'runtime' as const, id: `${runtime.id}:${runtime.generation}`, label: `${runtime.provider} generation ${runtime.generation}` } : { kind: 'workspace' as const, id: event.workspaceId ?? 'workspace', label: 'Workspace obligation' };
     const owner = event.targetRole ?? (event.targetMemberId ? members.get(event.targetMemberId)?.label ?? 'target member' : task?.ownerMemberId ? members.get(task.ownerMemberId)?.label ?? 'Task owner' : 'Manager/Deputy');
     const nextAction = disposition === 'active' ? (event.deliveryState === 'undeliverable' || event.deliveryState === 'transport_indeterminate' ? 'Deliver to a current reachable target; transport failure does not close this obligation.' : event.decisionRequired ? 'Current owner must record one semantic disposition.' : 'Continue the current obligation.') : disposition === 'stale_requires_review' ? 'Manager or Deputy must review and append a disposition in a later protected slice.' : 'Keep as causal history; no delivery-state rewrite is proposed.';
-    return { id: event.id, subject, eventId: event.id, eventTime: event.createdAt, ageMs: eventAge, sender: { label: senderMember?.label ?? 'unattributed', role: senderMember?.role ?? 'unknown' }, ...(stage(task?.title ?? event.content.summary) ? { stage: stage(task?.title ?? event.content.summary) } : {}), headline: short(event.content.summary), summary: short(event.content.summary, 480), transport: { state: event.deliveryState, queuedAt: event.createdAt, ...(event.deliveredAt ? { deliveredAt: event.deliveredAt } : {}), ...(event.processedAt ? { processedAt: event.processedAt } : {}), ...(delivery ? { targetGeneration: delivery.generation } : {}), ...(event.undeliverableReason ? { undeliverableReason: event.undeliverableReason } : {}) }, disposition, dispositionReason, causation, owner, nextAction, ...(problems.includes('overdue') ? { dueMs: BUDGET_MS } : {}), refs: refs(event), problems };
+    return { id: event.id, subject, eventId: event.id, eventTime: event.createdAt, ageMs: eventAge, sender: channel.sender, ...(channel.stage ? { stage: channel.stage } : {}), headline: channel.headline, summary: channel.summary.join(' '), transport: { state: event.deliveryState, queuedAt: event.createdAt, ...(event.deliveredAt ? { deliveredAt: event.deliveredAt } : {}), ...(event.processedAt ? { processedAt: event.processedAt } : {}), ...(delivery ? { targetGeneration: delivery.generation } : {}), ...(event.undeliverableReason ? { undeliverableReason: event.undeliverableReason } : {}) }, disposition, dispositionReason, causation, owner, nextAction, ...(problems.includes('overdue') ? { dueMs: BUDGET_MS } : {}), refs: refs(event), problems };
   });
   // Rule 4: same sourceId is one semantic Result. Mark all but the earliest
   // corresponding candidate cards as duplicate evidence, never extra work.

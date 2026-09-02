@@ -3,7 +3,7 @@ import { projectTemporal } from '../../../skills/agent-runtime-control-panel/run
 
 const at = '2026-09-02T00:00:00.000Z';
 const event = (id: string, kind: any, taskId?: string) => ({ id, workspaceId: 'w', taskId, kind, urgency: 'normal', decisionRequired: kind === 'decision_required', content: { summary: `${kind} fact`, evidenceRefs: [], contentHash: id, sensitivity: 'normal', retention: 'standard' }, deliveryState: 'queued', transitions: [{ state: 'queued', at }], createdAt: at });
-const facts = (channelEvents: any[], extra: any = {}) => ({ channelEvents, deliveries: [], tasks: [{ id: 'task-done', workspaceId: 'w', title: 'Completed task', lifecycle: 'completed', fence: 1, createdAt: at, updatedAt: '2026-09-02T01:00:00.000Z' }, { id: 'task-live', workspaceId: 'w', title: 'Live blocker', lifecycle: 'claimed', fence: 1, createdAt: at, updatedAt: at }], results: [{ id: 'result-done', workspaceId: 'w', taskId: 'task-done', memberId: 'm', fence: 1, status: 'candidate', summary: 'accepted evidence', evidenceRefs: [], createdAt: at }], sessions: [], members: [{ id: 'm', workspaceId: 'w', label: 'Owner', role: 'manager', joinKind: 'native', capabilities: [], lifecycle: 'active', createdAt: at, updatedAt: at }], goals: [], knowledge: [], now: '2026-09-02T02:00:01.000Z', ...extra });
+const facts = (channelEvents: any[], extra: any = {}) => ({ channelEvents, deliveries: [], tasks: [{ id: 'task-done', workspaceId: 'w', title: 'Completed task', lifecycle: 'completed', fence: 1, createdAt: at, updatedAt: '2026-09-02T01:00:00.000Z' }, { id: 'task-live', workspaceId: 'w', title: 'Live blocker', lifecycle: 'claimed', fence: 1, createdAt: at, updatedAt: at }], results: [{ id: 'result-done', workspaceId: 'w', taskId: 'task-done', memberId: 'm', fence: 1, status: 'candidate', summary: 'accepted evidence', evidenceRefs: [], createdAt: at }], sessions: [], members: [{ id: 'm', workspaceId: 'w', label: 'Owner', role: 'manager', joinKind: 'native', capabilities: [], lifecycle: 'active', createdAt: at, updatedAt: at }], goals: [], knowledge: [], nowMs: Date.parse('2026-09-02T02:00:01.000Z'), ...extra });
 
 describe('TemporalProjection', () => {
   it('keeps Delivery transport distinct from machine-provable semantic disposition', () => {
@@ -27,5 +27,12 @@ describe('TemporalProjection', () => {
     const projection = projectTemporal(facts([old, done], { results: [], deliveries: [{ id: 'delivery', fromActorId: 'a', runtimeSessionId: 'runtime-old', generation: 1, body: '', command: 'normal', state: 'queued', eventId: 'old-generation', createdAt: at }], sessions: [{ id: 'runtime-old', actorId: 'a', goalId: 'g', bindingId: 'b', generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'terminal', createdAt: at }, { id: 'runtime-new', actorId: 'a', goalId: 'g', bindingId: 'b', generation: 2, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'running', createdAt: at }] }));
     expect(projection.reconciliation.find((item) => item.eventId === 'old-generation')).toMatchObject({ disposition: 'invalidated' });
     expect(projection.problems.find((item) => item.id === 'completion-without-result')?.problems).toContain('completion_without_result');
+  });
+
+  it('uses the canonical Channel projection and injected time, never raw event wording or a clock', () => {
+    const raw = event('human-card', 'blocker', 'task-live'); raw.content.summary = 'blocker task_opaque999 must be fixed';
+    const projection = projectTemporal(facts([raw]));
+    expect(projection.generatedAt).toBe('2026-09-02T02:00:01.000Z');
+    expect(projection.cards[0].headline).not.toContain('task_opaque999');
   });
 });
