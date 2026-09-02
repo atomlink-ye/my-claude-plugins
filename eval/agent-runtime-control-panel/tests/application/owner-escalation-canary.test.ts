@@ -247,12 +247,20 @@ describe('owner escalation canary', () => {
   it('registers channels only at startup and reports a configured-but-unwired channel instead of pretending', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-registry-'));
     const { service } = await createControl(root);
-    // The shipped config declares Hermes, but no transport is wired in a test
-    // process. It must be visible as configured-and-unavailable rather than
-    // registered with a stub that would accept envelopes nobody receives.
-    const discovery = service.channelDiscovery();
-    expect(discovery.some((item) => item.adapterId === 'hermes' && item.configured && !item.available)).toBe(true);
-    expect(service.channels.has('hermes')).toBe(false);
+    // The shipped config declares Hermes and the ACP runtime adapter backs it,
+    // so the channel is genuinely available without any chat transport.
+    expect(service.channelDiscovery().some((item) => item.adapterId === 'hermes' && item.configured && item.available)).toBe(true);
+    expect(service.channels.has('hermes')).toBe(true);
+
+    // With no ACP adapter there is nothing to deliver through, and that must be
+    // reported rather than registered behind a stub that accepts envelopes
+    // nobody receives.
+    const bare = (await createControl(await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-bare-')))).service;
+    (bare as any).adapters.delete('hermes-acp');
+    (bare as any).channels = new (service.channels.constructor as any)();
+    (bare as any).registerConfiguredChannels([{ id: 'hermes', provider: 'builtin:hermes' }]);
+    expect(bare.channelDiscovery().some((item) => item.adapterId === 'hermes' && item.configured && !item.available)).toBe(true);
+    bare.close();
     service.close();
   });
 
@@ -308,6 +316,35 @@ describe('owner escalation canary', () => {
     expect(disposed.dispositions.at(-1)).toMatchObject({ actorMemberId: manager.id });
     expect(disposed.dispositions.at(-1)!.reason).toContain('undeliverable disposition');
     expect(disposed.deliveryState).toBe('undeliverable');
+    service.close();
+  });
+
+  it('wakes the Owner through a Hermes ACP prompt turn, never a human chat', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    // Replace the ACP runtime adapter with a recorder: the Owner channel must
+    // reach an internal ACP session, and nothing here may touch a chat.
+    const turns: Array<{ externalId: string; body: string; deliveryId: string }> = [];
+    (service as any).adapters.set('hermes-acp', { id: 'hermes-acp', startTurn: async (externalId: string, body: string, deliveryId: string) => { turns.push({ externalId, body, deliveryId }); return {}; } });
+    (service as any).channels = new ((service.channels as any).constructor)();
+    (service as any).registerConfiguredChannels([{ id: 'hermes', provider: 'builtin:hermes' }]);
+    await service.rebindActor({ actorId: workspace.ownerActorId, channel: 'hermes' as any, conversationRef: 'acp-session-opaque-1' });
+
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    const escalated = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'Manager ACK SLA expired' });
+
+    expect(escalated.receipt?.state).toBe('accepted');
+    expect(turns).toHaveLength(1);
+    // The ACP session id is the whole address; no chat id, path or prompt text
+    // about the recipient crosses this boundary.
+    expect(turns[0].externalId).toBe('acp-session-opaque-1');
+    expect(turns[0].deliveryId).toBe(escalated.event.id);
+    expect(turns[0].body).toContain('[ARCP escalation]');
+    expect(turns[0].body).not.toMatch(/oc_|om_|feishu|lark|\/(Users|home)\//i);
+    // A retried escalation must not start a second turn.
+    await service.escalateToOwnerActor({ eventId: decision.id, reason: 'Manager ACK SLA expired' });
+    expect(turns).toHaveLength(1);
     service.close();
   });
 });

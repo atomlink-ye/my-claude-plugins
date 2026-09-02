@@ -1,10 +1,9 @@
-import { spawn } from 'node:child_process';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { URL } from 'node:url';
 import { homedir } from 'node:os';
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { ArcpService } from './arcp.js';
 import { handleArcp } from './arcp-server.js';
@@ -212,31 +211,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     const app = await createServer(resolveDataDir(), port);
     app.arcp.setPort(port);
-    // Real Hermes wire, installed only in the daemon entrypoint so the
-    // deterministic suite can never reach a live conversation. The binding's
-    // conversation reference stays opaque to ARCP; only this transport parses
-    // it, and only the chat id is ever passed outward.
-    const hermesBin = process.env.ARCP_HERMES_CLI ?? 'lark-cli';
-    app.arcp.setHermesTransport(async (binding, envelope) => {
-      const chatId = /(oc_[a-zA-Z0-9]+)/.exec(binding.recipientRef)?.[1];
-      if (!chatId) return 'refused';
-      const text = `[ARCP escalation] ${envelope.summary}\nrefs: ${envelope.refs.join(', ')}`;
-      // The channel caps its idempotency key well below what an ARCP event id
-      // needs, so derive a bounded deterministic key: same escalation still maps
-      // to the same transport key, which is what idempotency actually requires.
-      const transportKey = `arcp-${createHash('sha256').update(envelope.idempotencyKey).digest('hex').slice(0, 40)}`;
-      return await new Promise((resolve) => {
-        // A supervisor-launched daemon does not inherit a login shell PATH, so the
-        // channel binary must be resolvable without one.
-        const child = spawn(hermesBin, ['im', '+messages-send', '--chat-id', chatId, '--text', text, '--idempotency-key', transportKey], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin` } });
-        let out = '';
-        child.stdout.on('data', (chunk) => { out += String(chunk); });
-        let err = '';
-        child.stderr.on('data', (chunk) => { err += String(chunk); });
-        child.on('error', (error) => { console.error(`[hermes-channel] spawn failed: ${error instanceof Error ? error.message : 'unknown'}`); resolve('refused'); });
-        child.on('close', (code) => { if (code !== 0) console.error(`[hermes-channel] exit ${code}: ${err.slice(0, 300)}`); resolve(code === 0 ? (/"duplicate"\s*:\s*true/.test(out) ? 'duplicate' : 'accepted') : 'refused'); });
-      });
-    });
     await startServer(app, port);
     console.log(`ARCP listening on http://127.0.0.1:${port}`);
   } catch (error) {

@@ -907,10 +907,29 @@ export class ArcpService implements ExecutionPlacementPort {
       if (!id || !provider) throw new ArcpError('invalid_request', 'actor channel entries need an id and a provider');
       if (this.channels.has(id)) throw new ArcpError('invalid_request', `actor channel ${id} is configured more than once`);
       if (provider !== 'builtin:hermes') throw new ArcpError('invalid_request', `actor channel provider ${provider} is not available in core`);
-      if (!this.hermesTransport) { this.channelStatus.push({ adapterId: id, configured: true, available: false, detail: 'no Hermes transport is wired; escalations will be recorded undeliverable' }); continue; }
-      this.channels.register(new HermesChannelAdapter(this.hermesTransport));
+      const transport = this.hermesTransport ?? this.hermesAcpTransport();
+      if (!transport) { this.channelStatus.push({ adapterId: id, configured: true, available: false, detail: 'no Hermes ACP runtime adapter is available; escalations will be recorded undeliverable' }); continue; }
+      this.channels.register(new HermesChannelAdapter(transport));
       this.channelStatus.push({ adapterId: id, configured: true, available: true });
     }
+  }
+
+  /** The Owner channel targets an internal Hermes ACP session, never a human
+   * chat. `recipientRef` is an opaque ACP session id and delivery is an ACP
+   * prompt turn, so the wake stays inside the agent control plane. Reaching a
+   * person is a separate, explicit Human Gate and is not this seam. */
+  private hermesAcpTransport(): ((binding: ChannelBindingRef, envelope: ActorDeliveryEnvelope) => Promise<'accepted' | 'duplicate' | 'refused'>) | undefined {
+    const adapter = this.adapters.get('hermes-acp') as (RuntimeAdapter & { startTurn?: (externalId: string, body: string, deliveryId: string) => Promise<unknown> }) | undefined;
+    if (!adapter?.startTurn) return undefined;
+    return async (binding, envelope) => {
+      if (!binding.recipientRef) return 'refused';
+      const body = `[ARCP escalation] ${envelope.summary}\nrefs: ${envelope.refs.join(', ')}`;
+      // The ACP session id is the whole address; nothing else about the
+      // recipient crosses this boundary, and the idempotency key doubles as
+      // the delivery id so a retried turn is recognisable downstream.
+      try { await adapter.startTurn!(binding.recipientRef, body, envelope.idempotencyKey); return 'accepted'; }
+      catch { return 'refused'; }
+    };
   }
 
   /** Install the real Hermes wire. Kept out of the constructor so the
