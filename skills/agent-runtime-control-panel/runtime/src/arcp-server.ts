@@ -46,7 +46,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
   try {
     const method = req.method ?? 'GET'; const path = url.pathname;
     if (method === 'GET' && path === '/v1/profiles') { send(res, 200, service.profiles()); return true; }
-    if (method === 'GET' && path === '/v1/discovery') { send(res, 200, await service.discovery()); return true; }
+    if (method === 'GET' && path === '/v1/discovery') { send(res, 200, { ...(await service.discovery()), actorChannels: service.channelDiscovery() }); return true; }
     if (method === 'GET' && path === '/v1/doctor') { const discovery = await service.discovery(); send(res, 200, { daemon: 'reachable', provider: discovery.available ? 'available' : 'unavailable', profiles: discovery.profiles.map(({ id, available }) => ({ id, available })), database: service.store.check?.() ?? service.store.snapshot(), }); return true; }
     if (method === 'POST' && path === '/v1/preflight') { send(res, 200, await service.preflight(await body(req) as any)); return true; }
     if (method === 'GET' && path === '/v1/provider-budgets') { send(res, 200, service.providerBudget() ?? { status: 'source_unavailable' }); return true; }
