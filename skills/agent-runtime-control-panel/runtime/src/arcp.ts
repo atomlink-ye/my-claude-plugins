@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,10 +24,12 @@ import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisi
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
 import { collectCodexbar, collectPiGrokCache, evaluateAdmission, matchesModel, runCommandCollector, translatePaseoProviderUsage, type AdmissionDecision, type ProviderBudgetConfig, type ProviderBudgetEnvelopeV1, type ProviderBudgetSource } from './provider-budget.js';
 import { RuntimeBudgetTracker, type RuntimeBudgetPolicy, type RuntimeBudgetSample, type RuntimeBudgetSignal, type RuntimeBudgetView } from './runtime-budget.js';
+import { checkoutIdentity, surfaceName, type CheckoutRef, type ExecutionPlacementPort, type ExecutionSurface, type ExecutionSurfaceBinding, type ExecutionSurfaceKind, type ExecutionSurfaceRef, type RepositoryLocator, type RepositoryRef, type RuntimeBinding, type RuntimeBindingReceipt, type RuntimeBindingRef, type RuntimeLaunchSpec, type SurfaceArchiveAuthorization, type SurfaceClaim, type SurfaceSpec } from './execution-placement.js';
 export { PROVIDER_BUDGET_SCHEMA, validateProviderBudgetEnvelope, evaluateAdmission, collectCodexbar, collectPiGrokCache, runCommandCollector, translatePaseoProviderUsage } from './provider-budget.js';
 export type { AdmissionDecision, ProviderBudgetBinding, ProviderBudgetConfig, ProviderBudgetEnvelopeV1, ProviderBudgetPolicy, ProviderBudgetSource, ProviderBudgetSourceTrust } from './provider-budget.js';
 export { RuntimeBudgetTracker, validateRuntimeBudgetSample } from './runtime-budget.js';
 export type { RuntimeBudgetPolicy, RuntimeBudgetSample, RuntimeBudgetSignal, RuntimeBudgetView, WakeCategory } from './runtime-budget.js';
+export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSurfaceBinding, ExecutionSurfaceKind, ExecutionSurfaceRef, RepositoryLocator, RepositoryRef, RuntimeBinding, RuntimeBindingReceipt, RuntimeBindingRef, SurfaceArchiveAuthorization, SurfaceClaim, SurfaceSpec } from './execution-placement.js';
 export type { StateStore } from './state-store.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
 export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
@@ -61,12 +64,12 @@ export interface PaseoPlacement { requested: { projectId?: string; workspaceId?:
  * each checkout, while agents remain Tabs inside that surface. */
 export interface CanonicalPaseoPlacement { checkout: string; projectId: string; workspaceId: string; }
 export interface RuntimeLaunchContext { workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; executionSurfaceId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
 export type TaskScope = 'product' | 'steward_analysis';
-export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; fence: number; createdAt: string; updatedAt: string; scope?: TaskScope; }
+export interface Task { id: string; workspaceId: string; title: string; lifecycle: 'proposed' | 'ready' | 'claimed' | 'running' | 'waiting' | 'candidate' | 'completed' | 'failed' | 'unknown' | 'cancelled'; ownerMemberId?: string; executionSurfaceId?: string; fence: number; createdAt: string; updatedAt: string; scope?: TaskScope; }
 export interface KnowledgeEntry { id: string; workspaceId: string; authorMemberId: string; kind: 'problem' | 'learning' | 'decision' | 'evidence' | 'runbook' | 'blocker'; text: string; tags: string[]; taskId?: string; goalId?: string; createdAt: string; }
 export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; sourceId?: string; createdAt: string; }
 export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
@@ -90,9 +93,9 @@ export interface RuntimeAdapter {
   stop(externalId: string): Promise<unknown>;
 }
 interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
-export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; }
+export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; executionSurfaces: ExecutionSurface[]; surfaceClaims: SurfaceClaim[]; runtimeBindings: RuntimeBinding[]; }
 
-const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [] });
+const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [] });
 export const CLAUDE_CACHE_DEFAULTS = { expiringMinutes: 55, expiredMinutes: 60 } as const;
 export const DEFAULT_SUPERVISION_COOLDOWN_MS = 900_000;
 // codex-full-access is Codex Terra medium at mode full-access: it never blocks
@@ -197,7 +200,7 @@ export class ArcpStore implements StateStore {
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
       const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, unknown>>; const channelEvents = legacyEvents.map(normalizeChannelEvent);
-      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [], supervisionPolicies: parsed.supervisionPolicies ?? [], supervisionReviews: parsed.supervisionReviews ?? [], supervisionSignals: parsed.supervisionSignals ?? [] };
+      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [], supervisionPolicies: parsed.supervisionPolicies ?? [], supervisionReviews: parsed.supervisionReviews ?? [], supervisionSignals: parsed.supervisionSignals ?? [], executionSurfaces: parsed.executionSurfaces ?? [], surfaceClaims: parsed.surfaceClaims ?? [], runtimeBindings: parsed.runtimeBindings ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
     }
@@ -296,6 +299,17 @@ async function repositoryIdentity(checkout: string): Promise<{ root: string; pro
   const remote = await git(checkout, ['config', '--get', 'remote.origin.url']).then((value) => value.trim()).catch(() => undefined);
   return { root: repositoryRoot, projectId: remoteProjectId(remote) };
 }
+/** Paseo may own a Workspace's archival lifecycle more broadly than ARCP's
+ * visibility policy. Capture enough Git identity before archiving a disposable
+ * surface to restore the checkout if the provider removes it. */
+async function worktreeRetention(checkout: CheckoutRef): Promise<{ repositoryRoot: string; branch?: string; revision: string } | undefined> {
+  if (!existsSync(checkout.path)) return undefined;
+  const common = (await git(checkout.path, ['rev-parse', '--git-common-dir'])).trim();
+  const repositoryRoot = path.dirname(path.isAbsolute(common) ? common : path.resolve(checkout.path, common));
+  const branch = (await git(checkout.path, ['branch', '--show-current'])).trim() || undefined;
+  const revision = (await git(checkout.path, ['rev-parse', 'HEAD'])).trim();
+  return { repositoryRoot, ...(branch ? { branch } : {}), revision };
+}
 class PlacementConflict extends Error {}
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
  * this adapter owns only safe Paseo transport/discovery calls and never exposes native handles. */
@@ -390,6 +404,8 @@ export class PaseoAdapter implements RuntimeAdapter {
     if (observedProjectId !== projectId) throw new PlacementConflict(`Paseo materialized Workspace ${workspaceId} under unexpected Project ${observedProjectId}`);
     return { checkout, projectId: observedProjectId, workspaceId };
   }
+  /** Paseo owns the sidebar row; archiving it never removes a Git worktree. */
+  archiveWorkspace(workspaceId: string) { return this.cli.run(['workspace', 'archive', workspaceId, '--json'], { timeoutMs: 30_000 }); }
   async providerSubagents(parentAgentId: string): Promise<ChildObservation> {
     if (!(this.cli instanceof PaseoCli)) return { source: 'unavailable', items: [] };
     const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws'; const url = raw.includes('://') ? raw : `ws://${raw}`;
@@ -457,9 +473,9 @@ export class PaseoAdapter implements RuntimeAdapter {
 }
 
 export type Profile = { id: string; provider: string; model: string; mode?: string; thinking?: string; role: string };
-export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; role?: string; unattended?: boolean };
+export type LaunchInput = { profileId?: string; provider?: string; model?: string; mode?: string; thinking?: string; role?: string; unattended?: boolean; executionSurfaceId?: string };
 
-export class ArcpService {
+export class ArcpService implements ExecutionPlacementPort {
   readonly store: StateStore;
   readonly adapter: RuntimeAdapter;
   private readonly adapters = new Map<string, RuntimeAdapter>();
@@ -472,6 +488,7 @@ export class ArcpService {
   private pumping?: Promise<void>;
   private pumpAgain = false;
   private readonly pendingResultSubmissions = new Set<Promise<unknown>>();
+  private readonly surfaceMaterializations = new Map<string, Promise<ExecutionSurfaceBinding>>();
   private readonly stewardCache = new Map<string, WorkspaceSteward>();
   private stewardFactory?: (service: ArcpService, workspaceId: string) => Promise<WorkspaceSteward>;
   private readonly startedAt = new Date().toISOString();
@@ -562,6 +579,99 @@ export class ArcpService {
     // while the control plane was down is recorded once rather than missed.
     await this.evaluateSupervision();
   }
+  /** Provider-neutral repository lookup. Paseo Project IDs never escape this
+   * placement boundary. */
+  async resolveRepository(input: RepositoryLocator): Promise<RepositoryRef> {
+    const identity = await repositoryIdentity(input.checkout);
+    return { id: identity.projectId ?? `local:${identity.root}`, root: identity.root, ...(identity.projectId ? { remote: identity.projectId } : {}) };
+  }
+  /** Materialize exactly one surface per checkout identity. Paseo handles are
+   * resolved only by the adapter and recorded behind its adapter id. */
+  async materializeSurface(input: SurfaceSpec): Promise<ExecutionSurfaceBinding> {
+    const requestedCheckout = checkoutIdentity(input.checkout);
+    const existing = input.kind === 'lane' ? undefined : this.store.snapshot().executionSurfaces.find((item) => checkoutIdentity(item.checkout.path) === requestedCheckout);
+    if (existing?.visibilityState === 'archived') throw new ArcpError('surface_archived', 'execution surface is archived; explicitly restore or unarchive it before reuse');
+    if (existing) return { surface: existing, adapterId: 'paseo' };
+    const repository = await this.resolveRepository({ checkout: requestedCheckout });
+    let placement: CanonicalPaseoPlacement | undefined;
+    let checkout = requestedCheckout;
+    if (input.kind === 'lane') {
+      const repositoryPlacement = await (this.adapter as PaseoAdapter).materializePlacement({ checkout: repository.root, title: surfaceName('working') });
+      if (!repositoryPlacement) throw new ArcpError('placement_unresolved', 'Paseo did not resolve the Repository binding for a lane');
+      const slug = `arcp-${randomUUID().slice(0, 8)}-${(input.slug ?? 'writer').replace(/[^a-z0-9]+/gi, '-').slice(0, 20)}`;
+      const created = asRecord((await this.cli.run(['workspace', 'create', '--isolation', 'worktree', '--path', repository.root, '--project', repositoryPlacement.projectId, '--mode', 'branch-off', '--new-branch', `arcp/${slug}`, '--base', 'HEAD', '--worktree-slug', slug, '--title', surfaceName('lane', input), '--json'], { timeoutMs: 30_000 })).value);
+      const workspaceId = setting(created.workspaceId ?? created.id);
+      if (!workspaceId) throw new ArcpError('placement_unresolved', 'Paseo did not materialize a lane Workspace');
+      const listed = (await this.cli.run(['workspace', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
+      const row = Array.isArray(listed) ? listed.map(asRecord).find((item) => setting(item.workspaceId ?? item.id) === workspaceId) : undefined;
+      const readback = await (this.adapter as PaseoAdapter).workspacePlacement(workspaceId).catch(() => undefined);
+      const lanePath = row && setting(row.cwd ?? row.path);
+      if (!row || !lanePath || !readback?.projectId || readback.projectId !== repositoryPlacement.projectId) throw new ArcpError('placement_unresolved', 'Paseo lane Workspace readback did not prove its Project and checkout');
+      checkout = checkoutIdentity(lanePath);
+      if (checkout === checkoutIdentity(repository.root)) throw new ArcpError('placement_unresolved', 'Paseo lane Workspace readback did not produce a distinct worktree checkout');
+      placement = { checkout, projectId: repositoryPlacement.projectId, workspaceId };
+    } else {
+      placement = await (this.adapter as PaseoAdapter).materializePlacement({ checkout, title: surfaceName(input.kind, input) });
+      if (!placement) throw new ArcpError('placement_unresolved', 'Paseo did not materialize an ExecutionSurface');
+    }
+    const at = now();
+    const checkoutRef: CheckoutRef = { id: idFor('checkout', checkout), repositoryId: repository.id, path: checkout };
+    const surface: ExecutionSurface = { id: idFor('surface', checkoutIdentity(checkout)), repositoryId: repository.id, checkout: checkoutRef, kind: input.kind, operationalState: 'active', visibilityState: 'visible', adapterBindings: { paseo: { projectId: placement.projectId, workspaceId: placement.workspaceId } }, createdAt: at, updatedAt: at };
+    await this.store.mutate((state) => { state.executionSurfaces.push(surface); });
+    return { surface, adapterId: 'paseo' };
+  }
+  /** One active writer is permitted on a surface; readers do not claim it. */
+  async claimSurface(surface: ExecutionSurfaceRef, runtimeSessionId: string): Promise<SurfaceClaim> {
+    return this.store.mutate((state) => {
+      if (!state.executionSurfaces.some((item) => item.id === surface.id && item.visibilityState === 'visible')) throw new ArcpError('not_found', 'execution surface not found');
+      if (!runtimeSessionId.trim() || !state.sessions.some((item) => item.id === runtimeSessionId)) throw new ArcpError('unknown_recipient', 'writer claim requires a persisted runtimeSessionId');
+      const active = state.surfaceClaims.find((item) => item.executionSurfaceId === surface.id && item.active);
+      if (active && active.runtimeSessionId !== runtimeSessionId) throw new ArcpError('task_held', 'execution surface already has an active writer claim');
+      if (active) return active;
+      const claim: SurfaceClaim = { id: `surface_claim_${randomUUID()}`, executionSurfaceId: surface.id, runtimeSessionId, holder: runtimeSessionId, mode: 'writer', active: true, createdAt: now() };
+      state.surfaceClaims.push(claim); return claim;
+    });
+  }
+  /** A Result/handoff calls this explicitly. It changes operations, not UI
+   * visibility: completed Tabs and Workspaces remain auditable. */
+  async releaseSurfaceClaim(surface: ExecutionSurfaceRef, operationalState: 'accepted' | 'parked' | 'abandoned' = 'accepted'): Promise<void> {
+    await this.store.mutate((state) => {
+      const item = state.executionSurfaces.find((value) => value.id === surface.id); if (!item) throw new ArcpError('not_found', 'execution surface not found');
+      for (const claim of state.surfaceClaims.filter((value) => value.executionSurfaceId === surface.id && value.active)) { claim.active = false; claim.releasedAt = now(); }
+      item.operationalState = operationalState; item.updatedAt = now();
+    });
+  }
+  async launchRuntime(input: RuntimeLaunchSpec): Promise<RuntimeBindingReceipt> {
+    if (input.writer) await this.claimSurface({ id: input.executionSurfaceId }, input.runtimeSessionId);
+    return this.store.mutate((state) => {
+      if (!state.executionSurfaces.some((item) => item.id === input.executionSurfaceId && item.visibilityState === 'visible')) throw new ArcpError('not_found', 'execution surface not found');
+      if (!state.sessions.some((item) => item.id === input.runtimeSessionId)) throw new ArcpError('unknown_recipient', 'runtime binding requires a persisted runtimeSessionId');
+      const existing = state.runtimeBindings.find((item) => item.executionSurfaceId === input.executionSurfaceId && item.runtimeSessionId === input.runtimeSessionId);
+      if (existing) return { binding: existing };
+      const binding: RuntimeBinding = { id: `runtime_binding_${randomUUID()}`, executionSurfaceId: input.executionSurfaceId, runtimeSessionId: input.runtimeSessionId, adapterId: 'paseo', generation: 1, state: 'launching', visibilityState: 'visible', createdAt: now() };
+      state.runtimeBindings.push(binding); return { binding };
+    });
+  }
+  async observeRuntime(binding: RuntimeBindingRef): Promise<{ state: string }> { const value = this.store.snapshot().runtimeBindings.find((item) => item.id === binding.id); if (!value) throw new ArcpError('not_found', 'runtime binding not found'); return { state: value.state }; }
+  async retireRuntime(binding: RuntimeBindingRef): Promise<void> { await this.store.mutate((state) => { const value = state.runtimeBindings.find((item) => item.id === binding.id); if (!value) throw new ArcpError('not_found', 'runtime binding not found'); value.state = 'retired'; }); }
+  /** Explicit owner/archive action only. Never invoke this from result,
+   * consumption, idle, terminal, or acceptance transitions. */
+  async archiveSurface(surface: ExecutionSurfaceRef, authorization: SurfaceArchiveAuthorization): Promise<void> {
+    const current = this.store.snapshot().executionSurfaces.find((item) => item.id === surface.id); if (!current) throw new ArcpError('not_found', 'execution surface not found');
+    const workspace = this.store.snapshot().workspaces.find((item) => item.id === authorization.controlWorkspaceId);
+    const associated = this.store.snapshot().tasks.some((item) => item.workspaceId === authorization.controlWorkspaceId && item.executionSurfaceId === surface.id) || this.store.snapshot().sessions.some((item) => item.workspaceId === authorization.controlWorkspaceId && item.executionSurfaceId === surface.id);
+    if (!workspace || workspace.ownerActorId !== authorization.actorId || !associated) throw new ArcpError('unauthorized', 'only the owning ControlWorkspace actor may archive its execution surface');
+    if (current.visibilityState === 'archived') return;
+    if (this.store.snapshot().surfaceClaims.some((item) => item.executionSurfaceId === surface.id && item.active)) throw new ArcpError('task_held', 'release the active writer claim before archiving');
+    const paseo = current.adapterBindings.paseo; if (!paseo) throw new ArcpError('placement_unresolved', 'execution surface has no Paseo binding');
+    const retention = ['lane', 'candidate'].includes(current.kind) ? await worktreeRetention(current.checkout).catch(() => undefined) : undefined;
+    await (this.adapter as PaseoAdapter).archiveWorkspace(paseo.workspaceId);
+    if (retention && !existsSync(current.checkout.path)) {
+      try { await git(retention.repositoryRoot, retention.branch ? ['worktree', 'add', current.checkout.path, retention.branch] : ['worktree', 'add', '--detach', current.checkout.path, retention.revision]); }
+      catch { throw new ArcpError('checkout_retention_failed', 'Paseo archived the surface but ARCP could not retain its Git worktree'); }
+    }
+    await this.store.mutate((state) => { const item = state.executionSurfaces.find((value) => value.id === surface.id)!; item.visibilityState = 'archived'; item.updatedAt = now(); for (const binding of state.runtimeBindings.filter((value) => value.executionSurfaceId === surface.id)) binding.visibilityState = 'archived'; });
+  }
   close(): void { if (this.pumpTimer) clearInterval(this.pumpTimer); }
   /** Daemon liveness and identity for the launcher; not a ControlWorkspace surface. */
   setPort(port: number): void { this.port = port; }
@@ -603,10 +713,34 @@ export class ArcpService {
   /** One placement gate for every Paseo launch entry point.  A caller without
    * an explicit placement may continue when discovery is unavailable; an
    * explicit or already-canonical placement never silently degrades. */
-  private async resolvePaseoPlacement<T extends { workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; title?: string }>(input: T): Promise<T> {
+  /** Compatibility bridge for existing wire fields. It records their resolved
+   * adapter binding on the provider-neutral surface instead of making the
+   * ControlWorkspace placement list the source of execution identity. */
+  private async recordCompatibilitySurface(checkout: string, kind: ExecutionSurfaceKind, placement: CanonicalPaseoPlacement): Promise<ExecutionSurface> {
+    const existing = this.store.snapshot().executionSurfaces.find((surface) => checkoutIdentity(surface.checkout.path) === checkoutIdentity(checkout));
+    if (existing) return existing;
+    // Compatibility callers historically passed synthetic paths in deterministic
+    // tests. Real placement still resolves Git identity, while this bridge keeps
+    // those persisted wire records readable until their callers migrate.
+    const repository = await this.resolveRepository({ checkout }).catch(() => ({ id: `local:${checkout}`, root: checkout })); const at = now();
+    const surface: ExecutionSurface = { id: idFor('surface', checkoutIdentity(checkout)), repositoryId: repository.id, checkout: { id: idFor('checkout', checkout), repositoryId: repository.id, path: checkout }, kind, operationalState: 'active', visibilityState: 'visible', adapterBindings: { paseo: { projectId: placement.projectId, workspaceId: placement.workspaceId } }, createdAt: at, updatedAt: at };
+    await this.store.mutate((state) => { if (!state.executionSurfaces.some((item) => item.id === surface.id)) state.executionSurfaces.push(surface); });
+    return surface;
+  }
+  private async resolvePaseoPlacement<T extends { workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; title?: string; executionSurfaceId?: string }>(input: T): Promise<T> {
     if (!(this.adapter instanceof PaseoAdapter) || !input.workspaceId) return input;
-    const checkout = path.resolve(input.workspace ?? process.cwd()); const state = this.store.snapshot();
+    const state = this.store.snapshot();
+    const requestedSurface = input.executionSurfaceId ? state.executionSurfaces.find((surface) => surface.id === input.executionSurfaceId) : undefined;
+    if (input.executionSurfaceId && !requestedSurface) throw new ArcpError('not_found', 'execution surface not found');
+    if (requestedSurface?.visibilityState === 'archived') throw new ArcpError('surface_archived', 'execution surface is archived; explicitly restore or unarchive it before reuse');
+    const checkout = path.resolve(requestedSurface?.checkout.path ?? input.workspace ?? process.cwd());
     const controlWorkspace = state.workspaces.find((item) => item.id === input.workspaceId);
+    if (requestedSurface) {
+      const paseo = requestedSurface.adapterBindings.paseo;
+      if (!paseo) throw new ArcpError('placement_unresolved', 'execution surface has no Paseo binding');
+      if ((input.paseoProjectId && input.paseoProjectId !== paseo.projectId) || (input.paseoWorkspaceId && input.paseoWorkspaceId !== paseo.workspaceId)) throw new ArcpError('placement_conflict', `PLACEMENT_CONFLICT: requested placement differs from execution surface ${requestedSurface.id}`);
+      return { ...input, workspace: checkout, paseoProjectId: paseo.projectId, paseoWorkspaceId: paseo.workspaceId, executionSurfaceId: requestedSurface.id };
+    }
     const persisted = controlWorkspace?.paseoPlacements?.find((item) => item.checkout === checkout);
     if (input.paseoProjectId && input.paseoWorkspaceId) {
       const observed = await this.adapter.workspacePlacement(input.paseoWorkspaceId).catch(() => undefined);
@@ -622,25 +756,26 @@ export class ArcpService {
     if (canonical) {
       if ((input.paseoProjectId && canonical.projectId !== input.paseoProjectId) || (input.paseoWorkspaceId && canonical.workspaceId !== input.paseoWorkspaceId)) throw new ArcpError('placement_conflict', `PLACEMENT_CONFLICT: requested placement differs from canonical Paseo Project ${canonical.projectId} and Workspace ${canonical.workspaceId}`);
       if (!persisted && controlWorkspace) await this.store.mutate((next) => { const workspace = next.workspaces.find((item) => item.id === input.workspaceId)!; workspace.paseoPlacements = [...(workspace.paseoPlacements ?? []), canonical!]; workspace.updatedAt = now(); });
-      return { ...input, paseoProjectId: canonical.projectId, paseoWorkspaceId: canonical.workspaceId, workspace: checkout };
+      const surface = await this.recordCompatibilitySurface(checkout, 'working', canonical);
+      return { ...input, paseoProjectId: canonical.projectId, paseoWorkspaceId: canonical.workspaceId, workspace: checkout, executionSurfaceId: surface.id };
     }
     if (input.paseoProjectId || input.paseoWorkspaceId || persisted) throw new ArcpError('placement_unresolved', unresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch');
     return { ...input, workspace: checkout, ...(unresolved ? { placementUnresolved: unresolved } : {}) };
   }
-  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string }> {
+  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
     if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
     try { input = await this.resolvePaseoPlacement(input); }
     catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof ArcpError ? error.message : 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be resolved before launch' }; }
-    const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
-    const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope });
     const profile = this.profileData.find((item) => item.id === preflight.profileId);
     const role = input.role?.trim() || profile?.role || 'worker';
+    const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
+    const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope, executionSurfaceId: input.executionSurfaceId });
     const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role, joinKind: 'managed', actorId: input.actorId, ...(input.taskScope === 'steward_analysis' ? { capabilities: ['claim_task', 'submit_result', 'read_context', 'write_knowledge'] } : {}) });
     if (!joined.credential) throw new ArcpError('internal_error', 'managed member credential was not issued');
-    const runtimeId = `runtime_${randomUUID()}`; const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
-    const session = await this.launch({ ...input, actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, runtimeId, memberCredential: joined.credential, clientStatePath } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string });
+    const runtimeId = `runtime_${randomUUID()}`; const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential); const writer = role.toLowerCase() === 'worker';
+    const session = await this.launch({ ...input, actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, runtimeId, memberCredential: joined.credential, clientStatePath, writer } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string });
     return { goal, task, member: joined.member, session, credential: joined.credential };
   }
   private async recordProviderBudgetEpisode(workspaceId: string, admission?: AdmissionDecision): Promise<void> {
@@ -773,7 +908,7 @@ export class ArcpService {
     if (needsElevation) return { action: 'warn', launchable: true, why: 'requested mode is weaker than auto and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
     return { action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission };
   }
-  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string }): Promise<RuntimeSession> {
+  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string }): Promise<RuntimeSession> {
     const preflight = await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
@@ -789,23 +924,24 @@ export class ArcpService {
     const available = discovered.profiles.find((item) => item.id === profile.id)?.available;
     if (!available) throw new ArcpError('profile_unavailable', 'requested provider, model, or mode is unavailable');
     const generation = Math.max(0, ...state.sessions.filter((item) => item.goalId === goal.id).map((item) => item.generation)) + 1;
-    const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
+    const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
     await this.store.mutate((next) => { next.sessions.push(session); });
+    if (input.executionSurfaceId) await this.launchRuntime({ executionSurfaceId: input.executionSurfaceId, runtimeSessionId: session.id, writer: input.writer });
     try {
       const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace, { workspaceId: input.workspaceId, paseoProjectId: input.paseoProjectId, paseoWorkspaceId: input.paseoWorkspaceId, taskId: input.taskId, memberId: input.memberId, runtimeId: session.id, memberCredential: input.memberCredential, clientStatePath: input.clientStatePath })).value);
       const externalId = String(result.id ?? result.agentId ?? '');
       if (!externalId) throw new Error('Paseo did not return a runtime identity');
       // Persist the opaque handle before postflight: reconcile must remain possible
       // when launch succeeded but the immediate observation timed out.
-      await this.store.mutate((next) => { const item = next.sessions.find((value) => value.id === session.id)!; item.externalId = externalId; item.placement!.requested.agentId = externalId; });
+      await this.store.mutate((next) => { const item = next.sessions.find((value) => value.id === session.id)!; item.externalId = externalId; item.placement!.requested.agentId = externalId; for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.nativeId = externalId; });
       const snapshot = await this.adapterFor(session).snapshot(externalId); const inspected = snapshot.agent;
       const workspacePlacement = input.paseoWorkspaceId && this.adapter instanceof PaseoAdapter ? await this.adapter.workspacePlacement(input.paseoWorkspaceId) : undefined;
       const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.currentModeId ?? inspected.mode ?? inspected.Mode, inspected.effectiveThinkingOptionId ?? inspected.thinkingOptionId ?? inspected.thinking ?? inspected.Thinking];
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
       const matchesPlan = expected.every((expectedValue, index) => !expectedValue || (typeof observed[index] === 'string' && capabilityToken(String(observed[index])) === capabilityToken(expectedValue)));
-      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementMatches(stored.placement!) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); return stored; });
+      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementMatches(stored.placement!) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
     } catch (error) {
-      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = isPaseoTitleRejected(error) ? 'attention' : 'transport_indeterminate'; return stored; });
+      return this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; stored.state = isPaseoTitleRejected(error) ? 'attention' : 'transport_indeterminate'; for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
     }
   }
   async observe(id: string): Promise<RuntimeSession> {
@@ -1340,11 +1476,11 @@ export class ArcpService {
     });
   }
   memberForCredential(credential: string): Member { const state = this.store.snapshot(); const id = state.memberCredentials[createHash('sha256').update(credential).digest('hex')]; const member = state.members.find((item) => item.id === id); if (!member) throw new ArcpError('unknown_sender', 'member credential is unknown'); return member; }
-  async createTask(input: { workspaceId: string; title: string; scope?: TaskScope }): Promise<Task> { return this.store.mutate((state) => { if (!state.workspaces.some((item) => item.id === input.workspaceId)) throw new ArcpError('not_found', 'workspace not found'); if (!input.title?.trim()) throw new ArcpError('invalid_request', 'task title is required'); const at = now(); const task = { id: `task_${randomUUID()}`, workspaceId: input.workspaceId, title: input.title.trim(), lifecycle: 'ready' as const, fence: 0, createdAt: at, updatedAt: at, ...(input.scope ? { scope: input.scope } : {}) }; state.tasks.push(task); return task; }); }
+  async createTask(input: { workspaceId: string; title: string; scope?: TaskScope; executionSurfaceId?: string }): Promise<Task> { return this.store.mutate((state) => { if (!state.workspaces.some((item) => item.id === input.workspaceId)) throw new ArcpError('not_found', 'workspace not found'); if (input.executionSurfaceId && !state.executionSurfaces.some((surface) => surface.id === input.executionSurfaceId)) throw new ArcpError('not_found', 'execution surface not found'); if (!input.title?.trim()) throw new ArcpError('invalid_request', 'task title is required'); const at = now(); const task = { id: `task_${randomUUID()}`, workspaceId: input.workspaceId, title: input.title.trim(), lifecycle: 'ready' as const, fence: 0, createdAt: at, updatedAt: at, ...(input.scope ? { scope: input.scope } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}) }; state.tasks.push(task); return task; }); }
   async heartbeat(memberId: string, presence: 'idle' | 'busy' | 'attention' = 'idle'): Promise<Member> { return this.store.mutate((state) => { const member = state.members.find((item) => item.id === memberId); if (!member) throw new ArcpError('unknown_sender', 'member is unknown'); const at = now(); member.lifecycle = presence; member.lastHeartbeatAt = at; member.leaseExpiresAt = new Date(Date.now() + 300_000).toISOString(); member.updatedAt = at; return member; }); }
   async claimTask(taskId: string, memberId: string, expectedFence?: number): Promise<Task> { const claimed = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === taskId); const member = state.members.find((item) => item.id === memberId); if (!task || !member || task.workspaceId !== member.workspaceId) throw new ArcpError('unknown_recipient', 'task or member is unknown'); if (!member.capabilities.includes('claim_task')) throw new ArcpError('unauthorized', 'member lacks claim_task capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot claim product Tasks'); if (expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== expectedFence) throw new ArcpError('stale_generation', `task claim fence is stale; current fence is ${task.fence}`); if (task.ownerMemberId === memberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) return task; if (task.ownerMemberId && ['claimed', 'running', 'waiting'].includes(task.lifecycle)) throw new ArcpError('task_held', 'task already has an active claim'); task.ownerMemberId = memberId; task.fence += 1; task.lifecycle = 'claimed'; task.updatedAt = now(); member.lifecycle = 'busy'; member.updatedAt = now(); return task; }); await this.publishChannelEvent({ workspaceId: claimed.workspaceId, taskId: claimed.id, sourceMemberId: claimed.ownerMemberId, targetRole: 'manager', kind: 'task_claimed', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Task ${claimed.id} claimed at fence ${claimed.fence}`, evidenceRefs: [] }); return claimed; }
   async addKnowledge(input: { workspaceId: string; authorMemberId: string; kind: KnowledgeEntry['kind']; text: string; tags?: string[]; taskId?: string; goalId?: string; targetMemberId?: string }): Promise<KnowledgeEntry> { const entry = await this.store.mutate((state) => { const member = state.members.find((item) => item.id === input.authorMemberId && item.workspaceId === input.workspaceId); if (!member) throw new ArcpError('unknown_sender', 'member is not in workspace'); if (!input.text?.trim()) throw new ArcpError('invalid_request', 'knowledge text is required'); const entry = { id: `knowledge_${randomUUID()}`, workspaceId: input.workspaceId, authorMemberId: input.authorMemberId, kind: input.kind, text: input.text.trim(), tags: input.tags ?? [], ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.goalId ? { goalId: input.goalId } : {}), createdAt: now() }; state.knowledge.push(entry); return entry; }); if (input.kind === 'blocker' || input.kind === 'evidence') await this.publishChannelEvent({ workspaceId: entry.workspaceId, taskId: entry.taskId, goalId: entry.goalId, sourceMemberId: entry.authorMemberId, ...(input.targetMemberId ? { targetMemberId: input.targetMemberId } : {}), ...(input.targetMemberId ? {} : { targetRole: 'manager' }), kind: input.kind === 'blocker' ? 'blocker' : 'finding', urgency: input.kind === 'blocker' ? 'urgent' : 'normal', consumptionPolicy: input.kind === 'blocker' ? 'ack_required' : 'consume_on_delivery', decisionRequired: input.kind === 'blocker', summary: `${input.kind} knowledge ${entry.id}`, evidenceRefs: [] }); return entry; }
-  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, targetRole: 'manager', kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires Manager decision`, evidenceRefs: [], relatedEventId: candidate.id }); return result; }); await this.pump(); return submitted; }
+  async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string }): Promise<Result> { const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? [])) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), createdAt: now() }; state.results.push(result); if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); if (task.executionSurfaceId) { for (const claim of state.surfaceClaims.filter((claim) => claim.executionSurfaceId === task.executionSurfaceId && claim.active)) { claim.active = false; claim.releasedAt = now(); } const surface = state.executionSurfaces.find((surface) => surface.id === task.executionSurfaceId); if (surface) { surface.operationalState = input.status === 'candidate' ? 'accepted' : input.status === 'failed' ? 'abandoned' : 'parked'; surface.updatedAt = now(); } } const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, targetRole: 'manager', kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires Manager decision`, evidenceRefs: [], relatedEventId: candidate.id }); return result; }); await this.pump(); return submitted; }
   context(workspaceId: string, memberId?: string) { const state = this.store.snapshot(); const workspace = state.workspaces.find((item) => item.id === workspaceId); if (!workspace) throw new ArcpError('not_found', 'workspace not found'); const roster = state.members.filter((item) => item.workspaceId === workspaceId).map((member) => ({ ...member, lifecycle: member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < Date.now() ? 'offline' as const : member.lifecycle })); const member = memberId ? state.members.find((item) => item.id === memberId) : undefined; return { workspace, roster, tasks: state.tasks.filter((item) => item.workspaceId === workspaceId), knowledge: state.knowledge.filter((item) => item.workspaceId === workspaceId), results: state.results.filter((item) => item.workspaceId === workspaceId), events: this.channelEvents(workspaceId, memberId), inbox: member ? this.projectedInbox(state, member, workspace) : [] }; }
   /** The member inbox renders the same canonical projection as `channel list`. */
   private projectedInbox(state: State, member: Member, workspace: ControlWorkspace): ProjectedInboxItem[] {
@@ -1565,7 +1701,16 @@ export class ArcpService {
     const placement = (context.workspace.paseoPlacements ?? []).map((item) => ({ controlWorkspaceId: workspaceId, projectId: item.projectId, workspaceId: item.workspaceId, checkout: item.checkout, tabs: sessions.filter((session) => session.placement?.requested.workspaceId === item.workspaceId).map((session) => ({ runtimeId: session.id, agentId: session.externalId, role: state.members.find((member) => member.id === session.memberId)?.role, goalId: session.goalId, goal: goals.find((goal) => goal.id === session.goalId)?.title, cwd: session.workspace, model: session.model, mode: session.mode, thinking: session.thinking })) }));
     const temporal = projectTemporal(this.temporalFacts(workspaceId, state, sessions), temporalFilter);
     const budgets = this.providerBudgetSnapshot ? { snapshot: this.providerBudgetSnapshot, source: this.providerBudgetSnapshot.source, admissions: [...new Map(sessions.map((session) => { const key = `${session.provider}:${session.model}`; return [key, evaluateAdmission({ envelope: this.providerBudgetSnapshot, bindings: this.providerBudgetConfig.bindings ?? [], policies: this.providerBudgetConfig.policies ?? [], providerId: session.provider, model: session.model, activeRuntimeCount: sessions.filter((other) => other.provider === session.provider && other.state !== 'terminal').length })] as const; })).values()] } : { status: 'source_unavailable' as const };
-    return { ...context, goals, runtime, placement, blocked: this.blockedRuntimes(workspaceId), providerBudget: budgets, latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
+    const surfaceIds = new Set([...context.tasks.map((task) => task.executionSurfaceId), ...sessions.map((session) => session.executionSurfaceId)].filter((id): id is string => Boolean(id)));
+    const surfaces = state.executionSurfaces.filter((surface) => surfaceIds.has(surface.id));
+    const execution = {
+      repositories: [...new Map(surfaces.map((surface) => [surface.repositoryId, { id: surface.repositoryId, checkout: surface.checkout.path }])).values()],
+      surfaces,
+      claims: state.surfaceClaims.filter((claim) => surfaceIds.has(claim.executionSurfaceId)),
+      bindings: state.runtimeBindings.filter((binding) => surfaceIds.has(binding.executionSurfaceId)),
+    };
+    const cooperation = { scope: context.workspace, goals, tasks: context.tasks, members: context.roster, results: context.results, knowledge: context.knowledge, events: context.events };
+    return { ...context, goals, runtime, placement, cooperation, execution, blocked: this.blockedRuntimes(workspaceId), providerBudget: budgets, latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
   }
   temporalReconciliation(workspaceId: string) {
     const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);

@@ -12,12 +12,13 @@ const event = (id: string, summary = 'event') => ({ id, workspaceId: 'workspace-
 describe('SQLite StateStore', () => {
   it('initializes crash-safe numbered migrations with required SQLite settings', async () => {
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
-    expect(store.status()).toMatchObject({ schemaVersion: 1, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
+    expect(store.status()).toMatchObject({ schemaVersion: 2, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
     const db = new DatabaseSync(store.file);
-    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1]);
+    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1, 2]);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('corrections', 'gates', 'legacy_records')").all() as any[])).toEqual([]);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_observations'").all() as any[])).toHaveLength(1);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'runtime_observations_runtime_idx'").all() as any[])).toHaveLength(1);
+    expect(store.status().tables).toMatchObject({ execution_surfaces: 0, surface_claims: 0, runtime_bindings: 0 });
     expect(store.check()).toMatchObject({ quickCheck: 'ok', integrityCheck: 'ok' }); db.close(); store.close();
   });
 
@@ -88,7 +89,7 @@ describe('SQLite StateStore', () => {
     expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true }); expect(store.export('finding').events).toHaveLength(1);
     const backup = path.join(dbDir, 'backup.sqlite'); await store.backupTo(backup); expect((await stat(backup)).mode & 0o777).toBe(0o600); const backupDb = new DatabaseSync(backup); expect((backupDb.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(1); backupDb.close();
     const raw = await readFile(store.file); expect(raw.toString()).not.toContain('credential-secret'); expect(raw.toString()).not.toContain('reminder content'); store.close();
-    const reopened = new SQLiteStateStore(dbDir); await reopened.init(); expect(reopened.export('finding').events).toHaveLength(1); expect(reopened.status().schemaVersion).toBe(1); reopened.close();
+    const reopened = new SQLiteStateStore(dbDir); await reopened.init(); expect(reopened.export('finding').events).toHaveLength(1); expect(reopened.status().schemaVersion).toBe(2); reopened.close();
   });
 
   it('reuses one hashed content row for an imported Result and identical task candidate event', async () => {
@@ -165,6 +166,9 @@ describe('SQLite StateStore', () => {
       supervisionPolicies: [{ id: 'policy-1', workspaceId: 'workspace-1', reviewAfterMs: 60_000, inactivityAfterMs: 30_000, cooldownMs: 90_000, stewardProfileId: 'codex-worker', automatic: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
       supervisionReviews: [{ id: 'supervision-1', workspaceId: 'workspace-1', policyId: 'policy-1', subjectKind: 'task', subjectId: 'task-1', generation: 1, reason: 'inactivity_budget', eventId: 'event-1', breachedAt: '2026-01-01T00:01:00.000Z', lastProgressAt: '2026-01-01T00:00:00.000Z', cooldownUntil: '2026-01-01T00:02:30.000Z', state: 'open' }],
       supervisionSignals: [{ id: 'signal-1', workspaceId: 'workspace-1', subjectId: 'task-1', kind: 'commit', digest: 'e923c2c', observedAt: '2026-01-01T00:00:00.000Z' }],
+      executionSurfaces: [{ id: 'surface-1', repositoryId: 'remote:example/repository', checkout: { id: 'checkout-1', repositoryId: 'remote:example/repository', path: '/private/checkout' }, kind: 'working', operationalState: 'accepted', visibilityState: 'visible', adapterBindings: { paseo: { projectId: 'prj-1', workspaceId: 'wks-1' } }, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:01:00.000Z' }],
+      surfaceClaims: [{ id: 'claim-1', executionSurfaceId: 'surface-1', runtimeSessionId: 'runtime-1', holder: 'runtime-1', mode: 'writer', active: false, createdAt: '2026-01-01T00:00:00.000Z', releasedAt: '2026-01-01T00:01:00.000Z' }],
+      runtimeBindings: [{ id: 'runtime-binding-1', executionSurfaceId: 'surface-1', runtimeSessionId: 'runtime-1', adapterId: 'paseo', nativeId: 'paseo-agent-1', generation: 1, state: 'retired', visibilityState: 'visible', createdAt: '2026-01-01T00:00:00.000Z' }],
     };
     const expected = structuredClone(source);
     expected.credentials = {};

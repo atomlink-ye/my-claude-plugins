@@ -16,6 +16,7 @@ function publicPanorama(value: any) {
   return { workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
     placement: value.placement ?? [],
+    cooperation: value.cooperation, execution: value.execution,
     blocked: value.blocked ?? [], temporal: value.temporal,
     events: value.events ?? [], providerBudget: value.providerBudget ?? { status: 'source_unavailable' }, latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef };
 }
@@ -46,7 +47,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const method = req.method ?? 'GET'; const path = url.pathname;
     if (method === 'GET' && path === '/v1/profiles') { send(res, 200, service.profiles()); return true; }
     if (method === 'GET' && path === '/v1/discovery') { send(res, 200, await service.discovery()); return true; }
-    if (method === 'GET' && path === '/v1/doctor') { const discovery = await service.discovery(); send(res, 200, { daemon: 'reachable', provider: discovery.available ? 'available' : 'unavailable', profiles: discovery.profiles.map(({ id, available }) => ({ id, available })), }); return true; }
+    if (method === 'GET' && path === '/v1/doctor') { const discovery = await service.discovery(); send(res, 200, { daemon: 'reachable', provider: discovery.available ? 'available' : 'unavailable', profiles: discovery.profiles.map(({ id, available }) => ({ id, available })), database: service.store.check?.() ?? service.store.snapshot(), }); return true; }
     if (method === 'POST' && path === '/v1/preflight') { send(res, 200, await service.preflight(await body(req) as any)); return true; }
     if (method === 'GET' && path === '/v1/provider-budgets') { send(res, 200, service.providerBudget() ?? { status: 'source_unavailable' }); return true; }
     if (method === 'POST' && path === '/v1/provider-budgets/refresh') { if (!admin && !authenticatedMember) throw new ArcpError('unauthorized', 'operator or member credential is required'); const input = await body(req); send(res, 200, await service.refreshProviderBudget(typeof input.sourceId === 'string' ? input.sourceId : undefined)); return true; }
@@ -62,6 +63,8 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }
     const panorama = path.match(/^\/v1\/workspaces\/([^/]+)\/panorama$/);
     if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const temporal = url.searchParams.get('temporal'); const filter = temporal === 'problems' ? 'problems' : temporal === 'task' && url.searchParams.get('task') ? { taskId: String(url.searchParams.get('task')) } : 'active'; send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1', filter))); return true; }
+    const archiveSurface = path.match(/^\/v1\/workspaces\/([^/]+)\/execution-surfaces\/([^/]+)\/archive$/);
+    if (method === 'POST' && archiveSurface) { if (!authenticatedActor) throw new ArcpError('unauthorized', 'owner actor credential is required'); const workspaceId = decodeURIComponent(archiveSurface[1]); await service.archiveSurface({ id: decodeURIComponent(archiveSurface[2]) }, { controlWorkspaceId: workspaceId, actorId: authenticatedActor.id }); send(res, 200, { archived: true, surfaceId: decodeURIComponent(archiveSurface[2]) }); return true; }
     const channelReconcile = path.match(/^\/v1\/workspaces\/([^/]+)\/channel\/reconcile$/);
     if (channelReconcile) { const workspaceId = decodeURIComponent(channelReconcile[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); if (method !== 'GET' || url.searchParams.get('dry-run') !== '1') throw new ArcpError('invalid_request', 'channel reconcile requires --dry-run in Round 4; applying dispositions is refused'); send(res, 200, { dryRun: true, proposals: service.temporalReconciliation(workspaceId) }); return true; }
     const runtimeDecision = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/decision$/);
