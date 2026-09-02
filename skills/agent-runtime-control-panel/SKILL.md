@@ -20,7 +20,32 @@ Normal messages queue until the recipient reaches a Paseo idle/terminal safe poi
 
 Claude interrupt is two-stage: `arcp interrupt RUNTIME --reason X --body X` returns a short-lived confirmation without changing the runtime; repeat its exact command with `--confirm TOKEN` to re-observe and interrupt. Claude normal send/reuse checks provider activity (not ARCP observation time): fresh under 55 minutes, expiring at 55–60, expired at 60+. Held reuse offers an exact fresh-session handoff command or `arcp reuse ... --confirm TOKEN`; ARCP never sends cache keepalives or forces compaction.
 
-Do not pass provider handles, raw task prompts, secrets, or private host paths into API records. Start with `arcp preflight`; omitted Claude/Codex mode resolves to live-validated `auto`. `arcp start` never silently elevates: use the preflight's exact `codex-full-access` or `claude-bypass-permissions` command when an unattended/editing Goal needs it. Pi/Grok remains mode-less. Use `arcp panorama --refresh` and `arcp runtime status ID --refresh` for safe telemetry, children, SCM and compatibility counts. Profile discovery fails closed: ARCP never picks another provider or paid model for a caller.
+Do not pass provider handles, raw task prompts, secrets, or private host paths into API records. Start with `arcp preflight`. It reports the requested and effective settings, named profile, live modes, admission, and an action: `launch`, `warn`, `hold`, or `route`. A hold states why and may include the exact explicit elevation or routing command; a launch does not authorize a different provider, model, paid model, or stronger mode. Omitted Claude/Codex mode resolves to live-validated `auto`; Pi/Grok remains mode-less. Use `arcp panorama --refresh` and `arcp runtime status ID --refresh` for safe telemetry, children, SCM and compatibility counts. Profile discovery fails closed.
+
+## Evaluation commands
+
+The runtime's default test command is the complete hermetic ARCP suite:
+
+```sh
+pnpm --dir skills/agent-runtime-control-panel/runtime test
+```
+
+It runs `test:deterministic`, clearing `ARCP_CAMPAIGN_STATE` and using only
+controlled local fixtures. Run a focused hermetic layer with `test:domain`,
+`test:persistence`, `test:application`, `test:adapters`, or `test:contracts`.
+The test tree and command map live in
+[`eval/agent-runtime-control-panel/README.md`](../../eval/agent-runtime-control-panel/README.md).
+
+Campaign-state canaries are a separate required-input check:
+
+```sh
+ARCP_CAMPAIGN_STATE=/absolute/path/to/state \
+  pnpm --dir skills/agent-runtime-control-panel/runtime test:canary
+```
+
+Without that variable, `test:canary` fails non-zero by design. It is not
+live-provider coverage. `arcp canary [--workspace WORKSPACE]` is instead a
+CLI discovery/context smoke probe; it does not run either test suite.
 
 ## Never block on a human
 
