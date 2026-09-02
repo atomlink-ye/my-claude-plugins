@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
 import { URL } from 'node:url';
@@ -211,6 +212,23 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     const app = await createServer(resolveDataDir(), port);
     app.arcp.setPort(port);
+    // Real Hermes wire, installed only in the daemon entrypoint so the
+    // deterministic suite can never reach a live conversation. The binding's
+    // conversation reference stays opaque to ARCP; only this transport parses
+    // it, and only the chat id is ever passed outward.
+    const hermesBin = process.env.ARCP_HERMES_CLI ?? 'lark-cli';
+    app.arcp.setHermesTransport(async (binding, envelope) => {
+      const chatId = /(oc_[a-zA-Z0-9]+)/.exec(binding.recipientRef)?.[1];
+      if (!chatId) return 'refused';
+      const text = `[ARCP escalation] ${envelope.summary}\nrefs: ${envelope.refs.join(', ')}`;
+      return await new Promise((resolve) => {
+        const child = spawn(hermesBin, ['im', '+messages-send', '--chat-id', chatId, '--text', text, '--idempotency-key', envelope.idempotencyKey], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = '';
+        child.stdout.on('data', (chunk) => { out += String(chunk); });
+        child.on('error', () => resolve('refused'));
+        child.on('close', (code) => resolve(code === 0 ? (/"duplicate"\s*:\s*true/.test(out) ? 'duplicate' : 'accepted') : 'refused'));
+      });
+    });
     await startServer(app, port);
     console.log(`ARCP listening on http://127.0.0.1:${port}`);
   } catch (error) {
