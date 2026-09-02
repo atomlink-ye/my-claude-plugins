@@ -4,10 +4,15 @@
   "dataEnv": "ARCP_DATA",
   "apiKeyEnv": "ARCP_API_KEY",
   "adapter": "paseo",
+  "routing": {
+    "guidance": "Roles describe the work intent, not a provider entitlement. ARCP shows the configured selection and explicit alternatives, but never changes provider, model, or permission mode without an explicit request."
+  },
   "profiles": [
     {"id":"claude-manager","provider":"claude","model":"claude-opus-5","mode":"auto","thinking":"medium","role":"manager"},
     {"id":"claude-bypass-permissions","provider":"claude","model":"claude-opus-5","mode":"bypassPermissions","thinking":"medium","role":"manager"},
+    {"id":"claude-sonnet-worker","provider":"claude","model":"claude-sonnet-5","mode":"auto","thinking":"medium","role":"worker"},
     {"id":"codex-worker","provider":"codex","model":"gpt-5.6-terra","mode":"auto","thinking":"medium","role":"worker"},
+    {"id":"codex-auto-review","provider":"codex","model":"gpt-5.6-terra","mode":"auto-review","thinking":"medium","role":"worker"},
     {"id":"codex-full-access","provider":"codex","model":"gpt-5.6-terra","mode":"full-access","thinking":"medium","role":"worker"},
     {"id":"pi-grok-worker","provider":"pi","model":"grok-cli/grok-4.6","role":"worker"}
   ],

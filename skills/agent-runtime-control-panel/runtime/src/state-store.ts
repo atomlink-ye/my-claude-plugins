@@ -105,6 +105,7 @@ const MIGRATIONS: Array<[number, string]> = [
     CREATE TABLE IF NOT EXISTS migration_audit (source_file TEXT NOT NULL, source_hash TEXT NOT NULL, imported_at TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(source_file, source_hash));
   `],
   [2, `CREATE TABLE IF NOT EXISTS execution_surfaces (id TEXT PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS surface_claims (id TEXT PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS runtime_bindings (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`],
+  [3, `CREATE TABLE IF NOT EXISTS selection_receipts (runtime_id TEXT PRIMARY KEY REFERENCES runtimes(id) ON DELETE CASCADE, chosen_role TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT, mode TEXT, reason TEXT NOT NULL, quota_snapshot TEXT NOT NULL);`],
 ];
 
 export function resolveDatabasePath(dirOrFile: string): string {
@@ -295,7 +296,7 @@ export class SQLiteStateStore implements StateStore {
   private persistWithinTransaction(state: State): void {
     const durable = postRedactionState(state);
     this.persistContent(durable);
-    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings']) this.connection.exec(`DELETE FROM ${table}`);
+    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'selection_receipts', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings']) this.connection.exec(`DELETE FROM ${table}`);
     this.persistRows('workspaces', durable.workspaces);
     this.persistRows('actors', durable.actors);
     this.persistRows('actor_bindings', durable.bindings);
@@ -303,6 +304,7 @@ export class SQLiteStateStore implements StateStore {
     this.persistRows('members', durable.members);
     this.persistRows('tasks', durable.tasks);
     this.persistRows('runtimes', durable.sessions);
+    this.persistSelectionReceipts(durable.sessions);
     this.persistRows('deliveries', durable.deliveries);
     this.persistRows('execution_surfaces', durable.executionSurfaces);
     this.persistRows('surface_claims', durable.surfaceClaims);
@@ -320,6 +322,17 @@ export class SQLiteStateStore implements StateStore {
   private persistRows(table: string, records: Array<{ id: string }>): void {
     const statement = this.connection.prepare(`INSERT INTO ${table}(id, payload) VALUES (?, ?)`);
     for (const record of records) statement.run(String(record.id), json(record));
+  }
+
+  /** Runtime payloads retain the full receipt for the CLI; this narrow
+   * projection makes every provider decision auditable across restarts. */
+  private persistSelectionReceipts(sessions: State['sessions']): void {
+    const statement = this.connection.prepare('INSERT INTO selection_receipts(runtime_id, chosen_role, provider, model, thinking, mode, reason, quota_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const session of sessions) {
+      const receipt = session.selectionReceipt;
+      if (!receipt) continue;
+      statement.run(session.id, receipt.chosenRole, receipt.provider, receipt.model, receipt.thinking, receipt.mode, receipt.reason, json(receipt.quotaSnapshot));
+    }
   }
 
   /** Rows whose lookup columns are projected beside the payload so supervision

@@ -12,9 +12,9 @@ const event = (id: string, summary = 'event') => ({ id, workspaceId: 'workspace-
 describe('SQLite StateStore', () => {
   it('initializes crash-safe numbered migrations with required SQLite settings', async () => {
     const dir = await root(); const store = new SQLiteStateStore(dir); await store.init();
-    expect(store.status()).toMatchObject({ schemaVersion: 2, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
+    expect(store.status()).toMatchObject({ schemaVersion: 3, journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000, mode: '0600' });
     const db = new DatabaseSync(store.file);
-    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1, 2]);
+    expect((db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as any[]).map((row) => row.version)).toEqual([1, 2, 3]);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('corrections', 'gates', 'legacy_records')").all() as any[])).toEqual([]);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_observations'").all() as any[])).toHaveLength(1);
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'runtime_observations_runtime_idx'").all() as any[])).toHaveLength(1);
@@ -89,7 +89,7 @@ describe('SQLite StateStore', () => {
     expect(await store.importLegacy(source)).toMatchObject({ imported: false, noop: true }); expect(store.export('finding').events).toHaveLength(1);
     const backup = path.join(dbDir, 'backup.sqlite'); await store.backupTo(backup); expect((await stat(backup)).mode & 0o777).toBe(0o600); const backupDb = new DatabaseSync(backup); expect((backupDb.prepare('SELECT count(*) AS count FROM event_journal').get() as any).count).toBe(1); backupDb.close();
     const raw = await readFile(store.file); expect(raw.toString()).not.toContain('credential-secret'); expect(raw.toString()).not.toContain('reminder content'); store.close();
-    const reopened = new SQLiteStateStore(dbDir); await reopened.init(); expect(reopened.export('finding').events).toHaveLength(1); expect(reopened.status().schemaVersion).toBe(2); reopened.close();
+    const reopened = new SQLiteStateStore(dbDir); await reopened.init(); expect(reopened.export('finding').events).toHaveLength(1); expect(reopened.status().schemaVersion).toBe(3); reopened.close();
   });
 
   it('reuses one hashed content row for an imported Result and identical task candidate event', async () => {
