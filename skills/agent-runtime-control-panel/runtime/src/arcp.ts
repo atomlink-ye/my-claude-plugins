@@ -1001,6 +1001,63 @@ export class ArcpService implements ExecutionPlacementPort {
   /** Register one stable sibling Hermes ACP on-call Runtime. This is a new
    * external process sharing ARCP Workspace/Knowledge/Delivery; it does not
    * attach to the operator's Feishu Hermes conversation, which remains Owner. */
+  /** Attach an ALREADY-RUNNING participant to an existing Member.
+   *
+   * `registerExternal` mints a new Member and launches a Hermes ACP process,
+   * so it cannot represent a participant that is already alive and already
+   * accountable — the Claude Manager of this Workspace is exactly that case.
+   * Without an attach path such a participant has a Member but no
+   * RuntimeSession, and every obligation addressed to it dead-letters with
+   * "no live target runtime session" even though a human is sitting there.
+   *
+   * This never mints a Member, never launches anything, and never invents an
+   * adapter: the caller names the participant channel and an opaque external
+   * ref. Re-attaching is idempotent so a reconnect resumes one accountable
+   * session instead of forking a second one at a new generation. */
+  async attachParticipant(input: { workspaceId: string; memberId: string; adapterId: string; externalId: string; workspace?: string }): Promise<RuntimeSession> {
+    const trimmedExternal = input.externalId?.trim();
+    if (!trimmedExternal) throw new ArcpError('invalid_request', 'participant attach requires an external reference', 'externalId');
+    if (!input.adapterId?.trim()) throw new ArcpError('invalid_request', 'participant attach requires an adapter id', 'adapterId');
+    return this.store.mutate((state) => {
+      const workspace = state.workspaces.find((item) => item.id === input.workspaceId && item.lifecycle === 'active');
+      if (!workspace) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
+      const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId);
+      if (!member) throw new ArcpError('unknown_recipient', 'member is not in this workspace');
+      const existing = state.sessions.find((item) => item.memberId === member.id && item.runtimeKind === 'external' && item.state !== 'terminal');
+      if (existing) {
+        // An attach must be repeatable. Changing the adapter or the external
+        // ref under a live session would silently redirect delivery, so that
+        // is a conflict rather than an update.
+        if (existing.adapterId !== input.adapterId || existing.externalId !== trimmedExternal) throw new ArcpError('placement_conflict', `member ${member.id} is already attached to ${existing.adapterId} session ${existing.externalId ?? 'unknown'}`);
+        return existing;
+      }
+      const binding = member.actorId ? state.bindings.find((item) => item.actorId === member.actorId) : undefined;
+      const session: RuntimeSession = {
+        id: `runtime_${randomUUID()}`,
+        actorId: member.actorId ?? workspace.ownerActorId,
+        goalId: `goal_attached_${member.id}`,
+        bindingId: binding?.id ?? `binding_attached_${member.id}`,
+        generation: 1,
+        runtimeKind: 'external',
+        adapterId: input.adapterId,
+        workspaceId: input.workspaceId,
+        memberId: member.id,
+        profileId: 'attached-participant',
+        provider: input.adapterId,
+        model: 'attached',
+        externalId: trimmedExternal,
+        workspace: input.workspace,
+        // An attached participant is reachable but its safe points are only as
+        // good as its channel's observation; it starts idle and is corrected by
+        // whatever observation the adapter can actually provide.
+        state: 'idle',
+        lastTurnState: 'idle',
+        createdAt: now(),
+      };
+      state.sessions.push(session);
+      return session;
+    });
+  }
   async registerExternal(input: { actorId: string; workspaceId: string; label?: string; role?: string; workspace?: string }): Promise<{ member: Member; session: RuntimeSession; credential?: string }> {
     const state = this.store.snapshot();
     if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');

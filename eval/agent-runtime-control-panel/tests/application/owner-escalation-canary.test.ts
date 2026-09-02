@@ -94,4 +94,30 @@ describe('owner escalation canary', () => {
     expect(stored.consumptionState).toBe('open');
     service.close();
   });
+
+  it('attaches a live participant to an existing Manager member so its obligations stop dead-lettering', async () => {
+    const { service, workspace, manager } = await platformWorkspace();
+    // Before attach the accountable Manager has a Member but no session, which
+    // is precisely the state that produced "no live target runtime session".
+    expect(service.state().sessions.filter((item) => item.memberId === manager.id)).toHaveLength(0);
+
+    const session = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-1' });
+    expect(session.memberId).toBe(manager.id);
+    expect(session.runtimeKind).toBe('external');
+    expect(session.state).toBe('idle');
+    // No Member was minted and nothing was launched.
+    expect(service.state().members.filter((item) => item.workspaceId === workspace.id)).toHaveLength(3);
+
+    // Re-attach is idempotent: a reconnect resumes one accountable session
+    // rather than forking a second generation.
+    const again = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-1' });
+    expect(again.id).toBe(session.id);
+    expect(service.state().sessions.filter((item) => item.memberId === manager.id)).toHaveLength(1);
+
+    // Silently redirecting a live session to another channel would reroute a
+    // human's obligations without anyone noticing.
+    await expect(service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'other-channel', externalId: 'participant-opaque-2' }))
+      .rejects.toMatchObject({ code: 'placement_conflict' });
+    service.close();
+  });
 });

@@ -151,3 +151,55 @@ For Claude, `interrupt` is deliberately two-stage and server-enforced: the first
 Port 8787, the `paseo-reminder` package, the unversioned reminder/message/child-watch/ledger/correction routes, the runtime that served them and the matching `arcp` verbs are removed. The daemon serves `/v1/*`, `/health` and `/self/runtime` and nothing else, and ARCP Channel, Delivery, Knowledge and Result are the only cooperation path; no proxy, shim or forwarding route is offered. `PASEO_COMPANION_RUNTIME_DIR`, `PASEO_COMPANION_DATA`, `PASEO_COMPANION_LOG` and `PASEO_COMPANION_PID` remain accepted as state-path names only, so an existing state directory stays readable.
 
 Records written by the retired workflow are user data. Nothing in ARCP reads or writes them any more, so archive the directory with `scripts/archive-legacy-reminder-state --data DIR --out DIR` before a plugin reinstall or re-clone removes it; see `runtime/README.md`. Deleting the records is a separate Owner-gated step.
+
+## Adapter, Fact, Policy, Decision
+
+ARCP keeps four responsibilities apart. Collapsing any two of them is how a
+control plane starts making unexplainable choices.
+
+| Boundary | Owns | Must never |
+| --- | --- | --- |
+| Adapter / FactSource | Talking to the outside world and normalizing what it saw | Decide a launch, route, hold or serialization |
+| Fact (`PolicyInputSnapshot`) | Immutable observations with `source`, `observedAt`, freshness, trust/confidence | Be edited after publication, or hide that an input was missing |
+| Policy | Deterministic eligibility and selection over supplied facts | Perform I/O, or reach for a source it was not given |
+| DecisionReceipt | The immutable record of what was chosen and why | Be rewritten, or omit the alternatives it rejected |
+
+Two adapter families exist and are not interchangeable. A **RuntimeHostAdapter**
+creates, observes and stops Runtimes that ARCP manages — `PaseoAdapter` is one.
+An **ActorChannelAdapter** wakes a participant conversation that already exists
+outside the Workspace — the Owner Deputy is the motivating case. Core ships one
+production channel (Hermes) plus a recording channel used by the deterministic
+suite; further channels are operator-installed through the startup registry and
+never named by an HTTP caller.
+
+Fact sources are provider-specific on purpose. Claude Code has an observed
+default-wake gate near 55 minutes of idle; Codex has no fixed TTL, so its cache
+assessment stays `unknown` or carries a confidence interval rather than
+borrowing Claude's threshold. **There is no single TTL that is correct for every
+provider**, and a source that cannot establish a fact must say so instead of
+guessing.
+
+A `DecisionReceipt` records the action (`launch`, `route`, `serialize`, `hold`,
+`drain`, `reuse`, `fresh_continuation`), the effective provider/model/profile/
+mode, reason codes, the exact facts it relied on with their freshness, the
+alternatives it rejected, the binding constraint, and the policy version with
+its re-evaluation trigger. Anything a caller sees is presented in that order —
+Fact, Source, Policy, Decision — so "why was this held?" is answerable from the
+record rather than from a transcript.
+
+A transport receipt is not a decision receipt. An adapter reports only that a
+wire accepted an envelope; it can never report that work was handled, accepted
+or decided.
+
+### Participants that ARCP did not launch
+
+`external register` mints a new Member and launches a Hermes ACP process, so it
+cannot represent a participant that is already running and already accountable.
+Attaching binds such a participant to an **existing** Member: it mints no
+Member, launches nothing, and names the participant channel plus an opaque
+external reference. Re-attaching is idempotent so a reconnect resumes one
+accountable session; pointing a live session at a different channel is refused,
+because that would silently reroute a participant's obligations.
+
+Until a Member has a live session, obligations addressed to it fail with
+`no live target runtime session` — a Member alone is not a delivery target.
