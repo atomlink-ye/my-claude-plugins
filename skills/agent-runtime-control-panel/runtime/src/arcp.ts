@@ -58,7 +58,9 @@ export type RecipientDispositionReceipt = RecipientDisposition & { id: string; a
 export interface ChannelDeferralPolicy { maxDeferrals: number; maxDeferredMs: number; allowCriticalDeferral?: boolean; }
 
 export interface Actor { id: string; clientIdentity: string; label: string; createdAt: string; }
-export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; createdAt: string; }
+/** A binding is a replaceable address, not an identity. `lifecycle` is absent
+ * on rows written before supersession existed; absent means current. */
+export interface ActorBinding { id: string; actorId: string; channel: 'hermes' | 'local'; profileRef?: string; conversationRef?: string; generation: number; lifecycle?: 'current' | 'superseded'; supersededAt?: string; createdAt: string; }
 export interface Goal { id: string; actorId: string; title: string; workspaceId?: string; state: GoalState; createdAt: string; updatedAt: string; }
 export type DecisionVerdict = 'accept' | 'refuse';
 export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress' | 'workspace_analysis_required';
@@ -878,6 +880,33 @@ export class ArcpService implements ExecutionPlacementPort {
   setPort(port: number): void { this.port = port; }
   health(): Record<string, unknown> { return { status: 'ok', startedAt: this.startedAt, uptimeSeconds: Math.floor((Date.now() - Date.parse(this.startedAt)) / 1000) }; }
   runtime(): Record<string, unknown> { return { pid: process.pid, cwd: process.cwd(), dataDir: this.dataDir, port: this.port || Number(process.env.PORT || 18787) }; }
+  /** Bindings written before supersession existed carry no lifecycle; treating
+   * absent as current keeps old rows addressable instead of orphaning them. */
+  private bindingIsCurrent(binding: ActorBinding): boolean { return (binding.lifecycle ?? 'current') === 'current'; }
+
+  /** Move an Actor to a new conversation without changing who it is.
+   *
+   * The old binding is marked superseded rather than mutated in place, so a
+   * wake already in flight against the previous generation stays explainable
+   * instead of silently retargeting a different conversation. */
+  async rebindActor(input: { actorId: string; channel: 'hermes' | 'local'; conversationRef: string; profileRef?: string }): Promise<ActorBinding> {
+    const conversationRef = input.conversationRef?.trim();
+    if (!conversationRef) throw new ArcpError('invalid_request', 'conversationRef is required', 'conversationRef');
+    return this.store.mutate((state) => {
+      if (!state.actors.some((item) => item.id === input.actorId)) throw new ArcpError('unknown_recipient', 'actor is not registered');
+      const prior = state.bindings.filter((item) => item.actorId === input.actorId && item.channel === input.channel);
+      const current = prior.filter((item) => this.bindingIsCurrent(item));
+      const existing = current.find((item) => item.conversationRef === conversationRef && item.profileRef === input.profileRef?.trim());
+      if (existing) return existing;
+      const at = now();
+      for (const item of current) { item.lifecycle = 'superseded'; item.supersededAt = at; }
+      const generation = prior.reduce((max, item) => Math.max(max, item.generation), 0) + 1;
+      const binding: ActorBinding = { id: idFor('binding', `${input.actorId}:${input.channel}:${input.profileRef ?? ''}:${conversationRef}:${generation}`), actorId: input.actorId, channel: input.channel, ...(input.profileRef?.trim() ? { profileRef: input.profileRef.trim() } : {}), conversationRef, generation, lifecycle: 'current', createdAt: at };
+      state.bindings.push(binding);
+      return binding;
+    });
+  }
+
   registerActor(input: { clientIdentity: string; label?: string; channel?: 'hermes' | 'local'; profileRef?: string; conversationRef?: string }): Promise<{ actor: Actor; binding: ActorBinding; credential?: string }> {
     const clientIdentity = input.clientIdentity?.trim();
     if (!clientIdentity) throw new ArcpError('invalid_request', 'clientIdentity is required');
@@ -1861,7 +1890,7 @@ export class ArcpService implements ExecutionPlacementPort {
    * the binding is replaceable, so the newest generation wins and the caller
    * always names an exact binding rather than scanning for a plausible one. */
   private currentOwnerBinding(state: State, ownerActorId: string): ChannelBindingRef | undefined {
-    const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel));
+    const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel) && this.bindingIsCurrent(item));
     if (!bindings.length) return undefined;
     const current = bindings.reduce((best, item) => (item.generation > best.generation ? item : best));
     if (!current.conversationRef) return undefined;

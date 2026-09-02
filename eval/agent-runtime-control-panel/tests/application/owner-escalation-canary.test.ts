@@ -187,4 +187,35 @@ describe('owner escalation canary', () => {
     expect(channel.wakes).toHaveLength(1);
     service.close();
   });
+
+  it('rebinds an Actor to a new conversation without changing identity, and wakes only the current generation', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    const before = service.state().bindings.find((item) => item.actorId === workspace.ownerActorId)!;
+
+    const rebound = await service.rebindActor({ actorId: workspace.ownerActorId, channel: 'recording' as any, conversationRef: 'conversation-opaque-2' });
+    // Identity is the Actor; only the address moved.
+    expect(rebound.actorId).toBe(workspace.ownerActorId);
+    expect(rebound.generation).toBe(before.generation + 1);
+    expect(rebound.id).not.toBe(before.id);
+    // The prior binding is retired explicitly rather than mutated in place, so
+    // a wake already in flight against it stays explainable.
+    const priorAfter = service.state().bindings.find((item) => item.id === before.id)!;
+    expect(priorAfter.lifecycle).toBe('superseded');
+    expect(priorAfter.conversationRef).toBe('conversation-opaque-1');
+    // Rebinding to the same conversation is idempotent, not a generation bump.
+    expect((await service.rebindActor({ actorId: workspace.ownerActorId, channel: 'recording' as any, conversationRef: 'conversation-opaque-2' })).id).toBe(rebound.id);
+
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+    // The wake must reach the CURRENT conversation at its exact generation.
+    expect(channel.wakes).toHaveLength(1);
+    expect(channel.wakes[0].envelope.recipientRef).toBe('conversation-opaque-2');
+    expect(channel.wakes[0].binding.generation).toBe(2);
+    expect(channel.wakes[0].binding.bindingId).toBe(rebound.id);
+    service.close();
+  });
 });
