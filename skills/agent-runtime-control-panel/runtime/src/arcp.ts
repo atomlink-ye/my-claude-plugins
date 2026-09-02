@@ -554,9 +554,6 @@ export class ArcpService {
     const checkout = path.resolve(input.workspace ?? process.cwd());
     const controlWorkspace = state.workspaces.find((item) => item.id === input.workspaceId)!;
     const persisted = controlWorkspace.paseoPlacements?.find((item) => item.checkout === checkout);
-    if (!persisted && (!input.paseoProjectId || !input.paseoWorkspaceId)) {
-      return { ...preflight, action: 'hold', launchable: false, why: 'PLACEMENT_CONFLICT: an unplaced checkout requires explicit canonical Paseo Project and Workspace IDs before launch' };
-    }
     if (persisted && ((input.paseoProjectId && input.paseoProjectId !== persisted.projectId) || (input.paseoWorkspaceId && input.paseoWorkspaceId !== persisted.workspaceId))) {
       return { ...preflight, action: 'hold', launchable: false, why: `PLACEMENT_CONFLICT: checkout already uses Paseo Project ${persisted.projectId} and Workspace ${persisted.workspaceId}; reuse that canonical placement` };
     }

@@ -193,11 +193,11 @@ describe('ARCP MVE control core', () => {
     expect(create).toEqual(['project', 'create', repositoryRoot, '--json']);
     service.close();
   });
-  it('rejects an ID-less managed launch before it can materialize a duplicate Paseo Workspace', async () => {
+  it('materializes one canonical placement for an ID-less managed launch', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-idless-placement-')); const service = await control(root);
     const { actor } = await service.registerActor({ clientIdentity: 'idless-placement-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'idless placement' });
-    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'must not mint', profileId: 'codex-worker' })).resolves.toMatchObject({ action: 'hold', launchable: false, why: expect.stringContaining('explicit canonical Paseo Project and Workspace IDs') });
-    expect((service.cli as any).calls.some((args: string[]) => args[0] === 'workspace' && args[1] === 'create')).toBe(false); expect((service.cli as any).launches).toBe(0);
+    await expect(service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'materialize once', profileId: 'codex-worker' })).resolves.toMatchObject({ session: { placement: { requested: { projectId: 'prj_default', workspaceId: 'wks_default' } } } });
+    expect((service.cli as any).calls.filter((args: string[]) => args[0] === 'workspace' && args[1] === 'create')).toHaveLength(1); expect((service.cli as any).launches).toBe(1);
     service.close();
   });
   it('launches without placement when implicit canonical materialization is unavailable', async () => {
