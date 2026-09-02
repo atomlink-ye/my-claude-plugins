@@ -216,19 +216,34 @@ async function git(cwd: string, args: string[]): Promise<string> {
  * this adapter owns only safe Paseo transport/discovery calls and never exposes native handles. */
 type PaseoModeClient = { connect(): Promise<void>; close(): Promise<void>; providers: { listModes(provider: string): Promise<unknown> } };
 
+/** Default budget for the discovery-plane calls (`provider ls`, `ls -g`,
+ * `inspect`) that back preflight() and doctor's live/available verdicts.
+ * These calls back a fail-closed decision, so the budget must stay generous:
+ * the daemon's response time grows with agent count, and a fixed 5s budget
+ * started reading a live daemon as unavailable once it carried ~100 agents
+ * (measured ~5.8s for `provider ls --json`, ~5.4s for `ls -g --json`).
+ * ARCP_DISCOVERY_TIMEOUT_MS lets an operator raise the budget without a code
+ * change; a call that genuinely exceeds it still throws, so preflight/doctor
+ * still fail closed to `hold`/`unavailable` rather than fabricate availability. */
+export const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
+function discoveryTimeoutMs(): number {
+  const raw = Number(process.env.ARCP_DISCOVERY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DISCOVERY_TIMEOUT_MS;
+}
+
 export class PaseoAdapter implements RuntimeAdapter {
   readonly adapterId = 'paseo';
   constructor(private readonly cli: PaseoCli, private readonly modeClientFactory?: () => PaseoModeClient) {}
-  discover() { return this.cli.run(['provider', 'ls', '--json'], { timeoutMs: 5_000 }); }
-  models(provider: string) { return this.cli.run(['provider', 'models', provider, '--json'], { timeoutMs: 5_000 }); }
+  discover() { return this.cli.run(['provider', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() }); }
+  models(provider: string) { return this.cli.run(['provider', 'models', provider, '--json'], { timeoutMs: discoveryTimeoutMs() }); }
   launch(profile: Profile, goalTitle: string, workspace?: string, context?: RuntimeLaunchContext) {
     const handoff = context?.workspaceId && context.taskId && context.runtimeId
       ? `\n\nARCP Worker handoff: workspace ${context.workspaceId}, task ${context.taskId}, runtime ${context.runtimeId}. Use the packaged CLI through Node. Claim with \`${packagedArcpCommand('task', 'claim', context.taskId, '--expected-fence', '0')}\`. Report durable learning with \`${packagedArcpCommand('knowledge', 'add', context.workspaceId, '--kind', 'learning', '--text', '<learning>')}\` and submit the candidate with \`${packagedArcpCommand('result', 'submit', context.workspaceId, '--task', context.taskId, '--summary', '<summary>', '--expected-fence', '1', '--evidence', '<evidence-ref[,evidence-ref...]>')}\`.`
       : '';
     return this.cli.run(['run', '-d', '--json', '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${handoff}`], { timeoutMs: 30_000 });
   }
-  observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: 5_000 }); }
-  registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: 5_000 }); }
+  observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: discoveryTimeoutMs() }); }
+  registry() { return this.cli.run(['ls', '-g', '--json'], { timeoutMs: discoveryTimeoutMs() }); }
   async providerSubagents(parentAgentId: string): Promise<ChildObservation> {
     if (!(this.cli instanceof PaseoCli)) return { source: 'unavailable', items: [] };
     const raw = process.env.PASEO_HOST || process.env.PASEO_COMPANION_PASEO_HOST || 'ws://127.0.0.1:6767/ws'; const url = raw.includes('://') ? raw : `ws://${raw}`;
