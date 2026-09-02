@@ -48,7 +48,12 @@ export function projectSequence(facts: SequenceFacts): SequenceProjection {
   }
   for (const session of facts.sessions.filter((item) => include(item.workspaceId))) {
     const subject = ref('runtime', session.id, `${session.provider} generation ${session.generation}`);
-    add(`runtime:${session.id}:launched`, session.createdAt, 'runtime_launched', subject, `Runtime launched: ${session.provider}`, { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation, provider: session.provider, hasContract: Boolean(session.taskId) }, { actor: actor(session.memberId, members), refs: [ref('goal', session.goalId), ...(session.taskId ? [ref('task', session.taskId)] : [])] });
+    add(`runtime:${session.id}:launched`, session.createdAt, 'runtime_launched', subject, `Runtime launched: ${session.provider}`, { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation, provider: session.provider, hasContract: Boolean(session.contractBoundAt) }, { actor: actor(session.memberId, members), refs: [ref('goal', session.goalId), ...(session.taskId ? [ref('task', session.taskId)] : [])] });
+    // A Contract bound in the launch itself is atomic with `runtime_launched`:
+    // this is the only producer of `goal_contract_bound` with `boundAtLaunch:
+    // true`. A Contract that instead arrives as a later Delivery is folded
+    // below, from the Delivery milestones, with `boundAtLaunch: false`.
+    if (session.contractBoundAt) add(`runtime:${session.id}:contract-bound`, session.contractBoundAt, 'goal_contract_bound', ref('goal', session.goalId), 'Goal Contract bound at launch', { goalId: session.goalId, boundAtLaunch: true }, { refs: [ref('runtime', session.id)], causal: [{ kind: 'caused_by', entryId: `runtime:${session.id}:launched` }] });
     if (session.lastObservedAt) add(`runtime:${session.id}:observed`, session.lastObservedAt, session.state === 'terminal' ? 'runtime_terminal' : 'runtime_observed', subject, `Runtime ${session.state}`, session.state === 'terminal' ? { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation } : { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation, state: session.state }, { causal: [{ kind: 'caused_by', entryId: `runtime:${session.id}:launched` }] });
     const previousGeneration = [...sessions.values()].filter((other) => other.id !== session.id && other.goalId === session.goalId && other.bindingId === session.bindingId && other.generation < session.generation).sort((a, b) => b.generation - a.generation)[0];
     if (previousGeneration) add(`runtime:${session.id}:generation`, session.createdAt, 'runtime_generation_changed', subject, `Runtime generation ${session.generation}`, { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation }, { causal: [{ kind: 'replaces', entryId: `runtime:${previousGeneration.id}:launched` }] });
@@ -63,6 +68,10 @@ export function projectSequence(facts: SequenceFacts): SequenceProjection {
     if (delivery.state === 'transport_indeterminate') milestones.push(['delivery_undeliverable', delivery.attemptedAt ?? delivery.createdAt]);
     let previous = `runtime:${delivery.runtimeSessionId}:launched`;
     for (const [kind, at] of milestones) { if (!at) continue; const id = `delivery:${delivery.id}:${kind}`; add(id, at, kind, subject, `Delivery ${kind.replace('delivery_', '')}`, kind === 'delivery_undeliverable' ? { ...base, undeliverableReason: delivery.refusedReason ?? 'transport_indeterminate' } : base, { refs: [ref('delivery', delivery.id), ref('runtime', delivery.runtimeSessionId), ...(delivery.eventId ? [ref('event', delivery.eventId)] : [])], causal: [{ kind: 'caused_by', entryId: previous }] }); previous = id; }
+    // A Contract delivered outside the launch reached the runtime only because
+    // it survived every fail-closed re-check; that is a real, non-atomic bind,
+    // never the atomic one, so it always folds with `boundAtLaunch: false`.
+    if (delivery.purpose === 'contract' && delivery.deliveredAt) { const goalId = delivery.subject?.taskId ? goalForTask.get(delivery.subject.taskId) : undefined; if (goalId) add(`delivery:${delivery.id}:contract-bound`, delivery.deliveredAt, 'goal_contract_bound', ref('goal', goalId), 'Goal Contract bound by late Delivery', { goalId, boundAtLaunch: false }, { refs: [ref('delivery', delivery.id), ref('runtime', delivery.runtimeSessionId)], causal: [{ kind: 'caused_by', entryId: `delivery:${delivery.id}:delivery_delivered` }] }); }
   }
   for (const event of facts.channelEvents.filter((item) => include(item.workspaceId))) {
     const subject = subjectFor(event.taskId, undefined, event.workspaceId, tasks, sessions);
