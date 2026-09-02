@@ -1,6 +1,53 @@
 # ARCP
 
-Use `scripts/arcp` as the product surface. Do not compose raw HTTP requests. Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create/join a ControlWorkspace.
+Use `scripts/arcp` as the product surface. Do not compose raw HTTP requests.
+
+## CLI command map
+
+```text
+workspace create|join|list|context
+surface archive|restore WORKSPACE SURFACE_ID (Owner actor only; never automatic)
+task create|claim|list WORKSPACE [--expected-fence N]
+knowledge add|search|list WORKSPACE
+result submit|list WORKSPACE [--expected-fence N] [--source-id ID] [--evidence REF[,REF...]]
+channel list WORKSPACE [--kind K] [--state S] [--consumption open|deferred|consumed|resolved] [--ack-required] [--decision-required]
+channel reconcile WORKSPACE --dry-run
+channel ack EVENT --reason 'what you did' [--disposition-id ID]
+channel resolve EVENT --summary '...' --verdict accept|refuse [--disposition-id ID]
+channel defer EVENT --for 30m|--until ISO|--after-event EVENT|--manual --reason 'why' [--disposition-id ID]
+channel resume EVENT [--disposition-id ID]
+channel ask RUNTIME --question '...' [--options 'a,b']
+channel withdraw DELIVERY
+steward analyze WORKSPACE --task TASK
+steward reports WORKSPACE
+supervision configure WORKSPACE [--review-after-ms N] [--inactivity-after-ms N] [--cooldown-ms N] [--steward-profile ID] [--automatic true|false]
+supervision status WORKSPACE
+release DELIVERY [--confirm TOKEN]
+db status|check|backup|export [--kind K] [--since T] | import --from DIR [--db PATH] [--overwrite]
+member heartbeat|list WORKSPACE
+goal start|list
+runtime status|list
+start --workspace WORKSPACE --title '<goal>' [--contract '<goal contract>' | --contract-file PATH] [--paseo-project PROJECT_ID] [--paseo-workspace WORKSPACE_ID] [--cwd PATH] [--show-credential]
+      [--primary-handler MEMBER] [--cc MEMBER]... [--escalate-to MEMBER]...
+external register WORKSPACE [--label LABEL] [--show-credential]
+external status|send|stop|reconcile RUNTIME
+reconcile RUNTIME
+inbox [--workspace WORKSPACE]
+panorama [--workspace WORKSPACE] [--temporal active|problems|task TASK_ID]
+status [--workspace WORKSPACE]
+tui [--workspace WORKSPACE] [--snapshot]
+canary [--workspace WORKSPACE]  discovery/context smoke probe; not a test suite
+
+send RUNTIME --body '...'
+send RUNTIME --contract-file PATH --subject-task TASK --subject-fence N [--not-after ISO8601]
+interrupt RUNTIME --reason ... --body ...
+reuse RUNTIME --body ... [--confirm TOKEN]
+ack DELIVERY [--reason ...]
+provider-budget read|refresh [--source ID]
+actor register|list · doctor · ensure · preflight
+```
+
+Start with `arcp doctor`, `arcp ensure`, `arcp actor register`, then create or join a ControlWorkspace.
 
 Useful CLI workflows: `workspace create --purpose …`, `workspace join WORKSPACE --label …`, `workspace context WORKSPACE`, `task create WORKSPACE --title …`, `task claim TASK --expected-fence N`, `knowledge add WORKSPACE --text …`, and `result submit WORKSPACE --task TASK --summary … --expected-fence N`. Read the current fence from `workspace context` or `panorama`; claim returns the next fence required for Result submission.
 
