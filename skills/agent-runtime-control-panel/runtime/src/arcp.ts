@@ -74,7 +74,7 @@ export interface RuntimeLaunchContext { workspaceId?: string; paseoProjectId?: s
  * transport delivery. The primary handler alone owns acknowledgement and
  * action; cc recipients observe and must never create a second obligation. */
 export interface ReportingRoute { launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds: string[]; escalationMemberIds: string[]; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; executionSurfaceId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; executionSurfaceId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; selectionReceipt?: SelectionReceipt; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; purpose?: DeliveryPurpose; subject?: DeliverySubject; notAfter?: string; refusedReason?: string; handedOffAfterWithdrawal?: boolean; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
@@ -83,7 +83,16 @@ export interface Task { id: string; workspaceId: string; title: string; lifecycl
 export interface KnowledgeEntry { id: string; workspaceId: string; authorMemberId: string; kind: 'problem' | 'learning' | 'decision' | 'evidence' | 'runbook' | 'blocker'; text: string; tags: string[]; taskId?: string; goalId?: string; createdAt: string; }
 export interface Result { id: string; workspaceId: string; taskId: string; memberId: string; fence: number; status: 'candidate' | 'failed' | 'unknown'; summary: string; evidenceRefs: string[]; sourceId?: string; createdAt: string; }
 export interface RuntimeSettings { provider: string; model: string; mode?: string; thinking?: string; }
-export interface ActionResult { action: 'launch' | 'route' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; recommendedCommands: string[]; liveModes: string[]; admission?: AdmissionDecision; runtimeSignals?: RuntimeBudgetSignal[]; }
+export type SelectionExplanation = {
+  roleIntent: string;
+  selection: 'explicit-settings' | 'named-profile' | 'role-intent' | 'default-profile';
+  selectedProfile: Pick<Profile, 'id' | 'provider' | 'model' | 'mode' | 'thinking' | 'role'>;
+  alternatives: Array<Pick<Profile, 'id' | 'provider' | 'model' | 'mode' | 'thinking' | 'role'> & { reason: string }>;
+};
+/** The durable account of an ARCP provider choice. `quotaSnapshot` is the
+ * exact provider-budget evidence available when ARCP made the choice. */
+export type SelectionReceipt = { chosenRole: string; provider: string; model: string; thinking: string | null; mode: string | null; reason: string; quotaSnapshot: ProviderBudgetEnvelopeV1 | null; };
+export interface ActionResult { action: 'launch' | 'route' | 'hold' | 'warn'; launchable: boolean; why: string; requested: RuntimeSettings; effective: RuntimeSettings; profileId: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt; recommendedCommands: string[]; liveModes: string[]; admission?: AdmissionDecision; runtimeSignals?: RuntimeBudgetSignal[]; }
 export interface RuntimeObservation { status: SessionState; activeTurn: boolean | 'unknown'; usage: { input: number | 'unknown'; cached: number | 'unknown'; output: number | 'unknown' }; context: { used: number | 'unknown'; max: number | 'unknown'; ratio: number | 'unknown'; quality: 'observed' | 'reported' | 'estimated' | 'unavailable' }; pendingPermissions: number | 'unknown'; attention: boolean | 'unknown'; attentionWhy?: string; compaction: { count: number | 'unknown'; status: 'completed' | 'loading' | 'none' | 'unavailable'; lastAt?: string }; cache: { activityAt?: string; ageMinutes: number | 'unknown'; state: 'fresh' | 'expiring' | 'expired' | 'unknown' }; burn: RuntimeBudgetView; lastObservedAt?: string; freshness: 'fresh' | 'stale' | 'unavailable' | 'unknown'; health: 'healthy' | 'degraded' | 'attention' | 'unavailable' | 'unknown'; requested: RuntimeSettings; observed: Partial<RuntimeSettings>; mismatch: boolean; }
 export interface ManagedChild { id: string; provider?: string; title?: string; status: string; createdAt?: string; updatedAt?: string; source: 'paseo_parent' | 'provider_subagents'; }
 export interface ChildObservation { source: 'provider_subagents' | 'paseo_parent' | 'unavailable' | 'none'; items: ManagedChild[]; }
@@ -244,7 +253,9 @@ export const DEFAULT_PROFILES = [
   { id: 'claude-manager', provider: 'claude', model: 'claude-opus-5', mode: 'auto', thinking: 'medium', role: 'manager' },
   { id: 'claude-bypass-permissions', provider: 'claude', model: 'claude-opus-5', mode: 'bypassPermissions', thinking: 'medium', role: 'manager' },
   { id: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium', role: 'worker' },
+  { id: 'codex-auto-review', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto-review', thinking: 'medium', role: 'worker' },
   { id: 'codex-full-access', provider: 'codex', model: 'gpt-5.6-terra', mode: 'full-access', thinking: 'medium', role: 'worker' },
+  { id: 'claude-sonnet-worker', provider: 'claude', model: 'claude-sonnet-5', mode: 'auto', thinking: 'medium', role: 'worker' },
   { id: 'pi-grok-worker', provider: 'pi', model: 'grok-cli/grok-4.6', role: 'worker' },
 ] as const;
 
@@ -300,11 +311,20 @@ function launchReceiptIdentity(value: Record<string, any>): string | undefined {
   const nested = asRecord(value.agent ?? value.runtime ?? value.result);
   return setting(value.id ?? value.agentId ?? value.sessionId ?? value.externalId ?? nested.id ?? nested.agentId ?? nested.sessionId);
 }
-const safeModeRank = (value: unknown) => {
+const safeModeRank = (provider: string, value: unknown) => {
   const mode = capabilityToken(String(value ?? ''));
   if (['plan', 'readonly', 'read', 'ask'].includes(mode)) return 0;
-  if (mode === 'auto') return 1;
-  if (['fullaccess', 'bypasspermissions'].includes(mode)) return 2;
+  if (provider === 'codex') {
+    if (mode === 'auto') return 1;
+    if (mode === 'autoreview') return 2;
+    if (mode === 'fullaccess') return 3;
+    return 1;
+  }
+  if (provider === 'claude') {
+    if (mode === 'auto') return 1;
+    if (mode === 'bypasspermissions') return 2;
+    return 1;
+  }
   return 1;
 };
 const safeJson = (value: unknown): Record<string, any> => asRecord(value);
@@ -535,6 +555,8 @@ export class ArcpService implements ExecutionPlacementPort {
   readonly adapter: RuntimeAdapter;
   private readonly adapters = new Map<string, RuntimeAdapter>();
   private profileData: Profile[] = [...DEFAULT_PROFILES];
+  /** Operator-authored plain text: returned verbatim, never interpreted. */
+  private routingGuidanceText = '';
   private providerBudgetConfig: ProviderBudgetConfig = {};
   private providerBudgetSnapshot?: ProviderBudgetEnvelopeV1;
   private readonly runtimeBudget = new RuntimeBudgetTracker();
@@ -704,8 +726,9 @@ export class ArcpService implements ExecutionPlacementPort {
     });
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
-      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy> };
+      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy>; routing?: { guidance?: unknown } };
       if (Array.isArray(config.profiles) && config.profiles.every((item) => item?.id && item.provider && item.model && item.role)) this.profileData = config.profiles;
+      if (typeof config.routing?.guidance === 'string') this.routingGuidanceText = config.routing.guidance;
       if (config.providerBudget && typeof config.providerBudget === 'object') this.providerBudgetConfig = config.providerBudget;
       if (config.runtimeBudget && Object.values(config.runtimeBudget).every((value) => typeof value === 'number' && Number.isFinite(value) && value > 0)) this.runtimeBudgetPolicy = { ...this.runtimeBudgetPolicy, ...config.runtimeBudget };
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
@@ -928,7 +951,7 @@ export class ArcpService implements ExecutionPlacementPort {
     if (input.paseoProjectId || input.paseoWorkspaceId || persisted) throw new ArcpError('placement_unresolved', unresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch');
     return { ...input, workspace: checkout, ...(unresolved ? { placementUnresolved: unresolved } : {}) };
   }
-  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string }> {
+  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
     if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
@@ -961,7 +984,7 @@ export class ArcpService implements ExecutionPlacementPort {
       const reportingRoute = this.resolveReportingRoute({ workspaceId: input.workspaceId, launchedByMemberId: input.launchedByMemberId, primaryHandlerMemberId: input.primaryHandlerMemberId, ccMemberIds: input.ccMemberIds, escalationMemberIds: input.escalationMemberIds, fallbackMemberId: joined.member.id });
       const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
       const session = await this.launchOrRefuse({ ...input, actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(input.contract ? { contract: input.contract } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute });
-      return { goal, task, member: joined.member, session, credential: joined.credential };
+      return { goal, task, member: joined.member, session, credential: joined.credential, routingGuidance: preflight.routingGuidance, selection: preflight.selection, selectionReceipt: preflight.selectionReceipt };
     } catch (error) { await this.abandonManagedLaunch({ memberId: joinedMemberId, runtimeId, goalId: goal.id, taskId: task.id }); throw error; }
   }
   private async recordProviderBudgetEpisode(workspaceId: string, admission?: AdmissionDecision): Promise<void> {
@@ -1058,8 +1081,10 @@ export class ArcpService implements ExecutionPlacementPort {
     const explicit = [input.provider, input.model, input.mode, input.thinking].some((value) => value !== undefined);
     if (input.profileId && explicit) throw new ArcpError('invalid_request', 'use either a named profile or explicit provider/model/mode/thinking');
     if (input.profileId || !explicit) {
-      const profile = this.profileData.find((item) => item.id === (input.profileId ?? 'codex-worker'));
-      if (!profile) throw new ArcpError('invalid_request', 'unknown launch profile');
+      const roleIntent = input.role?.trim();
+      const selectedProfileId = input.profileId ?? (roleIntent ? this.profileData.find((item) => sameSetting(item.role, roleIntent))?.id : 'codex-worker');
+      const profile = this.profileData.find((item) => item.id === selectedProfileId);
+      if (!profile) throw new ArcpError('invalid_request', roleIntent ? `no launch profile matches role intent ${roleIntent}` : 'unknown launch profile', roleIntent ? 'role' : 'profileId');
       if (capabilityToken(profile.provider) === 'pi' && profile.mode) throw new ArcpError('invalid_request', 'Pi/Grok has no ARCP mode; omit --mode');
       return profile;
     }
@@ -1068,8 +1093,32 @@ export class ArcpService implements ExecutionPlacementPort {
     const mode = setting(input.mode); const thinking = setting(input.thinking);
     return { id: 'explicit', provider: input.provider.trim(), model: input.model.trim(), ...(mode ? { mode } : {}), ...(thinking ? { thinking } : {}), role: 'explicit' };
   }
+  private selectionExplanation(input: LaunchInput, profile: Profile): SelectionExplanation {
+    const explicitSettings = [input.provider, input.model, input.mode, input.thinking].some((value) => value !== undefined);
+    const selection: SelectionExplanation['selection'] = explicitSettings ? 'explicit-settings' : input.profileId ? 'named-profile' : input.role?.trim() ? 'role-intent' : 'default-profile';
+    const roleIntent = input.role?.trim() || profile.role;
+    const selectedProfile = { id: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), role: profile.role };
+    // A role narrows the configured choices; it never authorizes a silent
+    // provider or permission-mode substitution. Operators choose an
+    // alternative profile explicitly after seeing this guidance.
+    const alternatives = selection === 'role-intent'
+      ? this.profileData.filter((item) => item.id !== profile.id && sameSetting(item.role, roleIntent)).map((item) => ({ id: item.id, provider: item.provider, model: item.model, ...(item.mode ? { mode: item.mode } : {}), ...(item.thinking ? { thinking: item.thinking } : {}), role: item.role, reason: 'matches the same role intent; select it explicitly to change provider or mode' }))
+      : [];
+    return { roleIntent, selection, selectedProfile, alternatives };
+  }
+  private selectionReceipt(input: LaunchInput, profile: Profile, selection: SelectionExplanation): SelectionReceipt {
+    const chosenRole = input.role?.trim() || (profile.id === 'explicit' ? 'worker' : profile.role);
+    const reason = selection.selection === 'role-intent'
+      ? `role intent ${chosenRole} selected configured profile ${profile.id}`
+      : selection.selection === 'named-profile'
+        ? `explicit profile ${profile.id} was requested`
+        : selection.selection === 'explicit-settings'
+          ? 'explicit provider and model settings were requested'
+          : `default profile ${profile.id} was selected`;
+    return { chosenRole, provider: profile.provider, model: profile.model, thinking: profile.thinking ?? null, mode: profile.mode ?? null, reason, quotaSnapshot: this.providerBudgetSnapshot ? structuredClone(this.providerBudgetSnapshot) : null };
+  }
   async preflight(input: LaunchInput): Promise<ActionResult> {
-    const profile = this.requestedProfile(input); const requested: RuntimeSettings = { provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}) };
+    const profile = this.requestedProfile(input); const selection = this.selectionExplanation(input, profile); const selectionReceipt = this.selectionReceipt(input, profile, selection); const requested: RuntimeSettings = { provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}) };
     const discovered = await this.discovery();
     let live = discovered.profiles.find((item) => item.id === profile.id)?.available === true;
     let liveModes: string[] = [];
@@ -1081,9 +1130,6 @@ export class ArcpService implements ExecutionPlacementPort {
         live = normalized(provider?.status) === 'available' && normalized(provider?.enabled) !== 'disabled' && Boolean(model) && (!profile.mode || liveModes.some((mode) => sameSetting(mode, profile.mode))) && (!profile.thinking || (Array.isArray(model?.thinkingOptionIds) && model.thinkingOptionIds.some((value: unknown) => sameSetting(value, profile.thinking))));
       }
     } catch { /* discovery receipt remains truthful */ }
-    const stronger = profile.provider === 'codex' ? 'full-access' : profile.provider === 'claude' ? 'bypassPermissions' : undefined;
-    const elevatedProfile = profile.provider === 'codex' ? 'codex-full-access' : profile.provider === 'claude' ? 'claude-bypass-permissions' : undefined;
-    const recommendedCommands = stronger && liveModes.some((mode) => sameSetting(mode, stronger)) ? [`arcp start --profile ${elevatedProfile} --title '<goal>'${input.unattended ? ' --unattended' : ''}`] : [];
     // An operator refresh makes quota admission authoritative. Until then,
     // interactive launches remain governed by their normal live validation;
     // unattended work still asks the fail-closed evaluator for a verdict.
@@ -1091,14 +1137,18 @@ export class ArcpService implements ExecutionPlacementPort {
     const admission = this.providerBudgetSnapshot || quotaAdmissionRequired ? evaluateAdmission({ envelope: this.providerBudgetSnapshot, bindings: this.providerBudgetConfig.bindings ?? [], policies: this.providerBudgetConfig.policies ?? [], providerId: profile.provider, model: profile.model, unattended: input.unattended, activeRuntimeCount: this.store.snapshot().sessions.filter((session) => session.provider === profile.provider && session.state !== 'terminal').length }) : undefined;
     const runtimeSignals = this.store.snapshot().sessions.filter((session) => session.provider === profile.provider && session.state !== 'terminal').flatMap((session) => this.runtimeBudget.view(session.id, this.runtimeBudgetPolicy).signals);
     const admissionHold = admission ? ['drain', 'hard_drain', 'hold_stale', 'hold_unknown', 'route'].includes(admission.action) : false;
-    if (!live) return { action: 'hold', launchable: false, why: 'requested provider, model, thinking, or mode is not live-validated', requested, effective: requested, profileId: profile.id, recommendedCommands: profile.mode === 'auto' ? recommendedCommands : [], liveModes, admission };
-    if (runtimeSignals.length) return { action: 'hold', launchable: false, why: `runtime budget signals: ${[...new Set(runtimeSignals)].join(', ')}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission, runtimeSignals: [...new Set(runtimeSignals)] };
-    if (admission?.action === 'drain' && admission.recommendedProviderProfile) { const target = this.profileData.find((item) => item.id === admission.recommendedProviderProfile); const bound = target && this.providerBudgetConfig.bindings?.some((item) => item.providerId === target.provider && item.sourceId === this.providerBudgetSnapshot?.source.id && (!item.modelPatterns?.length || item.modelPatterns.some((pattern) => matchesModel(pattern, target.model)))); if (target && bound) return { action: 'route', launchable: false, why: 'provider budget requires explicit route approval', requested, effective: requested, profileId: profile.id, recommendedCommands: [`arcp start --profile ${target.id} --title '<goal>'`], liveModes, admission }; }
-    if (admission && admissionHold) return { action: admission.action === 'route' ? 'route' : 'hold', launchable: false, why: `provider budget admission is ${admission.action}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission };
-    const needsElevation = ['claude', 'codex'].includes(profile.provider) && (safeModeRank(profile.mode) < safeModeRank('auto') || Boolean(input.unattended) && safeModeRank(profile.mode) < 2);
-    if (needsElevation && recommendedCommands.length) return { action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
-    if (needsElevation) return { action: 'warn', launchable: true, why: 'requested mode is weaker than auto and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands, liveModes };
-    return { action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission };
+    const action = (value: Omit<ActionResult, 'routingGuidance' | 'selection' | 'selectionReceipt'>): ActionResult => ({ ...value, routingGuidance: this.routingGuidanceText, selection, selectionReceipt });
+    if (!live) return action({ action: 'hold', launchable: false, why: 'requested provider, model, thinking, or mode is not live-validated', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });
+    if (runtimeSignals.length) return action({ action: 'hold', launchable: false, why: `runtime budget signals: ${[...new Set(runtimeSignals)].join(', ')}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission, runtimeSignals: [...new Set(runtimeSignals)] });
+    if (admission?.action === 'drain' && admission.recommendedProviderProfile) { const target = this.profileData.find((item) => item.id === admission.recommendedProviderProfile); const bound = target && this.providerBudgetConfig.bindings?.some((item) => item.providerId === target.provider && item.sourceId === this.providerBudgetSnapshot?.source.id && (!item.modelPatterns?.length || item.modelPatterns.some((pattern) => matchesModel(pattern, target.model)))); if (target && bound) return action({ action: 'route', launchable: false, why: 'provider budget requires explicit route approval', requested, effective: requested, profileId: profile.id, recommendedCommands: [`arcp start --profile ${target.id} --title '<goal>'`], liveModes, admission }); }
+    if (admission && admissionHold) return action({ action: admission.action === 'route' ? 'route' : 'hold', launchable: false, why: `provider budget admission is ${admission.action}`, requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });
+    const requiredRank = Boolean(input.unattended) ? 2 : 1;
+    const needsElevation = ['claude', 'codex'].includes(profile.provider) && safeModeRank(profile.provider, profile.mode) < requiredRank;
+    const recommendationRank = input.unattended ? requiredRank : profile.provider === 'codex' ? 3 : 2;
+    const providerRecommendations = this.profileData.filter((item) => item.provider === profile.provider && item.id !== profile.id && safeModeRank(item.provider, item.mode) >= recommendationRank && liveModes.some((mode) => sameSetting(mode, item.mode))).sort((a, b) => safeModeRank(a.provider, a.mode) - safeModeRank(b.provider, b.mode)).map((item) => `arcp start --profile ${item.id} --title '<goal>'${input.unattended ? ' --unattended' : ''}`);
+    if (needsElevation && providerRecommendations.length) return action({ action: 'hold', launchable: false, why: input.unattended ? 'unattended work requires an explicit stronger live mode' : 'requested mode is below the provider default auto', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
+    if (needsElevation) return action({ action: 'warn', launchable: true, why: 'requested mode is weaker than the provider default and no stronger live mode is available; ARCP will not substitute one', requested, effective: requested, profileId: profile.id, recommendedCommands: providerRecommendations, liveModes });
+    return action({ action: 'launch', launchable: true, why: 'requested settings are live-validated without substitution', requested, effective: requested, profileId: profile.id, recommendedCommands: [], liveModes, admission });
   }
   /** `launch` reports a classified adapter refusal by returning a session
    * rather than throwing. A managed start cannot accept that: without an
@@ -1122,7 +1172,7 @@ export class ArcpService implements ExecutionPlacementPort {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
     }
     const generation = Math.max(0, ...state.sessions.filter((item) => item.goalId === goal.id).map((item) => item.generation)) + 1;
-    const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
+    const session: RuntimeSession = { id: input.runtimeId ?? `runtime_${randomUUID()}`, actorId: input.actorId, goalId: goal.id, ...(input.taskId ? { taskId: input.taskId } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId } : {}), bindingId: binding.id, generation, runtimeKind: 'paseo', adapterId: 'paseo', ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), ...(input.memberId ? { memberId: input.memberId } : {}), profileId: profile.id, provider: profile.provider, model: profile.model, ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.thinking ? { thinking: profile.thinking } : {}), selectionReceipt: preflight.selectionReceipt, placement: { requested: { ...(input.paseoProjectId ? { projectId: input.paseoProjectId } : {}), ...(input.paseoWorkspaceId ? { workspaceId: input.paseoWorkspaceId } : {}) }, ...(input.placementUnresolved ? { unresolved: input.placementUnresolved } : {}) }, workspace: input.workspace, state: 'launching', createdAt: now() };
     await this.store.mutate((next) => { next.sessions.push(session); });
     if (input.executionSurfaceId) await this.launchRuntime({ executionSurfaceId: input.executionSurfaceId, runtimeSessionId: session.id, writer: input.writer });
     try {
