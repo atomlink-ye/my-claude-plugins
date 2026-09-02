@@ -166,7 +166,20 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && path === '/v1/goals') { const state = service.state(); const sessionIds = new Set(state.sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId).map((item) => item.goalId)); send(res, 200, authenticatedMember ? state.goals.filter((item) => item.workspaceId === authenticatedMember!.workspaceId || sessionIds.has(item.id)) : state.goals); return true; }
     const goal = path.match(/^\/v1\/goals\/([^/]+)\/lifecycle$/);
     if (method === 'POST' && goal) { send(res, 200, await service.setGoalState(decodeURIComponent(goal[1]), String((await body(req)).state) as any)); return true; }
-    if (method === 'POST' && path === '/v1/runtime-sessions') { const input = await body(req); const actorId = authenticatedActor?.id ?? String(input.actorId ?? ''); send(res, 201, publicSession(await service.launch({ ...input, actorId } as any))); return true; }
+    if (method === 'POST' && path === '/v1/runtime-sessions') {
+      const input = await body(req);
+      // A member credential authenticates a member, not an arbitrary actor id
+      // supplied in JSON. Require the actor principal to be explicit and bind
+      // it to the member before permitting a launch/replacement attempt.
+      if (authenticatedMember && !authenticatedActor) {
+        if (!authenticatedMember.actorId || (input.actorId !== undefined && input.actorId !== authenticatedMember.actorId)) throw new ArcpError('unauthorized', 'member-authenticated runtime launch requires its bound actor principal');
+        input.actorId = authenticatedMember.actorId;
+      }
+      if (authenticatedActor && authenticatedMember?.actorId && authenticatedMember.actorId !== authenticatedActor.id) throw new ArcpError('unauthorized', 'actor and member credentials identify different principals');
+      if ('replaceReserved' in input) throw new ArcpError('invalid_request', 'runtime replacement reservation is internal-only', 'replaceReserved');
+      const actorId = authenticatedActor?.id ?? String(input.actorId ?? '');
+      send(res, 201, publicSession(await service.launch({ ...input, actorId } as any))); return true;
+    }
     if (method === 'GET' && path === '/v1/runtime-sessions') { const sessions = service.state().sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId); send(res, 200, sessions.map(publicSession)); return true; }
     const external = path.match(/^\/v1\/external\/([^/]+)\/(status|send|stop|reconcile)$/);
     if (external && authenticatedMember) { const target = service.state().sessions.find((item) => item.id === decodeURIComponent(external[1])); if (!target || target.workspaceId !== authenticatedMember.workspaceId) throw new ArcpError('not_found', 'runtime session not found'); }

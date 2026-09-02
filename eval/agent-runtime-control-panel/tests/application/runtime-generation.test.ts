@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
+import { createServer } from '../../../../skills/agent-runtime-control-panel/runtime/src/server.js';
 import { createControl } from '../support/create-control.js';
 import { FakePaseoCli } from '../support/fake-paseo-cli.js';
 
@@ -43,10 +44,14 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     const { actor } = await service.registerActor({ clientIdentity: 'result-generation-owner' });
     const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'result generation' });
     const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'generation result', profileId: 'codex-worker' }) as any;
-    const runtimeState = JSON.parse(await readFile(path.join(root, 'runtime-members', `${started.session.id}.json`), 'utf8'));
+    const runtimeStatePath = path.join(root, 'runtime-members', `${started.session.id}-g${started.session.generation}.json`);
+    const runtimeState = JSON.parse(await readFile(runtimeStatePath, 'utf8'));
     expect(runtimeState).toMatchObject({ runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation, runtimeMemberCredentials: { [started.session.id]: started.credential } });
     const claimed = await service.claimTask(started.task.id, started.member.id, 0);
     const replaced = await service.replaceRuntime({ runtimeSessionId: started.session.id, profileId: 'codex-worker' });
+    const replacementStatePath = path.join(root, 'runtime-members', `${started.session.id}-g${replaced.generation}.json`);
+    expect(JSON.parse(await readFile(runtimeStatePath, 'utf8'))).toMatchObject({ runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation });
+    expect(JSON.parse(await readFile(replacementStatePath, 'utf8'))).toMatchObject({ runtimeSessionId: started.session.id, runtimeGeneration: replaced.generation });
 
     await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: claimed.id, memberId: started.member.id, status: 'candidate', summary: 'stale result', expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation })).rejects.toMatchObject({ code: 'stale_generation' });
     const current = await service.submitResult({ workspaceId: workspace.workspace.id, taskId: claimed.id, memberId: started.member.id, status: 'candidate', summary: 'current result', expectedFence: 1, runtimeSessionId: replaced.id, runtimeGeneration: replaced.generation });
@@ -106,7 +111,27 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     const secondOwner = await service.registerActor({ clientIdentity: 'takeover-foreign-owner' });
     const foreignGoal = await service.createGoal({ actorId: secondOwner.actor.id, title: 'foreign goal' });
     await expect(service.launch({ actorId: secondOwner.actor.id, goalId: foreignGoal.id, runtimeId: first.id, expectedGeneration: first.generation, profileId: 'codex-worker' })).rejects.toMatchObject({ code: 'unauthorized' });
+    await expect(service.launch({ actorId: firstOwner.actor.id, goalId: firstGoal.id, runtimeId: first.id, profileId: 'codex-worker', replaceReserved: true } as any)).rejects.toMatchObject({ code: 'invalid_request' });
     await expect(service.launch({ actorId: firstOwner.actor.id, goalId: firstGoal.id, runtimeId: first.id, profileId: 'codex-worker' })).rejects.toMatchObject({ code: 'invalid_request' });
     service.close();
+  });
+
+  it('rejects member body actor forgery and public reservation markers', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-runtime-generation-http-'));
+    const app = await createServer(root);
+    await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+    try {
+      const first = await app.arcp.registerActor({ clientIdentity: 'http-runtime-owner' });
+      const workspace = await app.arcp.createWorkspace({ ownerActorId: first.actor.id, purpose: 'http runtime auth' });
+      const foreign = await app.arcp.registerActor({ clientIdentity: 'http-runtime-foreign' });
+      const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+      const headers = { 'x-arcp-member-key': workspace.credential, 'content-type': 'application/json' };
+      const forgedActor = await fetch(`${base}/v1/runtime-sessions`, { method: 'POST', headers, body: JSON.stringify({ actorId: foreign.actor.id, goalId: 'foreign-goal', profileId: 'codex-worker' }) });
+      expect(forgedActor.status).toBe(401);
+      const forgedReservation = await fetch(`${base}/v1/runtime-sessions`, { method: 'POST', headers, body: JSON.stringify({ actorId: first.actor.id, goalId: 'missing-goal', profileId: 'codex-worker', replaceReserved: true }) });
+      expect(forgedReservation.status).toBe(400);
+    } finally {
+      app.arcp.close(); await new Promise<void>((resolve) => app.server.close(() => resolve()));
+    }
   });
 });

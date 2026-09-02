@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
@@ -121,6 +121,7 @@ export const providerBudgetEpisodeKey = (workspaceId: string, providerId: string
 const now = () => new Date().toISOString();
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 const DEFAULT_CHANNEL_DEFERRAL_POLICY: ChannelDeferralPolicy = { maxDeferrals: 3, maxDeferredMs: 24 * 60 * 60 * 1000 };
+const RUNTIME_REPLACEMENT_RESERVATION = Symbol('arcp-runtime-replacement-reservation');
 /** Runtime compatibility only: typed producers must supply a policy, while
  * pre-contract persisted/direct callers receive the conservative legacy map. */
 const legacyPolicyFor = (input: Pick<ChannelEventInput, 'kind' | 'decisionRequired'>): ConsumptionPolicy =>
@@ -665,7 +666,9 @@ export class ArcpService implements ExecutionPlacementPort {
         for (const claim of state.surfaceClaims.filter((value) => value.runtimeSessionId === session.id && value.active)) { claim.active = false; claim.releasedAt = now(); }
       }
     });
-    await unlink(path.join(path.dirname(this.store.file), 'runtime-members', `${input.runtimeId}.json`)).catch(() => undefined);
+    const runtimeMembers = path.join(path.dirname(this.store.file), 'runtime-members');
+    const files = await readdir(runtimeMembers).catch(() => [] as string[]);
+    await Promise.all(files.filter((file) => file === `${input.runtimeId}.json` || file.startsWith(`${input.runtimeId}-g`)).map((file) => unlink(path.join(runtimeMembers, file)).catch(() => undefined)));
   }
   /** Resolve the durable ReportingRoute for a launch. The launcher is the
    * default primary handler; an explicit primary hands accountability to
@@ -681,7 +684,7 @@ export class ArcpService implements ExecutionPlacementPort {
     return { ...(launcher ? { launchedByMemberId: launcher } : {}), ...(primary && primary !== input.fallbackMemberId ? { primaryHandlerMemberId: primary } : {}), ccMemberIds: [...new Set(cc)].filter((id) => id !== primary), escalationMemberIds: [...new Set(input.escalationMemberIds ?? [])] };
   }
   private async prepareRuntimeClientState(sessionId: string, workspaceId: string, memberId: string, credential: string, runtimeGeneration = 1): Promise<string> {
-    const root = path.join(path.dirname(this.store.file), 'runtime-members'); const file = path.join(root, `${sessionId}.json`);
+    const root = path.join(path.dirname(this.store.file), 'runtime-members'); const file = path.join(root, `${sessionId}-g${runtimeGeneration}.json`);
     // `arcp message ack …` is emitted inside the runtime's delivery envelope.
     // Keep the direct member credential in this already-private per-runtime
     // state file so that copy-paste acknowledgement is runnable without a
@@ -1175,7 +1178,7 @@ export class ArcpService implements ExecutionPlacementPort {
       if (!current) throw new ArcpError('not_found', 'runtime session not found');
       if (current.generation !== prior.generation) throw new ArcpError('stale_generation', 'runtime replacement raced with a newer generation');
       this.invalidateRuntimeGeneration(state, current, 'target runtime generation was replaced');
-      current.state = 'terminal';
+      current.state = 'launching';
       current.lastTurnState = 'idle';
       // Clearing the identity before launch prevents a late callback from the
       // old native process being attributed to the new generation.
@@ -1189,11 +1192,21 @@ export class ArcpService implements ExecutionPlacementPort {
     let memberCredential = input.memberCredential;
     let clientStatePath = input.clientStatePath;
     if (!memberCredential && prior.memberId && prior.workspaceId) {
-      clientStatePath ??= path.join(path.dirname(this.store.file), 'runtime-members', `${prior.id}.json`);
-      try {
-        const persisted = JSON.parse(await readFile(clientStatePath, 'utf8')) as { memberCredential?: string; runtimeMemberCredentials?: Record<string, string> };
-        memberCredential = persisted.runtimeMemberCredentials?.[prior.id] ?? persisted.memberCredential;
-      } catch { /* replacement can still be used for runtimes without managed credentials */ }
+      const root = path.join(path.dirname(this.store.file), 'runtime-members');
+      const currentPath = path.join(root, `${prior.id}-g${prior.generation}.json`);
+      const legacyPath = path.join(root, `${prior.id}.json`);
+      for (const candidate of [currentPath, ...(input.clientStatePath ? [input.clientStatePath] : []), legacyPath]) {
+        try {
+          const persisted = JSON.parse(await readFile(candidate, 'utf8')) as { memberCredential?: string; runtimeMemberCredentials?: Record<string, string> };
+          memberCredential = persisted.runtimeMemberCredentials?.[prior.id] ?? persisted.memberCredential;
+          if (memberCredential) break;
+        } catch { /* replacement can still be used for runtimes without managed credentials */ }
+      }
+    }
+    if (memberCredential && prior.memberId && prior.workspaceId) {
+      // Never rewrite the old generation's file. A process that lingers after
+      // replacement must continue to present its original provenance.
+      clientStatePath = await this.prepareRuntimeClientState(prior.id, prior.workspaceId, prior.memberId, memberCredential, nextGeneration);
     }
     const replaced = await this.launch({
       ...profileInput,
@@ -1201,7 +1214,7 @@ export class ArcpService implements ExecutionPlacementPort {
       goalId: prior.goalId,
       runtimeId: prior.id,
       expectedGeneration: nextGeneration,
-      replaceReserved: true,
+      [RUNTIME_REPLACEMENT_RESERVATION]: true,
       ...(input.workspace ?? prior.workspace ? { workspace: input.workspace ?? prior.workspace } : {}),
       ...(memberCredential ? { memberCredential } : {}),
       ...(clientStatePath ? { clientStatePath } : {}),
@@ -1215,7 +1228,7 @@ export class ArcpService implements ExecutionPlacementPort {
     return replaced;
   }
 
-  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; replaceReserved?: boolean }): Promise<RuntimeSession> {
+  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; [RUNTIME_REPLACEMENT_RESERVATION]?: true }): Promise<RuntimeSession> {
     const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
@@ -1224,12 +1237,13 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!goal || !binding) throw new ArcpError('unknown_recipient', 'actor or goal is not registered');
     const prior = input.runtimeId ? state.sessions.find((item) => item.id === input.runtimeId) : undefined;
     if (prior && (prior.actorId !== input.actorId || prior.goalId !== goal.id || (input.workspaceId !== undefined && prior.workspaceId !== input.workspaceId) || (input.memberId !== undefined && prior.memberId !== input.memberId))) throw new ArcpError('unauthorized', 'runtime replacement cannot take over another actor, goal, workspace, or member session');
-    if (prior && input.expectedGeneration === undefined && !input.replaceReserved) throw new ArcpError('invalid_request', 'runtime replacement requires expectedGeneration', 'expectedGeneration');
+    if (prior && input.expectedGeneration === undefined && input[RUNTIME_REPLACEMENT_RESERVATION] !== true) throw new ArcpError('invalid_request', 'runtime replacement requires expectedGeneration', 'expectedGeneration');
     if (input.memberId && !state.members.some((item) => item.id === input.memberId && (!input.workspaceId || item.workspaceId === input.workspaceId))) throw new ArcpError('unknown_recipient', 'managed member is not in workspace');
     input = await this.resolvePaseoPlacement(input);
     if (prior && input.expectedGeneration !== undefined && prior.generation !== input.expectedGeneration) throw new ArcpError('stale_generation', `runtime launch generation ${input.expectedGeneration} is stale; current generation is ${prior.generation}`);
-    const reservedReplacement = Boolean(prior && input.replaceReserved && input.expectedGeneration === prior.generation);
-    if (input.replaceReserved && !reservedReplacement) throw new ArcpError('stale_generation', 'runtime replacement reservation is no longer current');
+    const reservedReplacement = Boolean(prior && input[RUNTIME_REPLACEMENT_RESERVATION] === true && input.expectedGeneration === prior.generation);
+    if (input[RUNTIME_REPLACEMENT_RESERVATION] === true && !reservedReplacement) throw new ArcpError('stale_generation', 'runtime replacement reservation is no longer current');
+    if (reservedReplacement && (prior!.state !== 'launching' || prior!.externalId)) throw new ArcpError('stale_generation', 'runtime replacement reservation is not backed by a stopped runtime');
     if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal' && item.id !== prior?.id)) {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
     }
