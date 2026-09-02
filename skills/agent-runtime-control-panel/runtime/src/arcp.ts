@@ -114,7 +114,7 @@ function intendedTarget(event: ChannelEvent, member: Member, workspace: ControlW
 
 /** The durable records the one canonical projection builder is allowed to read. */
 function projectionFacts(state: State): ChannelProjectionFacts {
-  return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results };
+  return { members: state.members, tasks: state.tasks, goals: state.goals, knowledge: state.knowledge, results: state.results, channelEvents: state.channelEvents };
 }
 
 /**

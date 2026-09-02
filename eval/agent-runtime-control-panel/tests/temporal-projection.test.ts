@@ -78,6 +78,16 @@ describe('TemporalProjection', () => {
     expect(projection.cards.find((card) => card.id === 'no-result')?.problems).toContain('completion_without_result');
   });
 
+  it('removes accepted and refused decisions from active obligations even when their resolution packet is undeliverable', () => {
+    const accepted = event('accepted', 'decision_required', 'task-live'); accepted.decisionRequired = false; accepted.verdict = 'accept';
+    const refused = event('refused', 'decision_required', 'task-live'); refused.decisionRequired = false;
+    const refusal = event('refusal-record', 'decision_resolved', 'task-live'); refusal.relatedEventId = 'refused'; refusal.verdict = 'refuse'; refusal.deliveryState = 'undeliverable'; refusal.undeliverableReason = 'no live target runtime session';
+    const projection = projectTemporal(facts([accepted, refused, refusal]));
+    expect(projection.cards.map((card) => card.id)).not.toEqual(expect.arrayContaining(['accepted', 'refused']));
+    expect(projection.problems.find((card) => card.id === 'accepted')?.problems).not.toContain('decision');
+    expect(projection.problems.find((card) => card.id === 'refused')?.disposition).toBe('superseded');
+  });
+
   it('keeps the frozen surface to active, problems, and one task causal chain', () => {
     const input = facts([event('old', 'decision_required', 'task-done'), event('live', 'blocker', 'task-live')]);
     expect(projectTemporal(input, 'active').cards.map((card) => card.id)).toEqual(['live']);
