@@ -237,6 +237,18 @@ const safeJson = (value: unknown): Record<string, any> => asRecord(value);
 async function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => execFile('git', args, { cwd, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
+function remoteProjectId(remote: string | undefined): string | undefined {
+  if (!remote) return undefined;
+  const value = remote.trim().replace(/^ssh:\/\/git@/, '').replace(/^git@([^:]+):/, '$1/').replace(/^[a-z]+:\/\//i, '').replace(/\.git$/, '').replace(/^ssh\./, '');
+  return value.includes('/') ? `remote:${value}` : undefined;
+}
+async function repositoryIdentity(checkout: string): Promise<{ root: string; projectId?: string }> {
+  const common = await git(checkout, ['rev-parse', '--path-format=absolute', '--git-common-dir']).then((value) => path.resolve(value.trim())).catch(() => undefined);
+  const root = common ? path.dirname(common) : path.resolve(checkout);
+  const remote = await git(checkout, ['config', '--get', 'remote.origin.url']).then((value) => value.trim()).catch(() => undefined);
+  return { root, projectId: remoteProjectId(remote) };
+}
+class PlacementConflict extends Error {}
 /** The V1 first-class runtime adapter. Provider choices stay in validated profiles;
  * this adapter owns only safe Paseo transport/discovery calls and never exposes native handles. */
 type PaseoModeClient = { connect(): Promise<void>; close(): Promise<void>; providers: { listModes(provider: string): Promise<unknown> } };
@@ -287,23 +299,30 @@ export class PaseoAdapter implements RuntimeAdapter {
       const projectId = observed.projectId ?? input.projectId;
       return projectId ? { checkout, projectId, workspaceId: observed.workspaceId ?? input.workspaceId } : undefined;
     }
-    const root = await git(checkout, ['rev-parse', '--show-toplevel']).then((value) => path.resolve(value.trim())).catch(() => checkout);
+    const repository = await repositoryIdentity(checkout);
+    const projects = (await this.cli.run(['project', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
+    const listedProjects = Array.isArray(projects) ? projects.map(asRecord) : [];
+    const repositoryProject = listedProjects.find((item) => setting(item.projectId ?? item.id) === repository.projectId);
+    const canonicalProject = input.projectId ?? setting(repositoryProject?.projectId ?? repositoryProject?.id);
     const workspaces = (await this.cli.run(['workspace', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
     const listed = Array.isArray(workspaces) ? workspaces.map(asRecord) : [];
     const requested = input.workspaceId ? listed.find((item) => setting(item.workspaceId ?? item.id) === input.workspaceId) : undefined;
-    const existing = requested ?? listed.find((item) => path.resolve(String(item.cwd ?? item.path ?? '')) === checkout);
+    const placements = await Promise.all(listed.map(async (item) => ({ item, placement: await this.workspacePlacement(setting(item.workspaceId ?? item.id) ?? '').catch(() => undefined) })));
+    const candidates = placements.filter(({ item, placement }) => path.resolve(String(item.cwd ?? item.path ?? '')) === checkout && (!canonicalProject || placement?.projectId === canonicalProject));
+    if (!requested && candidates.length > 1) throw new PlacementConflict(`PLACEMENT_CONFLICT: ${candidates.length} Paseo Workspaces match checkout ${checkout}; select the canonical Workspace explicitly`);
+    const existing = requested ?? candidates[0]?.item;
     if (existing) {
       const workspaceId = setting(existing.workspaceId ?? existing.id);
       const projectId = setting(existing.projectId) ?? (workspaceId ? (await this.workspacePlacement(workspaceId))?.projectId : undefined);
       if (!workspaceId || !projectId) throw new Error('Paseo workspace listing omitted its stable placement identity');
+      if (canonicalProject && projectId !== canonicalProject) throw new PlacementConflict(`PLACEMENT_CONFLICT: requested Workspace ${workspaceId} belongs to Paseo Project ${projectId}; canonical repository Project is ${canonicalProject}`);
       return { checkout, projectId, workspaceId };
     }
-    let projectId = input.projectId;
+    let projectId = canonicalProject;
     if (!projectId) {
-      const projects = (await this.cli.run(['project', 'ls', '--json'], { timeoutMs: discoveryTimeoutMs() })).value;
-      const project = Array.isArray(projects) ? projects.map(asRecord).find((item) => path.resolve(String(item.path ?? '')) === root) : undefined;
+      const project = listedProjects.find((item) => path.resolve(String(item.path ?? '')) === repository.root);
       projectId = setting(project?.projectId ?? project?.id);
-      if (!projectId) projectId = setting(asRecord((await this.cli.run(['project', 'create', root, '--json'], { timeoutMs: discoveryTimeoutMs() })).value).projectId);
+      if (!projectId) projectId = setting(asRecord((await this.cli.run(['project', 'create', repository.root, '--json'], { timeoutMs: discoveryTimeoutMs() })).value).projectId);
     }
     if (!projectId) throw new Error('Paseo did not materialize a Project identity');
     const created = asRecord((await this.cli.run(['workspace', 'create', '--isolation', 'local', '--path', checkout, '--project', projectId, '--title', input.title, '--json'], { timeoutMs: discoveryTimeoutMs() })).value);
@@ -523,7 +542,7 @@ export class ArcpService {
     let canonical = persisted;
     if (!canonical && this.adapter instanceof PaseoAdapter) {
       try { canonical = await this.adapter.materializePlacement({ checkout, projectId: input.paseoProjectId, workspaceId: input.paseoWorkspaceId, title: `ARCP · ${input.title.trim()}` }); }
-      catch { return { ...preflight, action: 'hold', launchable: false, why: 'PLACEMENT_CONFLICT: canonical Paseo placement could not be materialized before launch' }; }
+      catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof PlacementConflict ? error.message : 'PLACEMENT_CONFLICT: canonical Paseo placement could not be materialized before launch' }; }
       if (canonical) {
         if ((input.paseoProjectId && canonical.projectId !== input.paseoProjectId) || (input.paseoWorkspaceId && canonical.workspaceId !== input.paseoWorkspaceId)) return { ...preflight, action: 'hold', launchable: false, why: `PLACEMENT_CONFLICT: requested placement differs from canonical Paseo Project ${canonical.projectId} and Workspace ${canonical.workspaceId}` };
         await this.store.mutate((next) => { const workspace = next.workspaces.find((item) => item.id === input.workspaceId)!; workspace.paseoPlacements = [...(workspace.paseoPlacements ?? []), canonical!]; workspace.updatedAt = now(); });
@@ -712,8 +731,14 @@ export class ArcpService {
       }
       const agents = (await this.adapterFor(prior).registry()).value;
       const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => String(item.id ?? item.agentId) === prior.externalId) : undefined;
-      if (!match) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
-      return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.placement) { item.placement.observed = paseoPlacement(match); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(match.status ?? match.Status); item.lastObservedAt = now(); return item; });
+      // Archived agents can disappear from Paseo's active registry. Inspecting
+      // the stable Agent ID distinguishes that durable terminal fact from an
+      // unavailable transport, preserving the ARCP session history.
+      const archived = !match && prior.externalId ? asRecord((await this.adapterFor(prior).observe(prior.externalId)).value) : undefined;
+      const resolved = match ?? archived;
+      if (!resolved) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
+      if (!match && !['archived', 'closed', 'completed', 'failed', 'stopped', 'cancelled', 'terminal'].includes(normalized(resolved.status ?? resolved.Status ?? resolved.lifecycle))) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
+      return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.placement) { item.placement.observed = paseoPlacement(resolved); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(resolved.status ?? resolved.Status ?? resolved.lifecycle); item.lastObservedAt = now(); return item; });
     } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'transport_indeterminate'; return item; }); await this.emitTransportUncertainty(uncertain); return uncertain; }
   }
   private cacheThresholds() { return { expiringMinutes: Number(process.env.ARCP_CACHE_EXPIRING_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiringMinutes), expiredMinutes: Number(process.env.ARCP_CACHE_EXPIRED_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiredMinutes) }; }

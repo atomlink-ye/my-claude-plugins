@@ -132,7 +132,7 @@ describe('ARCP MVE control core', () => {
     expect(handoff).toContain(`'result' 'submit' '${workspace.workspace.id}'`);
     const launchArgs = (service.cli as any).lastLaunchArgs as string[]; expect(launchArgs).toContain('--env'); expect(launchArgs.some((arg) => arg.startsWith('ARCP_RUNTIME_MEMBER_CREDENTIAL='))).toBe(false); expect(launchArgs.some((arg) => arg.startsWith('ARCP_CLIENT_STATE=') && arg.includes('/runtime-members/'))).toBe(true);
   });
-  it('uses an explicit Paseo Workspace ID for placement while retaining the requested cwd', async () => {
+  it('round-trips requested Paseo Project, Workspace, and Agent identities while retaining the requested cwd', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-placement-')); const service = await control(root, false, ['codex'], { agentId: 'paseo-session-1', projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
     (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_my-claude-plugins', workspaceId: 'wks_0e6198d7efcef5a2' });
     const { actor } = await service.registerActor({ clientIdentity: 'placement-owner' });
@@ -188,6 +188,14 @@ describe('ARCP MVE control core', () => {
     const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived task', profileId: 'codex-worker', paseoWorkspaceId: 'wks_0e6198d7efcef5a2' }) as any;
     const reconciled = await service.reconcile(started.session.id);
     expect(reconciled).toMatchObject({ id: started.session.id, state: 'terminal', placement: { requested: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1' }, observed: { workspaceId: 'wks_0e6198d7efcef5a2', agentId: 'paseo-session-1', lifecycle: 'archived' }, status: 'PLACEMENT_MATCH' } });
+    service.close();
+  });
+  it('reconciles an archived Agent missing from the active registry as terminal, not transport indeterminate', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-paseo-archived-missing-')); const service = await control(root, false, ['codex'], { status: 'archived', projectId: 'prj_plugins', workspaceId: 'wks_checkout' }, undefined, undefined, []);
+    (service.adapter as any).workspacePlacement = async () => ({ projectId: 'prj_plugins', workspaceId: 'wks_checkout' });
+    const { actor } = await service.registerActor({ clientIdentity: 'archive-missing-owner' }); const workspace = await service.createWorkspace({ ownerActorId: actor.id, purpose: 'archive missing' });
+    const started = await service.startManaged({ actorId: actor.id, workspaceId: workspace.workspace.id, title: 'archived missing task', profileId: 'codex-worker', paseoProjectId: 'prj_plugins', paseoWorkspaceId: 'wks_checkout' }) as any;
+    expect(await service.reconcile(started.session.id)).toMatchObject({ id: started.session.id, state: 'terminal', placement: { status: 'PLACEMENT_MATCH', observed: { projectId: 'prj_plugins', workspaceId: 'wks_checkout', agentId: 'paseo-session-1', lifecycle: 'archived' } } });
     service.close();
   });
   it('maps Hermes ACP turn-end events to the existing idle observation and safe-point event', async () => {
