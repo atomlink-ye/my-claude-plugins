@@ -243,4 +243,27 @@ describe('owner escalation canary', () => {
     expect(stored.consumptionState).toBe('open');
     service.close();
   });
+
+  it('registers channels only at startup and reports a configured-but-unwired channel instead of pretending', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-registry-'));
+    const { service } = await createControl(root);
+    // The shipped config declares Hermes, but no transport is wired in a test
+    // process. It must be visible as configured-and-unavailable rather than
+    // registered with a stub that would accept envelopes nobody receives.
+    const discovery = service.channelDiscovery();
+    expect(discovery.some((item) => item.adapterId === 'hermes' && item.configured && !item.available)).toBe(true);
+    expect(service.channels.has('hermes')).toBe(false);
+    service.close();
+  });
+
+  it('refuses a duplicate or unknown channel provider instead of skipping it quietly', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-channel-badconfig-'));
+    const { service } = await createControl(root);
+    const register = (service as any).registerConfiguredChannels.bind(service);
+    // A silently skipped channel is indistinguishable from a healthy one with
+    // no work, and the first symptom would be an escalation reaching nobody.
+    expect(() => register([{ id: 'x', provider: 'module:/tmp/evil.mjs' }])).toThrow(/not available in core/);
+    expect(() => register([{ id: 'hermes' }])).toThrow(/id and a provider/);
+    service.close();
+  });
 });

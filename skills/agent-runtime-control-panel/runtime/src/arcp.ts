@@ -22,7 +22,7 @@ export { projectTemporal, temporalReconciliationPreview } from './temporal-proje
 export type { TemporalFilter, TemporalProjection, TemporalProjectionFacts, TemporalCard, TemporalDisposition } from './temporal-projection.js';
 import { evaluateSupervision, materialProgressAt, supervisionPolicyId, supervisionSignalId, type SupervisionPolicy, type SupervisionReview, type SupervisionSignal, type SupervisionSignalKind, type SupervisionView } from './supervision.js';
 import { CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf } from './steward.js';
-import { ActorChannelRegistry, type ActorChannelAdapter, type ChannelBindingRef, type TransportReceipt } from './actor-channel.js';
+import { ActorChannelRegistry, HermesChannelAdapter, type ActorChannelAdapter, type ActorDeliveryEnvelope, type ChannelBindingRef, type TransportReceipt } from './actor-channel.js';
 import { collectCodexbar, collectPiGrokCache, evaluateAdmission, matchesModel, runCommandCollector, translatePaseoProviderUsage, type AdmissionDecision, type ProviderBudgetConfig, type ProviderBudgetEnvelopeV1, type ProviderBudgetSource } from './provider-budget.js';
 import { RuntimeBudgetTracker, type RuntimeBudgetPolicy, type RuntimeBudgetSample, type RuntimeBudgetSignal, type RuntimeBudgetView } from './runtime-budget.js';
 import { checkoutIdentity, surfaceName, type CheckoutRef, type ExecutionPlacementPort, type ExecutionSurface, type ExecutionSurfaceBinding, type ExecutionSurfaceKind, type ExecutionSurfaceRef, type RepositoryLocator, type RepositoryRef, type RuntimeBinding, type RuntimeBindingReceipt, type RuntimeBindingRef, type RuntimeLaunchSpec, type SurfaceArchiveAuthorization, type SurfaceClaim, type SurfaceRestoreEvidence, type SurfaceRestoreReceipt, type SurfaceSpec } from './execution-placement.js';
@@ -568,6 +568,8 @@ export class ArcpService implements ExecutionPlacementPort {
   /** Actor channels are a different seam from runtime hosts: they wake a
    * conversation that already exists outside this Workspace. */
   readonly channels = new ActorChannelRegistry();
+  private channelStatus: Array<{ adapterId: string; configured: boolean; available: boolean; detail?: string }> = [];
+  private hermesTransport?: (binding: ChannelBindingRef, envelope: ActorDeliveryEnvelope) => Promise<'accepted' | 'duplicate' | 'refused'>;
   private profileData: Profile[] = [...DEFAULT_PROFILES];
   /** Operator-authored plain text: returned verbatim, never interpreted. */
   private routingGuidanceText = '';
@@ -740,10 +742,11 @@ export class ArcpService implements ExecutionPlacementPort {
     });
     try {
       const configPath = process.env.ARCP_CONFIG ?? fileURLToPath(new URL('../../config/default.json', import.meta.url));
-      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy>; routing?: { guidance?: unknown } };
+      const config = JSON.parse(await readFile(configPath, 'utf8')) as { profiles?: Profile[]; providerBudget?: ProviderBudgetConfig; runtimeBudget?: Partial<RuntimeBudgetPolicy>; routing?: { guidance?: unknown }; adapters?: { actorChannels?: Array<{ id?: string; provider?: string }> } };
       if (Array.isArray(config.profiles) && config.profiles.every((item) => item?.id && item.provider && item.model && item.role)) this.profileData = config.profiles;
       if (typeof config.routing?.guidance === 'string') this.routingGuidanceText = config.routing.guidance;
       if (config.providerBudget && typeof config.providerBudget === 'object') this.providerBudgetConfig = config.providerBudget;
+      this.registerConfiguredChannels(config.adapters?.actorChannels);
       if (config.runtimeBudget && Object.values(config.runtimeBudget).every((value) => typeof value === 'number' && Number.isFinite(value) && value > 0)) this.runtimeBudgetPolicy = { ...this.runtimeBudgetPolicy, ...config.runtimeBudget };
     } catch { /* fallback is intentional for a packaged skill with no local override */ }
     // The automatic supervision trigger rides the existing delivery pump rather
@@ -880,6 +883,39 @@ export class ArcpService implements ExecutionPlacementPort {
   setPort(port: number): void { this.port = port; }
   health(): Record<string, unknown> { return { status: 'ok', startedAt: this.startedAt, uptimeSeconds: Math.floor((Date.now() - Date.parse(this.startedAt)) / 1000) }; }
   runtime(): Record<string, unknown> { return { pid: process.pid, cwd: process.cwd(), dataDir: this.dataDir, port: this.port || Number(process.env.PORT || 18787) }; }
+  /** Startup-only channel registration.
+   *
+   * Registration happens here and nowhere else, so no HTTP caller can name a
+   * module or choose where a wake is sent. An entry whose provider is unknown,
+   * or whose id repeats, is refused rather than skipped quietly: a channel that
+   * silently failed to register looks identical to one that has no work to do,
+   * and the first symptom would be an escalation that never reaches anyone.
+   *
+   * A configured channel with no transport wired is recorded as configured and
+   * unavailable, never registered. Escalation then fails as a durable
+   * undeliverable, which is the honest outcome; a stub that accepted envelopes
+   * would report a wake that never happened. */
+  private registerConfiguredChannels(entries?: Array<{ id?: string; provider?: string }>): void {
+    this.channelStatus = [];
+    for (const entry of entries ?? []) {
+      const id = entry?.id?.trim();
+      const provider = entry?.provider?.trim();
+      if (!id || !provider) throw new ArcpError('invalid_request', 'actor channel entries need an id and a provider');
+      if (this.channels.has(id)) throw new ArcpError('invalid_request', `actor channel ${id} is configured more than once`);
+      if (provider !== 'builtin:hermes') throw new ArcpError('invalid_request', `actor channel provider ${provider} is not available in core`);
+      if (!this.hermesTransport) { this.channelStatus.push({ adapterId: id, configured: true, available: false, detail: 'no Hermes transport is wired; escalations will be recorded undeliverable' }); continue; }
+      this.channels.register(new HermesChannelAdapter(this.hermesTransport));
+      this.channelStatus.push({ adapterId: id, configured: true, available: true });
+    }
+  }
+
+  /** Install the real Hermes wire. Kept out of the constructor so the
+   * deterministic suite can never reach a live conversation by accident. */
+  setHermesTransport(send: (binding: ChannelBindingRef, envelope: ActorDeliveryEnvelope) => Promise<'accepted' | 'duplicate' | 'refused'>): void { this.hermesTransport = send; }
+
+  /** Sanitized channel discovery: ids, capability and availability only. */
+  channelDiscovery(): Array<{ adapterId: string; configured: boolean; available: boolean; detail?: string }> { return [...this.channelStatus]; }
+
   /** Bindings written before supersession existed carry no lifecycle; treating
    * absent as current keeps old rows addressable instead of orphaning them. */
   private bindingIsCurrent(binding: ActorBinding): boolean { return (binding.lifecycle ?? 'current') === 'current'; }

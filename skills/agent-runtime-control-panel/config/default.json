@@ -4,27 +4,161 @@
   "dataEnv": "ARCP_DATA",
   "apiKeyEnv": "ARCP_API_KEY",
   "adapter": "paseo",
+  "adapters": {
+    "actorChannels": [
+      {
+        "id": "hermes",
+        "provider": "builtin:hermes"
+      }
+    ]
+  },
   "routing": {
     "guidance": "Roles describe the work intent, not a provider entitlement. ARCP shows the configured selection and explicit alternatives, but never changes provider, model, or permission mode without an explicit request."
   },
   "profiles": [
-    {"id":"claude-manager","provider":"claude","model":"claude-opus-5","mode":"auto","thinking":"medium","role":"manager"},
-    {"id":"claude-bypass-permissions","provider":"claude","model":"claude-opus-5","mode":"bypassPermissions","thinking":"medium","role":"manager"},
-    {"id":"codex-worker","provider":"codex","model":"gpt-5.6-terra","mode":"auto","thinking":"medium","role":"worker"},
-    {"id":"codex-auto-review","provider":"codex","model":"gpt-5.6-terra","mode":"auto-review","thinking":"medium","role":"worker"},
-    {"id":"codex-full-access","provider":"codex","model":"gpt-5.6-terra","mode":"full-access","thinking":"medium","role":"worker"},
-    {"id":"claude-sonnet-worker","provider":"claude","model":"claude-sonnet-5","mode":"auto","thinking":"medium","role":"worker"},
-    {"id":"claude-sonnet-worker-bypass","provider":"claude","model":"claude-sonnet-5","mode":"bypassPermissions","thinking":"medium","role":"worker"},
-    {"id":"pi-grok-worker","provider":"pi","model":"grok-cli/grok-4.6","role":"worker"}
+    {
+      "id": "claude-manager",
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "mode": "auto",
+      "thinking": "medium",
+      "role": "manager"
+    },
+    {
+      "id": "claude-bypass-permissions",
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "mode": "bypassPermissions",
+      "thinking": "medium",
+      "role": "manager"
+    },
+    {
+      "id": "codex-worker",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "mode": "auto",
+      "thinking": "medium",
+      "role": "worker"
+    },
+    {
+      "id": "codex-auto-review",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "mode": "auto-review",
+      "thinking": "medium",
+      "role": "worker"
+    },
+    {
+      "id": "codex-full-access",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "mode": "full-access",
+      "thinking": "medium",
+      "role": "worker"
+    },
+    {
+      "id": "claude-sonnet-worker",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "mode": "auto",
+      "thinking": "medium",
+      "role": "worker"
+    },
+    {
+      "id": "claude-sonnet-worker-bypass",
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "mode": "bypassPermissions",
+      "thinking": "medium",
+      "role": "worker"
+    },
+    {
+      "id": "pi-grok-worker",
+      "provider": "pi",
+      "model": "grok-cli/grok-4.6",
+      "role": "worker"
+    }
   ],
-  "runtimeBudget": {"maxOutputTokensPerMinute":3000,"maxTurnsPerMinute":2,"maxRepeatedWakeCount":3,"contextRatio":0.85},
+  "runtimeBudget": {
+    "maxOutputTokensPerMinute": 3000,
+    "maxTurnsPerMinute": 2,
+    "maxRepeatedWakeCount": 3,
+    "contextRatio": 0.85
+  },
   "providerBudget": {
-    "sources": [{"id":"paseo-native","kind":"paseo","trust":"advisory","estimated":true,"automaticAdmissionEligible":false},{"id":"local-codexbar","kind":"codexbar","trust":"authoritative","estimated":false,"automaticAdmissionEligible":true},{"id":"pi-grok-cache","kind":"pi-grok-cache","trust":"advisory","estimated":true,"automaticAdmissionEligible":false,"cachePath":"${ARCP_PI_GROK_CACHE}","maxOutputBytes":16384,"maxAgeMs":900000}],
-    "policies": [{"id":"default","maxAgeMs":300000,"drainRemainingPct":20,"hardDrainRemainingPct":10,"requiredPaidUnattended":true}],
+    "sources": [
+      {
+        "id": "paseo-native",
+        "kind": "paseo",
+        "trust": "advisory",
+        "estimated": true,
+        "automaticAdmissionEligible": false
+      },
+      {
+        "id": "local-codexbar",
+        "kind": "codexbar",
+        "trust": "authoritative",
+        "estimated": false,
+        "automaticAdmissionEligible": true
+      },
+      {
+        "id": "pi-grok-cache",
+        "kind": "pi-grok-cache",
+        "trust": "advisory",
+        "estimated": true,
+        "automaticAdmissionEligible": false,
+        "cachePath": "${ARCP_PI_GROK_CACHE}",
+        "maxOutputBytes": 16384,
+        "maxAgeMs": 900000
+      }
+    ],
+    "policies": [
+      {
+        "id": "default",
+        "maxAgeMs": 300000,
+        "drainRemainingPct": 20,
+        "hardDrainRemainingPct": 10,
+        "requiredPaidUnattended": true
+      }
+    ],
     "bindings": [
-      {"id":"claude-5h","providerId":"claude","sourceId":"local-codexbar","modelPatterns":["claude-opus-5","claude-sonnet-5"],"windowIds":["primary"],"admissionPolicyId":"default"},
-      {"id":"codex-weekly","providerId":"codex","sourceId":"local-codexbar","modelPatterns":["gpt-5.6-terra"],"windowIds":["secondary"],"admissionPolicyId":"default"},
-      {"id":"grok-primary","providerId":"pi","sourceId":"local-codexbar","modelPatterns":["grok-cli/grok-4.6"],"windowIds":["primary"],"admissionPolicyId":"default"}
+      {
+        "id": "claude-5h",
+        "providerId": "claude",
+        "sourceId": "local-codexbar",
+        "modelPatterns": [
+          "claude-opus-5",
+          "claude-sonnet-5"
+        ],
+        "windowIds": [
+          "primary"
+        ],
+        "admissionPolicyId": "default"
+      },
+      {
+        "id": "codex-weekly",
+        "providerId": "codex",
+        "sourceId": "local-codexbar",
+        "modelPatterns": [
+          "gpt-5.6-terra"
+        ],
+        "windowIds": [
+          "secondary"
+        ],
+        "admissionPolicyId": "default"
+      },
+      {
+        "id": "grok-primary",
+        "providerId": "pi",
+        "sourceId": "local-codexbar",
+        "modelPatterns": [
+          "grok-cli/grok-4.6"
+        ],
+        "windowIds": [
+          "primary"
+        ],
+        "admissionPolicyId": "default"
+      }
     ]
   }
 }
