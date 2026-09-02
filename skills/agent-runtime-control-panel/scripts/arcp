@@ -27,7 +27,7 @@ const HELP = `ARCP ControlWorkspace commands:
   member heartbeat|list WORKSPACE
   goal start|list
   runtime status|list
-  start --workspace WORKSPACE --title '<goal>' [--paseo-project PROJECT_ID] [--paseo-workspace WORKSPACE_ID] [--cwd PATH] [--show-credential]
+  start --workspace WORKSPACE --title '<goal>' [--contract '<goal contract>' | --contract-file PATH] [--paseo-project PROJECT_ID] [--paseo-workspace WORKSPACE_ID] [--cwd PATH] [--show-credential]
   external register WORKSPACE [--label LABEL] [--show-credential]
   external status|send|stop|reconcile RUNTIME
   reconcile RUNTIME
@@ -39,6 +39,8 @@ const HELP = `ARCP ControlWorkspace commands:
 
 Delivery and identity commands:
   send RUNTIME --body '...'          safe-point delivery
+  send RUNTIME --contract-file PATH --subject-task TASK --subject-fence N [--not-after ISO8601]
+                                     fail-closed late Goal Contract; bind contracts at start instead
   interrupt RUNTIME --reason ... --body ...
   reuse RUNTIME --body '...' [--confirm TOKEN]
   ack DELIVERY [--reason ...]
@@ -99,8 +101,8 @@ else if (area === 'task' && action === 'create') await call('POST',`/v1/workspac
 else if (area === 'task' && action === 'list') await call('GET',`/v1/workspaces/${encodeURIComponent(p[0])}/tasks`);
 else if (area === 'task' && action === 'claim') await call('POST',`/v1/tasks/${encodeURIComponent(p[0])}/claim`,{...(f['expected-fence'] === undefined ? {} : {expectedFence:Number(f['expected-fence'])})},true);
 else if (area === 'goal' && action === 'start') { const s=await load(); const g=await call('POST','/v1/goals',{title:f.title||p.join(' '),workspaceId:f.workspace||s.workspaceId}); if(g.id) await call('POST','/v1/runtime-sessions',{goalId:g.id,...launch(),workspace:f.cwd||process.cwd(),workspaceId:f.workspace||s.workspaceId,memberId:f.member}); }
-else if (area === 'start') { const s=await load(); const v=await call('POST','/v1/start',{workspaceId:f.workspace||s.workspaceId,title:f.title||p.join(' '),...(f.role?{role:f.role}:{}),...launch(),...(f['paseo-project']?{paseoProjectId:f['paseo-project']}:{}),...(f['paseo-workspace']?{paseoWorkspaceId:f['paseo-workspace']}:{}),workspace:f.cwd||process.cwd()},false,!f['show-credential']); if(v.credential && v.session?.id) await save({...await load(),runtimeMemberCredentials:{...(await load()).runtimeMemberCredentials||{},[v.session.id]:v.credential}}); }
-else if (area === 'send') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'normal',cacheConfirmation:f.confirm});
+else if (area === 'start') { const s=await load(); const contract=f['contract-file']?await readFile(String(f['contract-file']),'utf8'):f.contract; const v=await call('POST','/v1/start',{workspaceId:f.workspace||s.workspaceId,title:f.title||p.join(' '),...(contract?{contract:String(contract)}:{}),...(f.role?{role:f.role}:{}),...launch(),...(f['paseo-project']?{paseoProjectId:f['paseo-project']}:{}),...(f['paseo-workspace']?{paseoWorkspaceId:f['paseo-workspace']}:{}),workspace:f.cwd||process.cwd()},false,!f['show-credential']); if(v.credential && v.session?.id) await save({...await load(),runtimeMemberCredentials:{...(await load()).runtimeMemberCredentials||{},[v.session.id]:v.credential}}); }
+else if (area === 'send') { const contract=f['contract-file']?await readFile(String(f['contract-file']),'utf8'):f.contract; if(contract!==undefined&&(f['subject-task']===undefined||f['subject-fence']===undefined)){console.error('a contract delivery requires --subject-task and --subject-fence');process.exitCode=2;} else await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:contract!==undefined?String(contract):(f.body||p.slice(1).join(' ')),command:'normal',cacheConfirmation:f.confirm,...(contract===undefined?{}:{purpose:'contract',subject:{taskId:String(f['subject-task']),fence:Number(f['subject-fence'])},...(f['not-after']?{notAfter:String(f['not-after'])}:{})})}); }
 else if (area === 'reuse') await call('POST','/v1/reuse',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),cacheConfirmation:f.confirm});
 else if (area === 'interrupt') await call('POST','/v1/deliveries',{runtimeSessionId:p[0],body:f.body||p.slice(1).join(' '),command:'interrupt',reason:f.reason,cacheConfirmation:f.confirm});
 else if (area === 'knowledge' && action === 'add') await call('POST',`/v1/workspaces/${encodeURIComponent(p[0])}/knowledge`,{kind:f.kind||'learning',text:f.text||p.slice(1).join(' '),tags:f.tags?.split(',')},true);
