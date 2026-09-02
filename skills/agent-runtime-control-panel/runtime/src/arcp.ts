@@ -313,6 +313,13 @@ function launchReceiptIdentity(value: Record<string, any>): string | undefined {
   const nested = asRecord(value.agent ?? value.runtime ?? value.result);
   return setting(value.id ?? value.agentId ?? value.sessionId ?? value.externalId ?? nested.id ?? nested.agentId ?? nested.sessionId);
 }
+/** An attached participant is bound by channel identity, not by a provider
+ * plan. Its `provider`/`model` columns carry adapter identity, so comparing
+ * them against observed provider settings manufactures a permanent mismatch
+ * and wedges every safe-point delivery behind a phantom `attention` state. */
+const ATTACHED_PARTICIPANT_PROFILE = 'attached-participant';
+const isAttachedParticipant = (session: { profileId?: string }) => session.profileId === ATTACHED_PARTICIPANT_PROFILE;
+
 const safeModeRank = (provider: string, value: unknown) => {
   const mode = capabilityToken(String(value ?? ''));
   if (['plan', 'readonly', 'read', 'ask'].includes(mode)) return 0;
@@ -1282,7 +1289,11 @@ export class ArcpService implements ExecutionPlacementPort {
         if (item.placement) { item.placement.observed = paseoPlacement(observed); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; }
         if (setting(observed.lastDeliveryId)) item.lastDeliveryId = String(observed.lastDeliveryId);
         if (setting(observed.lastTurnState)) item.lastTurnState = normalizedTurnState(observed.lastTurnState);
-        const requested = [item.provider, item.model, item.mode, item.thinking]; const actual = [item.observed.provider, item.observed.model, item.observed.mode, item.observed.thinking];
+        // An attached participant declares no plan of its own, so observation is
+        // the only truth there is: adopt it rather than diffing against the
+        // adapter identity it was attached with.
+        if (isAttachedParticipant(item)) { if (item.observed.provider) item.provider = item.observed.provider; if (item.observed.model) item.model = item.observed.model; if (item.observed.mode) item.mode = item.observed.mode; if (item.observed.thinking) item.thinking = item.observed.thinking; }
+        const requested = isAttachedParticipant(item) ? [] : [item.provider, item.model, item.mode, item.thinking]; const actual = [item.observed.provider, item.observed.model, item.observed.mode, item.observed.thinking];
         item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : requested.every((value, index) => !value || sameSetting(value, actual[index])) ? sessionState(observed.status ?? observed.Status) : 'attention'; item.lastObservedAt = now();
         for (const delivery of state.deliveries.filter((value) => value.runtimeSessionId === id && value.generation === item.generation && ['delivered', 'running'].includes(value.state))) {
           if (item.state === 'running') delivery.state = 'running';
@@ -2181,7 +2192,7 @@ export class ArcpService implements ExecutionPlacementPort {
     const current = agent ?? {}; const usage = safeJson(current.lastUsage); const numeric = (value: unknown): number | 'unknown' => typeof value === 'number' && Number.isFinite(value) ? value : 'unknown';
     const used = numeric(usage.contextWindowUsedTokens); const max = numeric(usage.contextWindowMaxTokens); const ratio = typeof used === 'number' && typeof max === 'number' && max > 0 ? used / max : 'unknown';
     const observed: Partial<RuntimeSettings> = agent ? { ...(setting(current.provider) ? { provider: String(current.provider) } : {}), ...(setting(current.model) ? { model: String(current.model) } : {}), ...(setting(current.currentModeId ?? current.mode) ? { mode: String(current.currentModeId ?? current.mode) } : {}), ...(setting(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) ? { thinking: String(current.effectiveThinkingOptionId ?? current.thinkingOptionId ?? current.thinking) } : {}) } : (session.observed ?? {});
-    const mismatch = Boolean((requested.provider && !sameSetting(requested.provider, observed.provider)) || (requested.model && !sameSetting(requested.model, observed.model)) || (requested.mode && !sameSetting(requested.mode, observed.mode)) || (requested.thinking && !sameSetting(requested.thinking, observed.thinking)));
+    const mismatch = isAttachedParticipant(session) ? false : Boolean((requested.provider && !sameSetting(requested.provider, observed.provider)) || (requested.model && !sameSetting(requested.model, observed.model)) || (requested.mode && !sameSetting(requested.mode, observed.mode)) || (requested.thinking && !sameSetting(requested.thinking, observed.thinking)));
     const cacheInfo = agent ? this.cacheState(current, timeline ?? []) : { activityAt: undefined, ageMinutes: undefined, state: 'unknown' as const };
     const compactions = Array.isArray(timeline) ? timeline.map(safeJson).filter((item) => item.type === 'compaction') : [];
     const lastCompaction = compactions.at(-1); const observedAt = agent ? now() : session.lastObservedAt; const age = observedAt ? Date.now() - Date.parse(observedAt) : NaN;

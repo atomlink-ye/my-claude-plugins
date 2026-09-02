@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RecordingChannelAdapter } from '../../../../skills/agent-runtime-control-panel/runtime/src/actor-channel.js';
 import { createControl } from '../support/create-control.js';
+import { FakePaseoCli } from '../support/fake-paseo-cli.js';
 
 /** The proactive-channel canary.
  *
@@ -118,6 +119,28 @@ describe('owner escalation canary', () => {
     // human's obligations without anyone noticing.
     await expect(service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'other-channel', externalId: 'participant-opaque-2' }))
       .rejects.toMatchObject({ code: 'placement_conflict' });
+    service.close();
+  });
+
+  it('does not wedge an attached participant into attention by diffing adapter identity against provider truth', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-attached-observe-'));
+    const cli = new FakePaseoCli({ providers: ['claude'] });
+    const { service } = await createControl(root, { cli });
+    const owner = await service.registerActor({ clientIdentity: 'owner-deputy', label: 'Owner', channel: 'recording', conversationRef: 'c1' });
+    const ws = await service.createWorkspace({ purpose: 'attached observe', ownerActorId: owner.actor.id });
+    const manager = await service.joinWorkspace({ workspaceId: ws.workspace.id, label: 'Manager', role: 'manager' });
+    const session = await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'paseo-session-1' });
+
+    const observed = await service.observe(session.id);
+    // The adapter identity it was attached with is not a provider plan, so it
+    // must never be diffed against what the provider actually reports.
+    expect(observed.state).not.toBe('attention');
+    // Underlying provider telemetry stays truthful rather than being erased.
+    expect(observed.observed?.provider).toBe('claude');
+    expect(observed.provider).toBe('claude');
+    expect(observed.generation).toBe(1);
+    const view = await service.runtimeStatus(session.id);
+    expect(view.observation.mismatch).toBe(false);
     service.close();
   });
 });
