@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ArcpService, ArcpStore, type State } from '../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
-import { analysisBrief, WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
+import { analysisBrief, CodexRuntimeAnalyst, WorkspaceSteward, stewardViewOf, type StewardAnalyst, type StewardDossier } from '../../../skills/agent-runtime-control-panel/runtime/src/steward.js';
 import { evaluateSupervision, supervisionPolicyId, type SupervisionView } from '../../../skills/agent-runtime-control-panel/runtime/src/supervision.js';
 
 class DiscoveryCli {
@@ -191,5 +191,27 @@ describe('Round-3 convergence proofs', () => {
     await store.mutate((state: State) => { state.results.push(result); });
     const reopened = new ArcpStore(root); await reopened.init();
     expect(reopened.snapshot().results).toContainEqual(result);
+  });
+
+  it.each([false, true])('accepts only a cited Result authored by the launched Steward member (matching=%s)', async (matching) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-convergence-provenance-'));
+    const service = await serviceAt(root); const { actor, workspace } = await workspaceAt(service);
+    const impostor = await service.joinWorkspace({ workspaceId: workspace.id, label: 'impostor', role: 'worker' });
+    const subject = await service.createTask({ workspaceId: workspace.id, title: 'product task' });
+    const originalStartManaged = service.startManaged.bind(service);
+    (service as any).startManaged = async (input: any) => {
+      const started = await originalStartManaged(input);
+      const authorMemberId = matching ? started.member.id : impostor.member.id;
+      if (matching) await service.claimTask(started.task.id, authorMemberId, 0);
+      else await service.store.mutate((state: State) => { const task = state.tasks.find((item) => item.id === started.task.id)!; task.ownerMemberId = authorMemberId; task.fence = 1; task.lifecycle = 'claimed'; });
+      await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: authorMemberId, status: 'candidate', summary: 'cited Steward analysis', evidenceRefs: [subject.id], expectedFence: 1 });
+      return started;
+    };
+    const analyst = new CodexRuntimeAnalyst(service, { profileId: 'codex-worker', actorId: actor.id, waitMs: 0, pollMs: 1 });
+    const dossier = { key: 'provenance-check', workspace, subject, materialProgress: { refs: [] }, evidenceRefs: [subject.id], classification: 'STUCK', recommendation: 'STEER', why: 'no progress', request: { trigger: 'automatic', workspaceId: workspace.id, subjectTaskId: subject.id, generation: 0, progressSince: new Date(0).toISOString(), requestedAt: new Date().toISOString() } } as unknown as StewardDossier;
+    const narrative = await analyst.analyze(dossier);
+    expect(narrative.cited).toBe(matching);
+    expect(narrative.narrative).toBe(matching ? 'cited Steward analysis' : undefined);
+    service.close();
   });
 });

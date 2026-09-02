@@ -499,7 +499,7 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
       if (session.provider !== preflight.requested.provider || session.model !== preflight.requested.model) {
         throw new StewardProviderUnavailableError(`Steward runtime launched as ${session.provider}/${session.model} instead of ${preflight.requested.provider}/${preflight.requested.model}`);
       }
-      const narrative = await this.awaitNarrative(task.id);
+      const narrative = await this.awaitNarrative(task.id, session.memberId);
       return {
         ...(narrative ? { narrative: narrative.summary, cited: true, evidenceRefs: narrative.evidenceRefs } : { cited: false }),
         provider: session.provider,
@@ -513,13 +513,13 @@ export class CodexRuntimeAnalyst implements StewardAnalyst {
     }
   }
 
-  private async awaitNarrative(taskId: string): Promise<{ summary: string; evidenceRefs: string[] } | undefined> {
+  private async awaitNarrative(taskId: string, memberId?: string): Promise<{ summary: string; evidenceRefs: string[] } | undefined> {
     const pollMs = this.options.pollMs ?? 500;
     const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.()));
     const deadline = Date.now() + this.options.waitMs;
     for (;;) {
       const result = this.service.state().results.find((item) => item.taskId === taskId);
-      if (result?.status === 'candidate' && result.evidenceRefs.length > 0) return { summary: result.summary, evidenceRefs: result.evidenceRefs };
+      if (result?.status === 'candidate' && result.evidenceRefs.length > 0 && result.memberId === memberId) return { summary: result.summary, evidenceRefs: result.evidenceRefs };
       if (Date.now() >= deadline) return undefined;
       await sleep(pollMs);
     }
