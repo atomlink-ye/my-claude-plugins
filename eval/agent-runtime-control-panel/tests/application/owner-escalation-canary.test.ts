@@ -218,4 +218,29 @@ describe('owner escalation canary', () => {
     expect(channel.wakes[0].binding.bindingId).toBe(rebound.id);
     service.close();
   });
+
+  it('refuses to wake a retired conversation when every binding is superseded', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    // Retire every binding this Actor has. Identity survives; no address does.
+    await service.store.mutate((state: any) => {
+      for (const binding of state.bindings.filter((item: any) => item.actorId === workspace.ownerActorId)) { binding.lifecycle = 'superseded'; binding.supersededAt = new Date().toISOString(); }
+      return undefined;
+    });
+
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    const escalated = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+
+    // Waking a retired conversation would deliver a live obligation into a dead
+    // thread and report success. It must fail durably and visibly instead.
+    expect(channel.wakes).toHaveLength(0);
+    expect(escalated.receipt).toBeUndefined();
+    const stored = service.state().channelEvents.find((event) => event.id === escalated.event.id)!;
+    expect(stored.deliveryState).toBe('undeliverable');
+    expect(stored.consumptionState).toBe('open');
+    service.close();
+  });
 });
