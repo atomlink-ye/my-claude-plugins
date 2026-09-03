@@ -51,7 +51,7 @@ export interface ImportReport {
 
 type SqliteRow = Record<string, unknown>;
 const OBSERVATION_LIMIT = 100;
-const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [] });
+const emptyState = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [], documents: [], documentRevisions: [] });
 const json = (value: unknown): string => JSON.stringify(value);
 const parse = <T>(value: unknown, fallback: T): T => { try { return value === null || value === undefined ? fallback : JSON.parse(String(value)) as T; } catch { return fallback; } };
 const hash = (value: unknown): string => createHash('sha256').update(typeof value === 'string' ? value : stableJson(value)).digest('hex');
@@ -106,6 +106,16 @@ const MIGRATIONS: Array<[number, string]> = [
   `],
   [2, `CREATE TABLE IF NOT EXISTS execution_surfaces (id TEXT PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS surface_claims (id TEXT PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS runtime_bindings (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`],
   [3, `CREATE TABLE IF NOT EXISTS selection_receipts (runtime_id TEXT PRIMARY KEY REFERENCES runtimes(id) ON DELETE CASCADE, chosen_role TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT, mode TEXT, reason TEXT NOT NULL, quota_snapshot TEXT NOT NULL);`],
+  [4, `
+    CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS document_revisions (
+      id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      document_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.documentId')) VIRTUAL,
+      revision INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.revision')) VIRTUAL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS document_revisions_append_only ON document_revisions(document_id, revision);
+  `],
 ];
 
 export function resolveDatabasePath(dirOrFile: string): string {
@@ -133,6 +143,8 @@ const projection = (state: Partial<State>) => {
     executionSurfaces: durable.executionSurfaces,
     surfaceClaims: durable.surfaceClaims,
     runtimeBindings: durable.runtimeBindings,
+    documents: durable.documents,
+    documentRevisions: durable.documentRevisions,
   };
 };
 type StateProjection = ReturnType<typeof projection>;
@@ -278,7 +290,7 @@ export class SQLiteStateStore implements StateStore {
     });
     const results = (db.prepare('SELECT payload, content_id FROM results').all() as SqliteRow[]).map((row) => { const payload = parse<Record<string, unknown>>(row.payload, {}); const item = content.get(String(row.content_id)); return { ...payload, summary: item?.summary ?? '', evidenceRefs: item?.evidenceRefs ?? [] }; });
     const confirmations = rows('confirmations').map(({ id: _id, ...confirmation }) => confirmation) as unknown as State['confirmations'];
-    return postRedactionState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents, confirmations, supervisionPolicies: rows('supervision_policies') as unknown as State['supervisionPolicies'], supervisionReviews: rows('supervision_reviews') as unknown as State['supervisionReviews'], supervisionSignals: rows('supervision_signals') as unknown as State['supervisionSignals'], executionSurfaces: rows('execution_surfaces') as unknown as State['executionSurfaces'], surfaceClaims: rows('surface_claims') as unknown as State['surfaceClaims'], runtimeBindings: rows('runtime_bindings') as unknown as State['runtimeBindings'] });
+    return postRedactionState({ actors: rows('actors') as unknown as State['actors'], bindings: rows('actor_bindings') as unknown as State['bindings'], workspaces: rows('workspaces') as unknown as State['workspaces'], goals: rows('goals') as unknown as State['goals'], members: rows('members') as unknown as State['members'], tasks: rows('tasks') as unknown as State['tasks'], sessions: rows('runtimes') as unknown as State['sessions'], deliveries: rows('deliveries') as unknown as State['deliveries'], knowledge: knowledge as State['knowledge'], results: results as State['results'], channelEvents, confirmations, supervisionPolicies: rows('supervision_policies') as unknown as State['supervisionPolicies'], supervisionReviews: rows('supervision_reviews') as unknown as State['supervisionReviews'], supervisionSignals: rows('supervision_signals') as unknown as State['supervisionSignals'], executionSurfaces: rows('execution_surfaces') as unknown as State['executionSurfaces'], surfaceClaims: rows('surface_claims') as unknown as State['surfaceClaims'], runtimeBindings: rows('runtime_bindings') as unknown as State['runtimeBindings'], documents: rows('documents') as unknown as State['documents'], documentRevisions: rows('document_revisions') as unknown as State['documentRevisions'] });
   }
 
   private persist(state: State): void {
@@ -296,7 +308,7 @@ export class SQLiteStateStore implements StateStore {
   private persistWithinTransaction(state: State): void {
     const durable = postRedactionState(state);
     this.persistContent(durable);
-    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'selection_receipts', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings']) this.connection.exec(`DELETE FROM ${table}`);
+    for (const table of ['workspaces', 'actors', 'actor_bindings', 'goals', 'members', 'tasks', 'runtimes', 'selection_receipts', 'deliveries', 'confirmations', 'knowledge', 'results', 'channel_events', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings', 'documents', 'document_revisions']) this.connection.exec(`DELETE FROM ${table}`);
     this.persistRows('workspaces', durable.workspaces);
     this.persistRows('actors', durable.actors);
     this.persistRows('actor_bindings', durable.bindings);
@@ -309,6 +321,8 @@ export class SQLiteStateStore implements StateStore {
     this.persistRows('execution_surfaces', durable.executionSurfaces);
     this.persistRows('surface_claims', durable.surfaceClaims);
     this.persistRows('runtime_bindings', durable.runtimeBindings);
+    this.persistRows('documents', durable.documents);
+    this.persistRows('document_revisions', durable.documentRevisions);
     this.persistRows('confirmations', durable.confirmations.map((confirmation) => ({ ...confirmation, id: confirmation.tokenHash })));
     this.persistScopedRows('supervision_policies', ['workspace_id'], durable.supervisionPolicies, (item) => [item.workspaceId]);
     this.persistScopedRows('supervision_reviews', ['workspace_id', 'subject_id', 'generation'], durable.supervisionReviews, (item) => [item.workspaceId, item.subjectId, item.generation]);
@@ -405,7 +419,7 @@ export class SQLiteStateStore implements StateStore {
   status(): DatabaseStatus {
     const db = this.connection;
     const counts: Record<string, number> = {};
-    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
+    for (const table of ['event_journal', 'channel_events', 'content', 'workspaces', 'actors', 'members', 'goals', 'tasks', 'runtimes', 'deliveries', 'confirmations', 'knowledge', 'results', 'runtime_observations', 'legacy_reminders', 'migration_audit', 'supervision_policies', 'supervision_reviews', 'supervision_signals', 'execution_surfaces', 'surface_claims', 'runtime_bindings', 'documents', 'document_revisions']) counts[table] = Number((db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as SqliteRow).count);
     const mode = awaitableStat(this.file);
     return { path: this.file, schemaVersion: Number((db.prepare('SELECT max(version) AS version FROM schema_migrations').get() as SqliteRow).version ?? 0), journalMode: String((db.prepare('PRAGMA journal_mode').get() as SqliteRow).journal_mode), foreignKeys: Number((db.prepare('PRAGMA foreign_keys').get() as SqliteRow).foreign_keys), busyTimeout: Number((db.prepare('PRAGMA busy_timeout').get() as SqliteRow).timeout), observations: counts.runtime_observations, tables: counts, mode };
   }

@@ -51,7 +51,7 @@ export function publicPanorama(value: any, service: ArcpService) {
     blocked: value.blocked ?? [], temporal: value.temporal,
     events: value.events ?? [], providerBudget: value.providerBudget ?? { status: 'source_unavailable' }, latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef });
 }
-function publicStartInput(input: Record<string, unknown>) { const keys = ['workspaceId', 'title', 'contract', 'role', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskScope', 'executionSurfaceId', 'primaryHandlerMemberId', 'ccMemberIds', 'escalationMemberIds']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
+function publicStartInput(input: Record<string, unknown>) { const keys = ['workspaceId', 'title', 'contract', 'contractDocumentRef', 'role', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskScope', 'executionSurfaceId', 'primaryHandlerMemberId', 'ccMemberIds', 'escalationMemberIds']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
 function publicRuntimeLaunchInput(input: Record<string, unknown>) { const keys = ['goalId', 'workspaceId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskId', 'executionSurfaceId']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
 /**
  * Actor-only launches are the root bootstrap: the very first runtime in a
@@ -112,6 +112,48 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'POST' && path === '/v1/undeliverable-dispositions') { if (!authenticatedMember && !admin) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); if (!authenticatedMember) throw new ArcpError('unauthorized', 'disposing an obligation requires the disposing member credential'); const memberId = authenticatedMember.id; const event = await service.disposeUndeliverable({ eventId: String(input.eventId ?? ''), memberId, reason: String(input.reason ?? '') }); send(res, 200, { event: event.id, consumptionState: event.consumptionState, deliveryState: event.deliveryState }); return true; }
     if (method === 'POST' && path === '/v1/escalations') { if (!authenticatedMember && !admin) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); const eventId = String(input.eventId ?? ''); if (!eventId) throw new ArcpError('invalid_request', 'eventId is required', 'eventId'); const reason = String(input.reason ?? '').trim(); if (!reason) throw new ArcpError('invalid_request', 'reason is required', 'reason'); const subject = service.state().channelEvents.find((item) => item.id === eventId); if (!subject) throw new ArcpError('not_found', 'event not found'); if (authenticatedMember && subject.workspaceId !== authenticatedMember.workspaceId) throw new ArcpError('unauthorized', 'member cannot escalate an obligation in another workspace'); const escalated = await service.escalateToOwnerActor({ eventId, reason }); send(res, 200, { event: escalated.event.id, alreadyEscalated: escalated.alreadyEscalated, receipt: escalated.receipt ?? null, deliveryState: service.state().channelEvents.find((item) => item.id === escalated.event.id)?.deliveryState ?? null }); return true; }
     if (method === 'POST' && path === '/v1/participants/attach') { if (!authenticatedMember && !admin) throw new ArcpError('unauthorized', 'member credential is required'); const input = await body(req); const memberId = authenticatedMember ? authenticatedMember.id : String(input.memberId ?? ''); const workspaceId = authenticatedMember ? authenticatedMember.workspaceId : String(input.workspaceId ?? ''); send(res, 201, publicSession(await service.attachParticipant({ workspaceId, memberId, adapterId: String(input.adapterId ?? ''), externalId: String(input.externalId ?? ''), ...(input.workspace ? { workspace: String(input.workspace) } : {}) }))); return true; }
+    // Documents carry authority; messages carry deltas and pointers. Writing
+    // one requires a member credential, and the author is the credential's
+    // member, never a name supplied in the body.
+    if (method === 'POST' && /^\/v1\/workspaces\/[^/]+\/documents$/.test(path)) {
+      if (!authenticatedMember) throw new ArcpError('unauthorized', 'a member credential is required to author a document');
+      const workspaceId = decodeURIComponent(path.split('/')[3]);
+      if (authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'member cannot author a document in another workspace');
+      const input = await body(req);
+      send(res, 201, await service.createDocument({ workspaceId, memberId: authenticatedMember.id, kind: String(input.kind ?? 'note'), title: String(input.title ?? ''), body: String(input.body ?? '') }));
+      return true;
+    }
+    if (method === 'GET' && /^\/v1\/workspaces\/[^/]+\/documents$/.test(path)) {
+      const workspaceId = decodeURIComponent(path.split('/')[3]);
+      if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'member cannot list documents in another workspace');
+      send(res, 200, service.listDocuments(workspaceId, url.searchParams.get('kind') ?? undefined));
+      return true;
+    }
+    if (method === 'POST' && /^\/v1\/documents\/[^/]+\/revisions$/.test(path)) {
+      if (!authenticatedMember) throw new ArcpError('unauthorized', 'a member credential is required to revise a document');
+      const documentId = decodeURIComponent(path.split('/')[3]);
+      const input = await body(req);
+      send(res, 201, await service.reviseDocument({ documentId, memberId: authenticatedMember.id, body: String(input.body ?? '') }));
+      return true;
+    }
+    if (method === 'GET' && /^\/v1\/documents\/[^/]+\/diff$/.test(path)) {
+      const documentId = decodeURIComponent(path.split('/')[3]);
+      const from = Number(url.searchParams.get('from'));
+      const to = Number(url.searchParams.get('to'));
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) throw new ArcpError('invalid_request', 'diff requires integer from and to revisions', 'from');
+      const document = service.showDocument(documentId).document;
+      if (authenticatedMember && authenticatedMember.workspaceId !== document.workspaceId) throw new ArcpError('unauthorized', 'member cannot read a document in another workspace');
+      send(res, 200, service.diffDocument(documentId, from, to));
+      return true;
+    }
+    if (method === 'GET' && /^\/v1\/documents\/[^/]+$/.test(path)) {
+      const documentId = decodeURIComponent(path.split('/')[3]);
+      const revision = url.searchParams.get('revision');
+      const shown = service.showDocument(documentId, revision === null ? undefined : Number(revision));
+      if (authenticatedMember && authenticatedMember.workspaceId !== shown.document.workspaceId) throw new ArcpError('unauthorized', 'member cannot read a document in another workspace');
+      send(res, 200, shown);
+      return true;
+    }
     if (method === 'POST' && path === '/v1/start') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); const safeInput = publicStartInput(input); assertLaunchRelationship(service, authenticatedActor.id, authenticatedMember, safeInput.workspaceId); const started = await service.startManaged({ ...safeInput, actorId: authenticatedActor.id, ...(authenticatedMember ? { launchedByMemberId: authenticatedMember.id } : {}) } as any); if ('action' in started) send(res, 200, started); else send(res, 201, { goal: started.goal, task: started.task, member: publicMember(started.member), session: publicSession(started.session), credential: started.credential }); return true; }
     const workspaceContext = path.match(/^\/v1\/workspaces\/([^/]+)\/context$/);
     if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }

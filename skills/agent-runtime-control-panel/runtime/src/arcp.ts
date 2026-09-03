@@ -10,7 +10,8 @@ import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
-import { contentAddress, normalizeChannelEvent } from './content.js';
+import { contentAddress, documentAddress, normalizeChannelEvent } from './content.js';
+import { artifactRefFor, diffDocumentLines, resolveArtifactRef, DOCUMENT_BODY_LIMIT, DOCUMENT_KINDS, type DocumentArtifact, type DocumentKind, type DocumentRevision } from './document.js';
 import { projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
 import { renderChannelMarkdown, type ChannelMarkdownOptions } from './channel-markdown.js';
 import { projectTemporal, temporalReconciliationPreview, type TemporalFilter, type TemporalProjection, type TemporalProjectionFacts } from './temporal-projection.js';
@@ -32,6 +33,8 @@ export { RuntimeBudgetTracker, validateRuntimeBudgetSample } from './runtime-bud
 export type { RuntimeBudgetPolicy, RuntimeBudgetSample, RuntimeBudgetSignal, RuntimeBudgetView, WakeCategory } from './runtime-budget.js';
 export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSurfaceBinding, ExecutionSurfaceKind, ExecutionSurfaceRef, RepositoryLocator, RepositoryRef, RuntimeBinding, RuntimeBindingReceipt, RuntimeBindingRef, SurfaceArchiveAuthorization, SurfaceClaim, SurfaceRestoreEvidence, SurfaceRestoreReceipt, SurfaceSpec } from './execution-placement.js';
 export type { StateStore } from './state-store.js';
+export type { DocumentArtifact, DocumentRevision, DocumentKind, ArtifactRefParts, ArtifactResolution } from './document.js';
+export { formatArtifactRef, parseArtifactRef, resolveArtifactRef, artifactRefFor, diffDocumentLines, DOCUMENT_KINDS, DOCUMENT_BODY_LIMIT, SUMMARY_LIMIT } from './document.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
 export type { SupervisionBreach, SupervisionPolicy, SupervisionReview, SupervisionSignal, SupervisionView } from './supervision.js';
 
@@ -77,7 +80,11 @@ export interface RuntimeLaunchContext { parentAgentId?: string; workspaceId?: st
  * transport delivery. The primary handler alone owns acknowledgement and
  * action; cc recipients observe and must never create a second obligation. */
 export interface ReportingRoute { launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds: string[]; escalationMemberIds: string[]; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; parentAgentId?: string; executionSurfaceId?: string; /** Durable proof that the launch itself carried the Goal Contract. */ contractBoundAtLaunch?: true; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; selectionReceipt?: SelectionReceipt; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; parentAgentId?: string; executionSurfaceId?: string; /** Durable proof that the launch itself carried the Goal Contract. Asserted by
+   * the launcher from the presence of contract text; a reader cannot check it. */ contractBoundAtLaunch?: true;
+  /** ArtifactRef of the exact contract revision bound at launch. Unlike
+   * contractBoundAtLaunch this is verifiable: a reader can resolve it and
+   * re-hash the body without trusting the launcher. */ contractRef?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; selectionReceipt?: SelectionReceipt; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; purpose?: DeliveryPurpose; subject?: DeliverySubject; notAfter?: string; refusedReason?: string; handedOffAfterWithdrawal?: boolean; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; processedByMemberId?: string; processedReason?: string; acknowledgedAt?: string; acknowledgedByMemberId?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
@@ -115,9 +122,9 @@ export interface RuntimeAdapter {
   stop(externalId: string): Promise<unknown>;
 }
 interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
-export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; executionSurfaces: ExecutionSurface[]; surfaceClaims: SurfaceClaim[]; runtimeBindings: RuntimeBinding[]; }
+export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; executionSurfaces: ExecutionSurface[]; surfaceClaims: SurfaceClaim[]; runtimeBindings: RuntimeBinding[]; documents: DocumentArtifact[]; documentRevisions: DocumentRevision[]; }
 
-const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [] });
+const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [], documents: [], documentRevisions: [] });
 export const CLAUDE_CACHE_DEFAULTS = { expiringMinutes: 55, expiredMinutes: 60 } as const;
 export const DEFAULT_SUPERVISION_COOLDOWN_MS = 900_000;
 // codex-full-access is Codex Terra medium at mode full-access: it never blocks
@@ -223,7 +230,7 @@ export class ArcpStore implements StateStore {
     try {
       const parsed = JSON.parse(await readFile(this.file, 'utf8')) as Partial<State>;
       const legacyEvents = ((parsed as any).channelEvents ?? []) as Array<Record<string, unknown>>; const channelEvents = legacyEvents.map(normalizeChannelEvent);
-      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [], supervisionPolicies: parsed.supervisionPolicies ?? [], supervisionReviews: parsed.supervisionReviews ?? [], supervisionSignals: parsed.supervisionSignals ?? [], executionSurfaces: parsed.executionSurfaces ?? [], surfaceClaims: parsed.surfaceClaims ?? [], runtimeBindings: parsed.runtimeBindings ?? [] };
+      this.state = { actors: parsed.actors ?? [], bindings: parsed.bindings ?? [], credentials: parsed.credentials ?? {}, workspaces: parsed.workspaces ?? [], members: parsed.members ?? [], memberCredentials: parsed.memberCredentials ?? {}, tasks: parsed.tasks ?? [], knowledge: parsed.knowledge ?? [], results: parsed.results ?? [], goals: parsed.goals ?? [], sessions: (parsed.sessions ?? []).map((item) => ({ ...item, runtimeKind: item.runtimeKind ?? 'paseo', adapterId: item.adapterId ?? 'paseo' })), deliveries: parsed.deliveries ?? [], channelEvents, confirmations: parsed.confirmations ?? [], supervisionPolicies: parsed.supervisionPolicies ?? [], supervisionReviews: parsed.supervisionReviews ?? [], supervisionSignals: parsed.supervisionSignals ?? [], executionSurfaces: parsed.executionSurfaces ?? [], surfaceClaims: parsed.surfaceClaims ?? [], runtimeBindings: parsed.runtimeBindings ?? [], documents: parsed.documents ?? [], documentRevisions: parsed.documentRevisions ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('ARCP durable state is unreadable');
     }
@@ -1093,8 +1100,20 @@ export class ArcpService implements ExecutionPlacementPort {
     if (input.paseoProjectId || input.paseoWorkspaceId || persisted) throw new ArcpError('placement_unresolved', unresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch');
     return { ...input, workspace: checkout, ...(unresolved ? { placementUnresolved: unresolved } : {}) };
   }
-  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt }> {
+  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; contractDocumentRef?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
+    // Resolve and hash-verify the bound contract revision before anything is
+    // created. An unverifiable ref must not produce a Goal, Task, Member or
+    // runtime that later claims to have been launched under it.
+    let contract = input.contract;
+    let contractRef: string | undefined;
+    if (input.contractDocumentRef) {
+      const resolved = this.resolveDocumentRef(input.contractDocumentRef);
+      if (resolved.status !== 'verified') throw new ArcpError('invalid_request', `contract document ref is not verifiable: ${resolved.reason}`, 'contractDocumentRef');
+      if (resolved.revision.workspaceId !== input.workspaceId) throw new ArcpError('unauthorized', 'contract document belongs to another workspace', 'contractDocumentRef');
+      contract = resolved.revision.body;
+      contractRef = artifactRefFor(resolved.revision);
+    }
     const preflight = await this.preflight(input);
     if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
     // Lineage is resolved from durable state, never from the request, and it
@@ -1138,7 +1157,7 @@ export class ArcpService implements ExecutionPlacementPort {
       if (!joined.credential) throw new ArcpError('internal_error', 'managed member credential was not issued');
       const reportingRoute = this.resolveReportingRoute({ workspaceId: input.workspaceId, launchedByMemberId: input.launchedByMemberId, primaryHandlerMemberId: input.primaryHandlerMemberId, ccMemberIds: input.ccMemberIds, escalationMemberIds: input.escalationMemberIds, fallbackMemberId: joined.member.id });
       const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
-      const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(input.contract ? { contract: input.contract } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute });
+      const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(contract ? { contract } : {}), ...(contractRef ? { contractRef } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; contractRef?: string; reportingRoute?: ReportingRoute });
       return { goal, task, member: joined.member, session, credential: joined.credential, routingGuidance: preflight.routingGuidance, selection: preflight.selection, selectionReceipt: preflight.selectionReceipt };
     } catch (error) { await this.abandonManagedLaunch({ memberId: joinedMemberId, runtimeId, goalId: goal.id, taskId: task.id }); throw error; }
   }
@@ -1470,7 +1489,7 @@ export class ArcpService implements ExecutionPlacementPort {
     return replaced;
   }
 
-  async launch(input: LaunchInput & { parentAgentId?: string; launchedByMemberId?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; [RUNTIME_REPLACEMENT_RESERVATION]?: true }): Promise<RuntimeSession> {
+  async launch(input: LaunchInput & { parentAgentId?: string; launchedByMemberId?: string; contractRef?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; [RUNTIME_REPLACEMENT_RESERVATION]?: true }): Promise<RuntimeSession> {
     const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
@@ -1506,6 +1525,7 @@ export class ArcpService implements ExecutionPlacementPort {
       actorId: input.actorId,
       goalId: goal.id,
       ...(input.contract?.trim() ? { contractBoundAtLaunch: true as const } : {}),
+      ...(input.contractRef ? { contractRef: input.contractRef } : prior?.contractRef ? { contractRef: prior.contractRef } : {}),
       ...(input.taskId ?? prior?.taskId ? { taskId: input.taskId ?? prior?.taskId } : {}),
       ...(input.reportingRoute ?? prior?.reportingRoute ? { reportingRoute: input.reportingRoute ?? prior?.reportingRoute } : {}),
       ...(input.executionSurfaceId ?? prior?.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId ?? prior?.executionSurfaceId } : {}),
@@ -2498,6 +2518,82 @@ export class ArcpService implements ExecutionPlacementPort {
     const supplied = runtimeSessionId === undefined ? undefined : state.sessions.find((item) => item.id === runtimeSessionId);
     if (!current || (runtimeSessionId !== undefined && (!supplied || supplied.id !== current.id)) || (runtimeGeneration !== undefined && current.generation !== runtimeGeneration)) throw new ArcpError('stale_generation', 'runtime session generation changed before Result commit');
   }
+  /** Resolve a member for a document operation, scoped to its workspace. A
+   * credential proves who you are; it never proves you may read another
+   * workspace's authority. */
+  private documentMember(state: State, workspaceId: string, memberId: string): Member {
+    const member = state.members.find((item) => item.id === memberId && item.workspaceId === workspaceId);
+    if (!member) throw new ArcpError('unauthorized', 'member does not belong to this workspace');
+    return member;
+  }
+
+  private assertDocumentBody(body: string): string {
+    if (!body.trim()) throw new ArcpError('invalid_request', 'a document revision requires a non-empty body', 'body');
+    if (Buffer.byteLength(body, 'utf8') > DOCUMENT_BODY_LIMIT) throw new ArcpError('invalid_request', `a document body may not exceed ${DOCUMENT_BODY_LIMIT} bytes`, 'body');
+    return body;
+  }
+
+  /** Create a document at revision 1. The author comes from the authenticated
+   * member, never from the request. */
+  async createDocument(input: { workspaceId: string; memberId: string; kind: string; title: string; body: string }): Promise<{ document: DocumentArtifact; revision: DocumentRevision; ref: string }> {
+    const title = input.title.trim();
+    if (!title) throw new ArcpError('invalid_request', 'a document requires a title', 'title');
+    if (!DOCUMENT_KINDS.includes(input.kind as DocumentKind)) throw new ArcpError('invalid_request', `document kind must be one of ${DOCUMENT_KINDS.join(', ')}`, 'kind');
+    const body = this.assertDocumentBody(input.body);
+    return this.store.mutate((state) => {
+      const member = this.documentMember(state, input.workspaceId, input.memberId);
+      const at = now();
+      const document: DocumentArtifact = { id: `document_${randomUUID()}`, workspaceId: input.workspaceId, kind: input.kind as DocumentKind, title, authorMemberId: member.id, latestRevision: 1, createdAt: at, updatedAt: at };
+      const revision: DocumentRevision = { id: `revision_${randomUUID()}`, documentId: document.id, workspaceId: input.workspaceId, revision: 1, authorMemberId: member.id, body, bytes: Buffer.byteLength(body, 'utf8'), contentHash: documentAddress(body), createdAt: at };
+      state.documents.push(document);
+      state.documentRevisions.push(revision);
+      return { document, revision, ref: artifactRefFor(revision) };
+    });
+  }
+
+  /** Append revision N+1. Revision N is never mutated, so any ref already
+   * handed out keeps naming the bytes it named. */
+  async reviseDocument(input: { documentId: string; memberId: string; body: string }): Promise<{ document: DocumentArtifact; revision: DocumentRevision; ref: string }> {
+    const body = this.assertDocumentBody(input.body);
+    return this.store.mutate((state) => {
+      const document = state.documents.find((item) => item.id === input.documentId);
+      if (!document) throw new ArcpError('not_found', 'document not found');
+      const member = this.documentMember(state, document.workspaceId, input.memberId);
+      const at = now();
+      const next = document.latestRevision + 1;
+      const revision: DocumentRevision = { id: `revision_${randomUUID()}`, documentId: document.id, workspaceId: document.workspaceId, revision: next, authorMemberId: member.id, body, bytes: Buffer.byteLength(body, 'utf8'), contentHash: documentAddress(body), createdAt: at };
+      state.documentRevisions.push(revision);
+      document.latestRevision = next;
+      document.updatedAt = at;
+      return { document, revision, ref: artifactRefFor(revision) };
+    });
+  }
+
+  listDocuments(workspaceId: string, kind?: string): DocumentArtifact[] {
+    return this.store.snapshot().documents.filter((item) => item.workspaceId === workspaceId && (!kind || item.kind === kind));
+  }
+
+  showDocument(documentId: string, revision?: number): { document: DocumentArtifact; revision: DocumentRevision; ref: string } {
+    const state = this.store.snapshot();
+    const document = state.documents.find((item) => item.id === documentId);
+    if (!document) throw new ArcpError('not_found', 'document not found');
+    const wanted = revision ?? document.latestRevision;
+    const found = state.documentRevisions.find((item) => item.documentId === documentId && item.revision === wanted);
+    if (!found) throw new ArcpError('not_found', `document has no revision ${wanted}`);
+    return { document, revision: found, ref: artifactRefFor(found) };
+  }
+
+  diffDocument(documentId: string, from: number, to: number): { document: DocumentArtifact; from: number; to: number; diff: string } {
+    const document = this.showDocument(documentId, from).document;
+    return { document, from, to, diff: diffDocumentLines(this.showDocument(documentId, from).revision.body, this.showDocument(documentId, to).revision.body) };
+  }
+
+  /** Resolve and hash-verify a ref against durable revisions. Returns the
+   * refusal rather than throwing so callers can decide how loudly to fail. */
+  resolveDocumentRef(ref: string) {
+    return resolveArtifactRef(ref, this.store.snapshot().documentRevisions);
+  }
+
   async submitResult(input: { workspaceId: string; taskId: string; memberId: string; status: Result['status']; summary: string; evidenceRefs?: string[]; expectedFence?: number; sourceId?: string; runtimeSessionId?: string; runtimeGeneration?: number; generation?: number }): Promise<Result> { const runtimeGeneration = input.runtimeGeneration ?? input.generation; await this.enforceRuntimeIdentityBinding(input.taskId, input.memberId, 'result', input.runtimeSessionId, runtimeGeneration); const submitted = await this.store.mutate((state) => { const task = state.tasks.find((item) => item.id === input.taskId && item.workspaceId === input.workspaceId); const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId); if (!task || !member || task.ownerMemberId !== input.memberId) throw new ArcpError('task_held', 'member does not hold this task'); this.validateRuntimeResultProvenance(state, input.taskId, member, input.runtimeSessionId, runtimeGeneration); if (!member.capabilities.includes('submit_result')) throw new ArcpError('unauthorized', 'member lacks submit_result capability'); if (member.role === 'steward' || (member.role === STEWARD_ANALYSIS_ROLE && task.scope !== 'steward_analysis')) throw new ArcpError('unauthorized', 'Steward credentials cannot submit product Results'); if (!['candidate','failed','unknown'].includes(input.status)) throw new ArcpError('invalid_request', 'invalid result status'); if (input.expectedFence === undefined) throw new ArcpError('invalid_request', 'expectedFence is required; pass --expected-fence', 'expectedFence'); if (task.fence !== input.expectedFence) throw new ArcpError('stale_generation', `result fence is stale; current fence is ${task.fence}`); if ((input.evidenceRefs ?? []).some((value) => value.startsWith('/'))) throw new ArcpError('invalid_request', 'absolute evidence paths are not allowed'); const existing = input.sourceId ? state.results.find((item) => item.sourceId === input.sourceId) : undefined; if (existing) { if (existing.workspaceId !== input.workspaceId || existing.taskId !== input.taskId || existing.memberId !== input.memberId || existing.fence !== task.fence || existing.status !== input.status || existing.summary !== input.summary.trim() || JSON.stringify(existing.evidenceRefs) !== JSON.stringify(input.evidenceRefs ?? []) || existing.runtimeSessionId !== input.runtimeSessionId || existing.runtimeGeneration !== runtimeGeneration) throw new ArcpError('invalid_request', 'result source id conflicts with its durable payload', 'sourceId'); return existing; } const result = { id: `result_${randomUUID()}`, workspaceId: input.workspaceId, taskId: input.taskId, memberId: input.memberId, fence: task.fence, status: input.status, summary: input.summary.trim(), evidenceRefs: input.evidenceRefs ?? [], ...(input.sourceId ? { sourceId: input.sourceId } : {}), ...(input.runtimeSessionId ? { runtimeSessionId: input.runtimeSessionId } : {}), ...(runtimeGeneration !== undefined ? { runtimeGeneration } : {}), createdAt: now() }; state.results.push(result); for (const pending of state.deliveries.filter((item) => item.purpose === 'contract' && item.subject?.taskId === task.id && ['queued', 'held', 'waiting_safe_point', 'attempting'].includes(item.state))) { pending.state = 'withdrawn'; pending.refusedReason = `task ${task.id} already submitted result ${result.id}`; pending.reason = pending.refusedReason; } if (input.status === 'candidate') task.lifecycle = 'waiting'; else if (input.status === 'failed') task.lifecycle = 'failed'; else if (input.status === 'unknown') task.lifecycle = 'unknown'; task.updatedAt = now(); if (task.executionSurfaceId) { for (const claim of state.surfaceClaims.filter((claim) => claim.executionSurfaceId === task.executionSurfaceId && claim.active)) { claim.active = false; claim.releasedAt = now(); } const surface = state.executionSurfaces.find((surface) => surface.id === task.executionSurfaceId); if (surface) { surface.operationalState = input.status === 'candidate' ? 'accepted' : input.status === 'failed' ? 'abandoned' : 'parked'; surface.updatedAt = now(); } } const kind = input.status === 'candidate' ? 'task_candidate' : input.status === 'failed' ? 'task_failed' : 'task_unknown'; const candidate = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, kind, urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: input.status === 'candidate', summary: result.summary, evidenceRefs: result.evidenceRefs, notify: false }); if (input.status === 'candidate') { const route = state.sessions.find((item) => item.taskId === result.taskId && item.reportingRoute)?.reportingRoute; const primary = route?.primaryHandlerMemberId; const decision = this.appendChannelEvent(state, { id: input.sourceId ? `event_${input.sourceId}:decision` : undefined, workspaceId: result.workspaceId, taskId: result.taskId, resultId: result.id, sourceMemberId: result.memberId, ...(primary ? { targetMemberId: primary } : { targetRole: 'manager' }), kind: 'decision_required', urgency: 'normal', consumptionPolicy: 'decision_required', decisionRequired: true, summary: `Result ${result.id} requires ${primary ? `a decision from its accountable handler ${primary}` : 'Manager decision'}`, evidenceRefs: [], relatedEventId: candidate.id });
       // CC is observe-only: it references the same decision without minting a
       // second obligation, so a completed review is routed to the accountable

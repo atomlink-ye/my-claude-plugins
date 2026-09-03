@@ -11,6 +11,18 @@ export function contentAddress(summary: string, evidenceRefs: readonly string[])
   return createHash('sha256').update(JSON.stringify({ summary, evidenceRefs })).digest('hex');
 }
 
+/**
+ * Content-address a document body by its own exact UTF-8 bytes.
+ *
+ * Deliberately not routed through contentAddress: that hashes a channel-event
+ * envelope shape, so a document's identity would depend on JSON escaping rather
+ * than on the document's own bytes, and two independent formats would become
+ * silently coupled. Same module, same primitive, different domain.
+ */
+export function documentAddress(body: string): string {
+  return createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex');
+}
+
 function transitionState(value: unknown): ChannelTransition['state'] | undefined {
   return typeof value === 'string' && TRANSITION_STATES.includes(value as ChannelTransition['state'])
     ? value as ChannelTransition['state']
