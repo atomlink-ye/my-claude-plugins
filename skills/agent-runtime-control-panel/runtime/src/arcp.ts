@@ -1347,7 +1347,7 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!session.externalId) throw new ArcpError('launch_failed', `runtime launch returned no usable session (state ${session.state})`);
     return session;
   }
-  async launch(input: LaunchInput & { parentAgentId?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean }): Promise<RuntimeSession> {
+  async launch(input: LaunchInput & { parentAgentId?: string; launchedByMemberId?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean }): Promise<RuntimeSession> {
     const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
@@ -1355,6 +1355,14 @@ export class ArcpService implements ExecutionPlacementPort {
     const binding = state.bindings.find((item) => item.actorId === input.actorId);
     if (!goal || !binding) throw new ArcpError('unknown_recipient', 'actor or goal is not registered');
     if (input.memberId && !state.members.some((item) => item.id === input.memberId && (!input.workspaceId || item.workspaceId === input.workspaceId))) throw new ArcpError('unknown_recipient', 'managed member is not in workspace');
+    // Direct launch callers may name an authenticated launcher member, never a
+    // provider parent. Resolve the opaque parent from current durable runtime
+    // identity before placement or provider work, just as managed start does.
+    if (input.launchedByMemberId) {
+      const ids = [...new Set(state.sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId)).map((item) => item.externalId!))];
+      if (ids.length !== 1) throw new ArcpError('launch_held', ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch`);
+      input = { ...input, parentAgentId: ids[0] };
+    }
     input = await this.resolvePaseoPlacement(input);
     if (state.sessions.some((item) => item.goalId === goal.id && item.state !== 'terminal')) {
       throw new ArcpError('goal_held', 'goal already has a primary runtime session');
@@ -1488,7 +1496,7 @@ export class ArcpService implements ExecutionPlacementPort {
     const deliveryId = `delivery_${randomUUID()}`;
     const event = await this.publishChannelEvent({ workspaceId: session.workspaceId, goalId: session.goalId, sourceActorId: input.fromActorId, targetActorId: session.actorId, kind: 'attention', urgency: 'urgent', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: `Channel interrupt ${deliveryId} queued`, evidenceRefs: [], notify: false });
     const delivery: Delivery = { id: deliveryId, fromActorId: input.fromActorId, runtimeSessionId: session.id, generation: session.generation, body: input.body.trim(), command: 'interrupt', reason: input.reason.trim(), eventId: event.id, state: 'queued', createdAt: now() };
-    await this.store.mutate((state) => { state.deliveries.push(delivery); });
+    await this.store.mutate((state) => { const item = { ...delivery, state: 'attempting' as const, attemptedAt: now() }; state.deliveries.push(item); const event = state.channelEvents.find((value) => value.id === item.eventId); if (event) this.transitionEvent(event, 'transport_indeterminate', item.attemptedAt); });
     try { await this.adapterFor(session).interrupt(session.externalId, delivery.body); return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'delivered'; item.deliveredAt = now(); if (event) this.transitionEvent(event, 'delivered', item.deliveredAt); return item; }); }
     catch { return this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'transport_indeterminate'; if (event) this.transitionEvent(event, 'transport_indeterminate'); return item; }); }
   }

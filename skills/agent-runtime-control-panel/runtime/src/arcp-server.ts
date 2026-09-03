@@ -7,7 +7,7 @@ import type { WorkspaceSteward } from './steward.js';
 
 async function body(req: http.IncomingMessage): Promise<Record<string, unknown>> { let text = ''; for await (const part of req) text += String(part); try { return text ? JSON.parse(text) : {}; } catch { throw new ArcpError('invalid_request', 'invalid JSON'); } }
 function send(res: http.ServerResponse, status: number, value: unknown) { res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value)); }
-function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, ...safe } = value; return safe; }
+function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, parentAgentId: _parentAgentId, ...safe } = value; return safe; }
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 function publicActor(value: any) { const { credentialFingerprint: _credentialFingerprint, ...safe } = value; return safe; }
 function publicMember(value: any) { const { credentialHash: _credentialHash, ...safe } = value; return safe; }
@@ -169,7 +169,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && path === '/v1/goals') { const state = service.state(); const sessionIds = new Set(state.sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId).map((item) => item.goalId)); send(res, 200, authenticatedMember ? state.goals.filter((item) => item.workspaceId === authenticatedMember!.workspaceId || sessionIds.has(item.id)) : state.goals); return true; }
     const goal = path.match(/^\/v1\/goals\/([^/]+)\/lifecycle$/);
     if (method === 'POST' && goal) { send(res, 200, await service.setGoalState(decodeURIComponent(goal[1]), String((await body(req)).state) as any)); return true; }
-    if (method === 'POST' && path === '/v1/runtime-sessions') { const input = await body(req); const actorId = authenticatedActor?.id ?? String(input.actorId ?? ''); send(res, 201, publicSession(await service.launch({ ...input, actorId } as any))); return true; }
+    if (method === 'POST' && path === '/v1/runtime-sessions') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); const { actorId: _ignoredActor, parentAgentId: _ignoredParent, launchedByMemberId: _ignoredLauncher, ...safeInput } = input as Record<string, unknown>; send(res, 201, publicSession(await service.launch({ ...safeInput, actorId: authenticatedActor.id, ...(authenticatedMember ? { launchedByMemberId: authenticatedMember.id } : {}) } as any))); return true; }
     if (method === 'GET' && path === '/v1/runtime-sessions') { const sessions = service.state().sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId); send(res, 200, sessions.map(publicSession)); return true; }
     const external = path.match(/^\/v1\/external\/([^/]+)\/(status|send|stop|reconcile)$/);
     if (external && authenticatedMember) { const target = service.state().sessions.find((item) => item.id === decodeURIComponent(external[1])); if (!target || target.workspaceId !== authenticatedMember.workspaceId) throw new ArcpError('not_found', 'runtime session not found'); }

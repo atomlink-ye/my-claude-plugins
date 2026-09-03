@@ -541,7 +541,7 @@ describe('ARCP MVE control core', () => {
     expect(stale).toMatchObject({ action: 'hold', why: expect.stringContaining('stale') }); expect((service.cli as any).sends).toBe(0);
     const retry = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test' }) as any;
     const sent = await service.interrupt({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'stop', reason: 'test', confirmation: retry.confirmation }) as any;
-    expect(sent.state).toBe('delivered'); expect((service.cli as any).sends).toBe(1);
+    expect(sent.state).toBe('delivered'); expect((service.cli as any).sends).toBe(1); expect(service.state().channelEvents.find((event) => event.id === sent.eventId)?.transitions.map((item) => item.state)).toEqual(['queued', 'transport_indeterminate', 'delivered']);
   });
   it('persists a stale-cache hold and releases it after a fresh observation', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-held-release-')); const activity = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
