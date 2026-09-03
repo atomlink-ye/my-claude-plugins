@@ -723,6 +723,24 @@ describe('ARCP HTTP surface', () => {
     const absent = await fetch(`${base}/v1/tasks/${task.id}/claim`, { method: 'POST', headers, body: '{}' }); const absentBody: any = await absent.json();
     expect(absent.status).toBe(400); expect(absentBody).toMatchObject({ code: 'invalid_request', message: expect.stringContaining('--expected-fence'), field: 'expectedFence' });
   });
+  it('allowlists both public launch DTOs and rejects mismatched launch credentials before side effects', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-launch-boundary-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const owner = await app.arcp.registerActor({ clientIdentity: 'launch-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: owner.actor.id, purpose: 'launch boundary' }); const foreignActor = await app.arcp.registerActor({ clientIdentity: 'foreign-actor' }); const foreignWorkspace = await app.arcp.createWorkspace({ ownerActorId: foreignActor.actor.id, purpose: 'foreign' }); const foreignMember = await app.arcp.joinWorkspace({ workspaceId: foreignWorkspace.workspace.id, label: 'foreign-member', role: 'worker', actorId: foreignActor.actor.id }); const goal = await app.arcp.createGoal({ actorId: owner.actor.id, title: 'launch goal', workspaceId: workspace.workspace.id });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const headers = { 'x-arcp-actor-key': owner.credential!, 'x-arcp-member-key': workspace.credential!, 'content-type': 'application/json' };
+    let managed: any, direct: any; (app.arcp as any).startManaged = async (input: any) => { managed = input; return { action: 'hold' }; }; (app.arcp as any).launch = async (input: any) => { direct = input; return { id: 'r', state: 'idle' }; };
+    await fetch(`${base}/v1/start`, { method: 'POST', headers, body: JSON.stringify({ workspaceId: workspace.workspace.id, title: 'safe', admittedPreflight: { launchable: true }, unknownInternal: 'x' }) });
+    await fetch(`${base}/v1/runtime-sessions`, { method: 'POST', headers, body: JSON.stringify({ workspaceId: workspace.workspace.id, goalId: goal.id, admittedPreflight: { launchable: true }, unknownInternal: 'x' }) });
+    expect(managed).not.toHaveProperty('admittedPreflight'); expect(managed).not.toHaveProperty('unknownInternal'); expect(direct).not.toHaveProperty('admittedPreflight'); expect(direct).not.toHaveProperty('unknownInternal');
+    // The refusal must land before startManaged is reached at all: the stub is
+    // side-effect free, so a durable-state snapshot alone would pass vacuously.
+    // Observing that the stub was never called is the assertion with teeth.
+    const sibling = await app.arcp.createWorkspace({ ownerActorId: owner.actor.id, purpose: 'sibling' });
+    for (const [credential, message] of [[foreignMember.credential!, 'does not belong to authenticated actor'], [sibling.credential!, 'not in requested workspace']] as const) {
+      managed = undefined;
+      const refused = await fetch(`${base}/v1/start`, { method: 'POST', headers: { ...headers, 'x-arcp-member-key': credential }, body: JSON.stringify({ workspaceId: workspace.workspace.id, title: 'refused' }) });
+      expect(refused.status).toBe(401); expect(await refused.json()).toMatchObject({ code: 'unauthorized', message: expect.stringContaining(message) }); expect(managed).toBeUndefined();
+    }
+  });
   it('prevents an actor from stopping or reconciling an external runtime in another workspace', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-external-auth-')); process.env.ARCP_API_KEY = 'test-key'; app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
     const firstActor = await app.arcp.registerActor({ clientIdentity: 'first-actor' }); const secondActor = await app.arcp.registerActor({ clientIdentity: 'second-actor' }); const first = await app.arcp.createWorkspace({ ownerActorId: firstActor.actor.id, purpose: 'first' }); const second = await app.arcp.createWorkspace({ ownerActorId: secondActor.actor.id, purpose: 'second' });
