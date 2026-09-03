@@ -11,6 +11,7 @@ import WebSocket from 'ws';
 import { HermesAcpAdapter, type SafePointEvent } from './hermes-acp.js';
 import { SQLiteStateStore, type StateStore } from './state-store.js';
 import { contentAddress, documentAddress, normalizeChannelEvent } from './content.js';
+import { projectControlPanorama, renderControlPanorama, type ControlCampaignFacts, type ControlPanorama } from './control-panorama.js';
 import { artifactRefFor, diffDocumentLines, resolveArtifactRef, DOCUMENT_BODY_LIMIT, DOCUMENT_KINDS, type DocumentArtifact, type DocumentKind, type DocumentRevision } from './document.js';
 import { projectChannelEvent, type ChannelProjection, type ChannelProjectionFacts } from './channel-projection.js';
 import { renderChannelMarkdown, type ChannelMarkdownOptions } from './channel-markdown.js';
@@ -33,6 +34,8 @@ export { RuntimeBudgetTracker, validateRuntimeBudgetSample } from './runtime-bud
 export type { RuntimeBudgetPolicy, RuntimeBudgetSample, RuntimeBudgetSignal, RuntimeBudgetView, WakeCategory } from './runtime-budget.js';
 export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSurfaceBinding, ExecutionSurfaceKind, ExecutionSurfaceRef, RepositoryLocator, RepositoryRef, RuntimeBinding, RuntimeBindingReceipt, RuntimeBindingRef, SurfaceArchiveAuthorization, SurfaceClaim, SurfaceRestoreEvidence, SurfaceRestoreReceipt, SurfaceSpec } from './execution-placement.js';
 export type { StateStore } from './state-store.js';
+export type { ControlPanorama, ControlPanoramaFacts, ControlCampaignFacts, ControlRuntimeState, NextTriggerReason } from './control-panorama.js';
+export { projectControlPanorama, renderControlPanorama, UNKNOWN } from './control-panorama.js';
 export type { DocumentArtifact, DocumentRevision, DocumentKind, ArtifactRefParts, ArtifactResolution } from './document.js';
 export { formatArtifactRef, parseArtifactRef, resolveArtifactRef, artifactRefFor, diffDocumentLines, DOCUMENT_KINDS, DOCUMENT_BODY_LIMIT, SUMMARY_LIMIT } from './document.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
@@ -3077,6 +3080,42 @@ export class ArcpService implements ExecutionPlacementPort {
     const cooperation = { scope: context.workspace, goals, tasks: context.tasks, members: context.roster, results: context.results, knowledge: context.knowledge, events: context.events };
     return { ...context, goals, runtime, placement, cooperation, execution, blocked: this.blockedRuntimes(workspaceId), providerBudget: budgets, latestKnowledgeRef: context.knowledge.at(-1)?.id, latestResultRef: context.results.at(-1)?.id, temporal };
   }
+  /**
+   * One bounded, read-only control summary for a human. Builds the facts and
+   * hands them to the pure projection; the Markdown rendering comes from the
+   * same projection, so the two readings cannot disagree.
+   *
+   * Campaign facts are supplied by the caller. ARCP does not read the external
+   * task bundle: that is Owner-Deputy state, not control-plane state.
+   */
+  controlPanorama(workspaceId: string, options: { nowMs?: number; campaign?: ControlCampaignFacts; cacheClass?: string } = {}): ControlPanorama {
+    const state = this.store.snapshot();
+    const workspace = state.workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) throw new ArcpError('not_found', 'workspace not found');
+    const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);
+    const live = sessions.filter((item) => item.state !== 'terminal').at(-1);
+    const admission = live && this.providerBudgetSnapshot
+      ? evaluateAdmission({ envelope: this.providerBudgetSnapshot, bindings: this.providerBudgetConfig.bindings ?? [], policies: this.providerBudgetConfig.policies ?? [], providerId: live.provider, model: live.model })
+      : undefined;
+    return projectControlPanorama({
+      workspaceId,
+      workspacePurpose: workspace.purpose,
+      nowMs: options.nowMs ?? Date.now(),
+      sessions, members: state.members, goals: state.goals, tasks: state.tasks, results: state.results, events: state.channelEvents,
+      ...(admission ? { admission: { action: admission.action, providerId: admission.providerId, model: admission.model, reasons: admission.reasons } } : {}),
+      ...(this.providerBudgetSnapshot ? { budgetSource: { id: this.providerBudgetSnapshot.source.id, observedAt: this.providerBudgetSnapshot.source.observedAt, trust: this.providerBudgetSnapshot.source.trust } } : {}),
+      // Cache class lives on the async runtime observation, not on durable
+      // state. This projection stays synchronous and pure, so it reports
+      // `unknown` rather than fabricating a class. See DEFERRED P6.
+      ...(options.cacheClass ? { cacheClass: options.cacheClass } : {}),
+      ...(options.campaign ? { campaign: options.campaign } : {}),
+    });
+  }
+
+  controlPanoramaMarkdown(workspaceId: string, options: { nowMs?: number; campaign?: ControlCampaignFacts; cacheClass?: string } = {}): string {
+    return renderControlPanorama(this.controlPanorama(workspaceId, options));
+  }
+
   temporalReconciliation(workspaceId: string) {
     const state = this.store.snapshot(); const sessions = state.sessions.filter((item) => item.workspaceId === workspaceId);
     return temporalReconciliationPreview(this.temporalFacts(workspaceId, state, sessions));

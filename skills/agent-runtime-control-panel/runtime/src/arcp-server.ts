@@ -1,6 +1,7 @@
 import type http from 'node:http';
 import { URL } from 'node:url';
 import { ArcpError, ArcpService } from './arcp.js';
+import { renderControlPanorama } from './control-panorama.js';
 import type { DecisionVerdict, Member } from './arcp.js';
 import { StewardError } from './steward.js';
 import type { WorkspaceSteward } from './steward.js';
@@ -152,6 +153,19 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
       const shown = service.showDocument(documentId, revision === null ? undefined : Number(revision));
       if (authenticatedMember && authenticatedMember.workspaceId !== shown.document.workspaceId) throw new ArcpError('unauthorized', 'member cannot read a document in another workspace');
       send(res, 200, shown);
+      return true;
+    }
+    // One bounded read-only control summary. Campaign facts are query-supplied;
+    // the control plane does not read the external task bundle.
+    if (method === 'GET' && /^\/v1\/workspaces\/[^/]+\/control-panorama$/.test(path)) {
+      const workspaceId = decodeURIComponent(path.split('/')[3]);
+      if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'member cannot read another workspace');
+      const campaignKeys = ['campaignState', 'nextContractRef', 'nextLaunchBy', 'stopAuthority', 'currentRound', 'checkpointSha'] as const;
+      const campaign = Object.fromEntries(campaignKeys.filter((key) => url.searchParams.get(key)).map((key) => [key, url.searchParams.get(key)!]));
+      const options = { ...(Object.keys(campaign).length ? { campaign } : {}), ...(url.searchParams.get('cacheClass') ? { cacheClass: url.searchParams.get('cacheClass')! } : {}) };
+      const panorama = service.controlPanorama(workspaceId, options);
+      if (url.searchParams.get('format') === 'markdown') { res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8' }); res.end(renderControlPanorama(panorama)); return true; }
+      send(res, 200, panorama);
       return true;
     }
     if (method === 'POST' && path === '/v1/start') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); const safeInput = publicStartInput(input); assertLaunchRelationship(service, authenticatedActor.id, authenticatedMember, safeInput.workspaceId); const started = await service.startManaged({ ...safeInput, actorId: authenticatedActor.id, ...(authenticatedMember ? { launchedByMemberId: authenticatedMember.id } : {}) } as any); if ('action' in started) send(res, 200, started); else send(res, 201, { goal: started.goal, task: started.task, member: publicMember(started.member), session: publicSession(started.session), credential: started.credential }); return true; }
