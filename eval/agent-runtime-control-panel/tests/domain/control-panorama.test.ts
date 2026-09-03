@@ -146,6 +146,41 @@ describe('Control panorama — nextTrigger, and idle is never completion', () =>
   });
 });
 
+describe('Control panorama — liveness: active work with zero live handler', () => {
+  it('reports no breach when a live session is attached to the active Task', () => {
+    const panorama = projectControlPanorama(facts({ sessions: [session({ state: 'running' })], tasks: [task({ lifecycle: 'claimed' })] }));
+    expect(panorama.liveness).toEqual({ breached: false, taskId: UNKNOWN, lifecycle: UNKNOWN, ageMs: UNKNOWN, nextAction: UNKNOWN });
+  });
+
+  it('an idle or attention-state session still counts as a live handler', () => {
+    for (const state of ['idle', 'attention', 'launching']) {
+      const panorama = projectControlPanorama(facts({ sessions: [session({ state })], tasks: [task({ lifecycle: 'claimed' })] }));
+      expect(panorama.liveness.breached).toBe(false);
+    }
+  });
+
+  it('breaches when the only session attached to the active Task is terminal', () => {
+    const panorama = projectControlPanorama(facts({ sessions: [session({ state: 'terminal' })], tasks: [task({ lifecycle: 'claimed', updatedAt: at(60) })] }));
+    expect(panorama.liveness).toMatchObject({ breached: true, taskId: 'task-1', lifecycle: 'claimed', ageMs: 60 * 60_000 });
+    expect(panorama.liveness.breached && panorama.liveness.nextAction).toContain('task-1');
+  });
+
+  it('breaches when no session references the Task at all', () => {
+    const panorama = projectControlPanorama(facts({ sessions: [], tasks: [task({ lifecycle: 'running' })] }));
+    expect(panorama.liveness).toMatchObject({ breached: true, taskId: 'task-1', lifecycle: 'running' });
+  });
+
+  it('never breaches for a Task that is not active work, however empty the session list', () => {
+    const panorama = projectControlPanorama(facts({ sessions: [], tasks: [task({ lifecycle: 'completed' })] }));
+    expect(panorama.liveness.breached).toBe(false);
+  });
+
+  it('reports no breach, not unknown, when there is no active work at all', () => {
+    const panorama = projectControlPanorama({ workspaceId: WS, nowMs: NOW, sessions: [], members: [], goals: [], tasks: [], results: [], events: [] });
+    expect(panorama.liveness.breached).toBe(false);
+  });
+});
+
 describe('Control panorama — the Markdown is the same projection', () => {
   it('renders every section from the projection a human needs', () => {
     const panorama = projectControlPanorama(facts({
@@ -157,7 +192,8 @@ describe('Control panorama — the Markdown is the same projection', () => {
     const markdown = renderControlPanorama(panorama);
 
     expect(markdown).toContain('# Control panorama');
-    for (const heading of ['## Running', '## Work', '## Awaiting action', '## Latest disposition', '## Capacity', '## Campaign', '## Next']) expect(markdown).toContain(heading);
+    for (const heading of ['## Running', '## Work', '## Awaiting action', '## Liveness', '## Latest disposition', '## Capacity', '## Campaign', '## Next']) expect(markdown).toContain(heading);
+    expect(markdown).toContain('No breach: every active Task has a live runtime attached.');
     expect(markdown).toContain('40def2e5c32a721e47c4fefbd95901893e4a07c2');
     expect(markdown).toContain('drain');
     expect(markdown).toContain('owner_decision_pending');
@@ -166,6 +202,14 @@ describe('Control panorama — the Markdown is the same projection', () => {
     expect(markdown).toContain('caller-supplied, not control-plane truth');
     // Unknowns are visible to the reader, not silently dropped.
     expect(markdown).toContain('Cache: unknown');
+  });
+
+  it('renders the liveness breach with its Task, age and next action', () => {
+    const panorama = projectControlPanorama(facts({ sessions: [session({ state: 'terminal' })], tasks: [task({ lifecycle: 'claimed' })] }));
+    const markdown = renderControlPanorama(panorama);
+    expect(markdown).toContain('Task task-1 (claimed) has no live runtime handler');
+    expect(markdown).toContain('Age: 60m');
+    expect(markdown).toContain('relaunch a handler or escalate to the Owner');
   });
 
   it('carries no prompt, transcript, credential or private path into the rendering', () => {

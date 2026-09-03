@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto';
 /**
  * Supervision budgets: one deep evaluation module behind a small interface.
  *
- * The module answers exactly two questions and owns both answers:
- *   1. when did a supervised subject last make MATERIAL progress, and
- *   2. which subjects have breached a budget and are not already under review.
+ * The module answers exactly three questions and owns all three answers:
+ *   1. when did a supervised subject last make MATERIAL progress,
+ *   2. which subjects have breached a progress budget and are not already
+ *      under review, and
+ *   3. which subjects are active work with zero live handler attached.
  *
  * It is deliberately not a scheduler and not a policy engine. It has no timer,
  * no I/O and no clock of its own: the caller supplies `now`, so every decision
@@ -13,7 +15,7 @@ import { createHash } from 'node:crypto';
  */
 
 export type SupervisionSubjectKind = 'task';
-export type SupervisionReason = 'review_budget' | 'inactivity_budget';
+export type SupervisionReason = 'review_budget' | 'inactivity_budget' | 'liveness_breach';
 export type SupervisionSignalKind = 'commit' | 'runtime_observation';
 
 /** The owner-configured budget for one Workspace. One policy per Workspace. */
@@ -77,6 +79,11 @@ export interface SupervisedSubject {
   scope?: 'product' | 'steward_analysis';
 }
 
+/** The minimal live-session fact this module needs: is a subject's own runtime
+ * actually alive right now. Nothing else about a session is this module's
+ * business. */
+export interface SupervisionSessionFact { taskId?: string; state: string; }
+
 export interface SupervisionView {
   subjects: SupervisedSubject[];
   results: Array<{ taskId?: string; createdAt: string }>;
@@ -85,6 +92,12 @@ export interface SupervisionView {
   signals: SupervisionSignal[];
   policies: SupervisionPolicy[];
   reviews: SupervisionReview[];
+  /** Optional so a caller that only cares about progress budgets is never
+   * forced to supply it. Absence means "no session facts available", not
+   * "positively no handler" — the same unknown-is-not-absent rule the takeover
+   * path already applies to a Member: not resolving one is unknown, which is
+   * a different thing from seeing that it is gone. */
+  sessions?: readonly SupervisionSessionFact[];
 }
 
 export interface SupervisionBreach {
@@ -214,6 +227,21 @@ export const supervisionPolicyId = (workspaceId: string): string => digestId('po
 export const supervisionSignalId = (subjectId: string, kind: SupervisionSignalKind, digest: string, observedAt: string): string =>
   digestId('signal', `${subjectId}:${kind}:${digest}:${observedAt}`);
 
+/** A subject that just became active work, or whose runtime is mid-relaunch,
+ * gets this long to show a live session before its absence counts as a
+ * breach. This is not an SLA on progress — review/inactivity budgets already
+ * own that — it only keeps an ordinary claim-to-launch window from reading as
+ * a breach. */
+const LIVENESS_GRACE_MS = 5 * 60_000;
+
+/** True unless `view.sessions` positively shows no non-terminal session
+ * attached to this subject. No session facts supplied is unknown, never
+ * guessed as absent. */
+function hasLiveHandler(view: SupervisionView, subjectId: string): boolean {
+  if (view.sessions === undefined) return true;
+  return view.sessions.some((session) => session.taskId === subjectId && session.state !== 'terminal');
+}
+
 /**
  * Decide which subjects have breached a budget right now.
  *
@@ -237,10 +265,15 @@ export function evaluateSupervision(view: SupervisionView, nowMs: number): Super
       // the cooldown lapses, whatever happens to its generation in between.
       if (reviews.some((review) => Date.parse(review.cooldownUntil) > nowMs)) continue;
       const progress = materialProgressAt(view, subject);
+      // Liveness is checked last on purpose: a subject already breaching its
+      // review or inactivity budget reports that reason, not this one, so
+      // adding this arm never changes what an already-breaching subject
+      // reports.
       const reason: SupervisionReason | undefined =
         policy.reviewAfterMs !== undefined && nowMs - Date.parse(subject.createdAt) >= policy.reviewAfterMs ? 'review_budget'
           : policy.inactivityAfterMs !== undefined && nowMs - Date.parse(progress.at) >= policy.inactivityAfterMs ? 'inactivity_budget'
-            : undefined;
+            : !hasLiveHandler(view, subject.id) && nowMs - Date.parse(subject.updatedAt) >= LIVENESS_GRACE_MS ? 'liveness_breach'
+              : undefined;
       if (!reason) continue;
       // Dedupe: one breach per subject and generation, whatever the tick rate.
       if (reviews.some((review) => review.policyId === policy.id && review.generation === subject.generation)) continue;

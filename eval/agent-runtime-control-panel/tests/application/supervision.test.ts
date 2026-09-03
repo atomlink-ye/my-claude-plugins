@@ -212,6 +212,32 @@ describe('supervision budgets, state and reconciliation', () => {
     expect(evaluateSupervision({ ...view, policies: [{ ...policy, automatic: false }] }, T0 + 10_000_000)).toEqual([]);
   });
 
+  it('breaches on liveness only once handlerless activity outlives its grace period, and never on missing session facts', () => {
+    // reviewAfterMs is set far out of reach so only the liveness arm of the
+    // reason ternary can ever fire in this test; inactivityAfterMs is left
+    // unset for the same reason.
+    const policy = { id: 'policy-1', workspaceId: 'workspace-1', reviewAfterMs: 999_999_999, cooldownMs: 10_000, stewardProfileId: 'codex-worker', automatic: true, createdAt: at(0), updatedAt: at(0) };
+    const subject = { id: 'task-1', workspaceId: 'workspace-1', generation: 1, lifecycle: 'claimed', createdAt: at(0), updatedAt: at(0) };
+    const base: SupervisionView = { subjects: [subject], results: [], knowledge: [], events: [], signals: [], policies: [policy], reviews: [] };
+
+    // No session facts supplied at all: unknown, never guessed as absent.
+    expect(evaluateSupervision(base, T0 + 10_000_000)).toEqual([]);
+
+    // Positive evidence of absence (a session exists, but not for this
+    // subject), inside the five-minute grace period.
+    const handlerless: SupervisionView = { ...base, sessions: [{ taskId: 'other-task', state: 'running' }] };
+    expect(evaluateSupervision(handlerless, T0 + 5 * 60_000 - 1)).toEqual([]);
+
+    // Past the grace period, it breaches.
+    const [breach] = evaluateSupervision(handlerless, T0 + 5 * 60_000);
+    expect(breach).toMatchObject({ subjectId: 'task-1', generation: 1, reason: 'liveness_breach', reviewId: supervisionReviewId('policy-1', 'task-1', 1, 'liveness_breach') });
+
+    // A non-terminal session attached to the subject clears it, however long
+    // the elapsed time.
+    const attached: SupervisionView = { ...base, sessions: [{ taskId: 'task-1', state: 'idle' }] };
+    expect(evaluateSupervision(attached, T0 + 10_000_000)).toEqual([]);
+  });
+
   it('leaves an unclaimed or finished subject unsupervised', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-lifecycle-'));
     const { service, workspace, task } = await scenario(root);
@@ -334,6 +360,37 @@ describe('supervision budgets, state and reconciliation', () => {
       (restarted.store as any).close?.();
     });
   }
+
+  it('wakes the Manager exactly once when a claimed Task outlives its own session going terminal', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-supervision-liveness-'));
+    const { service, workspace, worker, task } = await scenario(root);
+    // reviewAfterMs is set far out of reach so only the liveness signal, not
+    // the review budget, can produce a breach in this test.
+    await service.configureSupervision({ workspaceId: workspace.id, reviewAfterMs: 999_999_999, cooldownMs: 60_000 });
+    // The Task's own handler crashed: a session bound to it, gone terminal,
+    // while the Task is still claimed. Nothing about the Task's own state
+    // says so — this is exactly the gap the signal exists to catch.
+    await service.store.mutate((state: any) => state.sessions.push({
+      id: 'liveness-worker-runtime', actorId: state.sessions[0].actorId, goalId: state.sessions[0].goalId, taskId: task.id,
+      bindingId: state.bindings[0].id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.id,
+      memberId: worker.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt-5.6-terra', state: 'terminal', createdAt: at(0),
+    }));
+
+    expect(await service.evaluateSupervision(T0 + 5 * 60_000 - 1)).toHaveLength(0);
+    const [review] = await service.evaluateSupervision(T0 + 5 * 60_000);
+    expect(review).toMatchObject({ workspaceId: workspace.id, subjectId: task.id, reason: 'liveness_breach', state: 'open' });
+
+    const events = analysisEvents(service, workspace.id);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ taskId: task.id, urgency: 'urgent', targetRole: 'manager' });
+    expect(events[0].content.summary).toContain('no live runtime handler');
+
+    // Idempotent across repeated ticks, same as the other two reasons.
+    for (let tick = 0; tick < 50; tick += 1) await service.evaluateSupervision(T0 + 5 * 60_000 + tick * 1_000);
+    expect(service.supervisionReviews(workspace.id)).toHaveLength(1);
+    expect(analysisEvents(service, workspace.id)).toHaveLength(1);
+    service.close();
+  });
 });
 
 describe('supervision HTTP route — a thin surface over the existing service API, not a second store', () => {

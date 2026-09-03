@@ -2946,6 +2946,7 @@ export class ArcpService implements ExecutionPlacementPort {
       signals: state.supervisionSignals,
       policies: state.supervisionPolicies,
       reviews: state.supervisionReviews,
+      sessions: state.sessions.map((session) => ({ taskId: session.taskId, state: session.state })),
     };
   }
   /** The last durable evidence of work on a Task, with the evidence category. */
@@ -2975,7 +2976,9 @@ export class ArcpService implements ExecutionPlacementPort {
           urgency: 'urgent',
           consumptionPolicy: 'ack_required',
           decisionRequired: false,
-          summary: `Workspace analysis required for ${breach.subjectKind} ${breach.subjectId} at generation ${breach.generation}; the ${breach.reason === 'review_budget' ? 'review budget' : 'inactivity budget'} elapsed`,
+          summary: breach.reason === 'liveness_breach'
+            ? `Workspace analysis required for ${breach.subjectKind} ${breach.subjectId} at generation ${breach.generation}: active work has no live runtime handler`
+            : `Workspace analysis required for ${breach.subjectKind} ${breach.subjectId} at generation ${breach.generation}; the ${breach.reason === 'review_budget' ? 'review budget' : 'inactivity budget'} elapsed`,
           evidenceRefs: [breach.subjectId, breach.policyId],
         });
         const review: SupervisionReview = { id: breach.reviewId, workspaceId: breach.workspaceId, policyId: breach.policyId, subjectKind: breach.subjectKind, subjectId: breach.subjectId, generation: breach.generation, reason: breach.reason, eventId: event.id, breachedAt: breach.breachedAt, lastProgressAt: breach.lastProgressAt, cooldownUntil: breach.cooldownUntil, state: 'open' };

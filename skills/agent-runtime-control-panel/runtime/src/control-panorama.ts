@@ -9,6 +9,7 @@
  */
 import type { ChannelEvent, Delivery, Goal, Member, Result, RuntimeSession, Task } from './arcp.js';
 import { projectDeliveryLatency, renderDeliveryLatency, type DeliveryLatency } from './delivery-latency.js';
+import { SUPERVISED_LIFECYCLES } from './supervision.js';
 
 /** A fact that could not be established. Never omitted, never guessed: a reader
  * must be able to tell "nothing pending" from "we could not see". */
@@ -52,6 +53,11 @@ export interface ControlPanoramaFacts {
 export interface ControlPanoramaRuntime { runtimeId: string; role: string | Unknown; memberId: string | Unknown; provider: string; state: ControlRuntimeState; }
 export interface ControlPanoramaPending { decisions: number; acks: number; takeovers: number; oldestOpenAgeMs: number | Unknown; oldestOpenEventId: string | Unknown; }
 export interface ControlPanoramaDisposition { eventId: string; kind: string; actor: string | Unknown; reason: string | Unknown; evidenceRefs: readonly string[]; at: string; }
+/** Active work with zero non-terminal RuntimeSession attached to it: a crash, a
+ * lapsed lease, or a launch that never registered. `breached: false` is the
+ * positive fact that every active Task has a live handler, not an absence of
+ * data — the sub-fields report `unknown` only then, mirroring `pending`. */
+export interface ControlPanoramaLiveness { breached: boolean; taskId: string | Unknown; lifecycle: string | Unknown; ageMs: number | Unknown; nextAction: string | Unknown; }
 
 export interface ControlPanorama {
   workspaceId: string;
@@ -62,6 +68,7 @@ export interface ControlPanorama {
   latestResult: { id: string; status: string; summary: string } | Unknown;
   checkpointSha: string | Unknown;
   pending: ControlPanoramaPending;
+  liveness: ControlPanoramaLiveness;
   latestDisposition: ControlPanoramaDisposition | Unknown;
   providerBudget: { admission: string; providerId: string; model: string; reasons: readonly string[]; sourceId: string | Unknown; observedAt: string | Unknown; trust: string | Unknown; cacheClass: string | Unknown } | Unknown;
   campaign: { campaignState: string | Unknown; nextContractRef: string | Unknown; nextLaunchBy: string | Unknown; stopAuthority: string | Unknown; currentRound: string | Unknown; checkpointSha: string | Unknown } | Unknown;
@@ -165,6 +172,22 @@ export function projectControlPanorama(facts: ControlPanoramaFacts): ControlPano
     ? { campaignState: facts.campaign.campaignState ?? UNKNOWN, nextContractRef: facts.campaign.nextContractRef ?? UNKNOWN, nextLaunchBy: facts.campaign.nextLaunchBy ?? UNKNOWN, stopAuthority: facts.campaign.stopAuthority ?? UNKNOWN, currentRound: facts.campaign.currentRound ?? UNKNOWN, checkpointSha: facts.campaign.checkpointSha ?? UNKNOWN }
     : UNKNOWN;
 
+  // Active work with no non-terminal RuntimeSession attached to it: a crash, a
+  // lapsed lease, or a launch that never registered. An idle or attention-state
+  // runtime still counts as attached — this catches the case where nothing at
+  // all is left standing behind the claim, which nothing else on this surface
+  // says on its own.
+  const livenessSubject = tasks.find((item) => SUPERVISED_LIFECYCLES.has(item.lifecycle) && !sessions.some((session) => session.taskId === item.id && session.state !== 'terminal'));
+  const liveness: ControlPanoramaLiveness = livenessSubject
+    ? {
+        breached: true,
+        taskId: livenessSubject.id,
+        lifecycle: livenessSubject.lifecycle,
+        ageMs: Math.max(0, facts.nowMs - Date.parse(livenessSubject.updatedAt)),
+        nextAction: `Task ${livenessSubject.id} is ${livenessSubject.lifecycle} with no live runtime attached; relaunch a handler or escalate to the Owner`,
+      }
+    : { breached: false, taskId: UNKNOWN, lifecycle: UNKNOWN, ageMs: UNKNOWN, nextAction: UNKNOWN };
+
   // Ordered by who is blocking: an obligation owed by a human outranks work owed
   // by an agent, which outranks the campaign queue. Idle is never completion —
   // a claimed Task with no Result is still owed, however quiet the runtime is.
@@ -185,6 +208,7 @@ export function projectControlPanorama(facts: ControlPanoramaFacts): ControlPano
     latestResult: latestResult ? { id: latestResult.id, status: latestResult.status, summary: latestResult.summary } : UNKNOWN,
     checkpointSha,
     pending,
+    liveness,
     latestDisposition,
     providerBudget,
     campaign,
@@ -225,6 +249,15 @@ export function renderControlPanorama(panorama: ControlPanorama): string {
   lines.push(`- Open ACKs: ${panorama.pending.acks}`);
   lines.push(`- Takeovers recorded: ${panorama.pending.takeovers}`);
   lines.push(`- Oldest open: ${age(panorama.pending.oldestOpenAgeMs)} (${panorama.pending.oldestOpenEventId})`);
+  lines.push('');
+
+  lines.push('## Liveness');
+  if (!panorama.liveness.breached) lines.push('No breach: every active Task has a live runtime attached.');
+  else {
+    lines.push(`- Task ${panorama.liveness.taskId} (${panorama.liveness.lifecycle}) has no live runtime handler`);
+    lines.push(`- Age: ${age(panorama.liveness.ageMs)}`);
+    lines.push(`- Next: ${panorama.liveness.nextAction}`);
+  }
   lines.push('');
 
   lines.push('## Latest disposition');
