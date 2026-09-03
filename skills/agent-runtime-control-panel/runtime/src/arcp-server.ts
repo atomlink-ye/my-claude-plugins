@@ -13,12 +13,12 @@ function redactProviderValue(value: any): any {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => providerHandle.test(key) ? [] : [[key, redactProviderValue(item)]]));
   return typeof value === 'string' && /\/(Users|home|private|tmp)\//.test(value) ? '<redacted>' : value;
 }
-function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, parentAgentId: _parentAgentId, ...safe } = value; return redactProviderValue(safe); }
+export function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, parentAgentId: _parentAgentId, ...safe } = value; return redactProviderValue(safe); }
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 function publicActor(value: any) { const { credentialFingerprint: _credentialFingerprint, ...safe } = value; return safe; }
 function publicMember(value: any) { const { credentialHash: _credentialHash, ...safe } = value; return safe; }
 function publicContext(value: any) { return { ...value, roster: value.roster.map(publicMember), inbox: (value.inbox ?? []).map(publicDelivery) }; }
-function publicPanorama(value: any) {
+export function publicPanorama(value: any) {
   return redactProviderValue({ workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
     runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
     placement: value.placement ?? [],

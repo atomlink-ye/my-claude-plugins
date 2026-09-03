@@ -9,6 +9,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ArcpService, ArcpStore, CLAUDE_CACHE_DEFAULTS, PASEO_TITLE_LIMIT, paseoTitle } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { createServer, resolveDataDir } from '../../../../skills/agent-runtime-control-panel/runtime/src/server.js';
+import { publicPanorama, publicSession } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
 import { renderTuiSnapshot, runTui } from '../../../../skills/agent-runtime-control-panel/runtime/src/tui.js';
 import { HermesAcpAdapter } from '../../../../skills/agent-runtime-control-panel/runtime/src/hermes-acp.js';
 import { PaseoCli, parseJson } from '../../../../skills/agent-runtime-control-panel/runtime/src/cli.js';
@@ -690,6 +691,13 @@ describe('ARCP Slice A channel correctness', () => {
 describe('ARCP HTTP surface', () => {
   let app: Awaited<ReturnType<typeof createServer>> | undefined;
   afterEach(async () => { if (app) { app.arcp.close(); await new Promise<void>((resolve) => app!.server.close(() => resolve())); } app = undefined; delete process.env.ARCP_API_KEY; });
+  it('recursively redacts nested provider handles and private paths from session and panorama projections', () => {
+    const handle = 'provider-agent-secret', pathLeak = '/Users/private/agent-state';
+    const session: any = { id: 'runtime', externalId: handle, parentAgentId: handle, workspace: pathLeak, placement: { requested: { agentId: handle, nested: { providerReference: handle } }, observed: { agentId: handle, deep: { nativeId: handle, path: pathLeak } } } };
+    const walk = (value: any): string[] => Array.isArray(value) ? value.flatMap(walk) : value && typeof value === 'object' ? Object.values(value).flatMap(walk) : typeof value === 'string' ? [value] : [];
+    const direct = publicSession(session); const panorama = publicPanorama({ workspace: {}, roster: [], tasks: [], goals: [], runtime: [{ session, observation: { deep: { recipientRef: handle, path: pathLeak } }, children: {}, workSummary: {} }], placement: [{ tabs: [{ agentId: handle, nested: { path: pathLeak } }] }], cooperation: { nested: { externalId: handle } }, execution: { nested: { nativeId: handle } } });
+    for (const value of [direct, panorama]) expect(walk(JSON.parse(JSON.stringify(value)))).not.toEqual(expect.arrayContaining([handle, pathLeak]));
+  });
   it('protects v1, keeps /health open, and serves nothing else outside /v1', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-')); process.env.ARCP_API_KEY = 'test-key';
     app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
