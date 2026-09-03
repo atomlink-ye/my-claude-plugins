@@ -23,13 +23,29 @@ export function publicSession(value: any) {
   if (value.placement) safe.placement = { requested: Object.fromEntries(['projectId', 'workspaceId'].filter((key) => value.placement.requested?.[key] !== undefined).map((key) => [key, value.placement.requested[key]])), ...(value.placement.status ? { status: value.placement.status } : {}) };
   return redactProviderValue(safe);
 }
+/**
+ * children[].id is a raw provider agent id and sits beside session in the
+ * response, so publicSession never sees it and the field-name redactor cannot
+ * recognise a bare `id`. Name each child by the ARCP RuntimeSession that owns
+ * it when ARCP knows one, and drop the handle otherwise: the count and status
+ * stay honest without publishing a provider handle.
+ */
+export function publicChildren(service: ArcpService, value: any) {
+  if (!value || !Array.isArray(value.items)) return { source: value?.source ?? 'unavailable', items: [] };
+  const sessions = service.state().sessions;
+  return { source: value.source, items: value.items.map((child: any) => {
+    const owner = sessions.find((item) => item.externalId && item.externalId === child.id);
+    const { id: _id, ...rest } = child;
+    return { ...(owner ? { runtimeSessionId: owner.id } : {}), ...rest };
+  }) };
+}
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 function publicActor(value: any) { const { credentialFingerprint: _credentialFingerprint, ...safe } = value; return safe; }
 function publicMember(value: any) { const { credentialHash: _credentialHash, ...safe } = value; return safe; }
 function publicContext(value: any) { return { ...value, roster: value.roster.map(publicMember), inbox: (value.inbox ?? []).map(publicDelivery) }; }
-export function publicPanorama(value: any) {
+export function publicPanorama(value: any, service: ArcpService) {
   return redactProviderValue({ workspace: value.workspace, roster: value.roster.map(publicMember), tasks: value.tasks, goals: value.goals,
-    runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: item.children, workSummary: item.workSummary })),
+    runtime: value.runtime.map((item: any) => ({ session: publicSession(item.session), observation: item.observation, children: publicChildren(service, item.children), workSummary: item.workSummary })),
     placement: value.placement ?? [],
     cooperation: value.cooperation, execution: value.execution,
     blocked: value.blocked ?? [], temporal: value.temporal,
@@ -37,7 +53,24 @@ export function publicPanorama(value: any) {
 }
 function publicStartInput(input: Record<string, unknown>) { const keys = ['workspaceId', 'title', 'contract', 'role', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskScope', 'executionSurfaceId', 'primaryHandlerMemberId', 'ccMemberIds', 'escalationMemberIds']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
 function publicRuntimeLaunchInput(input: Record<string, unknown>) { const keys = ['goalId', 'workspaceId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskId', 'executionSurfaceId']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
-function assertLaunchRelationship(service: ArcpService, actorId: string, member: Member | undefined, workspaceId?: unknown, goalId?: unknown, taskId?: unknown) { if (!member) return; if (member.actorId !== actorId) throw new ArcpError('unauthorized', 'launch member does not belong to authenticated actor'); if (workspaceId && member.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'launch member is not in requested workspace'); const state = service.state(); if (goalId) { const goal = state.goals.find((item) => item.id === goalId); if (!goal || goal.actorId !== actorId || (goal.workspaceId && goal.workspaceId !== member.workspaceId)) throw new ArcpError('unauthorized', 'launch goal is not authorized for authenticated member'); } if (taskId) { const task = state.tasks.find((item) => item.id === taskId); if (!task || task.workspaceId !== member.workspaceId) throw new ArcpError('unauthorized', 'launch task is not authorized for authenticated member'); } }
+/**
+ * Actor-only launches are the root bootstrap: the very first runtime in a
+ * workspace has no member to be launched by. That is the only case they cover,
+ * so they are narrowed to the actor that owns the target workspace instead of
+ * skipping every relationship check. A launch whose workspace cannot be
+ * resolved is unverifiable and fails closed.
+ */
+function assertRootLaunchAuthority(service: ArcpService, actorId: string, workspaceId?: unknown, goalId?: unknown): void {
+  const state = service.state();
+  const goal = goalId ? state.goals.find((item) => item.id === goalId) : undefined;
+  if (goalId && (!goal || goal.actorId !== actorId)) throw new ArcpError('unauthorized', 'a root launch may only use a goal owned by the authenticated actor');
+  const scope = (typeof workspaceId === 'string' && workspaceId) || goal?.workspaceId;
+  if (!scope) throw new ArcpError('unauthorized', 'a root launch must name the workspace it is rooted in');
+  const workspace = state.workspaces.find((item) => item.id === scope);
+  if (!workspace || workspace.ownerActorId !== actorId) throw new ArcpError('unauthorized', 'a root launch requires the workspace owner actor; supply a member credential to launch as a member');
+  if (goal?.workspaceId && goal.workspaceId !== scope) throw new ArcpError('unauthorized', 'a root launch goal is not in the requested workspace');
+}
+function assertLaunchRelationship(service: ArcpService, actorId: string, member: Member | undefined, workspaceId?: unknown, goalId?: unknown, taskId?: unknown) { if (!member) { assertRootLaunchAuthority(service, actorId, workspaceId, goalId); return; } if (member.actorId !== actorId) throw new ArcpError('unauthorized', 'launch member does not belong to authenticated actor'); if (workspaceId && member.workspaceId !== workspaceId) throw new ArcpError('unauthorized', 'launch member is not in requested workspace'); const state = service.state(); if (goalId) { const goal = state.goals.find((item) => item.id === goalId); if (!goal || goal.actorId !== actorId || (goal.workspaceId && goal.workspaceId !== member.workspaceId)) throw new ArcpError('unauthorized', 'launch goal is not authorized for authenticated member'); } if (taskId) { const task = state.tasks.find((item) => item.id === taskId); if (!task || task.workspaceId !== member.workspaceId) throw new ArcpError('unauthorized', 'launch task is not authorized for authenticated member'); } }
 
 /**
  * Build the per-Workspace Workspace Steward. Both triggers - Lane A's
@@ -83,7 +116,7 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const workspaceContext = path.match(/^\/v1\/workspaces\/([^/]+)\/context$/);
     if (method === 'GET' && workspaceContext) { const workspaceId = decodeURIComponent(workspaceContext[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); send(res, 200, publicContext(service.context(workspaceId, authenticatedMember?.id))); return true; }
     const panorama = path.match(/^\/v1\/workspaces\/([^/]+)\/panorama$/);
-    if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const temporal = url.searchParams.get('temporal'); const filter = temporal === 'problems' ? 'problems' : temporal === 'task' && url.searchParams.get('task') ? { taskId: String(url.searchParams.get('task')) } : 'active'; send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1', filter))); return true; }
+    if (method === 'GET' && panorama) { const workspaceId = decodeURIComponent(panorama[1]); if (authenticatedMember && authenticatedMember.workspaceId !== workspaceId) throw new ArcpError('not_found', 'workspace not found'); const temporal = url.searchParams.get('temporal'); const filter = temporal === 'problems' ? 'problems' : temporal === 'task' && url.searchParams.get('task') ? { taskId: String(url.searchParams.get('task')) } : 'active'; send(res, 200, publicPanorama(await service.panorama(workspaceId, url.searchParams.get('refresh') === '1', filter), service)); return true; }
     const archiveSurface = path.match(/^\/v1\/workspaces\/([^/]+)\/execution-surfaces\/([^/]+)\/archive$/);
     if (method === 'POST' && archiveSurface) { if (!authenticatedActor) throw new ArcpError('unauthorized', 'owner actor credential is required'); const workspaceId = decodeURIComponent(archiveSurface[1]); await service.archiveSurface({ id: decodeURIComponent(archiveSurface[2]) }, { controlWorkspaceId: workspaceId, actorId: authenticatedActor.id }); send(res, 200, { archived: true, surfaceId: decodeURIComponent(archiveSurface[2]) }); return true; }
     const restoreSurface = path.match(/^\/v1\/workspaces\/([^/]+)\/execution-surfaces\/([^/]+)\/restore$/);
@@ -192,14 +225,14 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     const external = path.match(/^\/v1\/external\/([^/]+)\/(status|send|stop|reconcile)$/);
     if (external && authenticatedMember) { const target = service.state().sessions.find((item) => item.id === decodeURIComponent(external[1])); if (!target || target.workspaceId !== authenticatedMember.workspaceId) throw new ArcpError('not_found', 'runtime session not found'); }
     if (external && authenticatedActor && ['stop', 'reconcile'].includes(external[2])) { const state = service.state(); const target = state.sessions.find((item) => item.id === decodeURIComponent(external[1])); if (!target || !state.members.some((member) => member.actorId === authenticatedActor!.id && member.workspaceId === target.workspaceId)) throw new ArcpError('not_found', 'runtime session not found'); }
-    if (external && method === 'GET' && external[2] === 'status') { const value = await service.runtimeStatus(decodeURIComponent(external[1]), url.searchParams.get('refresh') === '1'); send(res, 200, { session: publicSession(value.session), observation: value.observation, children: value.children, workSummary: value.workSummary }); return true; }
+    if (external && method === 'GET' && external[2] === 'status') { const value = await service.runtimeStatus(decodeURIComponent(external[1]), url.searchParams.get('refresh') === '1'); send(res, 200, { session: publicSession(value.session), observation: value.observation, children: publicChildren(service, value.children), workSummary: value.workSummary }); return true; }
     if (external && method === 'POST' && external[2] === 'send') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); send(res, 200, publicDelivery(await service.deliver({ ...input, runtimeSessionId: decodeURIComponent(external[1]), fromActorId: authenticatedActor.id } as any))); return true; }
     if (external && method === 'POST' && external[2] === 'stop') { send(res, 200, publicSession(await service.stopRuntime(decodeURIComponent(external[1])))); return true; }
     if (external && method === 'POST' && external[2] === 'reconcile') { send(res, 200, publicSession(await service.reconcile(decodeURIComponent(external[1])))); return true; }
     const observe = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/(observe|reconcile)$/);
     if (method === 'POST' && observe) { send(res, 200, publicSession(observe[2] === 'observe' ? await service.observe(decodeURIComponent(observe[1])) : await service.reconcile(decodeURIComponent(observe[1])))); return true; }
     const runtimeStatus = path.match(/^\/v1\/runtime-sessions\/([^/]+)\/status$/);
-    if (method === 'GET' && runtimeStatus) { const value = await service.runtimeStatus(decodeURIComponent(runtimeStatus[1]), url.searchParams.get('refresh') === '1'); send(res, 200, { session: publicSession(value.session), observation: value.observation, children: value.children, workSummary: value.workSummary }); return true; }
+    if (method === 'GET' && runtimeStatus) { const value = await service.runtimeStatus(decodeURIComponent(runtimeStatus[1]), url.searchParams.get('refresh') === '1'); send(res, 200, { session: publicSession(value.session), observation: value.observation, children: publicChildren(service, value.children), workSummary: value.workSummary }); return true; }
     if (method === 'POST' && path === '/v1/deliveries') { const requested = await body(req); if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const { fromActorId: _untrustedActor, ...publicRequested } = requested; send(res, 201, publicDelivery(await service.deliver({ ...publicRequested, fromActorId: authenticatedActor.id } as any))); return true; }
     if (method === 'POST' && path === '/v1/reuse') { const requested = await body(req); if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); send(res, 200, publicDelivery(await service.reuse({ ...requested, fromActorId: authenticatedActor.id } as any))); return true; }
     if (method === 'GET' && path === '/v1/deliveries') { send(res, 200, service.state().deliveries.map(publicDelivery)); return true; }

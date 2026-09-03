@@ -701,14 +701,64 @@ describe('ARCP HTTP surface', () => {
     const futureLeak = 'unanticipated-provider-receipt';
     const session: any = { id: 'runtime', externalId: handle, parentAgentId: handle, workspace: pathLeak, futureReceipt: futureLeak, someFutureField: { deep: { unknownKey: futureLeak } }, observed: { provider: 'codex', futureHandle: futureLeak, deep: { unknownKey: futureLeak } }, placement: { requested: { agentId: handle, nested: { providerReference: handle }, futureRequested: futureLeak }, observed: { agentId: handle, deep: { nativeId: handle, path: pathLeak } } } };
     const walk = (value: any): string[] => Array.isArray(value) ? value.flatMap(walk) : value && typeof value === 'object' ? Object.values(value).flatMap(walk) : typeof value === 'string' ? [value] : [];
-    const direct = publicSession(session); const panorama = publicPanorama({ workspace: {}, roster: [], tasks: [], goals: [], runtime: [{ session, observation: { deep: { recipientRef: handle, path: pathLeak } }, children: {}, workSummary: {} }], placement: [{ tabs: [{ agentId: handle, nested: { path: pathLeak } }] }], cooperation: { nested: { externalId: handle } }, execution: { nested: { nativeId: handle } } });
+    const direct = publicSession(session);
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-recursive-redaction-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve)); const actor = await app.arcp.registerActor({ clientIdentity: 'redaction-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.actor.id, purpose: 'redaction' });
     await app.arcp.store.mutate((state: any) => state.sessions.push({ ...session, actorId: actor.actor.id, goalId: 'goal-redaction', bindingId: actor.binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: workspace.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt', state: 'idle', createdAt: new Date().toISOString() }));
     const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const listed = await (await fetch(`${base}/v1/runtime-sessions`, { headers: { 'x-arcp-member-key': workspace.credential! } })).json();
+    const panorama = publicPanorama({ workspace: {}, roster: [], tasks: [], goals: [], runtime: [{ session, observation: { deep: { recipientRef: handle, path: pathLeak } }, children: {}, workSummary: {} }], placement: [{ tabs: [{ agentId: handle, nested: { path: pathLeak } }] }], cooperation: { nested: { externalId: handle } }, execution: { nested: { nativeId: handle } } }, app.arcp);
     for (const value of [direct, listed, panorama]) { const values = walk(JSON.parse(JSON.stringify(value))); expect(values).not.toContain(handle); expect(values).not.toContain(pathLeak); expect(values).not.toContain(futureLeak); }
     // The projection must still carry the fields the public contract promises,
     // or "nothing leaked" could be satisfied by returning nothing at all.
     expect(direct).toMatchObject({ id: 'runtime', observed: { provider: 'codex' } });
+  });
+  it('refuses actor-only launches outside the workspaces the actor owns', async () => {
+    // assertLaunchRelationship returns early when no member credential is
+    // supplied, and startManaged only checks that the workspace is active. That
+    // let any registered actor create a Goal, Task, Member and runtime inside a
+    // workspace it has no relationship to. Actor-only launch is legitimate for
+    // the root bootstrap - before any member exists - so it must be narrowed to
+    // the owning actor rather than removed.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-actor-only-launch-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const owner = await app.arcp.registerActor({ clientIdentity: 'launch-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: owner.actor.id, purpose: 'owned' });
+    const stranger = await app.arcp.registerActor({ clientIdentity: 'stranger' });
+    const ownerGoal = await app.arcp.createGoal({ actorId: owner.actor.id, title: 'owner goal', workspaceId: workspace.workspace.id });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    let managed: any, direct: any; (app.arcp as any).startManaged = async (input: any) => { managed = input; return { action: 'hold' }; }; (app.arcp as any).launch = async (input: any) => { direct = input; return { id: 'r', state: 'idle' }; };
+    const post = (path: string, key: string, payload: any) => fetch(`${base}${path}`, { method: 'POST', headers: { 'x-arcp-actor-key': key, 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+
+    for (const [path, payload] of [['/v1/start', { workspaceId: workspace.workspace.id, title: 'forged' }], ['/v1/runtime-sessions', { workspaceId: workspace.workspace.id, goalId: ownerGoal.id }]] as const) {
+      managed = undefined; direct = undefined;
+      const refused = await post(path, stranger.credential!, payload);
+      expect(refused.status).toBe(401); expect(await refused.json()).toMatchObject({ code: 'unauthorized' });
+      expect(managed).toBeUndefined(); expect(direct).toBeUndefined();
+    }
+    // A launch that names no workspace at all cannot be checked, so it must
+    // fail closed rather than fall through the missing-member early return.
+    managed = undefined; expect((await post('/v1/start', stranger.credential!, { title: 'unscoped' })).status).toBe(401); expect(managed).toBeUndefined();
+
+    // The owning actor keeps its root bootstrap path.
+    managed = undefined; expect((await post('/v1/start', owner.credential!, { workspaceId: workspace.workspace.id, title: 'root' })).status).toBe(200); expect(managed).toMatchObject({ workspaceId: workspace.workspace.id });
+    expect(managed.launchedByMemberId).toBeUndefined();
+  });
+  it('never returns raw provider child ids from runtime status or panorama', async () => {
+    // children[].id is a provider agent id, and it is a sibling of session in
+    // the response, so publicSession never sees it. The generic redactor keys
+    // off field names like agentId and cannot recognise a bare id.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-child-leak-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve));
+    const actor = await app.arcp.registerActor({ clientIdentity: 'child-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.actor.id, purpose: 'children' });
+    const childHandle = 'provider-child-agent-id', unknownHandle = 'provider-child-not-managed';
+    const session: any = { id: 'runtime_parent', actorId: actor.actor.id, goalId: 'goal', bindingId: actor.binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: workspace.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt', state: 'idle', createdAt: new Date().toISOString() };
+    await app.arcp.store.mutate((state: any) => { state.sessions.push(session); state.sessions.push({ ...session, id: 'runtime_child', externalId: childHandle }); });
+    const children = { source: 'paseo_parent', items: [{ id: childHandle, status: 'running', source: 'paseo_parent' }, { id: unknownHandle, status: 'idle', source: 'paseo_parent' }] };
+    (app.arcp as any).runtimeStatus = async () => ({ session, observation: {}, children, workSummary: {} });
+    const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+    const status = await (await fetch(`${base}/v1/runtime-sessions/runtime_parent/status`, { headers: { 'x-arcp-member-key': workspace.credential! } })).json();
+    const panorama = publicPanorama({ workspace: {}, roster: [], tasks: [], goals: [], runtime: [{ session, observation: {}, children, workSummary: {} }] } as any, app.arcp);
+    const walk = (value: any): string[] => Array.isArray(value) ? value.flatMap(walk) : value && typeof value === 'object' ? Object.values(value).flatMap(walk) : typeof value === 'string' ? [value] : [];
+    for (const value of [status, panorama]) { const values = walk(JSON.parse(JSON.stringify(value))); expect(values).not.toContain(childHandle); expect(values).not.toContain(unknownHandle); }
+    // Redaction must not silently drop children: a child ARCP knows is named by
+    // its RuntimeSession id, and the count stays honest for one it does not.
+    expect(status.children.items).toEqual([{ runtimeSessionId: 'runtime_child', status: 'running', source: 'paseo_parent' }, { status: 'idle', source: 'paseo_parent' }]);
   });
   it('protects v1, keeps /health open, and serves nothing else outside /v1', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-')); process.env.ARCP_API_KEY = 'test-key';
