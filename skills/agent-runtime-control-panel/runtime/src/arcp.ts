@@ -169,6 +169,10 @@ export function paseoTitle(role: string, goalTitle: string): string {
 }
 function isPaseoTitleRejected(error: unknown): boolean { const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase(); return message.includes('agent_create_failed') && (message.includes('too_big') || message.includes('maximum 200') || message.includes('config.title')); }
 /** Resolve the packaged CLI from the runtime module, in both src and dist. */
+/** Where this control plane actually listens. A launched runtime is handed its
+ * own control-plane address rather than left to guess the default port, which
+ * silently points it at whichever daemon happens to own 18787. */
+export const arcpBaseUrl = (): string | undefined => process.env.ARCP_URL || (process.env.PORT ? `http://127.0.0.1:${process.env.PORT}` : undefined);
 export const packagedArcpCommand = (...args: string[]): string => [process.execPath, fileURLToPath(new URL('../../scripts/arcp', import.meta.url)), ...args].map(shellQuote).join(' ');
 
 /**
@@ -416,7 +420,7 @@ export class PaseoAdapter implements RuntimeAdapter {
     const title = paseoTitle(profile.role, goalTitle);
     // Lineage is a provider fact, not a label: the parent agent id is passed
     // as the calling identity so `paseo inspect` reports a real ParentAgentId.
-    return this.cli.run(['run', '-d', '--json', '--title', title, '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(context?.paseoWorkspaceId ? ['--workspace', context.paseoWorkspaceId] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.runtimeId ? ['--label', `arcp-runtime=${context.runtimeId}`, '--label', `arcp-role=${profile.role}`] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${contract}${route}${handoff}`], { timeoutMs: 30_000, ...(context?.parentAgentId ? { agentId: context.parentAgentId } : {}) });
+    return this.cli.run(['run', '-d', '--json', '--title', title, '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(context?.paseoWorkspaceId ? ['--workspace', context.paseoWorkspaceId] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.runtimeId ? ['--label', `arcp-runtime=${context.runtimeId}`, '--label', `arcp-role=${profile.role}`] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), ...(arcpBaseUrl() ? ['--env', `ARCP_URL=${arcpBaseUrl()}`] : []), `Work on ARCP Goal: ${goalTitle}${contract}${route}${handoff}`], { timeoutMs: 30_000, ...(context?.parentAgentId ? { agentId: context.parentAgentId } : {}) });
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: discoveryTimeoutMs() }); }
   registry() { return this.cli.run(['ls', '-g', '-a', '--json'], { timeoutMs: discoveryTimeoutMs() }); }

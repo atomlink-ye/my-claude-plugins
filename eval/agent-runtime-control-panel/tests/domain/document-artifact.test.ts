@@ -7,6 +7,17 @@ import { artifactRefFor, diffDocumentLines, formatArtifactRef, parseArtifactRef,
 import { documentAddress } from '../../../../skills/agent-runtime-control-panel/runtime/src/content.js';
 import { publicSession } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
 
+class RecordingCli {
+  launches: string[][] = [];
+  async run(args: string[]) {
+    if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: true, modes: ['auto'] }], stdout: '', stderr: '' };
+    if (args[0] === 'provider' && args[1] === 'models') return { value: [{ id: 'gpt-5.6-terra', thinkingOptionIds: ['medium'] }], stdout: '', stderr: '' };
+    if (args[0] === 'inspect') return { value: { id: 'worker-live', status: 'idle', provider: 'codex', model: 'gpt-5.6-terra', mode: 'auto', thinking: 'medium' }, stdout: '', stderr: '' };
+    if (args[0] === 'run') { this.launches.push(args); return { value: { id: 'worker-live' }, stdout: '', stderr: '' }; }
+    return { value: [], stdout: '', stderr: '' };
+  }
+}
+
 class FakeCli {
   async run(args: string[]) {
     if (args[0] === 'provider' && args[1] === 'ls') return { value: [{ provider: 'codex', status: 'available', enabled: true, modes: ['auto'] }], stdout: '', stderr: '' };
@@ -143,6 +154,26 @@ describe('DocumentArtifact — identity, append-only revisions, and exact refs',
 });
 
 describe('Launch binding to an exact contract revision', () => {
+  it('hands the launched runtime its own control-plane address instead of the default port', async () => {
+    const previous = process.env.ARCP_URL;
+    process.env.ARCP_URL = 'http://127.0.0.1:18899';
+    try {
+      const cli = new RecordingCli();
+      const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-document-launch-env-'));
+      const service = new ArcpService(root, cli as any);
+      await service.init();
+      const { actor } = await service.registerActor({ clientIdentity: 'env-owner' });
+      const workspace = (await service.createWorkspace({ ownerActorId: actor.id, purpose: 'env' })).workspace;
+      await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'g', contract: 'scope', profileId: 'codex-worker', workspace: '/tmp' } as any);
+
+      const run = cli.launches.at(-1)!;
+      expect(run).toContain('ARCP_URL=http://127.0.0.1:18899');
+      service.close();
+    } finally {
+      if (previous === undefined) delete process.env.ARCP_URL; else process.env.ARCP_URL = previous;
+    }
+  });
+
   it('projects the contract binding evidence over HTTP, since a ref a reader cannot see proves nothing', async () => {
     const { service, actor, workspace, member } = await fixture();
     const contract = await service.createDocument({ workspaceId: workspace.id, memberId: member.id, kind: 'contract', title: 'c', body: 'authority\n' });
