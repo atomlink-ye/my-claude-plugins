@@ -411,4 +411,24 @@ describe('owner escalation canary', () => {
     expect(stored.undeliverableReason).toContain('indeterminate');
     service.close();
   });
+
+  it('does not let one channel generation counter outrank another channel', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    service.channels.register(new RecordingChannelAdapter('recording'));
+    service.channels.register(new RecordingChannelAdapter('other'));
+    // Generations are per channel. A higher counter on a second channel must
+    // not make that channel win the address.
+    await service.store.mutate((state: any) => {
+      const first = state.bindings.find((b: any) => b.actorId === workspace.ownerActorId);
+      state.bindings.push({ ...first, id: 'binding_other_ch', channel: 'other', generation: 9, conversationRef: 'other-conversation' });
+      return undefined;
+    });
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((e) => e.kind === 'decision_required' && e.resultId === result.id)!;
+    const escalated = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+    expect(escalated.receipt).toBeUndefined();
+    expect(service.state().channelEvents.find((e) => e.id === escalated.event.id)!.deliveryState).toBe('undeliverable');
+    service.close();
+  });
 });

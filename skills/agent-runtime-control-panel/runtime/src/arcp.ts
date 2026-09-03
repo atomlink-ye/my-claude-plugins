@@ -2013,8 +2013,15 @@ export class ArcpService implements ExecutionPlacementPort {
     // is not a candidate rather than a candidate that happens to fail later.
     const bindings = state.bindings.filter((item) => item.actorId === ownerActorId && this.channels.has(item.channel) && this.bindingIsCurrent(item) && Boolean(item.conversationRef));
     if (!bindings.length) return undefined;
-    const top = bindings.reduce((max, item) => Math.max(max, item.generation), 0);
-    const candidates = bindings.filter((item) => item.generation === top);
+    // Generations count per channel, so comparing them across channels would
+    // let a busy channel's higher counter outrank another channel entirely.
+    // Narrow to one channel first, and treat two live channels as ambiguous
+    // rather than silently preferring whichever counted further.
+    const channels = [...new Set(bindings.map((item) => item.channel))];
+    if (channels.length !== 1) return undefined;
+    const withinChannel = bindings.filter((item) => item.channel === channels[0]);
+    const top = withinChannel.reduce((max, item) => Math.max(max, item.generation), 0);
+    const candidates = withinChannel.filter((item) => item.generation === top);
     // Two live addresses at the same generation is an ambiguous identity, not a
     // tie to break. Guessing one would silently pick which human gets woken.
     if (candidates.length !== 1) return undefined;
