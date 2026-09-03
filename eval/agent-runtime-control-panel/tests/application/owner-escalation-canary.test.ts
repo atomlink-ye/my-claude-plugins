@@ -445,6 +445,43 @@ describe('owner escalation canary', () => {
     service.close();
   });
 
+  it('resolves launcher lineage on the direct launch path, not only on managed start', async () => {
+    // startManaged is not the only door: /v1/runtime-sessions reaches launch()
+    // directly. Both entry points now name a launcher member, so both must
+    // resolve the provider parent from durable state and fail closed. Without
+    // this the HTTP boundary hardening could be undone on the direct path with
+    // the managed-start canary still green.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-lineage-direct-'));
+    const cli = new FakePaseoCli({ providers: ['codex'] });
+    const { service } = await createControl(root, { cli });
+    const owner = await service.registerActor({ clientIdentity: 'owner', label: 'Owner', channel: 'local' });
+    const ws = await service.createWorkspace({ purpose: 'lineage-direct', ownerActorId: owner.actor.id });
+    const manager = await service.joinWorkspace({ workspaceId: ws.workspace.id, label: 'Manager', role: 'manager' });
+    const goalFor = async (title: string) => (await service.createGoal({ actorId: owner.actor.id, title, workspaceId: ws.workspace.id })).id;
+
+    const sessionsBefore = (service.state() as any).sessions.length;
+    await expect(service.launch({ actorId: owner.actor.id, goalId: await goalFor('held'), workspaceId: ws.workspace.id, profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any))
+      .rejects.toThrow(/LINEAGE_UNRESOLVED/);
+    expect((service.state() as any).sessions).toHaveLength(sessionsBefore);
+
+    await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'direct-parent-1' });
+    // A caller-supplied parentAgentId is present and wrong on purpose: the
+    // server-resolved live identity must win over anything the request names.
+    const session = await service.launch({ actorId: owner.actor.id, goalId: await goalFor('parented'), workspaceId: ws.workspace.id, profileId: 'codex-worker', launchedByMemberId: manager.member.id, parentAgentId: 'forged-direct-parent', workspace: root } as any);
+    expect(session.parentAgentId).toBe('direct-parent-1');
+
+    await service.store.mutate((st: any) => {
+      const one = st.sessions.find((x: any) => x.memberId === manager.member.id && x.runtimeKind === 'external');
+      st.sessions.push({ ...one, id: 'runtime_direct_rival', externalId: 'direct-parent-rival' });
+      return undefined;
+    });
+    const ambiguousBefore = (service.state() as any).sessions.length;
+    await expect(service.launch({ actorId: owner.actor.id, goalId: await goalFor('ambiguous'), workspaceId: ws.workspace.id, profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any))
+      .rejects.toThrow(/LINEAGE_AMBIGUOUS/);
+    expect((service.state() as any).sessions).toHaveLength(ambiguousBefore);
+    service.close();
+  });
+
   it('lets only an intended recipient dispose a Manager-targeted obligation', async () => {
     const { service, workspace, manager, worker, task } = await platformWorkspace();
     await service.claimTask(task.id, worker.id, task.fence);
