@@ -1211,28 +1211,45 @@ export class ArcpService implements ExecutionPlacementPort {
    * adapter: the caller names the participant channel and an opaque external
    * ref. Re-attaching is idempotent so a reconnect resumes one accountable
    * session instead of forking a second one at a new generation. */
-  async attachParticipant(input: { workspaceId: string; memberId: string; adapterId: string; externalId: string; workspace?: string }): Promise<RuntimeSession> {
+  async attachParticipant(input: { workspaceId: string; memberId: string; adapterId: string; externalId: string; workspace?: string; taskId?: string }): Promise<RuntimeSession> {
     const trimmedExternal = input.externalId?.trim();
     if (!trimmedExternal) throw new ArcpError('invalid_request', 'participant attach requires an external reference', 'externalId');
     if (!input.adapterId?.trim()) throw new ArcpError('invalid_request', 'participant attach requires an adapter id', 'adapterId');
+    const trimmedTaskId = input.taskId?.trim() || undefined;
     return this.store.mutate((state) => {
       const workspace = state.workspaces.find((item) => item.id === input.workspaceId && item.lifecycle === 'active');
       if (!workspace) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
       const member = state.members.find((item) => item.id === input.memberId && item.workspaceId === input.workspaceId);
       if (!member) throw new ArcpError('unknown_recipient', 'member is not in this workspace');
+      // The Task must be named explicitly by id. Guessing from a title or from
+      // "whatever Task is newest" would bind a runtime's provenance to the
+      // wrong unit of work without anyone asking for that Task by name.
+      let task: Task | undefined;
+      if (trimmedTaskId) {
+        task = state.tasks.find((item) => item.id === trimmedTaskId);
+        if (!task || task.workspaceId !== input.workspaceId) throw new ArcpError('unknown_recipient', 'task is not in this workspace', 'taskId');
+      }
+      // A Task is bound to at most one live runtime session at a time. A second
+      // attach naming the same Task while another session still holds it is
+      // working from a stale view of who currently owns that Task.
+      const assertTaskIsCurrent = () => { if (task && state.sessions.some((item) => item.taskId === task!.id && item.state !== 'terminal' && item.memberId !== member.id)) throw new ArcpError('stale_generation', `task ${task!.id} is already bound to a different live runtime session`, 'taskId'); };
       const existing = state.sessions.find((item) => item.memberId === member.id && item.runtimeKind === 'external' && item.state !== 'terminal');
       if (existing) {
         // An attach must be repeatable. Changing the adapter or the external
         // ref under a live session would silently redirect delivery, so that
         // is a conflict rather than an update.
         if (existing.adapterId !== input.adapterId || existing.externalId !== trimmedExternal) throw new ArcpError('placement_conflict', `member ${member.id} is already attached to ${existing.adapterId} session ${existing.externalId ?? 'unknown'}`);
+        if (task && existing.taskId && existing.taskId !== task.id) throw new ArcpError('placement_conflict', `member ${member.id}'s attached session ${existing.id} is already bound to task ${existing.taskId}`);
+        if (task && !existing.taskId) { assertTaskIsCurrent(); existing.taskId = task.id; }
         return existing;
       }
+      assertTaskIsCurrent();
       const binding = member.actorId ? state.bindings.find((item) => item.actorId === member.actorId) : undefined;
       const session: RuntimeSession = {
         id: `runtime_${randomUUID()}`,
         actorId: member.actorId ?? workspace.ownerActorId,
         goalId: `goal_attached_${member.id}`,
+        ...(task ? { taskId: task.id } : {}),
         bindingId: binding?.id ?? `binding_attached_${member.id}`,
         generation: 1,
         runtimeKind: 'external',

@@ -125,6 +125,61 @@ describe('owner escalation canary', () => {
     service.close();
   });
 
+  it('binds an explicit Task at initial attach', async () => {
+    const { service, workspace, manager, task } = await platformWorkspace();
+    const session = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-1', taskId: task.id });
+    expect(session.taskId).toBe(task.id);
+    service.close();
+  });
+
+  it('binds a Task on idempotent reattach when the current session has none', async () => {
+    const { service, workspace, manager, task } = await platformWorkspace();
+    const session = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-2' });
+    expect(session.taskId).toBeUndefined();
+
+    const bound = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-2', taskId: task.id });
+    expect(bound.id).toBe(session.id);
+    expect(bound.taskId).toBe(task.id);
+    expect(service.state().sessions.filter((item) => item.memberId === manager.id)).toHaveLength(1);
+    service.close();
+  });
+
+  it('refuses a different Task, a Task from another Workspace, and a Task already bound to a different live participant', async () => {
+    const { service, workspace, manager, worker, task } = await platformWorkspace();
+    const otherTask = await service.createTask({ workspaceId: workspace.id, title: 'a second unit of work' });
+    const otherWorkspace = await service.createWorkspace({ purpose: 'a different workspace', ownerActorId: workspace.ownerActorId });
+    const foreignTask = await service.createTask({ workspaceId: otherWorkspace.workspace.id, title: 'not in this workspace' });
+
+    // A Task must be named by id and validated against the Workspace it was
+    // attached under; a Task minted somewhere else is never eligible.
+    await expect(service.attachParticipant({ workspaceId: workspace.id, memberId: worker.id, adapterId: 'claude-code', externalId: 'participant-opaque-foreign', taskId: foreignTask.id }))
+      .rejects.toMatchObject({ code: 'unknown_recipient' });
+
+    const session = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-3', taskId: task.id });
+    // Rebinding the same live session to a different Task would silently
+    // redirect Result provenance away from the Task it was actually bound to.
+    await expect(service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-3', taskId: otherTask.id }))
+      .rejects.toMatchObject({ code: 'placement_conflict' });
+
+    // A Task already held by another live runtime session cannot be handed to
+    // a second participant on a stale view of who currently owns it.
+    await expect(service.attachParticipant({ workspaceId: workspace.id, memberId: worker.id, adapterId: 'claude-code', externalId: 'participant-opaque-worker-1', taskId: task.id }))
+      .rejects.toMatchObject({ code: 'stale_generation' });
+    expect(session.taskId).toBe(task.id);
+    service.close();
+  });
+
+  it('submits a Result with runtime provenance after claim through an attached session', async () => {
+    const { service, workspace, manager, task } = await platformWorkspace();
+    const session = await service.attachParticipant({ workspaceId: workspace.id, memberId: manager.id, adapterId: 'claude-code', externalId: 'participant-opaque-task-4', taskId: task.id });
+
+    const claimed = await service.claimTask(task.id, manager.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: manager.id, status: 'candidate', summary: 'candidate from the attached participant', expectedFence: claimed.fence, runtimeSessionId: session.id, runtimeGeneration: session.generation });
+    expect(result.runtimeSessionId).toBe(session.id);
+    expect(result.runtimeGeneration).toBe(session.generation);
+    service.close();
+  });
+
   it('does not wedge an attached participant into attention by diffing adapter identity against provider truth', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-attached-observe-'));
     const cli = new FakePaseoCli({ providers: ['claude'] });
