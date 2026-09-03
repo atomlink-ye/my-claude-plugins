@@ -418,13 +418,17 @@ describe('owner escalation canary', () => {
 
     // With exactly one live identity the child is parented on it.
     await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'parent-agent-1' });
-    const started = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
+    const started = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, parentAgentId: 'forged-parent-id', workspace: root } as any);
     expect('session' in started).toBe(true);
     // Lineage must reach the provider as the calling identity, not as a label.
     expect(cli.lastEnv).toBeDefined();
     const runCall = cli.calls.find((args) => args[0] === 'run');
     expect(runCall).toBeDefined();
     expect((started as any).session.reportingRoute.launchedByMemberId).toBe(manager.member.id);
+    // The durable parent proof is the server-resolved live provider identity,
+    // paired with the accountable Manager member. Caller input never wins.
+    expect((started as any).session.parentAgentId).toBe('parent-agent-1');
+    expect((started as any).session.parentAgentId).not.toBe('forged-parent-id');
 
     // The ambiguous-launcher path must be as clean as the unresolved one: a
     // second live identity makes the parent unknowable, and a hold there must
