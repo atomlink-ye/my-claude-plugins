@@ -65,6 +65,12 @@ describe('TemporalProjection', () => {
     expect(card.problems).toContain('generation_replaced');
   });
 
+  it('uses the latest delivery episode when an event was redelivered', () => {
+    const redelivered = event('redelivered', 'transport_uncertainty');
+    const projection = projectTemporal(facts([redelivered], { deliveries: [{ id: 'old', fromActorId: 'a', runtimeSessionId: 'runtime', generation: 1, consumptionEpisode: 0, body: '', command: 'normal', state: 'withdrawn', eventId: redelivered.id, createdAt: at }, { id: 'new', fromActorId: 'a', runtimeSessionId: 'runtime', generation: 2, consumptionEpisode: 1, body: '', command: 'normal', state: 'delivered', eventId: redelivered.id, createdAt: '2026-09-02T00:01:00.000Z' }], sessions: [{ id: 'runtime', actorId: 'a', goalId: 'g', bindingId: 'b', generation: 2, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'running', createdAt: at }] }), 'problems');
+    expect(projection.cards.find((card) => card.id === redelivered.id)?.problems).not.toContain('generation_replaced');
+  });
+
   it('detects duplicate completions, source identity retries, and stewardship recursion without creating a new semantic completion', () => {
     const first = event('completion-1', 'task_completed', 'task-done'); first.resultId = 'result-done';
     const second = event('completion-2', 'task_completed', 'task-done'); second.resultId = 'result-done'; second.createdAt = '2026-09-02T00:01:00.000Z';

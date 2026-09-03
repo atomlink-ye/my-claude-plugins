@@ -44,7 +44,7 @@ export interface TemporalProjection { filter: TemporalFilter; generatedAt: strin
 const BUDGET_MS = 60 * 60 * 1000;
 const age = (at: string, now: number) => Math.max(0, now - Date.parse(at));
 const eventRuntime = (event: ChannelEvent, deliveries: readonly Delivery[], sessions: readonly RuntimeSession[]) => {
-  const delivery = deliveries.find((item) => item.eventId === event.id);
+  const delivery = deliveries.filter((item) => item.eventId === event.id).sort((a, b) => (b.consumptionEpisode ?? 0) - (a.consumptionEpisode ?? 0) || b.createdAt.localeCompare(a.createdAt))[0];
   return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : sessions.find((item) => item.memberId === event.sourceMemberId && (!event.taskId || item.taskId === event.taskId));
 };
 const reachable = (event: ChannelEvent, delivery: Delivery | undefined, sessions: readonly RuntimeSession[]) => {
@@ -75,7 +75,7 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
   const cards: TemporalCard[] = facts.channelEvents.map((event) => {
     const channel = projectChannelEvent(event, facts);
     const task = event.taskId ? tasks.get(event.taskId) : undefined;
-    const delivery = facts.deliveries.find((item) => item.eventId === event.id);
+    const delivery = facts.deliveries.filter((item) => item.eventId === event.id).sort((a, b) => (b.consumptionEpisode ?? 0) - (a.consumptionEpisode ?? 0) || b.createdAt.localeCompare(a.createdAt))[0];
     const runtime = eventRuntime(event, facts.deliveries, facts.sessions);
     const senderMember = event.sourceMemberId ? members.get(event.sourceMemberId) : undefined;
     const results = task ? resultsByTask.get(task.id) ?? [] : [];

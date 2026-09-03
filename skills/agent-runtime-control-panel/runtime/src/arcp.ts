@@ -619,17 +619,15 @@ export class ArcpService implements ExecutionPlacementPort {
     }
   }
   private adapterFor(session: RuntimeSession): RuntimeAdapter { return this.adapters.get(session.adapterId || (session.runtimeKind === 'external' ? 'hermes-acp' : 'paseo')) ?? this.adapter; }
-  /** The launch receipt is the sole native identity for a runtime. Keep the
-   * session, placement, and all bindings converged even when older durable
-   * state only recorded it in one of those records. */
+  /** A native identity is a provenance fence, not a repair preference. Read
+   * only from a single unambiguous durable identity; conflicting copies must
+   * remain observable rather than being overwritten by read order. */
   private async canonicalRuntimeIdentity(session: RuntimeSession): Promise<string | undefined> {
     const state = this.store.snapshot();
     const current = state.sessions.find((item) => item.id === session.id) ?? session;
-    const bindingIdentities = [...new Set(state.runtimeBindings.filter((item) => item.runtimeSessionId === current.id).map((item) => setting(item.nativeId)).filter((item): item is string => Boolean(item)))];
-    // The launch receipt wins. Legacy sessions may fall back to a binding only
-    // when it yields one unambiguous opaque identity; choosing the first of
-    // conflicting bindings would make a read path manufacture provenance.
-    const identity = setting(current.externalId) ?? (bindingIdentities.length === 1 ? bindingIdentities[0] : undefined);
+    const identities = [...new Set([setting(current.externalId), setting(current.placement?.requested.agentId), setting(current.placement?.observed?.agentId), ...state.runtimeBindings.filter((item) => item.runtimeSessionId === current.id).map((item) => setting(item.nativeId))].filter((item): item is string => Boolean(item)))];
+    if (identities.length !== 1) return undefined;
+    const identity = identities[0];
     if (!identity) return undefined;
     // A read path must not pay a durable store write. Repair runs only when a
     // record genuinely disagrees with the launch receipt identity.
@@ -1350,23 +1348,45 @@ export class ArcpService implements ExecutionPlacementPort {
     const prior = this.store.snapshot().sessions.find((item) => item.id === id);
     if (!prior) throw new ArcpError('not_found', 'runtime session not found');
     const externalId = await this.canonicalRuntimeIdentity(prior);
+    const uncertain = async () => {
+      const updated = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = item.state; return item; });
+      if (updated.generation === prior.generation) await this.emitTransportUncertainty(updated); return updated;
+    };
+    const persist = async (agent: Record<string, any>, placementSource?: Record<string, any>, lifecycle?: unknown) => this.store.mutate((state) => {
+      const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item;
+      const observed = { ...(setting(agent.provider ?? agent.Provider) ? { provider: String(agent.provider ?? agent.Provider) } : {}), ...(setting(agent.model ?? agent.Model) ? { model: String(agent.model ?? agent.Model) } : {}), ...(setting(agent.currentModeId ?? agent.mode ?? agent.Mode) ? { mode: String(agent.currentModeId ?? agent.mode ?? agent.Mode) } : {}), ...(setting(agent.effectiveThinkingOptionId ?? agent.thinkingOptionId ?? agent.thinking ?? agent.Thinking) ? { thinking: String(agent.effectiveThinkingOptionId ?? agent.thinkingOptionId ?? agent.thinking ?? agent.Thinking) } : {}) };
+      item.observed = observed;
+      if (item.placement) { item.placement.observed = { ...paseoPlacement(placementSource ?? agent), ...paseoPlacement(agent) }; if (setting(lifecycle)) item.placement.observed.lifecycle = String(lifecycle); item.placement.status = placementStatus(item.placement); }
+      const requested = [item.provider, item.model, item.mode, item.thinking], actual = [observed.provider, observed.model, observed.mode, observed.thinking];
+      const settingsMatch = requested.every((value, index) => !value || (setting(actual[index]) !== undefined && normalized(actual[index]) !== 'unknown' && sameSetting(value, actual[index])));
+      item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : !settingsMatch ? 'attention' : sessionState(lifecycle ?? agent.status ?? agent.Status ?? agent.lifecycle); item.lastObservedAt = now();
+      for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = item.state;
+      return item;
+    });
     try {
       if (prior.runtimeKind === 'external') {
         const adapter = this.adapterFor(prior) as RuntimeAdapter & { reconcileExternal?: (externalId: string) => Promise<boolean> };
-        const valid = adapter.reconcileExternal ? await adapter.reconcileExternal(externalId ?? '') : false;
-        if (!valid) { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; return item; }); if (uncertain.generation === prior.generation) await this.emitTransportUncertainty(uncertain); return uncertain; }
+        if (!externalId || !adapter.reconcileExternal || !await adapter.reconcileExternal(externalId)) return uncertain();
+        const observed = (await adapter.snapshot(externalId)).agent;
+        if (launchReceiptIdentity(observed) !== externalId) { await persist(observed); return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation === prior.generation) { item.state = 'placement_mismatch'; for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = item.state; } return item; }); }
+        return persist(observed);
       }
+      if (!externalId) return uncertain();
       const agents = (await this.adapterFor(prior).registry()).value;
       const match = Array.isArray(agents) ? agents.map(asRecord).find((item) => launchReceiptIdentity(item) === externalId) : undefined;
       if (!match) {
         // The registry is Paseo's active-membership source. A known Agent ID
         // absent from that registry is parked/archived, not an indeterminate
         // transport; retain the durable ARCP row and placement history.
-        if (externalId) return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); return item; });
-        const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; return item; }); if (uncertain.generation === prior.generation) await this.emitTransportUncertainty(uncertain); return uncertain;
+        return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = item.state; return item; });
       }
-      return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; if (item.placement) { item.placement.observed = paseoPlacement(match); item.placement.status = placementStatus(item.placement); } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(match.status ?? match.Status ?? match.lifecycle); item.lastObservedAt = now(); return item; });
-    } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; return item; }); if (uncertain.generation === prior.generation) await this.emitTransportUncertainty(uncertain); return uncertain; }
+      const observed = (await this.adapterFor(prior).snapshot(externalId)).agent;
+      const observedLifecycle = setting(observed.status ?? observed.Status ?? observed.lifecycle), registryLifecycle = setting(match.status ?? match.Status ?? match.lifecycle);
+      const lifecycle = normalized(observedLifecycle) === 'unknown' || normalized(registryLifecycle) === 'unknown' ? 'unknown' : ['completed', 'failed', 'stopped', 'cancelled', 'archived', 'terminal'].includes(normalized(registryLifecycle)) ? registryLifecycle : observedLifecycle ?? registryLifecycle;
+      const updated = await persist(observed, match, lifecycle);
+      if (launchReceiptIdentity(observed) !== externalId) return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation === prior.generation) { item.state = 'placement_mismatch'; for (const binding of state.runtimeBindings.filter((value) => value.runtimeSessionId === id)) binding.state = item.state; } return item; });
+      return updated;
+    } catch { return uncertain(); }
   }
   private cacheThresholds() { return { expiringMinutes: Number(process.env.ARCP_CACHE_EXPIRING_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiringMinutes), expiredMinutes: Number(process.env.ARCP_CACHE_EXPIRED_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiredMinutes) }; }
   private cacheState(agent: Record<string, any>, timeline: unknown[] = []) {
@@ -1742,8 +1762,8 @@ export class ArcpService implements ExecutionPlacementPort {
     });
   }
   private async emitTransportUncertainty(session: RuntimeSession): Promise<void> {
-    await this.store.mutate((state) => { this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${session.id} health is uncertain`, evidenceRefs: [] }); this.appendChannelEvent(state, { workspaceId: session.workspaceId, goalId: session.goalId, taskId: session.taskId, sourceMemberId: session.memberId, sourceActorId: session.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${session.id} transport is uncertain`, evidenceRefs: [] }); });
-    if (!this.pumping) await this.pump();
+    const emitted = await this.store.mutate((state) => { const current = state.sessions.find((item) => item.id === session.id); if (!current || current.generation !== session.generation || current.state !== 'transport_indeterminate') return false; this.appendChannelEvent(state, { workspaceId: current.workspaceId, goalId: current.goalId, taskId: current.taskId, sourceMemberId: current.memberId, sourceActorId: current.actorId, targetRole: 'manager', kind: 'runtime_health', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${current.id} health is uncertain`, evidenceRefs: [] }); this.appendChannelEvent(state, { workspaceId: current.workspaceId, goalId: current.goalId, taskId: current.taskId, sourceMemberId: current.memberId, sourceActorId: current.actorId, targetRole: 'manager', kind: 'transport_uncertainty', urgency: 'urgent', consumptionPolicy: 'ack_required', decisionRequired: true, summary: `Runtime ${current.id} transport is uncertain`, evidenceRefs: [] }); return true; });
+    if (emitted && !this.pumping) await this.pump();
   }
   async publishChannelEvent(input: ChannelEventInput): Promise<ChannelEvent> {
     if (!input.summary?.trim()) throw new ArcpError('invalid_request', 'channel event summary is required');
