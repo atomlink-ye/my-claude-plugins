@@ -693,13 +693,22 @@ describe('ARCP HTTP surface', () => {
   afterEach(async () => { if (app) { app.arcp.close(); await new Promise<void>((resolve) => app!.server.close(() => resolve())); } app = undefined; delete process.env.ARCP_API_KEY; });
   it('recursively redacts nested provider handles and private paths from session, list, and panorama projections', async () => {
     const handle = 'provider-agent-secret', pathLeak = '/Users/private/agent-state';
-    const session: any = { id: 'runtime', externalId: handle, parentAgentId: handle, workspace: pathLeak, placement: { requested: { agentId: handle, nested: { providerReference: handle } }, observed: { agentId: handle, deep: { nativeId: handle, path: pathLeak } } } };
+    // handle and pathLeak sit under key names redactProviderValue already knows,
+    // so they alone cannot tell an allowlist projection apart from the old
+    // denylist. futureLeak is the discriminating case: it hides under key names
+    // no denylist could anticipate, at the top level and inside observed. Only
+    // an explicit projection drops it, which is the whole point of the change.
+    const futureLeak = 'unanticipated-provider-receipt';
+    const session: any = { id: 'runtime', externalId: handle, parentAgentId: handle, workspace: pathLeak, futureReceipt: futureLeak, someFutureField: { deep: { unknownKey: futureLeak } }, observed: { provider: 'codex', futureHandle: futureLeak, deep: { unknownKey: futureLeak } }, placement: { requested: { agentId: handle, nested: { providerReference: handle }, futureRequested: futureLeak }, observed: { agentId: handle, deep: { nativeId: handle, path: pathLeak } } } };
     const walk = (value: any): string[] => Array.isArray(value) ? value.flatMap(walk) : value && typeof value === 'object' ? Object.values(value).flatMap(walk) : typeof value === 'string' ? [value] : [];
     const direct = publicSession(session); const panorama = publicPanorama({ workspace: {}, roster: [], tasks: [], goals: [], runtime: [{ session, observation: { deep: { recipientRef: handle, path: pathLeak } }, children: {}, workSummary: {} }], placement: [{ tabs: [{ agentId: handle, nested: { path: pathLeak } }] }], cooperation: { nested: { externalId: handle } }, execution: { nested: { nativeId: handle } } });
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-recursive-redaction-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve)); const actor = await app.arcp.registerActor({ clientIdentity: 'redaction-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.actor.id, purpose: 'redaction' });
     await app.arcp.store.mutate((state: any) => state.sessions.push({ ...session, actorId: actor.actor.id, goalId: 'goal-redaction', bindingId: actor.binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: workspace.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt', state: 'idle', createdAt: new Date().toISOString() }));
     const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const listed = await (await fetch(`${base}/v1/runtime-sessions`, { headers: { 'x-arcp-member-key': workspace.credential! } })).json();
-    for (const value of [direct, listed, panorama]) { const values = walk(JSON.parse(JSON.stringify(value))); expect(values).not.toContain(handle); expect(values).not.toContain(pathLeak); }
+    for (const value of [direct, listed, panorama]) { const values = walk(JSON.parse(JSON.stringify(value))); expect(values).not.toContain(handle); expect(values).not.toContain(pathLeak); expect(values).not.toContain(futureLeak); }
+    // The projection must still carry the fields the public contract promises,
+    // or "nothing leaked" could be satisfied by returning nothing at all.
+    expect(direct).toMatchObject({ id: 'runtime', observed: { provider: 'codex' } });
   });
   it('protects v1, keeps /health open, and serves nothing else outside /v1', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-')); process.env.ARCP_API_KEY = 'test-key';
