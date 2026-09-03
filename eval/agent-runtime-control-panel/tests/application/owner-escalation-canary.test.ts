@@ -358,9 +358,15 @@ describe('owner escalation canary', () => {
 
     // A launcher with no live provider identity must fail closed. Silently
     // rooting the child would destroy the parent link with no way to recover it.
+    const before = { goals: service.state().goals.length, tasks: service.state().tasks.length, members: service.state().members.length };
     const held = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
     expect(held).toMatchObject({ action: 'hold', launchable: false });
     expect((held as any).why).toContain('LINEAGE_UNRESOLVED');
+    // A hold must leave nothing behind. Repeating a blocked start would
+    // otherwise accumulate orphan Goals, Tasks and member credentials while
+    // still reporting that nothing happened.
+    await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
+    expect({ goals: service.state().goals.length, tasks: service.state().tasks.length, members: service.state().members.length }).toEqual(before);
 
     // With exactly one live identity the child is parented on it.
     await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'parent-agent-1' });

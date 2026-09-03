@@ -1081,6 +1081,17 @@ export class ArcpService implements ExecutionPlacementPort {
     // observer role is told plainly that it owns no Task, instead of being
     // handed instructions that only fail at claim time.
     const taskHandoff = canOwnHandoffTask(capabilities);
+    // Lineage is resolved from durable state, never from the request, and it is
+    // resolved BEFORE anything is created. A hold that happens after the Goal,
+    // Task, Member and credential exist leaves orphans behind every time a
+    // launcher cannot be placed, so the cheapest check runs first.
+    let parentAgentId: string | undefined;
+    if (input.launchedByMemberId) {
+      const live = this.store.snapshot().sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId));
+      const ids = [...new Set(live.map((item) => item.externalId!))];
+      if (ids.length !== 1) return { ...preflight, action: 'hold', launchable: false, why: ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch` };
+      parentAgentId = ids[0];
+    }
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope, executionSurfaceId: input.executionSurfaceId });
     // Every failure after the Goal and Task exist retires the whole attempt:
@@ -1094,16 +1105,6 @@ export class ArcpService implements ExecutionPlacementPort {
       const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role, joinKind: 'managed', actorId: input.actorId, capabilities });
       joinedMemberId = joined.member.id;
       if (!joined.credential) throw new ArcpError('internal_error', 'managed member credential was not issued');
-      // Lineage is resolved here, from durable state, never from the request.
-      // A launcher we cannot place on exactly one live provider identity would
-      // otherwise be silently rooted, losing the parent link for good.
-      let parentAgentId: string | undefined;
-      if (input.launchedByMemberId) {
-        const live = this.store.snapshot().sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId));
-        const ids = [...new Set(live.map((item) => item.externalId!))];
-        if (ids.length !== 1) return { ...preflight, action: 'hold', launchable: false, why: ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch` };
-        parentAgentId = ids[0];
-      }
       const reportingRoute = this.resolveReportingRoute({ workspaceId: input.workspaceId, launchedByMemberId: input.launchedByMemberId, primaryHandlerMemberId: input.primaryHandlerMemberId, ccMemberIds: input.ccMemberIds, escalationMemberIds: input.escalationMemberIds, fallbackMemberId: joined.member.id });
       const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
       const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(input.contract ? { contract: input.contract } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute });
