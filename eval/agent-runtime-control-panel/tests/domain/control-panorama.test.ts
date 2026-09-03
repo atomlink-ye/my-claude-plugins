@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectControlPanorama, renderControlPanorama, UNKNOWN, type ControlPanoramaFacts } from '../../../../skills/agent-runtime-control-panel/runtime/src/control-panorama.js';
+import { projectControlPanorama, renderControlPanorama, safeTitle, UNKNOWN, type ControlPanoramaFacts } from '../../../../skills/agent-runtime-control-panel/runtime/src/control-panorama.js';
 
 const WS = 'workspace-1';
 const NOW = Date.parse('2026-09-03T12:00:00.000Z');
@@ -182,5 +182,57 @@ describe('Control panorama — the Markdown is the same projection', () => {
       expect(JSON.stringify(panorama)).not.toContain(leak);
       expect(rendered).not.toContain(leak);
     }
+  });
+});
+
+describe('Control panorama — a title is a label, not a prompt', () => {
+  // The exact shape that leaked on the live daemon: a Goal created with its
+  // whole launch prompt as the title.
+  const PROMPT_TITLE = [
+    'R5 CONVERGENCE REPAIR — authority, launch-failure and contract fail-closed',
+    '',
+    'IDENTITY: act as YOURSELF. ARCP_CLIENT_STATE is pre-set to your own credential.',
+    'SURFACE: worktree /Users/fanye/.paseo/worktrees/38jp2f3t/arcp-lane-authority-repair,',
+    'branch feat/arcp-authority-repair, base 5b3374104c9d249f15ad341420319c7f11a1dfbd.',
+    'You own: skills/agent-runtime-control-panel/runtime/src/arcp.ts, src/server.ts.',
+  ].join('\n');
+
+  it('never renders a private path or prompt body carried in a Goal or Task title', () => {
+    const panorama = projectControlPanorama(facts({
+      goals: [{ ...goal(), title: PROMPT_TITLE }],
+      tasks: [{ ...task(), title: PROMPT_TITLE }],
+    }));
+    const rendered = renderControlPanorama(panorama);
+
+    for (const payload of [JSON.stringify(panorama), rendered]) {
+      expect(payload).not.toContain('/Users/fanye');
+      expect(payload).not.toContain('.paseo/worktrees');
+      expect(payload).not.toContain('ARCP_CLIENT_STATE');
+      expect(payload).not.toContain('You own:');
+    }
+    // The label survives; the prompt body does not.
+    expect(panorama.goal).toMatchObject({ title: expect.stringContaining('R5 CONVERGENCE REPAIR') });
+    expect(panorama.goal !== UNKNOWN && panorama.goal.title).toContain('[title truncated]');
+    expect(panorama.task !== UNKNOWN && panorama.task.title).toContain('[title truncated]');
+  });
+
+  it('keeps a short ordinary title byte-identical, so the fix does not damage every normal title to defeat one bad one', () => {
+    const panorama = projectControlPanorama(facts());
+    expect(panorama.goal).toMatchObject({ title: 'ship the checkpoint' });
+    expect(panorama.task).toMatchObject({ title: 'do the work' });
+  });
+
+  it('bounds an over-long single-line title and scrubs rooted paths wherever they appear', () => {
+    expect(safeTitle('deploy from /Users/someone/.local/state/secret.json now')).toBe('deploy from <path> now');
+    expect(safeTitle('~/private/notes/plan.md is the plan')).toBe('<path> is the plan');
+    const long = 'x'.repeat(400);
+    const bounded = safeTitle(long);
+    expect(bounded.length).toBeLessThan(160);
+    expect(bounded).toContain('[title truncated]');
+  });
+
+  it('does not mark a title truncated when nothing was dropped', () => {
+    expect(safeTitle('a perfectly ordinary title')).toBe('a perfectly ordinary title');
+    expect(safeTitle('trailing blank lines\n\n')).toBe('trailing blank lines');
   });
 });

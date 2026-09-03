@@ -70,6 +70,34 @@ export interface ControlPanorama {
   latency: DeliveryLatency;
 }
 
+/** A title is a label, and labels are bounded. */
+const TITLE_LIMIT = 120;
+/** Rooted absolute paths: worktree layout and home directories are private. */
+const ABSOLUTE_PATH = /(?:~|\/(?:Users|home|var|tmp|opt|private))(?:\/[^\s,;"')\]]+)+/g;
+
+/**
+ * Render a Goal or Task title safely.
+ *
+ * Titles are operator-controlled free text and are the one field on this
+ * surface that carries whatever a human typed. Historical Goals in this
+ * campaign were created with an entire launch prompt as the title — worktree
+ * path, branch, file-ownership list and agent instructions — so rendering one
+ * verbatim published private paths and prompt bodies on a read-only surface.
+ *
+ * Sanitizing here rather than in the renderer is deliberate: JSON and Markdown
+ * both read this value, so neither can be fixed while the other still leaks.
+ */
+export function safeTitle(value: string): string {
+  const [firstLine = '', ...rest] = value.split(/\r?\n/);
+  const scrubbed = firstLine.replace(ABSOLUTE_PATH, '<path>');
+  const droppedBody = rest.some((line) => line.trim().length > 0);
+  const overLong = scrubbed.length > TITLE_LIMIT;
+  const shown = overLong ? `${scrubbed.slice(0, TITLE_LIMIT).trimEnd()}…` : scrubbed;
+  // Say when content was dropped, so a reader knows this is a truncation
+  // rather than the whole title.
+  return droppedBody || overLong ? `${shown} [title truncated]` : shown;
+}
+
 const OPEN_POLICIES = ['ack_required', 'decision_required'];
 const isOpenObligation = (event: ChannelEvent) => OPEN_POLICIES.includes(event.consumptionPolicy) && event.consumptionState === 'open';
 /** A commit reference a Worker actually reported. A branch tip or a clean tree
@@ -152,8 +180,8 @@ export function projectControlPanorama(facts: ControlPanoramaFacts): ControlPano
     workspaceId: facts.workspaceId,
     purpose: facts.workspacePurpose ?? UNKNOWN,
     runtimes,
-    goal: goal ? { id: goal.id, title: goal.title, state: goal.state } : UNKNOWN,
-    task: task ? { id: task.id, title: task.title, lifecycle: task.lifecycle, fence: task.fence } : UNKNOWN,
+    goal: goal ? { id: goal.id, title: safeTitle(goal.title), state: goal.state } : UNKNOWN,
+    task: task ? { id: task.id, title: safeTitle(task.title), lifecycle: task.lifecycle, fence: task.fence } : UNKNOWN,
     latestResult: latestResult ? { id: latestResult.id, status: latestResult.status, summary: latestResult.summary } : UNKNOWN,
     checkpointSha,
     pending,
