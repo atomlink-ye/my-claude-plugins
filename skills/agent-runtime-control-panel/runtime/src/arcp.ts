@@ -121,7 +121,16 @@ export interface RuntimeAdapter {
   interrupt(externalId: string, body: string): Promise<unknown>;
   stop(externalId: string): Promise<unknown>;
 }
-interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache'; actorId: string; runtimeSessionId: string; generation: number; reason?: string; activeTurn: string; childSet: string; activityAt?: string; expiresAt: string; }
+/**
+ * A one-time Owner authorization. Only the sha256 of the token is stored; the
+ * raw token is returned once at mint and never persisted.
+ *
+ * Kinds are never interchangeable — validateConfirmation matches on `kind`, so
+ * a cache-reheat token can never authorize an interrupt or a budget override.
+ * `budget_override` is minted before any Runtime exists, so it binds a
+ * LaunchIntent and a quota snapshot instead of a session.
+ */
+interface Confirmation { tokenHash: string; kind: 'interrupt' | 'cache' | 'budget_override'; actorId: string; runtimeSessionId?: string; generation?: number; reason?: string; activeTurn?: string; childSet?: string; activityAt?: string; intentHash?: string; snapshotHash?: string; admissionAction?: string; expiresAt: string; }
 export interface State { actors: Actor[]; bindings: ActorBinding[]; credentials: Record<string, string>; workspaces: ControlWorkspace[]; members: Member[]; memberCredentials: Record<string, string>; tasks: Task[]; knowledge: KnowledgeEntry[]; results: Result[]; goals: Goal[]; sessions: RuntimeSession[]; deliveries: Delivery[]; channelEvents: ChannelEvent[]; confirmations: Confirmation[]; supervisionPolicies: SupervisionPolicy[]; supervisionReviews: SupervisionReview[]; supervisionSignals: SupervisionSignal[]; executionSurfaces: ExecutionSurface[]; surfaceClaims: SurfaceClaim[]; runtimeBindings: RuntimeBinding[]; documents: DocumentArtifact[]; documentRevisions: DocumentRevision[]; }
 
 const empty = (): State => ({ actors: [], bindings: [], credentials: {}, workspaces: [], members: [], memberCredentials: {}, tasks: [], knowledge: [], results: [], goals: [], sessions: [], deliveries: [], channelEvents: [], confirmations: [], supervisionPolicies: [], supervisionReviews: [], supervisionSignals: [], executionSurfaces: [], surfaceClaims: [], runtimeBindings: [], documents: [], documentRevisions: [] });
@@ -1104,7 +1113,7 @@ export class ArcpService implements ExecutionPlacementPort {
     if (input.paseoProjectId || input.paseoWorkspaceId || persisted) throw new ArcpError('placement_unresolved', unresolved ?? 'PLACEMENT_UNRESOLVED: requested Paseo placement could not be resolved before launch');
     return { ...input, workspace: checkout, ...(unresolved ? { placementUnresolved: unresolved } : {}) };
   }
-  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; contractDocumentRef?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt }> {
+  async startManaged(input: LaunchInput & { actorId: string; workspaceId: string; title: string; contract?: string; contractDocumentRef?: string; requestBudgetOverride?: boolean; overrideReason?: string; budgetConfirmation?: string; paseoProjectId?: string; paseoWorkspaceId?: string; workspace?: string; taskScope?: TaskScope; executionSurfaceId?: string; launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds?: string[]; escalationMemberIds?: string[] }): Promise<ActionResult | { goal: Goal; task: Task; member: Member; session: RuntimeSession; credential: string; routingGuidance: string; selection: SelectionExplanation; selectionReceipt: SelectionReceipt; admission?: AdmissionDecision; budgetOverride?: Record<string, unknown> }> {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     // Resolve and hash-verify the bound contract revision before anything is
     // created. An unverifiable ref must not produce a Goal, Task, Member or
@@ -1119,7 +1128,10 @@ export class ArcpService implements ExecutionPlacementPort {
       contractRef = artifactRefFor(resolved.revision);
     }
     const preflight = await this.preflight(input);
-    if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
+    const budgetOverride = await this.resolveBudgetOverride(input, preflight);
+    if ('refusal' in budgetOverride) throw new ArcpError('invalid_request', budgetOverride.refusal, budgetOverride.field);
+    if ('receipt' in budgetOverride) return { ...preflight, ...budgetOverride.receipt } as unknown as ActionResult;
+    if (!preflight.launchable && !budgetOverride.confirmed) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
     // Lineage is resolved from durable state, never from the request, and it
     // runs before ANY durable or provider-side effect. Placement is not a read:
     // it can materialize a provider workspace and persist a ControlWorkspace
@@ -1161,8 +1173,11 @@ export class ArcpService implements ExecutionPlacementPort {
       if (!joined.credential) throw new ArcpError('internal_error', 'managed member credential was not issued');
       const reportingRoute = this.resolveReportingRoute({ workspaceId: input.workspaceId, launchedByMemberId: input.launchedByMemberId, primaryHandlerMemberId: input.primaryHandlerMemberId, ccMemberIds: input.ccMemberIds, escalationMemberIds: input.escalationMemberIds, fallbackMemberId: joined.member.id });
       const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
-      const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(contract ? { contract } : {}), ...(contractRef ? { contractRef } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; contractRef?: string; reportingRoute?: ReportingRoute });
-      return { goal, task, member: joined.member, session, credential: joined.credential, routingGuidance: preflight.routingGuidance, selection: preflight.selection, selectionReceipt: preflight.selectionReceipt };
+      const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(contract ? { contract } : {}), ...(contractRef ? { contractRef } : {}), ...(budgetOverride.confirmed ? { budgetOverrideConfirmed: true } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; contractRef?: string; budgetOverrideConfirmed?: boolean; reportingRoute?: ReportingRoute });
+      // The admission that actually governed this launch is preserved unchanged.
+      // An override never rewrites `drain` into `launch`; it records that an
+      // authenticated Owner knowingly spent the remaining capacity anyway.
+      return { goal, task, member: joined.member, session, credential: joined.credential, routingGuidance: preflight.routingGuidance, selection: preflight.selection, selectionReceipt: preflight.selectionReceipt, ...(preflight.admission ? { admission: preflight.admission } : {}), ...(budgetOverride.confirmed ? { budgetOverride: { confirmedByActorId: input.actorId, reason: input.overrideReason?.trim() ?? '', admissionAction: preflight.admission!.action, evidence: this.budgetRiskFacts(preflight.admission!), effectiveLaunch: { profileId: session.profileId, provider: session.provider, model: session.model, mode: session.mode ?? null, thinking: session.thinking ?? null } } } : {}) };
     } catch (error) { await this.abandonManagedLaunch({ memberId: joinedMemberId, runtimeId, goalId: goal.id, taskId: task.id }); throw error; }
   }
   private async recordProviderBudgetEpisode(workspaceId: string, admission?: AdmissionDecision): Promise<void> {
@@ -1493,8 +1508,16 @@ export class ArcpService implements ExecutionPlacementPort {
     return replaced;
   }
 
-  async launch(input: LaunchInput & { parentAgentId?: string; launchedByMemberId?: string; contractRef?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; [RUNTIME_REPLACEMENT_RESERVATION]?: true }): Promise<RuntimeSession> {
-    const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
+  async launch(input: LaunchInput & { parentAgentId?: string; launchedByMemberId?: string; contractRef?: string; budgetOverrideConfirmed?: boolean; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; expectedGeneration?: number; [RUNTIME_REPLACEMENT_RESERVATION]?: true }): Promise<RuntimeSession> {
+    const preflight = input.admittedPreflight ?? await this.preflight(input);
+    // A confirmed Owner override lifts exactly one hold: the drain/hard_drain
+    // budget verdict it was minted against. Every other hold - unvalidated
+    // provider settings, runtime budget signals - still refuses, so the override
+    // cannot become a general-purpose launch bypass.
+    const budgetHoldOverridden = Boolean(input.budgetOverrideConfirmed) && !preflight.launchable
+      && Boolean(preflight.admission && ['drain', 'hard_drain'].includes(preflight.admission.action))
+      && preflight.why === `provider budget admission is ${preflight.admission!.action}`;
+    if (!preflight.launchable && !budgetHoldOverridden) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
     const goal = state.goals.find((item) => item.id === input.goalId && item.actorId === input.actorId);
@@ -1687,6 +1710,132 @@ export class ArcpService implements ExecutionPlacementPort {
     const state = this.store.snapshot(); const goal = state.goals.find((item) => item.id === session.goalId); const task = state.tasks.find((item) => item.workspaceId === session.workspaceId && item.title === goal?.title); const knowledge = state.knowledge.filter((item) => item.workspaceId === session.workspaceId).at(-1); const result = state.results.filter((item) => item.workspaceId === session.workspaceId).at(-1);
     return { ...receipt, handoff: { ...(goal ? { goalId: goal.id } : {}), ...(task ? { taskId: task.id } : {}), ...(knowledge ? { latestKnowledgeRef: knowledge.id } : {}), ...(result ? { latestResultRef: result.id } : {}), workSummary: await this.workSummary(session.workspace) } };
   }
+  /**
+   * Decide the budget-override outcome for one start attempt, before any Goal,
+   * Task, Member, Runtime or provider call. Exactly one of:
+   *   { refusal } — fail closed
+   *   { receipt } — stage one: no launch, return the risk receipt and token
+   *   { confirmed } — stage two passed, or no override was involved
+   *
+   * The admission result itself is never rewritten. `drain` stays `drain`; the
+   * override is an Owner decision recorded on top of a truthful policy result.
+   */
+  private async resolveBudgetOverride(
+    input: { actorId: string; workspaceId: string; title: string; contractDocumentRef?: string; unattended?: boolean; requestBudgetOverride?: boolean; overrideReason?: string; budgetConfirmation?: string },
+    preflight: ActionResult,
+  ): Promise<{ refusal: string; field?: string } | { receipt: Record<string, unknown> } | { confirmed: boolean }> {
+    if (!input.requestBudgetOverride && !input.budgetConfirmation) return { confirmed: false };
+    if (input.requestBudgetOverride && input.budgetConfirmation) return { refusal: 'request a budget override or confirm one, not both', field: 'budgetConfirmation' };
+    const admission = preflight.admission;
+    // Only a knowingly-spent budget can be overridden. A stale or unknown
+    // snapshot means capacity is not known, so there is no fresh capacity to
+    // spend and no honest risk receipt to sign.
+    if (!admission || !['drain', 'hard_drain'].includes(admission.action)) return { refusal: `budget override applies only to a drain or hard_drain admission; current admission is ${admission?.action ?? 'unavailable'}`, field: 'requestBudgetOverride' };
+    if (this.providerBudgetSnapshot?.source.trust !== 'authoritative') return { refusal: 'budget override requires an authoritative provider budget snapshot', field: 'requestBudgetOverride' };
+    // The same profile resolution preflight used, so the hash binds the profile
+    // that would actually launch rather than the one the request named.
+    const profile = this.requestedProfile(input as LaunchInput);
+    const intentHash = this.launchIntentHash(input, profile, Boolean(input.unattended));
+
+    if (input.requestBudgetOverride) {
+      const reason = input.overrideReason?.trim();
+      if (!reason) return { refusal: 'a budget override requires --reason explaining why this launch is worth the remaining capacity', field: 'overrideReason' };
+      const retry = `arcp start --workspace ${input.workspaceId} --title '${input.title}' --profile ${profile.id}`;
+      return { receipt: await this.budgetOverrideReceipt({ actorId: input.actorId, reason }, admission, intentHash, retry) };
+    }
+
+    const refusal = await this.validateBudgetOverride(input.budgetConfirmation!, { actorId: input.actorId, ...(input.overrideReason?.trim() ? { reason: input.overrideReason.trim() } : {}) }, admission, intentHash);
+    if (refusal) return { refusal, field: 'budgetConfirmation' };
+    return { confirmed: true };
+  }
+
+  /** Mint a one-time budget-override authorization. Creates the confirmation
+   * record and nothing else — no Goal, Task, Member, Runtime or provider call. */
+  private async budgetOverrideReceipt(input: { actorId: string; reason: string }, admission: AdmissionDecision, intentHash: string, retryCommand: string) {
+    const token = randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + Number(process.env.ARCP_CONFIRMATION_SECONDS ?? 300) * 1000).toISOString();
+    const record: Confirmation = {
+      tokenHash: createHash('sha256').update(token).digest('hex'), kind: 'budget_override', actorId: input.actorId,
+      reason: input.reason, intentHash, snapshotHash: this.budgetSnapshotHash(admission), admissionAction: admission.action, expiresAt,
+    };
+    await this.store.mutate((state) => {
+      state.confirmations = state.confirmations.filter((item) => Date.parse(item.expiresAt) > Date.now() && !(item.kind === 'budget_override' && item.actorId === input.actorId && item.intentHash === intentHash));
+      state.confirmations.push(record);
+    });
+    return { confirmation: token, expiresAt, risk: this.budgetRiskFacts(admission), reason: input.reason, recommendedCommands: [`${retryCommand} --confirm ${token}`] };
+  }
+
+  /**
+   * Consume a budget-override token, revalidating authority and facts. Returns
+   * the refusal reason rather than a boolean so the caller can fail closed with
+   * something the Owner can act on. The token is consumed on any outcome, so a
+   * replay of the same token cannot succeed.
+   */
+  private async validateBudgetOverride(token: string, input: { actorId: string; reason?: string }, admission: AdmissionDecision, intentHash: string): Promise<string | undefined> {
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const record = this.store.snapshot().confirmations.find((item) => item.tokenHash === tokenHash && item.kind === 'budget_override');
+    await this.store.mutate((state) => { state.confirmations = state.confirmations.filter((item) => item.tokenHash !== tokenHash && Date.parse(item.expiresAt) > Date.now()); });
+    if (!record) return 'budget override confirmation is unknown, already used, or of a different kind';
+    if (Date.parse(record.expiresAt) <= Date.now()) return 'budget override confirmation has expired';
+    if (record.actorId !== input.actorId) return 'budget override confirmation belongs to a different actor';
+    if (record.intentHash !== intentHash) return 'launch intent changed since the override was confirmed';
+    if (input.reason !== undefined && record.reason !== input.reason) return 'override reason changed since it was confirmed';
+    if (record.snapshotHash !== this.budgetSnapshotHash(admission)) return 'provider budget snapshot changed since the override was confirmed';
+    return undefined;
+  }
+
+  /**
+   * The exact launch an Owner is being asked to authorize. Any change to a
+   * field a launch would actually use produces a different hash, so a token
+   * minted for one intent can never authorize another.
+   */
+  private launchIntentHash(input: { actorId: string; workspaceId: string; title: string; contractDocumentRef?: string }, profile: Profile, unattended: boolean): string {
+    return createHash('sha256').update(JSON.stringify({
+      actorId: input.actorId, workspaceId: input.workspaceId, title: input.title.trim(),
+      profileId: profile.id, provider: profile.provider, model: profile.model,
+      mode: profile.mode ?? null, thinking: profile.thinking ?? null, unattended,
+      contractDocumentRef: input.contractDocumentRef ?? null,
+    })).digest('hex');
+  }
+
+  /**
+   * The exact capacity facts the Owner is signing off on: the admission-relevant
+   * windows, when they were observed, and how much concurrent work is already
+   * reserved. If any of it moves between request and retry the hash changes and
+   * the confirmation fails closed — the Owner confirmed specific numbers, not an
+   * override in general.
+   */
+  private budgetSnapshotHash(admission: AdmissionDecision): string {
+    const provider = this.providerBudgetSnapshot?.providers.find((item) => item.providerId === admission.providerId);
+    const windows = (provider?.windows ?? []).filter((item) => admission.relevantWindows.includes(item.id))
+      .map((item) => ({ id: item.id, remainingPct: item.remainingPct ?? null, resetsAt: item.resetsAt ?? null }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const reservations = this.store.snapshot().sessions.filter((item) => item.provider === admission.providerId && item.state !== 'terminal').length;
+    return createHash('sha256').update(JSON.stringify({
+      sourceId: this.providerBudgetSnapshot?.source.id ?? null,
+      observedAt: this.providerBudgetSnapshot?.source.observedAt ?? null,
+      action: admission.action, providerId: admission.providerId, model: admission.model,
+      windows, reservations,
+    })).digest('hex');
+  }
+
+  /** The bounded, Owner-readable view of what an override would spend. Carries
+   * no token hash, no credential and no provider identity payload. */
+  private budgetRiskFacts(admission: AdmissionDecision) {
+    const provider = this.providerBudgetSnapshot?.providers.find((item) => item.providerId === admission.providerId);
+    return {
+      admissionAction: admission.action,
+      admissionReasons: admission.reasons,
+      providerId: admission.providerId,
+      model: admission.model,
+      snapshotSourceId: this.providerBudgetSnapshot?.source.id ?? null,
+      snapshotObservedAt: this.providerBudgetSnapshot?.source.observedAt ?? null,
+      windows: (provider?.windows ?? []).filter((item) => admission.relevantWindows.includes(item.id))
+        .map((item) => ({ id: item.id, label: item.label, remainingPct: item.remainingPct ?? null, resetsAt: item.resetsAt ?? null })),
+      activeReservations: this.store.snapshot().sessions.filter((item) => item.provider === admission.providerId && item.state !== 'terminal').length,
+    };
+  }
+
   private async validateConfirmation(kind: Confirmation['kind'], token: string, session: RuntimeSession, input: { actorId: string; reason?: string }, facts: Awaited<ReturnType<ArcpService['facts']>>) {
     const tokenHash = createHash('sha256').update(token).digest('hex'); const record = this.store.snapshot().confirmations.find((item) => item.tokenHash === tokenHash && item.kind === kind);
     const valid = Boolean(record && Date.parse(record.expiresAt) > Date.now() && record.actorId === input.actorId && record.runtimeSessionId === session.id && record.generation === session.generation && record.reason === input.reason && record.activeTurn === facts.activeTurn && record.childSet === facts.childSet && record.activityAt === facts.cache.activityAt);

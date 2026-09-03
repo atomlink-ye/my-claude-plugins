@@ -51,7 +51,7 @@ export function publicPanorama(value: any, service: ArcpService) {
     blocked: value.blocked ?? [], temporal: value.temporal,
     events: value.events ?? [], providerBudget: value.providerBudget ?? { status: 'source_unavailable' }, latestKnowledgeRef: value.latestKnowledgeRef, latestResultRef: value.latestResultRef });
 }
-function publicStartInput(input: Record<string, unknown>) { const keys = ['workspaceId', 'title', 'contract', 'contractDocumentRef', 'role', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskScope', 'executionSurfaceId', 'primaryHandlerMemberId', 'ccMemberIds', 'escalationMemberIds']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
+function publicStartInput(input: Record<string, unknown>) { const keys = ['workspaceId', 'title', 'contract', 'contractDocumentRef', 'requestBudgetOverride', 'overrideReason', 'budgetConfirmation', 'role', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskScope', 'executionSurfaceId', 'primaryHandlerMemberId', 'ccMemberIds', 'escalationMemberIds']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
 function publicRuntimeLaunchInput(input: Record<string, unknown>) { const keys = ['goalId', 'workspaceId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'unattended', 'paseoProjectId', 'paseoWorkspaceId', 'workspace', 'taskId', 'executionSurfaceId']; return Object.fromEntries(keys.filter((key) => input[key] !== undefined).map((key) => [key, input[key]])); }
 /**
  * Actor-only launches are the root bootstrap: the very first runtime in a
