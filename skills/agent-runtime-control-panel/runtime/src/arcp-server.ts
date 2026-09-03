@@ -13,7 +13,16 @@ function redactProviderValue(value: any): any {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => providerHandle.test(key) ? [] : [[key, redactProviderValue(item)]]));
   return typeof value === 'string' && /\/(Users|home|private|tmp)\//.test(value) ? '<redacted>' : value;
 }
-export function publicSession(value: any) { const { workspace: _workspace, externalId: _externalId, parentAgentId: _parentAgentId, ...safe } = value; return redactProviderValue(safe); }
+export function publicSession(value: any) {
+  // Session transport/provider receipts are internal provenance. Project the
+  // public contract explicitly so newly added nested receipt fields are not
+  // exposed by default.
+  const keys = ['id', 'actorId', 'goalId', 'taskId', 'reportingRoute', 'executionSurfaceId', 'bindingId', 'generation', 'runtimeKind', 'adapterId', 'workspaceId', 'memberId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'selectionReceipt', 'state', 'lastObservedAt', 'lastDeliveryId', 'lastTurnState', 'blockedOnEventId', 'blockedSince', 'createdAt'];
+  const safe = Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
+  if (value.observed) safe.observed = Object.fromEntries(['provider', 'model', 'mode', 'thinking'].filter((key) => value.observed[key] !== undefined).map((key) => [key, value.observed[key]]));
+  if (value.placement) safe.placement = { requested: Object.fromEntries(['projectId', 'workspaceId'].filter((key) => value.placement.requested?.[key] !== undefined).map((key) => [key, value.placement.requested[key]])), ...(value.placement.status ? { status: value.placement.status } : {}) };
+  return redactProviderValue(safe);
+}
 function publicDelivery(value: any) { const { body: _body, ...safe } = value; return safe; }
 function publicActor(value: any) { const { credentialFingerprint: _credentialFingerprint, ...safe } = value; return safe; }
 function publicMember(value: any) { const { credentialHash: _credentialHash, ...safe } = value; return safe; }

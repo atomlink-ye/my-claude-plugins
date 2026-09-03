@@ -699,7 +699,7 @@ describe('ARCP HTTP surface', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-recursive-redaction-')); app = await createServer(root); await new Promise<void>((resolve) => app!.server.listen(0, '127.0.0.1', resolve)); const actor = await app.arcp.registerActor({ clientIdentity: 'redaction-owner' }); const workspace = await app.arcp.createWorkspace({ ownerActorId: actor.actor.id, purpose: 'redaction' });
     await app.arcp.store.mutate((state: any) => state.sessions.push({ ...session, actorId: actor.actor.id, goalId: 'goal-redaction', bindingId: actor.binding.id, generation: 1, runtimeKind: 'paseo', adapterId: 'paseo', workspaceId: workspace.workspace.id, memberId: workspace.member.id, profileId: 'codex-worker', provider: 'codex', model: 'gpt', state: 'idle', createdAt: new Date().toISOString() }));
     const address = app.server.address(); const base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`; const listed = await (await fetch(`${base}/v1/runtime-sessions`, { headers: { 'x-arcp-member-key': workspace.credential! } })).json();
-    for (const value of [direct, listed, panorama]) expect(walk(JSON.parse(JSON.stringify(value)))).not.toEqual(expect.arrayContaining([handle, pathLeak]));
+    for (const value of [direct, listed, panorama]) { const values = walk(JSON.parse(JSON.stringify(value))); expect(values).not.toContain(handle); expect(values).not.toContain(pathLeak); }
   });
   it('protects v1, keeps /health open, and serves nothing else outside /v1', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-http-')); process.env.ARCP_API_KEY = 'test-key';
