@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','participant','escalate','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
+const argv = process.argv.slice(2), area = argv[0], twoWord = ['actor','workspace','task','knowledge','result','member','goal','runtime','external','participant','channel','steward','supervision','db','provider-budget','surface'].includes(area), action = twoWord ? argv[1] : undefined, args = argv.slice(twoWord ? 2 : 1), base = process.env.ARCP_URL || `http://127.0.0.1:${process.env.PORT || 18787}`, admin = process.env.ARCP_API_KEY;
 const HELP = `ARCP ControlWorkspace commands:
   workspace create|join|list|context
   surface archive|restore WORKSPACE SURFACE_ID (Owner actor only; never automatic)

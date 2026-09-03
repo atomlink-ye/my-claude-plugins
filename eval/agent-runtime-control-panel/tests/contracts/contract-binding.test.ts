@@ -338,6 +338,9 @@ describe('ARCP launched-runtime authority', () => {
     const { service, actor, workspace } = await fixture();
     const deputy = await service.joinWorkspace({ workspaceId: workspace.id, label: 'deputy', role: 'owner' });
     const manager = await service.joinWorkspace({ workspaceId: workspace.id, label: 'manager', role: 'manager' });
+    // A launcher must have exactly one live provider identity to parent the
+    // child on; without it the launch now holds rather than silently rooting.
+    await service.attachParticipant({ workspaceId: workspace.id, memberId: deputy.member.id, adapterId: 'paseo', externalId: 'deputy-parent-agent' });
     const started: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'reviewed round', role: 'reviewer', profileId: 'codex-worker', workspace: '/tmp', launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id } as any);
     expect(started.session.reportingRoute).toMatchObject({ launchedByMemberId: deputy.member.id, primaryHandlerMemberId: manager.member.id, ccMemberIds: [deputy.member.id] });
     await service.claimTask(started.task.id, started.member.id, 0);

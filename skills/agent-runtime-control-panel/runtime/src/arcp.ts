@@ -72,7 +72,7 @@ export interface PaseoPlacement { requested: { projectId?: string; workspaceId?:
 /** A durable Paseo execution surface.  A ControlWorkspace may have one for
  * each checkout, while agents remain Tabs inside that surface. */
 export interface CanonicalPaseoPlacement { checkout: string; projectId: string; workspaceId: string; }
-export interface RuntimeLaunchContext { workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; }
+export interface RuntimeLaunchContext { parentAgentId?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; taskId?: string; memberId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean; }
 /** Who a launched runtime reports to, recorded at launch and independent of
  * transport delivery. The primary handler alone owns acknowledgement and
  * action; cc recipients observe and must never create a second obligation. */
@@ -404,7 +404,9 @@ export class PaseoAdapter implements RuntimeAdapter {
       ? `\n\nARCP ReportingRoute: report completion, blockers and your Result to primary handler ${context.reportingRoute.primaryHandlerMemberId}${context.reportingRoute.ccMemberIds.length ? ` (cc, observe-only: ${context.reportingRoute.ccMemberIds.join(', ')})` : ''}${context.reportingRoute.escalationMemberIds.length ? `; escalation chain ${context.reportingRoute.escalationMemberIds.join(' -> ')}` : ''}. The primary handler alone owns acknowledgement and the decision on your Result.`
       : '';
     const title = paseoTitle(profile.role, goalTitle);
-    return this.cli.run(['run', '-d', '--json', '--title', title, '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(context?.paseoWorkspaceId ? ['--workspace', context.paseoWorkspaceId] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.runtimeId ? ['--label', `arcp-runtime=${context.runtimeId}`, '--label', `arcp-role=${profile.role}`] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${contract}${route}${handoff}`], { timeoutMs: 30_000 });
+    // Lineage is a provider fact, not a label: the parent agent id is passed
+    // as the calling identity so `paseo inspect` reports a real ParentAgentId.
+    return this.cli.run(['run', '-d', '--json', '--title', title, '--provider', profile.provider, '--model', profile.model, ...(profile.mode ? ['--mode', profile.mode] : []), ...(profile.thinking ? ['--thinking', profile.thinking] : []), ...(context?.paseoWorkspaceId ? ['--workspace', context.paseoWorkspaceId] : []), ...(workspace ? ['--cwd', workspace] : []), ...(context?.runtimeId ? ['--label', `arcp-runtime=${context.runtimeId}`, '--label', `arcp-role=${profile.role}`] : []), ...(context?.clientStatePath ? ['--env', `ARCP_CLIENT_STATE=${context.clientStatePath}`] : []), `Work on ARCP Goal: ${goalTitle}${contract}${route}${handoff}`], { timeoutMs: 30_000, ...(context?.parentAgentId ? { agentId: context.parentAgentId } : {}) });
   }
   observe(externalId: string) { return this.cli.run(['inspect', externalId, '--json'], { timeoutMs: discoveryTimeoutMs() }); }
   registry() { return this.cli.run(['ls', '-g', '-a', '--json'], { timeoutMs: discoveryTimeoutMs() }); }
@@ -1092,9 +1094,19 @@ export class ArcpService implements ExecutionPlacementPort {
       const joined = await this.joinWorkspace({ workspaceId: input.workspaceId, label: `managed-${preflight.profileId}`, role, joinKind: 'managed', actorId: input.actorId, capabilities });
       joinedMemberId = joined.member.id;
       if (!joined.credential) throw new ArcpError('internal_error', 'managed member credential was not issued');
+      // Lineage is resolved here, from durable state, never from the request.
+      // A launcher we cannot place on exactly one live provider identity would
+      // otherwise be silently rooted, losing the parent link for good.
+      let parentAgentId: string | undefined;
+      if (input.launchedByMemberId) {
+        const live = this.store.snapshot().sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId));
+        const ids = [...new Set(live.map((item) => item.externalId!))];
+        if (ids.length !== 1) return { ...preflight, action: 'hold', launchable: false, why: ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch` };
+        parentAgentId = ids[0];
+      }
       const reportingRoute = this.resolveReportingRoute({ workspaceId: input.workspaceId, launchedByMemberId: input.launchedByMemberId, primaryHandlerMemberId: input.primaryHandlerMemberId, ccMemberIds: input.ccMemberIds, escalationMemberIds: input.escalationMemberIds, fallbackMemberId: joined.member.id });
       const clientStatePath = await this.prepareRuntimeClientState(runtimeId, input.workspaceId, joined.member.id, joined.credential);
-      const session = await this.launchOrRefuse({ ...input, actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(input.contract ? { contract: input.contract } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute });
+      const session = await this.launchOrRefuse({ ...input, ...(parentAgentId ? { parentAgentId } : {}), actorId: input.actorId, goalId: goal.id, workspaceId: input.workspaceId, memberId: joined.member.id, taskId: task.id, taskHandoff, runtimeId, memberCredential: joined.credential, clientStatePath, writer, admittedPreflight: preflight, reportingRoute, ...(input.contract ? { contract: input.contract } : {}) } as LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; paseoProjectId?: string; paseoWorkspaceId?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute });
       return { goal, task, member: joined.member, session, credential: joined.credential, routingGuidance: preflight.routingGuidance, selection: preflight.selection, selectionReceipt: preflight.selectionReceipt };
     } catch (error) { await this.abandonManagedLaunch({ memberId: joinedMemberId, runtimeId, goalId: goal.id, taskId: task.id }); throw error; }
   }
@@ -1332,7 +1344,7 @@ export class ArcpService implements ExecutionPlacementPort {
     if (!session.externalId) throw new ArcpError('launch_failed', `runtime launch returned no usable session (state ${session.state})`);
     return session;
   }
-  async launch(input: LaunchInput & { actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean }): Promise<RuntimeSession> {
+  async launch(input: LaunchInput & { parentAgentId?: string; actorId: string; goalId: string; workspace?: string; workspaceId?: string; paseoProjectId?: string; paseoWorkspaceId?: string; placementUnresolved?: string; executionSurfaceId?: string; writer?: boolean; memberId?: string; taskId?: string; runtimeId?: string; memberCredential?: string; clientStatePath?: string; admittedPreflight?: ActionResult; contract?: string; reportingRoute?: ReportingRoute; taskHandoff?: boolean }): Promise<RuntimeSession> {
     const preflight = input.admittedPreflight ?? await this.preflight(input); if (!preflight.launchable) throw new ArcpError(preflight.why.startsWith('requested provider') ? 'profile_unavailable' : 'launch_held', preflight.why);
     const profile = this.requestedProfile(input);
     const state = this.store.snapshot();
@@ -1349,7 +1361,7 @@ export class ArcpService implements ExecutionPlacementPort {
     await this.store.mutate((next) => { next.sessions.push(session); });
     if (input.executionSurfaceId) await this.launchRuntime({ executionSurfaceId: input.executionSurfaceId, runtimeSessionId: session.id, writer: input.writer });
     try {
-      const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace, { workspaceId: input.workspaceId, paseoProjectId: input.paseoProjectId, paseoWorkspaceId: input.paseoWorkspaceId, taskId: input.taskId, memberId: input.memberId, runtimeId: session.id, memberCredential: input.memberCredential, clientStatePath: input.clientStatePath, ...(input.taskHandoff === false ? { taskHandoff: false } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.contract ? { contract: input.contract } : {}) })).value);
+      const result = asRecord((await this.adapter.launch(profile, goal.title, input.workspace, { ...(input.parentAgentId ? { parentAgentId: input.parentAgentId } : {}), workspaceId: input.workspaceId, paseoProjectId: input.paseoProjectId, paseoWorkspaceId: input.paseoWorkspaceId, taskId: input.taskId, memberId: input.memberId, runtimeId: session.id, memberCredential: input.memberCredential, clientStatePath: input.clientStatePath, ...(input.taskHandoff === false ? { taskHandoff: false } : {}), ...(input.reportingRoute ? { reportingRoute: input.reportingRoute } : {}), ...(input.contract ? { contract: input.contract } : {}) })).value);
       const externalId = launchReceiptIdentity(result);
       if (!externalId) throw new Error('Paseo did not return a runtime identity');
       // Persist the opaque handle before postflight: reconcile must remain possible
@@ -2026,7 +2038,12 @@ export class ArcpService implements ExecutionPlacementPort {
       // would let a transient channel outage silence an obligation forever.
       // Unknown is not parity, so it is retried on the same durable row rather
       // than duplicated into a second one.
-      if (existing && !(existing.deliveryState === 'undeliverable' && existing.consumptionState === 'open')) return { event: existing, binding: undefined, alreadyEscalated: true };
+      // A transport whose outcome is unknown is not a delivered one. Treating
+      // an attempt interrupted by a crash as already-escalated would silence the
+      // obligation for good, so anything short of an observed delivery is
+      // retried on the same durable row.
+      const settled = existing ? ['delivered', 'processed', 'acknowledged', 'resolved', 'withdrawn'].includes(existing.deliveryState) : false;
+      if (existing && settled) return { event: existing, binding: undefined, alreadyEscalated: true };
       if (existing) { const retryBinding = this.currentOwnerBinding(state, workspace.ownerActorId); if (retryBinding) this.transitionEvent(existing, 'queued'); return { event: existing, binding: retryBinding, alreadyEscalated: false }; }
       const binding = this.currentOwnerBinding(state, workspace.ownerActorId);
       const event = this.appendChannelEvent(state, {

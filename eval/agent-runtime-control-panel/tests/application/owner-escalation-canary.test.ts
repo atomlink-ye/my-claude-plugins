@@ -347,4 +347,30 @@ describe('owner escalation canary', () => {
     expect(turns).toHaveLength(1);
     service.close();
   });
+
+  it('parents a launch on the launcher live provider identity and holds when it cannot', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-lineage-'));
+    const cli = new FakePaseoCli({ providers: ['codex'] });
+    const { service } = await createControl(root, { cli });
+    const owner = await service.registerActor({ clientIdentity: 'owner', label: 'Owner', channel: 'local' });
+    const ws = await service.createWorkspace({ purpose: 'lineage', ownerActorId: owner.actor.id });
+    const manager = await service.joinWorkspace({ workspaceId: ws.workspace.id, label: 'Manager', role: 'manager' });
+
+    // A launcher with no live provider identity must fail closed. Silently
+    // rooting the child would destroy the parent link with no way to recover it.
+    const held = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
+    expect(held).toMatchObject({ action: 'hold', launchable: false });
+    expect((held as any).why).toContain('LINEAGE_UNRESOLVED');
+
+    // With exactly one live identity the child is parented on it.
+    await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'parent-agent-1' });
+    const started = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
+    expect('session' in started).toBe(true);
+    // Lineage must reach the provider as the calling identity, not as a label.
+    expect(cli.lastEnv).toBeDefined();
+    const runCall = cli.calls.find((args) => args[0] === 'run');
+    expect(runCall).toBeDefined();
+    expect((started as any).session.reportingRoute.launchedByMemberId).toBe(manager.member.id);
+    service.close();
+  });
 });
