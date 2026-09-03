@@ -1988,7 +1988,11 @@ export class ArcpService implements ExecutionPlacementPort {
       if (event.consumptionState !== 'open') continue;
       // An escalation must never escalate itself into a loop.
       if (event.id.endsWith(':owner-escalation')) continue;
-      if (state.channelEvents.some((item) => item.id === `${event.id}:owner-escalation`)) continue;
+      const existingEscalation = state.channelEvents.find((item) => item.id === `${event.id}:owner-escalation`);
+      // A successful escalation is exactly-once, and an in-flight one must be
+      // reconciled manually. An undeliverable one is still owed, however: a
+      // later sweep must retry it when the Owner binding becomes reachable.
+      if (existingEscalation && ['delivered', 'processed', 'acknowledged', 'resolved', 'withdrawn', 'transport_indeterminate'].includes(existingEscalation.deliveryState)) continue;
       const handler = event.targetMemberId ? state.members.find((item) => item.id === event.targetMemberId) : undefined;
       const leaseLapsed = Boolean(handler?.leaseExpiresAt && Date.parse(handler.leaseExpiresAt) < now);
       const since = Date.parse(event.deliveredAt ?? event.createdAt);

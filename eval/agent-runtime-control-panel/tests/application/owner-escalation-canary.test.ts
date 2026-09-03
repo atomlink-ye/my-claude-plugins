@@ -171,6 +171,28 @@ describe('owner escalation canary', () => {
     service.close();
   });
 
+  it('retries an automatic escalation after its previously undeliverable Owner path recovers', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting a decision', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((event) => event.kind === 'decision_required' && event.resultId === result.id)!;
+    // Model an earlier escalation that could not reach its Owner. Its durable
+    // row remains causal history, but it must not permanently suppress SLA
+    // recovery once an Owner binding is reachable again.
+    await service.store.mutate((state: any) => {
+      const original = state.channelEvents.find((event: any) => event.id === decision.id);
+      state.channelEvents.push({ ...original, id: `${decision.id}:owner-escalation`, targetMemberId: undefined, targetActorId: workspace.ownerActorId, targetRole: undefined, kind: 'decision_required', deliveryState: 'undeliverable', consumptionState: 'open', transitions: [...original.transitions, { state: 'undeliverable', at: new Date().toISOString() }], dispositions: [], createdAt: new Date().toISOString() });
+      return undefined;
+    });
+    const fired = await service.escalateOverdueObligations({ nowMs: Date.parse(decision.createdAt) + 20 * 60_000 });
+    expect(fired).toEqual([{ eventId: decision.id, reason: 'ack_sla_expired' }]);
+    expect(channel.wakes).toHaveLength(1);
+    expect(service.state().channelEvents.find((event) => event.id === `${decision.id}:owner-escalation`)?.deliveryState).toBe('delivered');
+    service.close();
+  });
+
   it('treats a lapsed handler lease as immediate unreachability rather than waiting out the SLA', async () => {
     const { service, workspace, manager, worker, task } = await platformWorkspace();
     const channel = new RecordingChannelAdapter('recording');
@@ -319,6 +341,20 @@ describe('owner escalation canary', () => {
     expect(disposed.dispositions.at(-1)).toMatchObject({ actorMemberId: manager.id });
     expect(disposed.dispositions.at(-1)!.reason).toContain('undeliverable disposition');
     expect(disposed.deliveryState).toBe('undeliverable');
+    service.close();
+  });
+
+  it('keeps stale reconciliation proposals read-only until an accountable member records a disposition', async () => {
+    const { service, workspace, manager } = await platformWorkspace();
+    const stale = await service.publishChannelEvent({ workspaceId: workspace.id, targetMemberId: manager.id, kind: 'blocker', urgency: 'normal', consumptionPolicy: 'ack_required', decisionRequired: true, summary: 'historical blocker without a durable resolution', evidenceRefs: [], notify: false });
+    const before = service.state().channelEvents.find((event) => event.id === stale.id)!;
+    const proposal = service.temporalReconciliation(workspace.id).find((item) => item.eventId === stale.id)!;
+    expect(proposal).toMatchObject({ disposition: 'stale_requires_review', deterministic: false });
+    // Reconciliation computes an explanation; it never writes a disposition
+    // or treats an ambiguous historical obligation as green.
+    const after = service.state().channelEvents.find((event) => event.id === stale.id)!;
+    expect(after.consumptionState).toBe('open');
+    expect(after.dispositions).toEqual(before.dispositions);
     service.close();
   });
 
