@@ -36,6 +36,8 @@ export type { CheckoutRef, ExecutionPlacementPort, ExecutionSurface, ExecutionSu
 export type { StateStore } from './state-store.js';
 export type { ControlPanorama, ControlPanoramaFacts, ControlCampaignFacts, ControlRuntimeState, NextTriggerReason } from './control-panorama.js';
 export { projectControlPanorama, renderControlPanorama, UNKNOWN } from './control-panorama.js';
+export type { DeliveryLatency, DeliveryLatencyFacts, DeliveryLatencyHops, Duration } from './delivery-latency.js';
+export { projectDeliveryLatency, renderDeliveryLatency } from './delivery-latency.js';
 export type { DocumentArtifact, DocumentRevision, DocumentKind, ArtifactRefParts, ArtifactResolution } from './document.js';
 export { formatArtifactRef, parseArtifactRef, resolveArtifactRef, artifactRefFor, diffDocumentLines, DOCUMENT_KINDS, DOCUMENT_BODY_LIMIT, SUMMARY_LIMIT } from './document.js';
 export { DURABLE_PROGRESS_EVENT_KINDS, NON_PROGRESS_EVENT_KINDS, SUPERVISED_LIFECYCLES, evaluateSupervision, materialProgressAt } from './supervision.js';
@@ -3101,7 +3103,7 @@ export class ArcpService implements ExecutionPlacementPort {
       workspaceId,
       workspacePurpose: workspace.purpose,
       nowMs: options.nowMs ?? Date.now(),
-      sessions, members: state.members, goals: state.goals, tasks: state.tasks, results: state.results, events: state.channelEvents,
+      sessions, members: state.members, goals: state.goals, tasks: state.tasks, results: state.results, events: state.channelEvents, deliveries: state.deliveries,
       ...(admission ? { admission: { action: admission.action, providerId: admission.providerId, model: admission.model, reasons: admission.reasons } } : {}),
       ...(this.providerBudgetSnapshot ? { budgetSource: { id: this.providerBudgetSnapshot.source.id, observedAt: this.providerBudgetSnapshot.source.observedAt, trust: this.providerBudgetSnapshot.source.trust } } : {}),
       // Cache class lives on the async runtime observation, not on durable

@@ -7,7 +7,8 @@
  * is testable without freezing a global clock. The renderer consumes the same
  * projection the JSON does, so the two cannot drift.
  */
-import type { ChannelEvent, Goal, Member, Result, RuntimeSession, Task } from './arcp.js';
+import type { ChannelEvent, Delivery, Goal, Member, Result, RuntimeSession, Task } from './arcp.js';
+import { projectDeliveryLatency, renderDeliveryLatency, type DeliveryLatency } from './delivery-latency.js';
 
 /** A fact that could not be established. Never omitted, never guessed: a reader
  * must be able to tell "nothing pending" from "we could not see". */
@@ -41,6 +42,7 @@ export interface ControlPanoramaFacts {
   tasks: readonly Task[];
   results: readonly Result[];
   events: readonly ChannelEvent[];
+  deliveries?: readonly Delivery[];
   admission?: { action: string; providerId: string; model: string; reasons: readonly string[] };
   budgetSource?: { id: string; observedAt: string; trust: string };
   cacheClass?: string;
@@ -65,6 +67,7 @@ export interface ControlPanorama {
   campaign: { campaignState: string | Unknown; nextContractRef: string | Unknown; nextLaunchBy: string | Unknown; stopAuthority: string | Unknown; currentRound: string | Unknown; checkpointSha: string | Unknown } | Unknown;
   nextTrigger: string;
   nextTriggerReason: NextTriggerReason;
+  latency: DeliveryLatency;
 }
 
 const OPEN_POLICIES = ['ack_required', 'decision_required'];
@@ -159,6 +162,7 @@ export function projectControlPanorama(facts: ControlPanoramaFacts): ControlPano
     campaign,
     nextTrigger,
     nextTriggerReason,
+    latency: projectDeliveryLatency({ workspaceId: facts.workspaceId, nowMs: facts.nowMs, events, deliveries: facts.deliveries ?? [], results }),
   };
 }
 
@@ -225,6 +229,9 @@ export function renderControlPanorama(panorama: ControlPanorama): string {
     lines.push(`- Next launch by: ${panorama.campaign.nextLaunchBy}`);
     lines.push(`- Stop authority: ${panorama.campaign.stopAuthority}`);
   }
+  lines.push('');
+
+  lines.push(renderDeliveryLatency(panorama.latency));
   lines.push('');
 
   lines.push('## Next');
