@@ -57,6 +57,14 @@ describe('TemporalProjection', () => {
     expect(projection.cards.find((card) => card.id === 'waiting')?.problems).toEqual(expect.arrayContaining(['delivery_generation_mismatch', 'timestamp_nonmonotonic', 'safe_point_invalid']));
   });
 
+  it('reports generation_replaced for the actual same-session generation replacement path', () => {
+    const old = event('old-episode', 'transport_uncertainty');
+    const projection = projectTemporal(facts([old], { deliveries: [{ id: 'old-delivery', fromActorId: 'a', runtimeSessionId: 'runtime', generation: 1, body: '', command: 'normal', state: 'withdrawn', eventId: 'old-episode', createdAt: at }], sessions: [{ id: 'runtime', actorId: 'a', goalId: 'g', bindingId: 'b', generation: 2, runtimeKind: 'paseo', adapterId: 'paseo', profileId: 'p', provider: 'codex', model: 'm', state: 'running', createdAt: at }] }), 'problems');
+    const card = projection.cards.find((item) => item.id === 'old-episode')!;
+    expect(card).toMatchObject({ disposition: 'invalidated', causation: { replacement: 'runtime' } });
+    expect(card.problems).toContain('generation_replaced');
+  });
+
   it('detects duplicate completions, source identity retries, and stewardship recursion without creating a new semantic completion', () => {
     const first = event('completion-1', 'task_completed', 'task-done'); first.resultId = 'result-done';
     const second = event('completion-2', 'task_completed', 'task-done'); second.resultId = 'result-done'; second.createdAt = '2026-09-02T00:01:00.000Z';

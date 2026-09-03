@@ -85,7 +85,12 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     const resolutionEvent = facts.channelEvents.find((item) => item.kind === 'decision_resolved' && (item.relatedEventId === event.id || item.relatedEventId === linkedDecision?.id));
     const resolution = event.verdict ?? resolutionEvent?.verdict;
     const candidateResult = event.resultId ? facts.results.find((item) => item.id === event.resultId) : undefined;
-    const replacement = runtime && facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation);
+    // A replacement preserves the logical RuntimeSession id and advances its
+    // generation. Older implementations only looked for another session id,
+    // leaving the real replacement path unable to surface generation_replaced.
+    const replacement = runtime && (delivery && delivery.generation < runtime.generation
+      ? runtime
+      : facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation));
     let disposition: TemporalDisposition = 'active'; let dispositionReason = 'No machine-provable semantic replacement or resolution.'; const causation: TemporalCausation = event.relatedEventId ? { causedBy: event.relatedEventId } : {};
     if (candidateResult) { causation.resultId = candidateResult.id; causation.resultStatus = candidateResult.status; }
     if (event.consumptionState === 'consumed') { disposition = 'consumed'; dispositionReason = 'The informational or acknowledged obligation is durably consumed.'; }

@@ -59,7 +59,7 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     service.close();
   });
 
-  it('requires managed runtime provenance for Result submission, including after replacement', async () => {
+  it('accepts the terminal newest generation but directly refuses stale or mismatched managed provenance', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-runtime-result-provenance-'));
     const { service } = await createControl(root, { cli: new FakePaseoCli({ inspectValue: { id: 'runtime-provenance-1' } }) });
     const { actor } = await service.registerActor({ clientIdentity: 'result-provenance-owner' });
@@ -72,16 +72,13 @@ describe('ARCP RuntimeSession generation lifecycle', () => {
     expect(service.state().results).toHaveLength(0);
     expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
 
-    await service.replaceRuntime({ runtimeSessionId: started.session.id, profileId: 'codex-worker' });
-    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing after replacement', expectedFence: 1 })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
-    expect(service.state().results).toHaveLength(0);
-    expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
-
+    const replacement = await service.replaceRuntime({ runtimeSessionId: started.session.id, profileId: 'codex-worker' });
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'old generation', expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation })).rejects.toMatchObject({ code: 'stale_generation' });
+    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'wrong session', expectedFence: 1, runtimeSessionId: 'other-runtime-session', runtimeGeneration: replacement.generation })).rejects.toMatchObject({ code: 'stale_generation' });
     await service.stopRuntime(started.session.id);
     await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'missing after stop', expectedFence: 1 })).rejects.toMatchObject({ code: 'invalid_request', field: 'runtimeSessionId' });
-    await expect(service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'terminal provenance', expectedFence: 1, runtimeSessionId: started.session.id, runtimeGeneration: started.session.generation + 1 })).rejects.toMatchObject({ code: 'stale_generation' });
-    expect(service.state().results).toHaveLength(0);
-    expect(service.state().channelEvents.filter((event) => ['task_candidate', 'decision_required'].includes(event.kind))).toHaveLength(0);
+    const terminal = await service.submitResult({ workspaceId: workspace.workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'terminal provenance', expectedFence: 1, runtimeSessionId: replacement.id, runtimeGeneration: replacement.generation });
+    expect(terminal).toMatchObject({ runtimeSessionId: replacement.id, runtimeGeneration: replacement.generation, summary: 'terminal provenance' });
     service.close();
   });
 

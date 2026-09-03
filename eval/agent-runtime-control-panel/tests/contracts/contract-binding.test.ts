@@ -215,6 +215,23 @@ describe('ARCP runtime observation does not corrupt durable state', () => {
     expect(service.state().runtimeBindings[0].nativeId).toBe('worker-live');
     service.close();
   });
+
+  it('F2 fails closed on ambiguous binding fallback and labels an incomplete placement observation Unknown', async () => {
+    const { service } = await fixture();
+    await service.store.mutate((state: any) => {
+      delete state.sessions[0].externalId;
+      state.sessions[0].placement = { requested: { agentId: 'worker-live', workspaceId: 'workspace-required' } };
+      state.runtimeBindings.push({ id: 'binding-receipt', executionSurfaceId: 'surface-1', runtimeSessionId: 'worker-runtime', nativeId: 'worker-live', writer: true, state: 'idle', createdAt: new Date().toISOString() });
+      state.runtimeBindings.push({ id: 'binding-conflict', executionSurfaceId: 'surface-2', runtimeSessionId: 'worker-runtime', nativeId: 'other-runtime', writer: false, state: 'idle', createdAt: new Date().toISOString() });
+    });
+    expect(await (service as any).canonicalRuntimeIdentity(service.state().sessions[0])).toBeUndefined();
+    const status = await service.runtimeStatus('worker-runtime');
+    expect(status.observation).toMatchObject({ health: 'attention', mismatch: true, observed: {} });
+    await service.store.mutate((state: any) => state.runtimeBindings = state.runtimeBindings.filter((item: any) => item.id !== 'binding-conflict'));
+    await service.observe('worker-runtime');
+    expect(service.state().sessions[0].placement?.status).toBe('PLACEMENT_UNKNOWN');
+    service.close();
+  });
 });
 
 describe('ARCP managed launch credential lifecycle', () => {

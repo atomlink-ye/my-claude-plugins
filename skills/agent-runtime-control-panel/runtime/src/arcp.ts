@@ -65,7 +65,7 @@ export interface ChannelEventContent { summary: string; evidenceRefs: string[]; 
 export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string; }
 export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; reroutedToMemberId?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority: ChannelPriority; consumptionPolicy: ConsumptionPolicy; consumptionState: ConsumptionState; expectedAction: ExpectedAction; dispositions: RecipientDispositionReceipt[]; nextVisibleAt?: string; dependencyEventId?: string; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; consumedAt?: string; resolvedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; }
 type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority?: ChannelPriority; consumptionPolicy: ConsumptionPolicy; expectedAction?: ExpectedAction; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; notify?: boolean };
-export interface PaseoPlacement { requested: { projectId?: string; workspaceId?: string; agentId?: string }; observed?: { projectId?: string; workspaceId?: string; agentId?: string; lifecycle?: string }; status?: 'PLACEMENT_MATCH' | 'PLACEMENT_MISMATCH'; unresolved?: string; }
+export interface PaseoPlacement { requested: { projectId?: string; workspaceId?: string; agentId?: string }; observed?: { projectId?: string; workspaceId?: string; agentId?: string; lifecycle?: string }; status?: 'PLACEMENT_MATCH' | 'PLACEMENT_MISMATCH' | 'PLACEMENT_UNKNOWN'; unresolved?: string; }
 /** A durable Paseo execution surface.  A ControlWorkspace may have one for
  * each checkout, while agents remain Tabs inside that surface. */
 export interface CanonicalPaseoPlacement { checkout: string; projectId: string; workspaceId: string; }
@@ -285,9 +285,11 @@ function paseoPlacement(record: Record<string, any>): PaseoPlacement['observed']
   const lifecycle = setting(record.lifecycle ?? record.status);
   return { ...(projectId ? { projectId } : {}), ...(workspaceId ? { workspaceId } : {}), ...(agentId ? { agentId } : {}), ...(lifecycle ? { lifecycle } : {}) };
 }
-function placementMatches(placement: PaseoPlacement): boolean {
-  const observed = placement.observed;
-  return !observed || (['projectId', 'workspaceId', 'agentId'] as const).every((key) => !placement.requested[key] || !observed[key] || placement.requested[key] === observed[key]);
+function placementStatus(placement: PaseoPlacement): NonNullable<PaseoPlacement['status']> {
+  const keys = ['projectId', 'workspaceId', 'agentId'] as const;
+  const requested = keys.filter((key) => Boolean(placement.requested[key]));
+  if (!requested.length || !placement.observed || requested.some((key) => !placement.observed![key])) return 'PLACEMENT_UNKNOWN';
+  return requested.every((key) => placement.requested[key] === placement.observed![key]) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH';
 }
 function normalizedTurnState(value: unknown): 'running' | 'requires_action' | 'idle' {
   const state = normalized(value);
@@ -623,7 +625,11 @@ export class ArcpService implements ExecutionPlacementPort {
   private async canonicalRuntimeIdentity(session: RuntimeSession): Promise<string | undefined> {
     const state = this.store.snapshot();
     const current = state.sessions.find((item) => item.id === session.id) ?? session;
-    const identity = setting(current.externalId) ?? setting(state.runtimeBindings.find((item) => item.runtimeSessionId === current.id && item.nativeId)?.nativeId);
+    const bindingIdentities = [...new Set(state.runtimeBindings.filter((item) => item.runtimeSessionId === current.id).map((item) => setting(item.nativeId)).filter((item): item is string => Boolean(item)))];
+    // The launch receipt wins. Legacy sessions may fall back to a binding only
+    // when it yields one unambiguous opaque identity; choosing the first of
+    // conflicting bindings would make a read path manufacture provenance.
+    const identity = setting(current.externalId) ?? (bindingIdentities.length === 1 ? bindingIdentities[0] : undefined);
     if (!identity) return undefined;
     // A read path must not pay a durable store write. Repair runs only when a
     // record genuinely disagrees with the launch receipt identity.
@@ -1296,7 +1302,7 @@ export class ArcpService implements ExecutionPlacementPort {
       const observed = [inspected.provider ?? inspected.Provider, inspected.model ?? inspected.Model, inspected.currentModeId ?? inspected.mode ?? inspected.Mode, inspected.effectiveThinkingOptionId ?? inspected.thinkingOptionId ?? inspected.thinking ?? inspected.Thinking];
       const expected = [profile.provider, profile.model, profile.mode, profile.thinking];
       const matchesPlan = expected.every((expectedValue, index) => !expectedValue || sameSetting(expectedValue, observed[index]));
-      const updated = await this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; if (stored.generation !== session.generation) throw new ArcpError('stale_generation', 'runtime launch completed after a newer generation replaced it'); if (stored.state !== 'launching') return stored; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementMatches(stored.placement!) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
+      const updated = await this.store.mutate((next) => { const stored = next.sessions.find((item) => item.id === session.id)!; if (stored.generation !== session.generation) throw new ArcpError('stale_generation', 'runtime launch completed after a newer generation replaced it'); if (stored.state !== 'launching') return stored; stored.observed = { ...(setting(observed[0]) ? { provider: String(observed[0]) } : {}), ...(setting(observed[1]) ? { model: String(observed[1]) } : {}), ...(setting(observed[2]) ? { mode: String(observed[2]) } : {}), ...(setting(observed[3]) ? { thinking: String(observed[3]) } : {}) }; stored.placement!.observed = { ...workspacePlacement, ...paseoPlacement(inspected) }; stored.placement!.status = placementStatus(stored.placement!); stored.state = stored.placement!.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : matchesPlan ? sessionState(inspected.status ?? inspected.Status) : 'attention'; stored.lastObservedAt = now(); for (const runtimeBinding of next.runtimeBindings.filter((value) => value.runtimeSessionId === session.id)) runtimeBinding.state = stored.state; return stored; });
       await this.updateRuntimeClientStateGeneration(input.clientStatePath, session.id, session.generation);
       return updated;
     } catch (error) {
@@ -1324,7 +1330,7 @@ export class ArcpService implements ExecutionPlacementPort {
         const item = state.sessions.find((value) => value.id === id)!;
         if (item.generation !== prior.generation) return item;
         item.observed = { ...(setting(observed.provider ?? observed.Provider) ? { provider: String(observed.provider ?? observed.Provider) } : {}), ...(setting(observed.model ?? observed.Model) ? { model: String(observed.model ?? observed.Model) } : {}), ...(setting(observed.currentModeId ?? observed.mode ?? observed.Mode) ? { mode: String(observed.currentModeId ?? observed.mode ?? observed.Mode) } : {}), ...(setting(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) ? { thinking: String(observed.effectiveThinkingOptionId ?? observed.thinkingOptionId ?? observed.thinking ?? observed.Thinking) } : {}) };
-        if (item.placement) { item.placement.observed = paseoPlacement(observed); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; }
+        if (item.placement) { item.placement.observed = paseoPlacement(observed); item.placement.status = placementStatus(item.placement); }
         if (setting(observed.lastDeliveryId)) item.lastDeliveryId = String(observed.lastDeliveryId);
         if (setting(observed.lastTurnState)) item.lastTurnState = normalizedTurnState(observed.lastTurnState);
         const requested = [item.provider, item.model, item.mode, item.thinking]; const actual = [item.observed.provider, item.observed.model, item.observed.mode, item.observed.thinking];
@@ -1359,7 +1365,7 @@ export class ArcpService implements ExecutionPlacementPort {
         if (externalId) return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); return item; });
         const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; return item; }); if (uncertain.generation === prior.generation) await this.emitTransportUncertainty(uncertain); return uncertain;
       }
-      return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; if (item.placement) { item.placement.observed = paseoPlacement(match); item.placement.status = placementMatches(item.placement) ? 'PLACEMENT_MATCH' : 'PLACEMENT_MISMATCH'; } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(match.status ?? match.Status ?? match.lifecycle); item.lastObservedAt = now(); return item; });
+      return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; if (item.placement) { item.placement.observed = paseoPlacement(match); item.placement.status = placementStatus(item.placement); } item.state = item.placement?.status === 'PLACEMENT_MISMATCH' ? 'placement_mismatch' : sessionState(match.status ?? match.Status ?? match.lifecycle); item.lastObservedAt = now(); return item; });
     } catch { const uncertain = await this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; if (item.generation !== prior.generation) return item; item.state = 'transport_indeterminate'; return item; }); if (uncertain.generation === prior.generation) await this.emitTransportUncertainty(uncertain); return uncertain; }
   }
   private cacheThresholds() { return { expiringMinutes: Number(process.env.ARCP_CACHE_EXPIRING_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiringMinutes), expiredMinutes: Number(process.env.ARCP_CACHE_EXPIRED_MINUTES ?? CLAUDE_CACHE_DEFAULTS.expiredMinutes) }; }
@@ -2012,7 +2018,11 @@ export class ArcpService implements ExecutionPlacementPort {
     if (managedBound.length && runtimeSessionId === undefined) throw new ArcpError('invalid_request', 'runtime session id is required when submitting from a managed runtime session', 'runtimeSessionId');
     if (managedBound.length && runtimeGeneration === undefined) throw new ArcpError('invalid_request', 'runtime generation is required when submitting from a managed runtime session', 'runtimeGeneration');
     if (runtimeSessionId === undefined && runtimeGeneration === undefined) return;
-    const current = state.sessions.filter((item) => item.taskId === taskId && item.memberId === member.id && item.state !== 'terminal').sort((a, b) => b.generation - a.generation)[0];
+    // The newest bound generation remains the provenance authority even after
+    // its runtime stops: it may still need to durably record work completed
+    // before termination. Replacement, rather than liveness alone, makes a
+    // generation stale.
+    const current = managedBound[0] ?? state.sessions.filter((item) => item.taskId === taskId && item.memberId === member.id).sort((a, b) => b.generation - a.generation)[0];
     const supplied = runtimeSessionId === undefined ? undefined : state.sessions.find((item) => item.id === runtimeSessionId);
     if (!current || (runtimeSessionId !== undefined && (!supplied || supplied.id !== current.id)) || (runtimeGeneration !== undefined && current.generation !== runtimeGeneration)) throw new ArcpError('stale_generation', 'runtime session generation changed before Result commit');
   }
