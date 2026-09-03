@@ -13,6 +13,7 @@ result submit|list WORKSPACE [--expected-fence N] [--source-id ID] [--evidence R
 channel list WORKSPACE [--kind K] [--state S] [--consumption open|deferred|consumed|resolved] [--ack-required] [--decision-required]
 channel reconcile WORKSPACE --dry-run
 channel ack EVENT --reason 'what you did' [--disposition-id ID]
+channel dispose EVENT --reason 'why this undeliverable obligation is retired'
 channel resolve EVENT --summary '...' --verdict accept|refuse [--disposition-id ID]
 channel defer EVENT --for 30m|--until ISO|--after-event EVENT|--manual --reason 'why' [--disposition-id ID]
 channel resume EVENT [--disposition-id ID]

@@ -325,6 +325,8 @@ describe('owner escalation canary', () => {
     const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
     const candidate = service.state().channelEvents.find((e) => e.kind === 'task_candidate' && e.resultId === result.id)!;
     const decision = service.state().channelEvents.find((e) => e.kind === 'decision_required' && e.resultId === result.id)!;
+    expect(candidate.consumptionPolicy).toBe('consume_on_delivery');
+    expect(decision.consumptionPolicy).toBe('decision_required');
 
     // A live obligation must keep its normal path: this disposition is only for
     // history that can never reach anyone.
