@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { ArcpService } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp.js';
 import { artifactRefFor, diffDocumentLines, formatArtifactRef, parseArtifactRef, resolveArtifactRef, DOCUMENT_BODY_LIMIT } from '../../../../skills/agent-runtime-control-panel/runtime/src/document.js';
 import { documentAddress } from '../../../../skills/agent-runtime-control-panel/runtime/src/content.js';
+import { publicSession } from '../../../../skills/agent-runtime-control-panel/runtime/src/arcp-server.js';
 
 class FakeCli {
   async run(args: string[]) {
@@ -142,6 +143,17 @@ describe('DocumentArtifact — identity, append-only revisions, and exact refs',
 });
 
 describe('Launch binding to an exact contract revision', () => {
+  it('projects the contract binding evidence over HTTP, since a ref a reader cannot see proves nothing', async () => {
+    const { service, actor, workspace, member } = await fixture();
+    const contract = await service.createDocument({ workspaceId: workspace.id, memberId: member.id, kind: 'contract', title: 'c', body: 'authority\n' });
+    const started: any = await service.startManaged({ actorId: actor.id, workspaceId: workspace.id, title: 'g', contractDocumentRef: contract.ref, profileId: 'codex-worker', workspace: '/tmp' } as any);
+
+    const projected: any = publicSession(started.session);
+    expect(projected.contractRef).toBe(contract.ref);
+    expect(projected.contractBoundAtLaunch).toBe(true);
+    service.close();
+  });
+
   it('binds a launch to a verified revision, records the ref durably, and hands the runtime the exact bytes', async () => {
     const { service, actor, workspace, member } = await fixture();
     const body = '# Goal Contract\n\nOwn exactly `src/x.ts`.\n';

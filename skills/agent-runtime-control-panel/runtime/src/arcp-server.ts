@@ -17,7 +17,7 @@ export function publicSession(value: any) {
   // Session transport/provider receipts are internal provenance. Project the
   // public contract explicitly so newly added nested receipt fields are not
   // exposed by default.
-  const keys = ['id', 'actorId', 'goalId', 'taskId', 'reportingRoute', 'executionSurfaceId', 'bindingId', 'generation', 'runtimeKind', 'adapterId', 'workspaceId', 'memberId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'selectionReceipt', 'state', 'lastObservedAt', 'lastDeliveryId', 'lastTurnState', 'blockedOnEventId', 'blockedSince', 'createdAt'];
+  const keys = ['id', 'actorId', 'goalId', 'taskId', 'reportingRoute', 'executionSurfaceId', 'bindingId', 'generation', 'runtimeKind', 'adapterId', 'workspaceId', 'memberId', 'profileId', 'provider', 'model', 'mode', 'thinking', 'selectionReceipt', 'contractBoundAtLaunch', 'contractRef', 'state', 'lastObservedAt', 'lastDeliveryId', 'lastTurnState', 'blockedOnEventId', 'blockedSince', 'createdAt'];
   const safe = Object.fromEntries(keys.filter((key) => value[key] !== undefined).map((key) => [key, value[key]]));
   if (value.observed) safe.observed = Object.fromEntries(['provider', 'model', 'mode', 'thinking'].filter((key) => value.observed[key] !== undefined).map((key) => [key, value.observed[key]]));
   if (value.placement) safe.placement = { requested: Object.fromEntries(['projectId', 'workspaceId'].filter((key) => value.placement.requested?.[key] !== undefined).map((key) => [key, value.placement.requested[key]])), ...(value.placement.status ? { status: value.placement.status } : {}) };
