@@ -57,7 +57,10 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       const { projection, anomalies } = anomalyKinds(service, workspace.id);
       expect(started.session.contractBoundAtLaunch).toBe(true);
       expect(projection.entries.find((entry) => entry.kind === 'runtime_launched')?.facts).toMatchObject({ runtimeId: started.session.id, generation: 1, hasContract: true });
-      expect(projection.entries.find((entry) => entry.kind === 'goal_contract_bound')?.facts).toEqual({ goalId: started.goal.id, boundAtLaunch: true });
+      // A raw --contract launch names no revision, so the strongest claim available
+      // is the launcher's own assertion. Exact equality is kept deliberately: this
+      // pin exists to catch an unexpected fact appearing here.
+      expect(projection.entries.find((entry) => entry.kind === 'goal_contract_bound')?.facts).toEqual({ goalId: started.goal.id, boundAtLaunch: true, contractEvidence: 'asserted' });
       expect(anomalies.anomalies).toEqual([]);
     } finally {
       service.close();

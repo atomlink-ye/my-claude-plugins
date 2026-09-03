@@ -1,8 +1,11 @@
 import type { ChannelEvent, Delivery, Goal, KnowledgeEntry, Member, Result, RuntimeSession, Task } from './arcp.js';
+import { resolveArtifactRef, type DocumentRevision } from './document.js';
 import type { ExecutionSurface, SurfaceClaim } from './execution-placement.js';
 import { compareSequenceEntries, missingSequenceFacts, sequenceRankOf, type ReportingRoute, type SequenceEntry, type SequenceEntryKind, type SequenceFacts, type SequenceProjection, type SequenceRef } from './sequence-model.js';
 
 type Fact = string | number | boolean;
+/** Documents are optional so legacy callers retain their asserted-only fold. */
+type SequenceFactsWithDocuments = SequenceFacts & { documentRevisions?: readonly DocumentRevision[] };
 const validAt = (value: string | undefined) => value && Number.isFinite(Date.parse(value)) ? value : undefined;
 const ref = (kind: SequenceRef['kind'], id: string, label?: string): SequenceRef => ({ kind, id, ...(label ? { label } : {}) });
 const actor = (memberId: string | undefined, members: ReadonlyMap<string, Member>) => {
@@ -18,7 +21,7 @@ const subjectFor = (taskId: string | undefined, runtimeId: string | undefined, w
 };
 
 /** Pure fold of durable ARCP facts.  This module never reads the clock or writes state. */
-export function projectSequence(facts: SequenceFacts): SequenceProjection {
+export function projectSequence(facts: SequenceFactsWithDocuments): SequenceProjection {
   const scoped = <T extends { workspaceId?: string }>(items: readonly T[]) => facts.workspaceId ? items.filter((item) => item.workspaceId === facts.workspaceId) : items;
   const members = new Map(scoped(facts.members).map((item) => [item.id, item]));
   const tasks = new Map(scoped(facts.tasks).map((item) => [item.id, item]));
@@ -49,7 +52,18 @@ export function projectSequence(facts: SequenceFacts): SequenceProjection {
   for (const session of facts.sessions.filter((item) => include(item.workspaceId))) {
     const subject = ref('runtime', session.id, `${session.provider} generation ${session.generation}`);
     add(`runtime:${session.id}:launched`, session.createdAt, 'runtime_launched', subject, `Runtime launched: ${session.provider}`, { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation, provider: session.provider, hasContract: Boolean(session.contractBoundAtLaunch) }, { actor: actor(session.memberId, members), refs: [ref('goal', session.goalId), ...(session.taskId ? [ref('task', session.taskId)] : [])] });
-    if (session.contractBoundAtLaunch) add(`runtime:${session.id}:contract-bound`, session.createdAt, 'goal_contract_bound', ref('goal', session.goalId), 'Goal Contract bound at launch', { goalId: session.goalId, boundAtLaunch: true }, { refs: [ref('runtime', session.id), ...(session.taskId ? [ref('task', session.taskId)] : [])], causal: [{ kind: 'caused_by', entryId: `runtime:${session.id}:launched` }] });
+    // A named revision is stronger than the launcher's boolean assertion.  It
+    // must resolve against the supplied durable revisions, or fail closed.
+    const contractResolution = session.contractRef ? resolveArtifactRef(session.contractRef, facts.documentRevisions ?? []) : undefined;
+    const contractEvidence = contractResolution
+      ? contractResolution.status === 'verified' ? 'verified' : 'refuted'
+      : session.contractBoundAtLaunch ? 'asserted' : undefined;
+    if (contractEvidence) add(`runtime:${session.id}:contract-bound`, session.createdAt, 'goal_contract_bound', ref('goal', session.goalId), 'Goal Contract bound at launch', {
+      goalId: session.goalId,
+      boundAtLaunch: contractEvidence !== 'refuted',
+      contractEvidence,
+      ...(session.contractRef ? { contractRef: session.contractRef } : {}),
+    }, { refs: [ref('runtime', session.id), ...(session.taskId ? [ref('task', session.taskId)] : [])], causal: [{ kind: 'caused_by', entryId: `runtime:${session.id}:launched` }] });
     if (session.lastObservedAt) add(`runtime:${session.id}:observed`, session.lastObservedAt, session.state === 'terminal' ? 'runtime_terminal' : 'runtime_observed', subject, `Runtime ${session.state}`, session.state === 'terminal' ? { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation } : { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation, state: session.state }, { causal: [{ kind: 'caused_by', entryId: `runtime:${session.id}:launched` }] });
     const previousGeneration = [...sessions.values()].filter((other) => other.id !== session.id && other.goalId === session.goalId && other.bindingId === session.bindingId && other.generation < session.generation).sort((a, b) => b.generation - a.generation)[0];
     if (previousGeneration) add(`runtime:${session.id}:generation`, session.createdAt, 'runtime_generation_changed', subject, `Runtime generation ${session.generation}`, { runtimeId: session.id, lineageId: session.bindingId, generation: session.generation }, { causal: [{ kind: 'replaces', entryId: `runtime:${previousGeneration.id}:launched` }] });
