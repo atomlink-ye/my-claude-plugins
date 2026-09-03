@@ -55,10 +55,9 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
     try {
       const started: any = await managed(service, actor.id, workspace.id, 'atomic contract', { contract: 'Own the assigned checkout and report a candidate.' });
       const { projection, anomalies } = anomalyKinds(service, workspace.id);
-      expect(started.session.taskId).toBe(started.task.id);
-      expect((service as any).adapter.cli.lastLaunchArgs.at(-1)).toContain('ARCP Goal Contract');
-      expect(projection.entries.find((entry) => entry.kind === 'runtime_launched')?.facts).toMatchObject({ runtimeId: started.session.id, generation: 1 });
-      expect(projection.entries.some((entry) => entry.kind === 'goal_contract_bound')).toBe(false);
+      expect(started.session.contractBoundAtLaunch).toBe(true);
+      expect(projection.entries.find((entry) => entry.kind === 'runtime_launched')?.facts).toMatchObject({ runtimeId: started.session.id, generation: 1, hasContract: true });
+      expect(projection.entries.find((entry) => entry.kind === 'goal_contract_bound')?.facts).toEqual({ goalId: started.goal.id, boundAtLaunch: true });
       expect(anomalies.anomalies).toEqual([]);
     } finally {
       service.close();
@@ -87,12 +86,14 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       await service.stopRuntime(first.session.id);
       const second: any = await service.launch({ actorId: actor.id, goalId: first.goal.id, workspaceId: workspace.id, profileId: 'codex-worker', workspace: '/tmp' });
       expect(second.generation).toBe(2);
+      const current = await service.deliver({ fromActorId: actor.id, runtimeSessionId: second.id, body: 'current delivery' });
+      expect(current.safePointObservedAt).toBeDefined();
       await service.store.mutate((state: any) => {
-        const old = state.sessions.find((item: any) => item.id === first.session.id);
-        old.lastObservedAt = new Date(Date.now() - 2_000).toISOString();
+        // The public delivery API will not manufacture a safe point for an
+        // already-stopped runtime. Persist this impossible stale receipt to
+        // exercise the detector against the durable state an operator may find.
         const at = new Date().toISOString();
         state.deliveries.push({ id: 'stale-safe-point', fromActorId: actor.id, runtimeSessionId: first.session.id, generation: 1, body: 'old delivery', command: 'normal', state: 'waiting_safe_point', createdAt: at, safePointObservedAt: at });
-        state.deliveries.push({ id: 'valid-current-safe-point', fromActorId: actor.id, runtimeSessionId: second.id, generation: 2, body: 'current delivery', command: 'normal', state: 'waiting_safe_point', createdAt: at, safePointObservedAt: at });
       });
       expectExactKinds(service, workspace.id, ['stale_safe_point']);
     } finally {
@@ -107,6 +108,9 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       await service.stopRuntime(first.session.id);
       const second: any = await service.launch({ actorId: actor.id, goalId: first.goal.id, workspaceId: workspace.id, profileId: 'codex-worker', workspace: '/tmp' });
       expect(second.generation).toBe(2);
+      // The public delivery path refuses obsolete generations. Persist the
+      // impossible delivered receipt to prove detection of corrupted durable
+      // history rather than inventing a liveness signal.
       await service.store.mutate((state: any) => state.deliveries.push({ id: 'late-wake', fromActorId: actor.id, runtimeSessionId: first.session.id, generation: 1, body: 'old delivery', command: 'normal', state: 'delivered', createdAt: new Date().toISOString(), deliveredAt: new Date().toISOString() }));
       expectExactKinds(service, workspace.id, ['late_self_wake']);
     } finally {
@@ -125,17 +129,19 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
     }
   });
 
-  it('detects duplicate_worker only when overlap begins after the prior generation is still active', async () => {
+  it('does not flag a legitimate same-member replacement after real stopRuntime, but detects an impossible durable overlap', async () => {
     const { service, actor, workspace } = await fixture();
     try {
       const first: any = await managed(service, actor.id, workspace.id, 'duplicate worker');
+      await service.stopRuntime(first.session.id);
+      const replacement: any = await service.launch({ actorId: actor.id, goalId: first.goal.id, workspaceId: workspace.id, profileId: 'codex-worker', workspace: '/tmp', memberId: first.member.id, taskId: first.task.id } as any);
+      expect(replacement.generation).toBe(2);
+      expectExactKinds(service, workspace.id, []);
       await service.store.mutate((state: any) => {
-        const source = state.sessions.find((item: any) => item.id === first.session.id);
-        const terminalAt = new Date(Date.now() - 2_000).toISOString();
-        source.state = 'terminal';
-        source.lastObservedAt = terminalAt;
-        const secondAt = new Date(Date.now() - 1_000).toISOString();
-        state.sessions.push({ ...structuredClone(source), id: 'prior-terminal-worker', generation: 2, externalId: 'paseo-session-prior-terminal', createdAt: secondAt, state: 'idle', lastObservedAt: undefined });
+        // launch() rejects a second live session for this Goal. Persist the
+        // impossible overlap so the detector remains able to report corrupted
+        // durable state, after proving the normal replacement path above.
+        const source = state.sessions.find((item: any) => item.id === replacement.id);
         state.sessions.push({ ...structuredClone(source), id: 'overlapping-worker', generation: 3, externalId: 'paseo-session-overlap', createdAt: new Date().toISOString(), state: 'idle', lastObservedAt: undefined });
       });
       expectExactKinds(service, workspace.id, ['duplicate_worker']);
@@ -174,6 +180,8 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       const started: any = await managed(service, actor.id, workspace.id, 'wrong attribution');
       await service.claimTask(started.task.id, started.member.id, 0);
       const other = await service.joinWorkspace({ workspaceId: workspace.id, label: 'other member', role: 'owner' });
+      // submitResult enforces claimant identity; persist a contradictory
+      // Result only to prove the detector can expose a corrupted durable log.
       await service.store.mutate((state: any) => {
         state.results.push({ id: 'wrong-member-result', workspaceId: workspace.id, taskId: started.task.id, memberId: other.member.id, fence: 1, status: 'candidate', summary: 'mismatched durable submitter', evidenceRefs: ['commit:mismatch'], createdAt: new Date().toISOString() });
       });
