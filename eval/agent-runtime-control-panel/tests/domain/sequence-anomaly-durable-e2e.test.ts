@@ -38,6 +38,11 @@ function anomalyKinds(service: ArcpService, workspaceId: string) {
   return { projection, anomalies: projectSequenceAnomalies(projection) };
 }
 
+function expectExactKinds(service: ArcpService, workspaceId: string, expected: string[]) {
+  const actual = anomalyKinds(service, workspaceId).anomalies.anomalies.map((item) => item.kind).sort();
+  expect(actual).toEqual([...expected].sort());
+}
+
 async function managed(service: ArcpService, actorId: string, workspaceId: string, title: string, extra: Record<string, unknown> = {}) {
   const started = await service.startManaged({ actorId, workspaceId, title, profileId: 'codex-worker', workspace: '/tmp', ...extra } as any);
   if (!('session' in started)) throw new Error(`managed launch did not start: ${JSON.stringify(started)}`);
@@ -52,7 +57,8 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       const { projection, anomalies } = anomalyKinds(service, workspace.id);
       expect(started.session.taskId).toBe(started.task.id);
       expect((service as any).adapter.cli.lastLaunchArgs.at(-1)).toContain('ARCP Goal Contract');
-      expect(projection.entries.find((entry) => entry.kind === 'runtime_launched')?.facts).toMatchObject({ hasContract: true });
+      expect(projection.entries.find((entry) => entry.kind === 'runtime_launched')?.facts).toMatchObject({ runtimeId: started.session.id, generation: 1 });
+      expect(projection.entries.some((entry) => entry.kind === 'goal_contract_bound')).toBe(false);
       expect(anomalies.anomalies).toEqual([]);
     } finally {
       service.close();
@@ -68,7 +74,7 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       await service.claimTask(started.task.id, started.member.id, 0);
       await service.submitResult({ workspaceId: workspace.id, taskId: started.task.id, memberId: started.member.id, status: 'candidate', summary: 'candidate after late contract', evidenceRefs: ['commit:durable'], expectedFence: 1 });
       const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toEqual(expect.arrayContaining(['contract_after_start', 'candidate_before_contract']));
+      expect(anomalies.anomalies.map((item) => item.kind).sort()).toEqual(['candidate_before_contract', 'contract_after_start']);
     } finally {
       service.close();
     }
@@ -84,10 +90,11 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       await service.store.mutate((state: any) => {
         const old = state.sessions.find((item: any) => item.id === first.session.id);
         old.lastObservedAt = new Date(Date.now() - 2_000).toISOString();
-        state.deliveries.push({ id: 'stale-safe-point', fromActorId: actor.id, runtimeSessionId: first.session.id, generation: 1, body: 'old delivery', command: 'normal', state: 'waiting_safe_point', createdAt: new Date().toISOString(), safePointObservedAt: new Date().toISOString() });
+        const at = new Date().toISOString();
+        state.deliveries.push({ id: 'stale-safe-point', fromActorId: actor.id, runtimeSessionId: first.session.id, generation: 1, body: 'old delivery', command: 'normal', state: 'waiting_safe_point', createdAt: at, safePointObservedAt: at });
+        state.deliveries.push({ id: 'valid-current-safe-point', fromActorId: actor.id, runtimeSessionId: second.id, generation: 2, body: 'current delivery', command: 'normal', state: 'waiting_safe_point', createdAt: at, safePointObservedAt: at });
       });
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('stale_safe_point');
+      expectExactKinds(service, workspace.id, ['stale_safe_point']);
     } finally {
       service.close();
     }
@@ -101,8 +108,7 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       const second: any = await service.launch({ actorId: actor.id, goalId: first.goal.id, workspaceId: workspace.id, profileId: 'codex-worker', workspace: '/tmp' });
       expect(second.generation).toBe(2);
       await service.store.mutate((state: any) => state.deliveries.push({ id: 'late-wake', fromActorId: actor.id, runtimeSessionId: first.session.id, generation: 1, body: 'old delivery', command: 'normal', state: 'delivered', createdAt: new Date().toISOString(), deliveredAt: new Date().toISOString() }));
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('late_self_wake');
+      expectExactKinds(service, workspace.id, ['late_self_wake']);
     } finally {
       service.close();
     }
@@ -113,23 +119,26 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
     try {
       await service.createGoal({ actorId: actor.id, workspaceId: workspace.id, title: 'same durable goal' });
       await service.createGoal({ actorId: actor.id, workspaceId: workspace.id, title: 'same durable goal' });
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('duplicate_goal');
+      expectExactKinds(service, workspace.id, ['duplicate_goal']);
     } finally {
       service.close();
     }
   });
 
-  it('detects duplicate_worker from overlapping durable launches for one member and Goal', async () => {
+  it('detects duplicate_worker only when overlap begins after the prior generation is still active', async () => {
     const { service, actor, workspace } = await fixture();
     try {
       const first: any = await managed(service, actor.id, workspace.id, 'duplicate worker');
       await service.store.mutate((state: any) => {
         const source = state.sessions.find((item: any) => item.id === first.session.id);
-        state.sessions.push({ ...structuredClone(source), id: 'overlapping-worker', generation: 2, externalId: 'paseo-session-overlap', createdAt: new Date().toISOString(), state: 'idle' });
+        const terminalAt = new Date(Date.now() - 2_000).toISOString();
+        source.state = 'terminal';
+        source.lastObservedAt = terminalAt;
+        const secondAt = new Date(Date.now() - 1_000).toISOString();
+        state.sessions.push({ ...structuredClone(source), id: 'prior-terminal-worker', generation: 2, externalId: 'paseo-session-prior-terminal', createdAt: secondAt, state: 'idle', lastObservedAt: undefined });
+        state.sessions.push({ ...structuredClone(source), id: 'overlapping-worker', generation: 3, externalId: 'paseo-session-overlap', createdAt: new Date().toISOString(), state: 'idle', lastObservedAt: undefined });
       });
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('duplicate_worker');
+      expectExactKinds(service, workspace.id, ['duplicate_worker']);
     } finally {
       service.close();
     }
@@ -143,16 +152,17 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       // API rejects a second writer, so persist the competing claim directly
       // to prove the detector catches what an operator would find on disk.
       const surfaceId = 'surface-conflict';
+      const otherGoal = await service.createGoal({ actorId: actor.id, workspaceId: workspace.id, title: 'other surface goal' });
+      const otherMember = await service.joinWorkspace({ workspaceId: workspace.id, label: 'other writer', role: 'worker' });
       await service.store.mutate((state: any) => {
         const at = new Date().toISOString();
         state.executionSurfaces.push({ id: surfaceId, repositoryId: 'repo-conflict', checkout: { id: 'checkout-conflict', repositoryId: 'repo-conflict', path: '/tmp/conflict' }, kind: 'working', operationalState: 'active', visibilityState: 'visible', adapterBindings: {}, createdAt: at, updatedAt: at });
         const source = state.sessions.find((item: any) => item.id === first.session.id);
-        state.sessions.push({ ...structuredClone(source), id: 'conflicting-writer', generation: 2, externalId: 'paseo-session-conflict', createdAt: new Date().toISOString(), state: 'idle' });
+        state.sessions.push({ ...structuredClone(source), id: 'conflicting-writer', goalId: otherGoal.id, memberId: otherMember.member.id, generation: 1, externalId: 'paseo-session-conflict', createdAt: new Date().toISOString(), state: 'idle' });
         state.surfaceClaims.push({ id: 'first-claim', executionSurfaceId: surfaceId, runtimeSessionId: first.session.id, holder: first.session.id, mode: 'writer', active: true, createdAt: at });
         state.surfaceClaims.push({ id: 'conflicting-claim', executionSurfaceId: surfaceId, runtimeSessionId: 'conflicting-writer', holder: 'conflicting-writer', mode: 'writer', active: true, createdAt: new Date().toISOString() });
       });
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('surface_conflict');
+      expectExactKinds(service, workspace.id, ['surface_conflict']);
     } finally {
       service.close();
     }
@@ -167,8 +177,7 @@ describe('Sequence anomaly projection from durable ArcpService data', () => {
       await service.store.mutate((state: any) => {
         state.results.push({ id: 'wrong-member-result', workspaceId: workspace.id, taskId: started.task.id, memberId: other.member.id, fence: 1, status: 'candidate', summary: 'mismatched durable submitter', evidenceRefs: ['commit:mismatch'], createdAt: new Date().toISOString() });
       });
-      const { anomalies } = anomalyKinds(service, workspace.id);
-      expect(anomalies.anomalies.map((item) => item.kind)).toContain('wrong_member_attribution');
+      expectExactKinds(service, workspace.id, ['wrong_member_attribution']);
     } finally {
       service.close();
     }
