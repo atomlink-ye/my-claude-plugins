@@ -1,7 +1,10 @@
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
+const execFileAsync = promisify(execFile);
 import { RecordingChannelAdapter } from '../../../../skills/agent-runtime-control-panel/runtime/src/actor-channel.js';
 import { createControl } from '../support/create-control.js';
 import { FakePaseoCli } from '../support/fake-paseo-cli.js';
@@ -372,12 +375,6 @@ describe('owner escalation canary', () => {
     // still reporting that nothing happened.
     await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
     expect(snapshot()).toEqual(before);
-    // NOT A PIN. This asserts no provider workspace/project call escapes a held
-    // launch, which is the property we want, but with this fixture placement
-    // short-circuits on an existing binding and makes no such call either way.
-    // Moving lineage back after placement leaves this green, so the ordering
-    // itself is verified by reading, not by this suite. Recorded rather than
-    // dressed up: a fixture that materializes fresh placement would pin it.
     expect(cli.calls.slice(paseoCallsBefore).filter((args) => args[0] === 'workspace' || args[0] === 'project')).toEqual([]);
     // The ambiguous-launcher path must be as clean as the unresolved one.
 
@@ -471,6 +468,31 @@ describe('owner escalation canary', () => {
     const escalated = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
     expect(escalated.receipt).toBeUndefined();
     expect(service.state().channelEvents.find((e) => e.id === escalated.event.id)!.deliveryState).toBe('undeliverable');
+    service.close();
+  });
+
+  it('reaches no placement or provider call when the launcher cannot be parented', async () => {
+    // The earlier attempt at this could not fail: its workspace root was a
+    // plain temp directory, so resolvePaseoPlacement never reached
+    // materializePlacement and no provider call happened either way. A real Git
+    // checkout is what makes the ordering observable.
+    const repo = await mkdtemp(path.join(os.tmpdir(), 'arcp-lineage-repo-'));
+    await execFileAsync('git', ['init', '-q', repo]);
+    await execFileAsync('git', ['-C', repo, 'commit', '-q', '--allow-empty', '-m', 'root']);
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-lineage-data-'));
+    const cli = new FakePaseoCli({ providers: ['codex'] });
+    const { service } = await createControl(root, { cli });
+    const owner = await service.registerActor({ clientIdentity: 'owner', label: 'Owner', channel: 'local' });
+    const ws = await service.createWorkspace({ purpose: 'lineage placement', ownerActorId: owner.actor.id });
+    const manager = await service.joinWorkspace({ workspaceId: ws.workspace.id, label: 'Manager', role: 'manager' });
+
+    const before = cli.calls.length;
+    const held = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: repo } as any);
+    expect(held).toMatchObject({ action: 'hold', launchable: false });
+    // A launcher that cannot be parented must not cause ARCP to create a
+    // provider workspace or persist a surface on the way to refusing.
+    expect(cli.calls.slice(before).filter((args) => args[0] === 'project' || args[0] === 'workspace')).toEqual([]);
+    expect((service.state() as any).executionSurfaces ?? []).toHaveLength(0);
     service.close();
   });
 });
