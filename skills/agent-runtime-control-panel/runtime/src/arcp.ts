@@ -1949,6 +1949,11 @@ export class ArcpService implements ExecutionPlacementPort {
       // Only a genuinely dead obligation may be retired this way. Anything that
       // could still reach a recipient must go through its normal disposition.
       if (event.deliveryState !== 'undeliverable') throw new ArcpError('invalid_request', 'only an undeliverable obligation can be disposed this way');
+      // Being in the Workspace is not accountability. Only the member the
+      // obligation was actually addressed to may retire it, otherwise any
+      // participant could quietly clear a Manager's queue.
+      const workspace = state.workspaces.find((item) => item.id === event.workspaceId);
+      if (!intendedTarget(event, member, workspace)) throw new ArcpError('unauthorized', 'only an intended recipient of this obligation may dispose it');
       if (event.consumptionState !== 'open') return event;
       if (event.consumptionPolicy === 'decision_required') throw new ArcpError('invalid_request', 'a decision obligation must be resolved with a verdict, not disposed');
       this.appendDisposition(event, { kind: 'ack', reason: `undeliverable disposition: ${reason}` }, member.id);
@@ -2024,7 +2029,7 @@ export class ArcpService implements ExecutionPlacementPort {
    * tick all resolve to the same durable row and the adapter sees the same
    * idempotency key. A missing or superseded binding is a durable
    * `undeliverable` escalation, never a silent drop. */
-  async escalateToOwnerActor(input: { eventId: string; reason: string }): Promise<{ event: ChannelEvent; receipt?: TransportReceipt; alreadyEscalated: boolean }> {
+  async escalateToOwnerActor(input: { eventId: string; reason: string }): Promise<{ event: ChannelEvent; receipt?: TransportReceipt; alreadyEscalated: boolean; indeterminate?: boolean }> {
     const escalationId = `${input.eventId}:owner-escalation`;
     const prepared = await this.store.mutate((state) => {
       const triggering = state.channelEvents.find((item) => item.id === input.eventId);
@@ -2044,6 +2049,15 @@ export class ArcpService implements ExecutionPlacementPort {
       // retried on the same durable row.
       const settled = existing ? ['delivered', 'processed', 'acknowledged', 'resolved', 'withdrawn'].includes(existing.deliveryState) : false;
       if (existing && settled) return { event: existing, binding: undefined, alreadyEscalated: true };
+      // A send that was in flight when the process died has an unknown outcome.
+      // Retrying it could wake twice and calling it done could silence the
+      // obligation, so it is recorded indeterminate and surfaced for
+      // reconciliation instead of being guessed either way.
+      if (existing && ['attempting', 'transport_indeterminate'].includes(existing.deliveryState)) {
+        this.transitionEvent(existing, 'transport_indeterminate');
+        existing.undeliverableReason = 'escalation transport outcome is indeterminate; reconcile before retrying';
+        return { event: existing, binding: undefined, alreadyEscalated: true, indeterminate: true };
+      }
       if (existing) { const retryBinding = this.currentOwnerBinding(state, workspace.ownerActorId); if (retryBinding) this.transitionEvent(existing, 'queued'); return { event: existing, binding: retryBinding, alreadyEscalated: false }; }
       const binding = this.currentOwnerBinding(state, workspace.ownerActorId);
       const event = this.appendChannelEvent(state, {
@@ -2066,7 +2080,7 @@ export class ArcpService implements ExecutionPlacementPort {
       if (!binding) { this.transitionEvent(event, 'undeliverable'); event.undeliverableReason = 'owner actor has no current channel binding'; }
       return { event, binding, alreadyEscalated: false };
     });
-    if (prepared.alreadyEscalated || !prepared.binding) return { event: prepared.event, alreadyEscalated: prepared.alreadyEscalated };
+    if (prepared.alreadyEscalated || !prepared.binding) return { event: prepared.event, alreadyEscalated: prepared.alreadyEscalated, ...((prepared as { indeterminate?: boolean }).indeterminate ? { indeterminate: true } : {}) };
     const adapter = this.channels.get(prepared.binding.adapterId) as ActorChannelAdapter;
     const receipt = await adapter.deliver(prepared.binding, {
       idempotencyKey: escalationId,

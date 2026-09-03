@@ -373,4 +373,42 @@ describe('owner escalation canary', () => {
     expect((started as any).session.reportingRoute.launchedByMemberId).toBe(manager.member.id);
     service.close();
   });
+
+  it('lets only an intended recipient dispose a Manager-targeted obligation', async () => {
+    const { service, workspace, manager, worker, task } = await platformWorkspace();
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
+    const candidate = service.state().channelEvents.find((e) => e.kind === 'task_candidate' && e.resultId === result.id)!;
+    await service.store.mutate((state: any) => { const e = state.channelEvents.find((x: any) => x.id === candidate.id); e.deliveryState = 'undeliverable'; e.targetRole = 'manager'; return undefined; });
+
+    // Membership is not accountability: a worker must not be able to clear a
+    // Manager's queue just by being in the same Workspace.
+    await expect(service.disposeUndeliverable({ eventId: candidate.id, memberId: worker.id, reason: 'not mine to retire' }))
+      .rejects.toMatchObject({ code: 'unauthorized' });
+    const disposed = await service.disposeUndeliverable({ eventId: candidate.id, memberId: manager.id, reason: 'addressed to me and unreachable' });
+    expect(disposed.consumptionState).toBe('consumed');
+    service.close();
+  });
+
+  it('records an in-flight escalation as indeterminate rather than retrying or calling it done', async () => {
+    const { service, workspace, worker, task } = await platformWorkspace();
+    const channel = new RecordingChannelAdapter('recording');
+    service.channels.register(channel);
+    await service.claimTask(task.id, worker.id, task.fence);
+    const result = await service.submitResult({ workspaceId: workspace.id, taskId: task.id, memberId: worker.id, status: 'candidate', summary: 'awaiting', expectedFence: task.fence + 1 });
+    const decision = service.state().channelEvents.find((e) => e.kind === 'decision_required' && e.resultId === result.id)!;
+    await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+    expect(channel.wakes).toHaveLength(1);
+
+    // Simulate a crash mid-send: the row is left attempting with no receipt.
+    await service.store.mutate((state: any) => { state.channelEvents.find((e: any) => e.id === `${decision.id}:owner-escalation`).deliveryState = 'attempting'; return undefined; });
+    const again = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
+    // Neither a second wake nor a silent success: an explicit indeterminate.
+    expect(again.indeterminate).toBe(true);
+    expect(channel.wakes).toHaveLength(1);
+    const stored = service.state().channelEvents.find((e) => e.id === `${decision.id}:owner-escalation`)!;
+    expect(stored.deliveryState).toBe('transport_indeterminate');
+    expect(stored.undeliverableReason).toContain('indeterminate');
+    service.close();
+  });
 });
