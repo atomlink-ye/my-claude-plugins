@@ -220,7 +220,21 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'GET' && path === '/v1/goals') { const state = service.state(); const sessionIds = new Set(state.sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId).map((item) => item.goalId)); send(res, 200, authenticatedMember ? state.goals.filter((item) => item.workspaceId === authenticatedMember!.workspaceId || sessionIds.has(item.id)) : state.goals); return true; }
     const goal = path.match(/^\/v1\/goals\/([^/]+)\/lifecycle$/);
     if (method === 'POST' && goal) { send(res, 200, await service.setGoalState(decodeURIComponent(goal[1]), String((await body(req)).state) as any)); return true; }
-    if (method === 'POST' && path === '/v1/runtime-sessions') { if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const input = await body(req); const safeInput = publicRuntimeLaunchInput(input); assertLaunchRelationship(service, authenticatedActor.id, authenticatedMember, safeInput.workspaceId, safeInput.goalId, safeInput.taskId); send(res, 201, publicSession(await service.launch({ ...safeInput, actorId: authenticatedActor.id, ...(authenticatedMember ? { launchedByMemberId: authenticatedMember.id } : {}) } as any))); return true; }
+    if (method === 'POST' && path === '/v1/runtime-sessions') {
+      const input = await body(req);
+      // A member credential authenticates a member, not an arbitrary actor id
+      // supplied in JSON. Require the actor principal to be explicit and bind
+      // it to the member before permitting a launch/replacement attempt.
+      if (authenticatedMember && !authenticatedActor && (!authenticatedMember.actorId || (input.actorId !== undefined && input.actorId !== authenticatedMember.actorId))) throw new ArcpError('unauthorized', 'member-authenticated runtime launch requires its bound actor principal');
+      if (authenticatedActor && authenticatedMember?.actorId && authenticatedMember.actorId !== authenticatedActor.id) throw new ArcpError('unauthorized', 'actor and member credentials identify different principals');
+      if ('replaceReserved' in input) throw new ArcpError('invalid_request', 'runtime replacement reservation is internal-only', 'replaceReserved');
+      // The actor principal comes from a credential, never from the body.
+      const actorId = authenticatedActor?.id ?? authenticatedMember?.actorId;
+      if (!actorId) throw new ArcpError('unknown_sender', 'actor credential is required');
+      const safeInput = publicRuntimeLaunchInput(input);
+      assertLaunchRelationship(service, actorId, authenticatedMember, safeInput.workspaceId, safeInput.goalId, safeInput.taskId);
+      send(res, 201, publicSession(await service.launch({ ...safeInput, actorId, ...(authenticatedMember ? { launchedByMemberId: authenticatedMember.id } : {}) } as any))); return true;
+    }
     if (method === 'GET' && path === '/v1/runtime-sessions') { const sessions = service.state().sessions.filter((item) => !authenticatedMember || item.workspaceId === authenticatedMember.workspaceId); send(res, 200, sessions.map(publicSession)); return true; }
     const external = path.match(/^\/v1\/external\/([^/]+)\/(status|send|stop|reconcile)$/);
     if (external && authenticatedMember) { const target = service.state().sessions.find((item) => item.id === decodeURIComponent(external[1])); if (!target || target.workspaceId !== authenticatedMember.workspaceId) throw new ArcpError('not_found', 'runtime session not found'); }
@@ -236,8 +250,10 @@ export async function handleArcp(req: http.IncomingMessage, res: http.ServerResp
     if (method === 'POST' && path === '/v1/deliveries') { const requested = await body(req); if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); const { fromActorId: _untrustedActor, ...publicRequested } = requested; send(res, 201, publicDelivery(await service.deliver({ ...publicRequested, fromActorId: authenticatedActor.id } as any))); return true; }
     if (method === 'POST' && path === '/v1/reuse') { const requested = await body(req); if (!authenticatedActor) throw new ArcpError('unknown_sender', 'actor credential is required'); send(res, 200, publicDelivery(await service.reuse({ ...requested, fromActorId: authenticatedActor.id } as any))); return true; }
     if (method === 'GET' && path === '/v1/deliveries') { send(res, 200, service.state().deliveries.map(publicDelivery)); return true; }
+    const process = path.match(/^\/v1\/deliveries\/([^/]+)\/process$/);
+    if (method === 'POST' && process) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.processDelivery(decodeURIComponent(process[1]), authenticatedMember.id, typeof value.reason === 'string' ? value.reason : undefined))); return true; }
     const ack = path.match(/^\/v1\/deliveries\/([^/]+)\/ack$/);
-    if (method === 'POST' && ack) { const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), typeof value.generation === 'number' ? value.generation : undefined))); return true; }
+    if (method === 'POST' && ack) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.acknowledge(decodeURIComponent(ack[1]), typeof value.generation === 'number' ? value.generation : undefined, authenticatedMember.id))); return true; }
     const withdraw = path.match(/^\/v1\/deliveries\/([^/]+)\/withdraw$/);
     if (method === 'POST' && withdraw) { if (!authenticatedMember) throw new ArcpError('unauthorized', 'member credential is required'); const value = await body(req); send(res, 200, publicDelivery(await service.withdraw(decodeURIComponent(withdraw[1]), String(value.reason ?? 'withdrawn'), authenticatedMember.id))); return true; }
     const release = path.match(/^\/v1\/deliveries\/([^/]+)\/release$/);

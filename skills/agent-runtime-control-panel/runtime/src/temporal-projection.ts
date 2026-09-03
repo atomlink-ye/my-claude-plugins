@@ -18,7 +18,7 @@ export interface TemporalProjectionFacts {
   /** Injected by the caller: builders never read the clock. */
   nowMs?: number;
 }
-export interface TemporalCausation { causedBy?: string; supersedes?: string; resolvedBy?: string; replacement?: string; }
+export interface TemporalCausation { causedBy?: string; supersedes?: string; resolvedBy?: string; replacement?: string; resultId?: string; resultStatus?: Result['status']; }
 export interface TemporalCard {
   id: string;
   subject: { kind: 'task' | 'runtime' | 'workspace'; id: string; label: string };
@@ -44,7 +44,7 @@ export interface TemporalProjection { filter: TemporalFilter; generatedAt: strin
 const BUDGET_MS = 60 * 60 * 1000;
 const age = (at: string, now: number) => Math.max(0, now - Date.parse(at));
 const eventRuntime = (event: ChannelEvent, deliveries: readonly Delivery[], sessions: readonly RuntimeSession[]) => {
-  const delivery = deliveries.find((item) => item.eventId === event.id);
+  const delivery = deliveries.filter((item) => item.eventId === event.id).sort((a, b) => (b.consumptionEpisode ?? 0) - (a.consumptionEpisode ?? 0) || b.createdAt.localeCompare(a.createdAt))[0];
   return delivery ? sessions.find((item) => item.id === delivery.runtimeSessionId) : sessions.find((item) => item.memberId === event.sourceMemberId && (!event.taskId || item.taskId === event.taskId));
 };
 const reachable = (event: ChannelEvent, delivery: Delivery | undefined, sessions: readonly RuntimeSession[]) => {
@@ -75,7 +75,7 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
   const cards: TemporalCard[] = facts.channelEvents.map((event) => {
     const channel = projectChannelEvent(event, facts);
     const task = event.taskId ? tasks.get(event.taskId) : undefined;
-    const delivery = facts.deliveries.find((item) => item.eventId === event.id);
+    const delivery = facts.deliveries.filter((item) => item.eventId === event.id).sort((a, b) => (b.consumptionEpisode ?? 0) - (a.consumptionEpisode ?? 0) || b.createdAt.localeCompare(a.createdAt))[0];
     const runtime = eventRuntime(event, facts.deliveries, facts.sessions);
     const senderMember = event.sourceMemberId ? members.get(event.sourceMemberId) : undefined;
     const results = task ? resultsByTask.get(task.id) ?? [] : [];
@@ -85,8 +85,14 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     const resolutionEvent = facts.channelEvents.find((item) => item.kind === 'decision_resolved' && (item.relatedEventId === event.id || item.relatedEventId === linkedDecision?.id));
     const resolution = event.verdict ?? resolutionEvent?.verdict;
     const candidateResult = event.resultId ? facts.results.find((item) => item.id === event.resultId) : undefined;
-    const replacement = runtime && facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation);
+    // A replacement preserves the logical RuntimeSession id and advances its
+    // generation. Older implementations only looked for another session id,
+    // leaving the real replacement path unable to surface generation_replaced.
+    const replacement = runtime && (delivery && delivery.generation < runtime.generation
+      ? runtime
+      : facts.sessions.find((item) => item.id !== runtime.id && item.goalId === runtime.goalId && item.generation > runtime.generation));
     let disposition: TemporalDisposition = 'active'; let dispositionReason = 'No machine-provable semantic replacement or resolution.'; const causation: TemporalCausation = event.relatedEventId ? { causedBy: event.relatedEventId } : {};
+    if (candidateResult) { causation.resultId = candidateResult.id; causation.resultStatus = candidateResult.status; }
     if (event.consumptionState === 'consumed') { disposition = 'consumed'; dispositionReason = 'The informational or acknowledged obligation is durably consumed.'; }
     else if (event.consumptionState === 'resolved') { disposition = 'resolved'; dispositionReason = 'A durable decision verdict already closes this obligation.'; }
     else if (event.consumptionState === 'invalidated') { disposition = 'invalidated'; dispositionReason = 'The target generation ended or was replaced; this obligation must not wake it.'; }
@@ -117,7 +123,7 @@ export function projectTemporal(facts: TemporalProjectionFacts, filter: Temporal
     // subject, so one predicate decides both its problem card and its grouping.
     const stewardSubject = task?.scope === 'steward_analysis' || members.get(task?.ownerMemberId ?? '')?.role === 'steward-analyst';
     if (stewardSubject) problems.push('steward_recursion');
-    if (event.kind === 'task_completed' && !results.some((result) => result.createdAt <= event.createdAt)) problems.push('completion_without_result');
+    if (event.kind === 'task_completed' && !candidateResult && !results.some((result) => result.createdAt <= event.createdAt && result.fence === task?.fence && result.status === 'candidate')) problems.push('completion_without_result');
     if (replacement) problems.push('generation_replaced');
     if (delivery && runtime && delivery.generation !== runtime.generation) problems.push('delivery_generation_mismatch');
     if (nonMonotonic(delivery)) problems.push('timestamp_nonmonotonic');

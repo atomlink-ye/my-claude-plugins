@@ -1,4 +1,4 @@
-import type { ChannelEvent, ChannelEventKind, ConsumptionPolicy, ConsumptionState, ExpectedAction, Goal, KnowledgeEntry, Member, Result, Task } from './arcp.js';
+import type { ChannelEvent, ChannelEventKind, ConsumptionPolicy, ConsumptionState, Delivery, ExpectedAction, Goal, KnowledgeEntry, Member, Result, RuntimeSession, Task } from './arcp.js';
 
 /**
  * The one human-readable projection of a durable ChannelEvent.
@@ -20,6 +20,10 @@ export interface ChannelProjectionSender { label: string; role: string; }
  * Markdown renderer emits a bullet list — without any surface re-parsing text.
  */
 export interface ChannelProjectionRef { label: string; value: string; }
+export interface ChannelProjectionTransport { state: string; deliveredAt?: string; }
+export interface ChannelProjectionRecipientProcessing { state: 'unobserved' | 'processed'; memberId?: string; memberLabel?: string; at?: string; }
+export interface ChannelProjectionAcknowledgement { state: 'not_required' | 'pending' | 'acknowledged'; memberId?: string; at?: string; reason?: string; }
+export interface ChannelProjectionResultCausality { relation: 'reported_by_result' | 'completed_by_result'; resultId: string; taskId: string; fence: number; status: Result['status']; sourceId?: string; createdAt: string; }
 export interface ChannelProjection {
   eventId: string;
   /** The durable event kind, so a renderer can pick a stable status icon. */
@@ -49,6 +53,12 @@ export interface ChannelProjection {
   expectedAction: ExpectedAction;
   decisionRequired: boolean;
   verdict?: ChannelEvent['verdict'];
+  /** Transport, recipient processing, and acknowledgement are independent
+   * facts. In particular, an idle runtime never populates processing. */
+  transport: ChannelProjectionTransport;
+  recipientProcessing: ChannelProjectionRecipientProcessing;
+  acknowledgement: ChannelProjectionAcknowledgement;
+  resultCausality?: ChannelProjectionResultCausality;
   deliveryState: ChannelEvent['deliveryState'];
   createdAt: string;
 }
@@ -62,6 +72,8 @@ export interface ChannelProjectionFacts {
   results: readonly Result[];
   /** Resolution is durable event state, not a delivery outcome. */
   channelEvents?: readonly ChannelEvent[];
+  deliveries?: readonly Delivery[];
+  sessions?: readonly RuntimeSession[];
 }
 
 export const HEADLINE_MAX = 120;
@@ -228,6 +240,15 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
     ?? (knowledge?.taskId ? facts.tasks.find((item) => item.id === knowledge.taskId) : undefined)
     ?? (result ? facts.tasks.find((item) => item.id === result.taskId) : undefined);
   const goal = event.goalId ? facts.goals.find((item) => item.id === event.goalId) : undefined;
+  const delivery = facts.deliveries?.filter((item) => item.eventId === event.id)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
+  const recipientSession = delivery ? facts.sessions?.find((item) => item.id === delivery.runtimeSessionId) : undefined;
+  const recipient = recipientSession?.memberId
+    ? facts.members.find((item) => item.id === recipientSession.memberId)
+    : event.targetMemberId ? facts.members.find((item) => item.id === event.targetMemberId) : undefined;
+  const ackReceipt = event.dispositions?.find((item) => item.kind === 'ack');
+  const processedAt = delivery?.processedAt ?? (ackReceipt ? ackReceipt.at : undefined);
+  const acknowledgedAt = delivery?.acknowledgedAt ?? event.acknowledgedAt ?? ackReceipt?.at;
 
   // Detail preference: the linked durable record carries the actual outcome;
   // the event summary is usually only its machine-addressable stub.
@@ -277,6 +298,15 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
     ...evidenceRefs.filter((ref) => ref !== knowledge?.id).map((ref) => ({ label: 'Evidence', value: bound(scrub(ref), SUBJECT_MAX) })),
   ];
 
+  const resultCausality = result && task ? {
+    relation: event.kind === 'task_completed' ? 'completed_by_result' as const : 'reported_by_result' as const,
+    resultId: result.id,
+    taskId: result.taskId,
+    fence: result.fence,
+    status: result.status,
+    ...(result.sourceId ? { sourceId: result.sourceId } : {}),
+    createdAt: result.createdAt,
+  } : undefined;
   return {
     eventId: event.id,
     kind: event.kind,
@@ -296,6 +326,12 @@ export function projectChannelEvent(event: ChannelEvent, facts: ChannelProjectio
     expectedAction: event.expectedAction ?? (event.kind === 'decision_required' ? { kind: 'resolve', instruction: 'Resolve with an accept or refuse verdict and a reason.' } : event.decisionRequired ? { kind: 'ack', instruction: 'ACK after handling, or defer with a reason if blocked.' } : { kind: 'none', instruction: 'No reply required — this message is consumed when delivered.' }),
     decisionRequired: event.decisionRequired,
     ...(event.verdict ? { verdict: event.verdict } : {}),
+    transport: { state: delivery?.state ?? event.deliveryState, ...(delivery?.deliveredAt ? { deliveredAt: delivery.deliveredAt } : event.deliveredAt ? { deliveredAt: event.deliveredAt } : {}) },
+    recipientProcessing: { state: processedAt ? 'processed' : 'unobserved', ...(recipient ? { memberId: recipient.id, memberLabel: bound(scrub(recipient.label), SUBJECT_MAX) } : {}), ...(processedAt ? { at: processedAt } : {}) },
+    acknowledgement: event.consumptionPolicy === 'consume_on_delivery'
+      ? { state: 'not_required' as const }
+      : { state: acknowledgedAt ? 'acknowledged' as const : 'pending' as const, ...(ackReceipt ? { memberId: ackReceipt.actorMemberId, at: ackReceipt.at, reason: ackReceipt.reason } : delivery?.acknowledgedByMemberId ? { memberId: delivery.acknowledgedByMemberId, ...(delivery.acknowledgedAt ? { at: delivery.acknowledgedAt } : {}) } : {}) },
+    ...(resultCausality ? { resultCausality } : {}),
     deliveryState: event.deliveryState,
     createdAt: event.createdAt,
   };
