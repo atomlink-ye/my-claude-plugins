@@ -77,7 +77,7 @@ export interface RuntimeLaunchContext { parentAgentId?: string; workspaceId?: st
  * transport delivery. The primary handler alone owns acknowledgement and
  * action; cc recipients observe and must never create a second obligation. */
 export interface ReportingRoute { launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds: string[]; escalationMemberIds: string[]; }
-export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; parentAgentId?: string; executionSurfaceId?: string; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; selectionReceipt?: SelectionReceipt; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
+export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; parentAgentId?: string; executionSurfaceId?: string; /** Durable proof that the launch itself carried the Goal Contract. */ contractBoundAtLaunch?: true; bindingId: string; generation: number; runtimeKind: 'paseo' | 'external'; adapterId: string; workspaceId?: string; memberId?: string; profileId: string; provider: string; model: string; mode?: string; thinking?: string; selectionReceipt?: SelectionReceipt; observed?: Partial<RuntimeSettings>; placement?: PaseoPlacement; workspace?: string; externalId?: string; acpSessionId?: string; pid?: number; lastDeliveryId?: string; lastTurnState?: string; blockedOnEventId?: string; blockedSince?: string; blockedQuestion?: string; state: SessionState; lastObservedAt?: string; createdAt: string; }
 export interface Delivery { id: string; fromActorId: string; runtimeSessionId: string; generation: number; body: string; command: 'normal' | 'interrupt'; purpose?: DeliveryPurpose; subject?: DeliverySubject; notAfter?: string; refusedReason?: string; handedOffAfterWithdrawal?: boolean; reason?: string; eventId?: string; consumptionEpisode?: number; state: DeliveryState; createdAt: string; cacheAuthorized?: true; safePointObservedAt?: string; safePointStatus?: string; attemptedAt?: string; deliveredAt?: string; processedAt?: string; processedByMemberId?: string; processedReason?: string; acknowledgedAt?: string; acknowledgedByMemberId?: string; }
 export interface ControlWorkspace { id: string; purpose: string; lifecycle: 'active' | 'completed' | 'cancelled'; ownerActorId: string; ownerMemberId?: string; paseoPlacements?: CanonicalPaseoPlacement[]; channelDeferralPolicy?: ChannelDeferralPolicy; createdAt: string; updatedAt: string; }
 export interface Member { id: string; workspaceId: string; actorId?: string; joinKind: 'managed' | 'native'; label: string; role: string; capabilities: string[]; lifecycle: 'invited' | 'joining' | 'active' | 'idle' | 'busy' | 'attention' | 'offline' | 'retired'; leaseExpiresAt?: string; lastHeartbeatAt?: string; createdAt: string; updatedAt: string; }
@@ -1238,7 +1238,7 @@ export class ArcpService implements ExecutionPlacementPort {
   async stopRuntime(id: string): Promise<RuntimeSession> {
     const session = this.store.snapshot().sessions.find((item) => item.id === id); if (!session) throw new ArcpError('not_found', 'runtime session not found');
     if (session.externalId) await this.adapterFor(session).stop(session.externalId).catch(() => undefined);
-    return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'terminal'; item.lastTurnState = 'idle'; return item; });
+    return this.store.mutate((state) => { const item = state.sessions.find((value) => value.id === id)!; item.state = 'terminal'; item.lastTurnState = 'idle'; item.lastObservedAt = now(); return item; });
   }
   async setGoalState(id: string, stateValue: GoalState): Promise<Goal> {
     if (!['active', 'completed', 'cancelled'].includes(stateValue)) throw new ArcpError('invalid_request', 'invalid goal state');
@@ -1505,6 +1505,7 @@ export class ArcpService implements ExecutionPlacementPort {
       id: prior?.id ?? input.runtimeId ?? `runtime_${randomUUID()}`,
       actorId: input.actorId,
       goalId: goal.id,
+      ...(input.contract?.trim() ? { contractBoundAtLaunch: true as const } : {}),
       ...(input.taskId ?? prior?.taskId ? { taskId: input.taskId ?? prior?.taskId } : {}),
       ...(input.reportingRoute ?? prior?.reportingRoute ? { reportingRoute: input.reportingRoute ?? prior?.reportingRoute } : {}),
       ...(input.executionSurfaceId ?? prior?.executionSurfaceId ? { executionSurfaceId: input.executionSurfaceId ?? prior?.executionSurfaceId } : {}),
