@@ -163,12 +163,14 @@ describe('ARCP atomic contract binding', () => {
   });
 
   it('B0-4 recovers an inherited attempting contract as transport-indeterminate after restart', async () => {
-    const { root, service, actor, task } = await fixture();
-    await service.store.mutate((state: any) => state.deliveries.push({ id: 'delivery-crashed-attempt', fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'contract', command: 'normal', purpose: 'contract', subject: { taskId: task.id, fence: 0 }, state: 'attempting', createdAt: new Date().toISOString() }));
+    const { root, service, actor, task, workspace, worker } = await fixture();
+    const event = await service.publishChannelEvent({ workspaceId: workspace.id, taskId: task.id, sourceActorId: actor.id, targetMemberId: worker.member.id, kind: 'material_progress', urgency: 'normal', consumptionPolicy: 'consume_on_delivery', decisionRequired: false, summary: 'contract dispatch', evidenceRefs: [], notify: false });
+    await service.store.mutate((state: any) => state.deliveries.push({ id: 'delivery-crashed-attempt', fromActorId: actor.id, runtimeSessionId: 'worker-runtime', generation: 1, body: 'contract', command: 'normal', purpose: 'contract', subject: { taskId: task.id, fence: 0 }, eventId: event.id, state: 'attempting', createdAt: new Date().toISOString() }));
     service.close();
     const restarted = new ArcpService(root, new FakeCli() as any);
     await restarted.init();
     expect(restarted.state().deliveries.find((item) => item.id === 'delivery-crashed-attempt')?.state).toBe('transport_indeterminate');
+    expect(restarted.state().channelEvents.find((item) => item.id === event.id)?.deliveryState).toBe('transport_indeterminate');
     expect(restarted.state().channelEvents.some((item) => item.kind === 'transport_uncertainty' && item.content.summary.includes('delivery-crashed-attempt'))).toBe(true);
     restarted.close();
   });

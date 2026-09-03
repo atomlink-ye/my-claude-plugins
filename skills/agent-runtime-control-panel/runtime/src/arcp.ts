@@ -1594,7 +1594,14 @@ export class ArcpService implements ExecutionPlacementPort {
           const facts = await this.facts(session);
           if (facts.cache.state !== 'fresh' && !delivery.cacheAuthorized) { await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; item.safePointStatus = `cache_${facts.cache.state}`; return item; }); continue; }
         }
-        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'running'; return item; });
+        await this.store.mutate((state) => { const item = state.deliveries.find((value) => value.id === delivery.id)!; const runtime = state.sessions.find((value) => value.id === session.id)!; const event = item.eventId ? state.channelEvents.find((value) => value.id === item.eventId) : undefined; item.state = 'attempting'; item.safePointObservedAt = now(); item.safePointStatus = observed.state; item.attemptedAt = now(); runtime.lastDeliveryId = delivery.id; runtime.lastTurnState = 'running';
+          // This durable transition brackets the irreversible adapter call.
+          // The adapter may have accepted a turn for minutes before it returns;
+          // during that window readers must see uncertainty, never a queued
+          // event that is indistinguishable from a turn that was never sent.
+          if (event) this.transitionEvent(event, 'transport_indeterminate', item.attemptedAt);
+          return item;
+        });
         try {
           // The last read before the irreversible start-turn. Contract validity
           // is re-checked here, not only before the observe()/facts() awaits

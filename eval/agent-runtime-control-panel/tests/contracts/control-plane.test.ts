@@ -666,6 +666,19 @@ describe('ARCP Slice A channel correctness', () => {
     expect(delivery.state).toBe('delivered'); expect((first.cli as any).sends).toBe(1); first.close();
     const second = await control(root); expect((second.cli as any).sends).toBe(0); expect(second.state().deliveries.find((item) => item.id === delivery.id)?.state).toBe('processed'); second.close();
   });
+  it('records an in-flight adapter acceptance before the turn can block, then recovers it as indeterminate after SIGTERM-style restart', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-inflight-crash-')); const first = await control(root);
+    const { actor } = await first.registerActor({ clientIdentity: 'inflight-owner' }); const goal = await first.createGoal({ actorId: actor.id, title: 'inflight crash' }); const runtime = await first.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
+    let accepted!: () => void, finish!: () => void; const acceptedAtAdapter = new Promise<void>((resolve) => { accepted = resolve; }); const finishTurn = new Promise<void>((resolve) => { finish = resolve; });
+    (first as any).adapters.set('paseo', { id: 'paseo', snapshot: async () => ({ agent: { id: runtime.externalId, status: 'idle', provider: runtime.provider, model: runtime.model, mode: runtime.mode, thinking: runtime.thinking } }), startTurn: async () => { accepted(); await finishTurn; } });
+    const dispatch = first.deliver({ fromActorId: actor.id, runtimeSessionId: runtime.id, body: 'accepted but still running' }) as Promise<any>;
+    await acceptedAtAdapter;
+    const delivery = first.state().deliveries.at(-1)!; const event = first.state().channelEvents.find((item) => item.id === delivery.eventId)!;
+    // This assertion is the live-production symptom: adapter work is in flight
+    // while a durable reader would otherwise see only a queued ChannelEvent.
+    expect(event.deliveryState).toBe('transport_indeterminate');
+    finish(); await dispatch; first.close();
+  });
   it('awaits restart pump and distinguishes delivered history from waiting safe-point work', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'arcp-restart-pump-')); const first = await control(root);
     const { actor } = await first.registerActor({ clientIdentity: 'restart-pump-owner' }); const goal = await first.createGoal({ actorId: actor.id, title: 'restart pump' }); const runtime = await first.launch({ actorId: actor.id, goalId: goal.id, profileId: 'codex-worker' });
