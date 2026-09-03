@@ -1068,6 +1068,19 @@ export class ArcpService implements ExecutionPlacementPort {
     const state = this.store.snapshot(); if (!state.workspaces.some((item) => item.id === input.workspaceId && item.lifecycle === 'active')) throw new ArcpError('workspace_closed', 'team workspace is unavailable');
     const preflight = await this.preflight(input);
     if (!preflight.launchable) { await this.recordProviderBudgetEpisode(input.workspaceId, preflight.admission); return preflight; }
+    // Lineage is resolved from durable state, never from the request, and it
+    // runs before ANY durable or provider-side effect. Placement is not a read:
+    // it can materialize a provider workspace and persist a ControlWorkspace
+    // placement and ExecutionSurface, so a hold after it still leaves state
+    // behind. The cheapest check that can reject the launch therefore runs
+    // first, ahead of placement as well as ahead of Goal/Task/Member.
+    let parentAgentId: string | undefined;
+    if (input.launchedByMemberId) {
+      const live = this.store.snapshot().sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId));
+      const ids = [...new Set(live.map((item) => item.externalId!))];
+      if (ids.length !== 1) return { ...preflight, action: 'hold', launchable: false, why: ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch` };
+      parentAgentId = ids[0];
+    }
     try { input = await this.resolvePaseoPlacement(input); }
     catch (error) { return { ...preflight, action: 'hold', launchable: false, why: error instanceof ArcpError ? error.message : 'PLACEMENT_UNRESOLVED: canonical Paseo placement could not be resolved before launch' }; }
     // Resolve the profile through the same path used by preflight and launch.
@@ -1081,17 +1094,6 @@ export class ArcpService implements ExecutionPlacementPort {
     // observer role is told plainly that it owns no Task, instead of being
     // handed instructions that only fail at claim time.
     const taskHandoff = canOwnHandoffTask(capabilities);
-    // Lineage is resolved from durable state, never from the request, and it is
-    // resolved BEFORE anything is created. A hold that happens after the Goal,
-    // Task, Member and credential exist leaves orphans behind every time a
-    // launcher cannot be placed, so the cheapest check runs first.
-    let parentAgentId: string | undefined;
-    if (input.launchedByMemberId) {
-      const live = this.store.snapshot().sessions.filter((item) => item.memberId === input.launchedByMemberId && item.state !== 'terminal' && Boolean(item.externalId));
-      const ids = [...new Set(live.map((item) => item.externalId!))];
-      if (ids.length !== 1) return { ...preflight, action: 'hold', launchable: false, why: ids.length ? `LINEAGE_AMBIGUOUS: launching member ${input.launchedByMemberId} has ${ids.length} live provider identities` : `LINEAGE_UNRESOLVED: launching member ${input.launchedByMemberId} has no live provider identity to parent this launch` };
-      parentAgentId = ids[0];
-    }
     const goal = await this.createGoal({ actorId: input.actorId, title: input.title, workspaceId: input.workspaceId });
     const task = await this.createTask({ workspaceId: input.workspaceId, title: input.title, scope: input.taskScope, executionSurfaceId: input.executionSurfaceId });
     // Every failure after the Goal and Task exist retires the whole attempt:
@@ -2057,11 +2059,11 @@ export class ArcpService implements ExecutionPlacementPort {
       // retried on the same durable row.
       const settled = existing ? ['delivered', 'processed', 'acknowledged', 'resolved', 'withdrawn'].includes(existing.deliveryState) : false;
       if (existing && settled) return { event: existing, binding: undefined, alreadyEscalated: true };
-      // A send that was in flight when the process died has an unknown outcome.
-      // Retrying it could wake twice and calling it done could silence the
-      // obligation, so it is recorded indeterminate and surfaced for
-      // reconciliation instead of being guessed either way.
-      if (existing && ['attempting', 'transport_indeterminate'].includes(existing.deliveryState)) {
+      // The row is marked indeterminate before the wire is touched, so a
+      // process that dies mid-send leaves this state rather than a queued one.
+      // Retrying could wake twice and calling it done could silence the
+      // obligation, so it is surfaced for reconciliation instead of guessed.
+      if (existing && existing.deliveryState === 'transport_indeterminate') {
         this.transitionEvent(existing, 'transport_indeterminate');
         existing.undeliverableReason = 'escalation transport outcome is indeterminate; reconcile before retrying';
         return { event: existing, binding: undefined, alreadyEscalated: true, indeterminate: true };
@@ -2090,6 +2092,11 @@ export class ArcpService implements ExecutionPlacementPort {
     });
     if (prepared.alreadyEscalated || !prepared.binding) return { event: prepared.event, alreadyEscalated: prepared.alreadyEscalated, ...((prepared as { indeterminate?: boolean }).indeterminate ? { indeterminate: true } : {}) };
     const adapter = this.channels.get(prepared.binding.adapterId) as ActorChannelAdapter;
+    // The attempt is recorded durably BEFORE the wire is touched. If the
+    // process dies between the send and the receipt, the row says attempting
+    // rather than queued, so recovery reconciles an unknown outcome instead of
+    // sending again and waking a human twice.
+    await this.store.mutate((state) => { const event = state.channelEvents.find((item) => item.id === escalationId); if (event) this.transitionEvent(event, 'transport_indeterminate'); return undefined; });
     const receipt = await adapter.deliver(prepared.binding, {
       idempotencyKey: escalationId,
       recipientRef: prepared.binding.recipientRef,

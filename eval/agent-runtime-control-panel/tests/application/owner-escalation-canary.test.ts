@@ -358,7 +358,12 @@ describe('owner escalation canary', () => {
 
     // A launcher with no live provider identity must fail closed. Silently
     // rooting the child would destroy the parent link with no way to recover it.
-    const before = { goals: service.state().goals.length, tasks: service.state().tasks.length, members: service.state().members.length };
+    // Count every durable surface a held launch could touch, not just the three
+    // I first thought of: placement and ExecutionSurface are created by
+    // resolvePaseoPlacement and are exactly what an early hold must not leave.
+    const snapshot = () => { const st: any = service.state(); return { goals: st.goals.length, tasks: st.tasks.length, members: st.members.length, surfaces: (st.executionSurfaces ?? []).length, claims: (st.surfaceClaims ?? []).length, sessions: st.sessions.length, workspacePlacements: JSON.stringify((st.workspaces ?? []).map((w: any) => w.paseoPlacements ?? null)) }; };
+    const before = snapshot();
+    const paseoCallsBefore = cli.calls.length;
     const held = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
     expect(held).toMatchObject({ action: 'hold', launchable: false });
     expect((held as any).why).toContain('LINEAGE_UNRESOLVED');
@@ -366,7 +371,15 @@ describe('owner escalation canary', () => {
     // otherwise accumulate orphan Goals, Tasks and member credentials while
     // still reporting that nothing happened.
     await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
-    expect({ goals: service.state().goals.length, tasks: service.state().tasks.length, members: service.state().members.length }).toEqual(before);
+    expect(snapshot()).toEqual(before);
+    // NOT A PIN. This asserts no provider workspace/project call escapes a held
+    // launch, which is the property we want, but with this fixture placement
+    // short-circuits on an existing binding and makes no such call either way.
+    // Moving lineage back after placement leaves this green, so the ordering
+    // itself is verified by reading, not by this suite. Recorded rather than
+    // dressed up: a fixture that materializes fresh placement would pin it.
+    expect(cli.calls.slice(paseoCallsBefore).filter((args) => args[0] === 'workspace' || args[0] === 'project')).toEqual([]);
+    // The ambiguous-launcher path must be as clean as the unresolved one.
 
     // With exactly one live identity the child is parented on it.
     await service.attachParticipant({ workspaceId: ws.workspace.id, memberId: manager.member.id, adapterId: 'paseo', externalId: 'parent-agent-1' });
@@ -377,6 +390,19 @@ describe('owner escalation canary', () => {
     const runCall = cli.calls.find((args) => args[0] === 'run');
     expect(runCall).toBeDefined();
     expect((started as any).session.reportingRoute.launchedByMemberId).toBe(manager.member.id);
+
+    // The ambiguous-launcher path must be as clean as the unresolved one: a
+    // second live identity makes the parent unknowable, and a hold there must
+    // also leave no placement, surface or session behind.
+    await service.store.mutate((st: any) => {
+      const one = st.sessions.find((x: any) => x.memberId === manager.member.id && x.runtimeKind === 'external');
+      st.sessions.push({ ...one, id: 'runtime_rival_b', externalId: 'parent-rival' });
+      return undefined;
+    });
+    const ambiguousBefore = snapshot();
+    const ambiguous = await service.startManaged({ actorId: owner.actor.id, workspaceId: ws.workspace.id, title: 'child', profileId: 'codex-worker', launchedByMemberId: manager.member.id, workspace: root } as any);
+    expect((ambiguous as any).why).toContain('LINEAGE_AMBIGUOUS');
+    expect(snapshot()).toEqual(ambiguousBefore);
     service.close();
   });
 
@@ -406,12 +432,22 @@ describe('owner escalation canary', () => {
     await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
     expect(channel.wakes).toHaveLength(1);
 
-    // Simulate a crash mid-send: the row is left attempting with no receipt.
-    await service.store.mutate((state: any) => { state.channelEvents.find((e: any) => e.id === `${decision.id}:owner-escalation`).deliveryState = 'attempting'; return undefined; });
+    // Real crash simulation: the wire accepts, then the process dies before the
+    // receipt is written. Forcing an unreachable state would prove nothing, so
+    // the adapter records the wake and then throws exactly where a crash would.
+    await service.store.mutate((state: any) => { const e = state.channelEvents.find((x: any) => x.id === `${decision.id}:owner-escalation`); e.deliveryState = 'queued'; e.consumptionState = 'open'; return undefined; });
+    (service.channels as any).adapters.set('recording', { id: 'recording', capabilities: () => ({ adapterId: 'recording', outboundWake: true, inboundReceipts: false }), validate: async () => ({ bindingId: 'b', generation: 1, state: 'current' }), deliver: async (b: any, env: any) => { channel.wakes.push({ binding: b, envelope: env }); throw new Error('process died after the send was accepted'); } });
+    await expect(service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' })).rejects.toThrow();
+    expect(channel.wakes).toHaveLength(2);
+    const midFlight = service.state().channelEvents.find((e) => e.id === `${decision.id}:owner-escalation`)!;
+    expect(midFlight.deliveryState).toBe('transport_indeterminate');
+
+    service.channels.register(new RecordingChannelAdapter('recording2'));
     const again = await service.escalateToOwnerActor({ eventId: decision.id, reason: 'SLA expired' });
     // Neither a second wake nor a silent success: an explicit indeterminate.
     expect(again.indeterminate).toBe(true);
-    expect(channel.wakes).toHaveLength(1);
+    // No third wake: an unknown outcome is reconciled, never re-sent.
+    expect(channel.wakes).toHaveLength(2);
     const stored = service.state().channelEvents.find((e) => e.id === `${decision.id}:owner-escalation`)!;
     expect(stored.deliveryState).toBe('transport_indeterminate');
     expect(stored.undeliverableReason).toContain('indeterminate');
