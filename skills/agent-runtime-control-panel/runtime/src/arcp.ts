@@ -69,7 +69,7 @@ export type DecisionVerdict = 'accept' | 'refuse';
 export type ChannelEventKind = 'decision_required' | 'decision_resolved' | 'task_claimed' | 'task_candidate' | 'task_completed' | 'task_failed' | 'task_unknown' | 'phase_progress' | 'phase_completed' | 'blocker' | 'finding' | 'permission' | 'attention' | 'runtime_health' | 'transport_uncertainty' | 'material_progress' | 'workspace_analysis_required';
 export interface ChannelEventContent { summary: string; evidenceRefs: string[]; contentHash: string; sensitivity: 'normal' | 'sensitive'; retention: 'standard' | 'bounded'; }
 export interface ChannelTransition { state: 'queued' | 'delivered' | 'processed' | 'acknowledged' | 'transport_indeterminate' | 'undeliverable' | 'withdrawn'; at: string; }
-export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; reroutedToMemberId?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority: ChannelPriority; consumptionPolicy: ConsumptionPolicy; consumptionState: ConsumptionState; expectedAction: ExpectedAction; dispositions: RecipientDispositionReceipt[]; nextVisibleAt?: string; dependencyEventId?: string; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; consumedAt?: string; resolvedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; }
+export interface ChannelEvent { id: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; reroutedToMemberId?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority: ChannelPriority; consumptionPolicy: ConsumptionPolicy; consumptionState: ConsumptionState; expectedAction: ExpectedAction; dispositions: RecipientDispositionReceipt[]; nextVisibleAt?: string; dependencyEventId?: string; decisionRequired: boolean; content: ChannelEventContent; deliveryState: ChannelTransition['state']; transitions: ChannelTransition[]; createdAt: string; deliveredAt?: string; processedAt?: string; acknowledgedAt?: string; consumedAt?: string; resolvedAt?: string; undeliverableReason?: string; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; takeover?: HandlerTakeover; }
 type ChannelEventInput = { id?: string; workspaceId?: string; goalId?: string; taskId?: string; resultId?: string; sourceMemberId?: string; sourceActorId?: string; targetMemberId?: string; targetActorId?: string; targetRole?: string; targetSubscription?: string; semanticKey?: string; kind: ChannelEventKind; urgency: 'normal' | 'urgent'; priority?: ChannelPriority; consumptionPolicy: ConsumptionPolicy; expectedAction?: ExpectedAction; decisionRequired: boolean; summary: string; evidenceRefs: string[]; relatedEventId?: string; verdict?: DecisionVerdict; decisionOptions?: string[]; notify?: boolean };
 export interface PaseoPlacement { requested: { projectId?: string; workspaceId?: string; agentId?: string }; observed?: { projectId?: string; workspaceId?: string; agentId?: string; lifecycle?: string }; status?: 'PLACEMENT_MATCH' | 'PLACEMENT_MISMATCH' | 'PLACEMENT_UNKNOWN'; unresolved?: string; }
 /** A durable Paseo execution surface.  A ControlWorkspace may have one for
@@ -80,6 +80,10 @@ export interface RuntimeLaunchContext { parentAgentId?: string; workspaceId?: st
  * transport delivery. The primary handler alone owns acknowledgement and
  * action; cc recipients observe and must never create a second obligation. */
 export interface ReportingRoute { launchedByMemberId?: string; primaryHandlerMemberId?: string; ccMemberIds: string[]; escalationMemberIds: string[]; }
+export type HandlerTakeoverTrigger = 'primary_unavailable' | 'ack_sla_expired';
+/** Durable proof of why accountability for an obligation moved. Without it a
+ * takeover is indistinguishable from an ordinary reassignment. */
+export interface HandlerTakeover { fromMemberId?: string; toMemberId: string; trigger: HandlerTakeoverTrigger; evidence: string; at: string; }
 export interface RuntimeSession { id: string; actorId: string; goalId: string; taskId?: string; reportingRoute?: ReportingRoute; parentAgentId?: string; executionSurfaceId?: string; /** Durable proof that the launch itself carried the Goal Contract. Asserted by
    * the launcher from the presence of contract text; a reader cannot check it. */ contractBoundAtLaunch?: true;
   /** ArtifactRef of the exact contract revision bound at launch. Unlike
@@ -2395,6 +2399,81 @@ export class ArcpService implements ExecutionPlacementPort {
   /** Manager ACK SLA defaults. Configurable rather than a hardcoded promise:
    * these are the design's starting local targets, not a product guarantee. */
   static readonly DEFAULT_ACK_SLA_MS = { urgent: 120_000, normal: 900_000 };
+
+  /** The route governing an obligation, taken from the runtime session that owns
+   * its Task. This is the same lookup the cc fan-out uses. */
+  private routeForEvent(state: State, event: ChannelEvent): ReportingRoute | undefined {
+    return event.taskId ? state.sessions.find((item) => item.taskId === event.taskId && item.reportingRoute)?.reportingRoute : undefined;
+  }
+
+  /** A Member is positively unavailable only when we can see it and see that it
+   * is gone. Not resolving one is unknown, which is a different thing. */
+  private memberUnavailable(member: Member | undefined, nowMs: number): string | undefined {
+    if (!member) return undefined;
+    if (['retired', 'offline'].includes(member.lifecycle)) return `accountable handler ${member.id} is ${member.lifecycle}`;
+    if (member.leaseExpiresAt && Date.parse(member.leaseExpiresAt) < nowMs) return `accountable handler ${member.id} lease expired at ${member.leaseExpiresAt}`;
+    return undefined;
+  }
+
+  /**
+   * Activate a deferred escalation target.
+   *
+   * An escalation Member named at launch is dormant: it holds nothing while the
+   * primary handler is live and inside its SLA. It takes over only on positive,
+   * durable evidence — the primary is observably gone, or an open obligation
+   * outlived its ACK budget.
+   *
+   * Takeover *moves* accountability. The obligation's target is reassigned, so
+   * there is exactly one accountable handler before and after; a second
+   * obligation is never appended.
+   *
+   * Fail closed in both directions. A primary that cannot be observed is
+   * unknown, not unavailable, and never triggers a takeover — inferring "gone"
+   * from "cannot see" would hand accountability away on a lookup failure. And if
+   * no escalation Member is itself eligible, the obligation stays open and
+   * visibly overdue on the primary rather than being parked on someone
+   * unreachable.
+   *
+   * Owner escalation (`escalateOverdueObligations`) is deliberately untouched.
+   */
+  async activateDeferredTakeovers(input: { nowMs?: number; slaMs?: { urgent: number; normal: number } } = {}): Promise<Array<{ eventId: string; fromMemberId?: string; toMemberId: string; trigger: HandlerTakeoverTrigger; evidence: string }>> {
+    const nowMs = input.nowMs ?? Date.now();
+    const sla = input.slaMs ?? ArcpService.DEFAULT_ACK_SLA_MS;
+    return this.store.mutate((state) => {
+      const activated: Array<{ eventId: string; fromMemberId?: string; toMemberId: string; trigger: HandlerTakeoverTrigger; evidence: string }> = [];
+      for (const event of state.channelEvents) {
+        if (!['ack_required', 'decision_required'].includes(event.consumptionPolicy)) continue;
+        if (event.consumptionState !== 'open') continue;
+        // Once per obligation, so a repeated sweep re-derives the same row.
+        if (event.takeover) continue;
+        if (event.id.endsWith(':owner-escalation')) continue;
+        const candidates = this.routeForEvent(state, event)?.escalationMemberIds ?? [];
+        if (!candidates.length) continue;
+
+        const handler = event.targetMemberId ? state.members.find((item) => item.id === event.targetMemberId) : undefined;
+        const unavailable = this.memberUnavailable(handler, nowMs);
+        const since = Date.parse(event.deliveredAt ?? event.createdAt);
+        const budget = event.urgency === 'urgent' ? sla.urgent : sla.normal;
+        const overdue = Number.isFinite(since) && nowMs - since > budget;
+        if (!unavailable && !overdue) continue;
+
+        const target = candidates
+          .map((id) => state.members.find((item) => item.id === id))
+          .find((item): item is Member => Boolean(item) && item!.id !== event.targetMemberId && !['retired', 'offline'].includes(item!.lifecycle));
+        // No eligible escalation Member: leave it open on the primary rather
+        // than parking accountability somewhere it cannot be discharged.
+        if (!target) continue;
+
+        const trigger: HandlerTakeoverTrigger = unavailable ? 'primary_unavailable' : 'ack_sla_expired';
+        const evidence = unavailable ?? `obligation ${event.id} stayed open past its ${event.urgency} ACK budget of ${budget}ms`;
+        const takeover: HandlerTakeover = { ...(event.targetMemberId ? { fromMemberId: event.targetMemberId } : {}), toMemberId: target.id, trigger, evidence, at: now() };
+        event.takeover = takeover;
+        event.targetMemberId = target.id;
+        activated.push({ eventId: event.id, ...(takeover.fromMemberId ? { fromMemberId: takeover.fromMemberId } : {}), toMemberId: target.id, trigger, evidence });
+      }
+      return activated;
+    });
+  }
 
   /** Turn an unhandled Manager obligation into an Owner escalation automatically.
    *
